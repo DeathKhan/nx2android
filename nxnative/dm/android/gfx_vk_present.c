@@ -9,7 +9,7 @@
 #include <math.h>
 #include <time.h>
 #include "overlay_layout.h"
-#include "font5x7.h"
+#include "pixel_font.h"   // the fallback text: Fusion Pixel 12 px, CJK (upstream nx2android 85244e05c; it replaced font5x7.h)
 #include "overlay_font.h"
 #include "overlay_vert.spv.h"
 #include "overlay_frag.spv.h"
@@ -289,13 +289,12 @@ static void ov_box_ring(uint8_t *px, uint32_t w, uint32_t h, const ov_ctl *c, co
         else if (d < -ring) ov_plot(px, w, h, x, y, 50, 30);
     }
 }
+const uint8_t *dm_overlay_font(void);   // overlay_theme.c
+typedef struct { uint8_t *px; uint32_t w, h; } ov_plain;
+static void ov_text_plot(void *u, int x, int y) { const ov_plain *o = u; ov_plot(o->px, o->w, o->h, x, y, 220, 255); }
 static void ov_text(uint8_t *px, uint32_t w, uint32_t h, float cx, float cy, const char *s, int scale) {
-    int n = glyph_count(s), x0 = (int)(cx - n * 6 * scale / 2.0f), y0 = (int)(cy - 7 * scale / 2.0f);
-    for (int i = 0, cell = 0; s[i]; cell++) {
-        const unsigned char *g = glyph5x7(utf8_next(s, &i));
-        for (int col = 0; col < 5; col++) for (int row = 0; row < 7; row++) if (g[col] >> row & 1)
-            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) ov_plot(px, w, h, x0 + cell * 6 * scale + col * scale + dx, y0 + row * scale + dy, 220, 255);
-    }
+    const uint8_t *f = dm_overlay_font(); ov_plain o = {px, w, h};
+    pf_draw(f, s, (int)(cx - pf_width(f, s) * scale / 2.0f), (int)(cy + PF_CAP * scale / 2.0f), scale, ov_text_plot, &o);
 }
 // colour drawing for the menu button and the panel: straight alpha, "over" blending, shapes antialiased by their distance
 typedef struct { uint8_t *px; uint32_t stride, x0, y0, w, h; } ov_canvas;   // a w x h window of rows `stride` texels wide, at (x0, y0)
@@ -369,17 +368,14 @@ static void cv_line(const ov_canvas *cv, float ax, float ay, float bx, float by,
         float ex = px - dx * h, ey = py - dy * h; cv_blend(cv, x, y, c, t / 2 + 0.5f - sqrtf(ex * ex + ey * ey));
     }
 }
-static float cv_text_w(const char *s, int scale) { return (float)glyph_count(s) * 6 * scale - scale; }   // (glyphs, not bytes: UTF-8, upstream nx2android #102)
-static void cv_text(const ov_canvas *cv, float x, float cy, const char *s, int scale, const uint8_t c[4]) {   // the 5x7 letters; x: the left edge
-    int x0 = (int)(x + 0.5f), y0 = (int)(cy - 7 * scale / 2.0f + 0.5f);
-    for (int i = 0, cell = 0; s[i]; cell++) {
-        const unsigned char *g = glyph5x7(utf8_next(s, &i));
-        for (int col = 0; col < 5; col++) for (int row = 0; row < 7; row++) if (g[col] >> row & 1)
-            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) cv_blend(cv, x0 + cell * 6 * scale + col * scale + dx, y0 + row * scale + dy, c, 1);
-    }
+static float cv_text_w(const char *s, int scale) { return (float)(pf_width(dm_overlay_font(), s) * scale); }
+typedef struct { const ov_canvas *cv; const uint8_t *c; } cv_ink;
+static void cv_text_plot(void *u, int x, int y) { const cv_ink *k = u; cv_blend(k->cv, x, y, k->c, 1); }
+static void cv_text(const ov_canvas *cv, float x, float cy, const char *s, int scale, const uint8_t c[4]) {   // x: the left edge
+    cv_ink k = {cv, c}; pf_draw(dm_overlay_font(), s, (int)(x + 0.5f), (int)(cy + PF_CAP * scale / 2.0f + 0.5f), scale, cv_text_plot, &k);
 }
-// Text: the TrueType font (overlay_font.c) at px pixels to the em, or, without one, the 5x7 letters at the whole scale nearest the same capital height
-static int tx_scale(float px) { int s = (int)lroundf(px * 0.72f / 7); return s < 1 ? 1 : s; }
+// Text: the TrueType font (overlay_font.c) at px pixels to the em, or, without one, the pixel font (pixel_font.h) at the whole scale nearest the same capital height
+static int tx_scale(float px) { int s = (int)lroundf(px * 0.72f / PF_CAP); return s < 1 ? 1 : s; }   // (the pixel font's capital: PF_CAP rows)
 static float tx_w(const char *s, float px, int bold) { return ovf_ready() ? ovf_width(s, px, bold) : cv_text_w(s, tx_scale(px)); }
 typedef struct { const ov_canvas *cv; const uint8_t *c; } tx_ctx;
 static void tx_put(void *ctx, int x, int y, float cov) { const tx_ctx *t = ctx; cv_blend(t->cv, x, y, t->c, cov); }
@@ -771,7 +767,7 @@ static void ov_raster(uint8_t *px, uint32_t w, uint32_t h, uint32_t sh) {
         }
         if (ov_round(c)) ov_circle(px, w, h, b[0], b[1], b[2], c->kind == OV_BUTTON ? 2.5f : 3.0f);
         else ov_box_ring(px, w, h, c, b, 2.5f);
-        int ls = ts; while (ls > 1 && 7 * ls > fminf(b[2], b[3])) ls--;   // smaller on a small button (-, +)
+        int ls = ts; while (ls > 1 && PF_CAP * ls > fminf(b[2], b[3])) ls--;   // smaller on a small button (-, +)
         if (c->label[0]) ov_text(px, w, h, b[0], b[1], c->label, ls);
     }
     ov_canvas strip = {px, g_ov.tw, 0, 0, w, h + sh};
@@ -805,9 +801,15 @@ static float ov_glow(int64_t t, int64_t now) {   // a held button's glow: bright
     if (!t) return 0;
     float f = (float)(now - t) / OV_FLASH_NS; return f >= 1 ? 0.22f : 0.22f + 0.48f * (1 - f) * (1 - f);
 }
-// The frame rate counter: the game's frames shown per second, measured over half a second, in the window's top left corner on a dark box. Its characters
-// (OV_FPS_CHARS) are rasterized at the window's resolution into the rows under the panel, one cell each (the digits white, the letters the accent's); the counter is put together from them on every present, so a changing number needs no upload
-static float ov_fps_cell(void) { return (ovf_ready() ? 7.0f : 6.0f) * g_ov.gs + 2; }   // a character cell's width in texels
+// The frame rate counter: the game's frames shown per second, measured over half a second, in the corner the player chose on a dark box. Its characters
+// (OV_FPS_CHARS) are rasterized at the window's resolution into the rows under the panel, one cell each (the digits white, the letters the accent's, then red copies);
+// the counter is put together from them on every present, so a changing number needs no upload
+static float ov_fps_cell(void) {   // a character cell's width in texels: TrueType's, else the pixel font's widest advance of OV_FPS_CHARS (8 columns: A, O, T), a clear texel each side
+    if (ovf_ready()) return 7.0f * g_ov.gs + 2;
+    static int adv;
+    if (!adv) for (const char *c = OV_FPS_CHARS; *c; c++) { char one[2] = {*c, 0}; int a = pf_width(dm_overlay_font(), one); if (a > adv) adv = a; }
+    return (float)adv * g_ov.gs + 2;
+}
 static void ov_fps_glyphs(void) {   // the characters into the rows under the panel
     ov_canvas cv = {g_ov.px, g_ov.tw, 0, g_ov.h + g_ov.sh + g_ov.ph, g_ov.tw, g_ov.gh};
     for (uint32_t y = 0; y < g_ov.gh; y++) memset(g_ov.px + 4 * ((size_t)(cv.y0 + y) * g_ov.tw), 0, (size_t)g_ov.tw * 4);
@@ -1021,7 +1023,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
           if (g_ov.pw < (uint32_t)ceilf(fmaxf(a[2], b[2]))) g_ov.pw = (uint32_t)ceilf(fmaxf(a[2], b[2]));
           if (g_ov.ph < (uint32_t)ceilf(a[3] + b[3]) + 4) g_ov.ph = (uint32_t)ceilf(a[3] + b[3]) + 4; }
         g_ov.tw = g_ov.pw > w ? g_ov.pw : w;
-        g_ov.gs = (uint32_t)fmaxf(2, roundf(g_sext.height * 0.024f / 7)); g_ov.gh = 7 * g_ov.gs + 8;   // the counter's capitals: 2.4% of the window's height
+        g_ov.gs = (uint32_t)fmaxf(2, roundf(g_sext.height * 0.024f / 7)); g_ov.gh = (ovf_ready() ? 7 : PF_CAP) * g_ov.gs + 8;   // the counter's capitals: 2.4% of the window's height (the pixel font's are PF_CAP rows)
         if (g_ov.tw < (uint32_t)((2 * strlen(OV_FPS_CHARS) + 2) * ov_fps_cell() + g_ov.gh)) g_ov.tw = (uint32_t)((2 * strlen(OV_FPS_CHARS) + 2) * ov_fps_cell() + g_ov.gh);   // (twice: the red copies)
         ov_accent_update(); g_ov.acc = g_acc_rgb;
         uint32_t th = h + sh + g_ov.ph + g_ov.gh;
