@@ -32,6 +32,7 @@
 #include <sys/mman.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -237,7 +238,8 @@ static uint64_t g_btn; static float g_ax[8]; static int g_pad_used;   // lx ly r
 // Face buttons. Android names a pad's buttons by the Xbox layout (BUTTON_A at the bottom, B right, X left, Y top), so by position the bottom button is Nintendo's B and the
 // right one A (as the iOS front end maps). A device whose buttons carry Nintendo's labels in Nintendo's places and reports them by label (the AYN Odin 3: its right button, labelled A,
 // sends BUTTON_A) wants them as labelled: env.txt DM_PAD_LABELS=1, which porter install writes for such devices
-static int pad_labels(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PAD_LABELS"); v = e && atoi(e) > 0; } return v; }
+// upstream nx2android names the same switch DM_PAD_XBOX=1 (its Super Mario Odyssey and Super Mario Bros. Wonder profile rows): it turns this on too
+static int pad_labels(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PAD_LABELS"), *x = getenv("DM_PAD_XBOX"); v = (e && atoi(e) > 0) || (x && atoi(x) > 0); } return v; }
 int dm_pad_labels(void) { return pad_labels(); }   // (gfx_vk_present.c: the menu's key hints name the buttons as labelled)
 static uint64_t key_bit(int32_t k) {
     switch (k) {
