@@ -176,6 +176,7 @@ static void original_index_read(void);
 static int g_indirect_touch;   // DM_VK_INDIRECT_TOUCH (live): 1 transfer reads before indirect draws, 2 pass split alone, 0 off
 static int g_samp_snap = 1;   // DM_NVN_SAMP_SNAP=0 (live): samplers as registered now, not as the bind saw them (gfx_vk_tex.c vk_samp_at)
 static uint64_t g_x_flat[8]; static int g_x_flat_mode[8], g_x_nflat;   // DM_VK_X_FLAT_VS=<vertex shader key>[:mode][,...] (live debugging): mode bits 1 solid magenta pixel shader, 2 no depth test, 4 no blending (7 when left out)
+// Additional diagnostic bits: 8 no alpha coverage, 16 no depth bias, 32 no depth test/write, 64 no stencil. Captured in the pipeline key (pkey.flat), so a live change takes effect.
 static uint64_t g_x_logfs;   // DM_VK_LOG_FS=<fragment shader key> (live): one line per draw with it, with its samplers as the draw sees them
 static int g_rd_touch = 1, g_x_rdkeep, g_x_nskipvs; static uint64_t g_x_skipvs[8];   // DM_VK_RD_TOUCH, DM_VK_X_RDKEEP, DM_VK_X_SKIPVS (see prepare_draw)
 static char g_x_tracesize[40], g_x_traceframe[40]; static int g_x_traceframe_on;
@@ -1967,9 +1968,13 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
         k->mode == 0 ? VK_POLYGON_MODE_POINT : k->mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL, k->cull, k->front ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE,
         k->bias_en, 0, 0, 0, 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, (VkSampleCountFlagBits)k->samples, 0, 0, NULL, k->a2c, 0};
+    if (flat & 8) ms.alphaToCoverageEnable = 0;
+    if (flat & 16) rs.depthBiasEnable = 0;
     VkStencilOpState sf = {sop(k->sfail[0]), sop(k->szpass[0]), sop(k->szfail[0]), cmpop(k->sf[0]), 0xff, 0xff, 0}, sb = {sop(k->sfail[1]), sop(k->szpass[1]), sop(k->szfail[1]), cmpop(k->sf[1]), 0xff, 0xff, 0};
     VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0, k->dt, k->dt && k->dw, cmpop(k->df), 0, k->st, sf, sb, 0, 1};
     if (flat & 2) { ds.depthTestEnable = ds.depthWriteEnable = ds.stencilTestEnable = 0; }
+    if (flat & 32) ds.depthTestEnable = ds.depthWriteEnable = 0;
+    if (flat & 64) ds.stencilTestEnable = 0;
     VkPipelineColorBlendAttachmentState cba[8];
     for (uint32_t i = 0; i < k->ncol; i++) cba[i] = (VkPipelineColorBlendAttachmentState){(k->blend_en >> i) & 1, bfac(k->bl[i].src), bfac(k->bl[i].dst), bop(k->bl[i].eq),
         bfac(k->bl[i].srca), bfac(k->bl[i].dsta), bop(k->bl[i].eqa), k->wmask[i]};
@@ -3400,7 +3405,7 @@ static int prepare_draw(int prim, int indexed) {
     if (g_no_cull < 0) g_no_cull = getenv("DM_VK_NOCULL") != NULL;
     pkey k; memset(&k, 0, sizeof k);
     for (int i = 0; i < 3; i++) k.key[i] = S.sh[i] ? S.sh[i]->key : 0;
-    if (S.sh[0] && S.sh[1] && !S.rast_discard) for (int i = 0; i < g_x_nflat; i++) if (k.key[0] == g_x_flat[i]) k.flat = (uint32_t)g_x_flat_mode[i] & 7;
+    if (S.sh[0] && S.sh[1] && !S.rast_discard) for (int i = 0; i < g_x_nflat; i++) if (k.key[0] == g_x_flat[i]) k.flat = (uint32_t)g_x_flat_mode[i] & 127;
     k.topo = topo(prim); k.restart = S.prim_restart && (k.topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) && indexed;
     k.raster_discard = S.rast_discard; k.alt = (uint32_t)(g_spv_alt && (!g_spv_key || k.key[0] == g_spv_key || k.key[1] == g_spv_key || k.key[2] == g_spv_key)); k.cull = g_no_cull ? 0 : S.poly.cull;
     // counter-clockwise front faces in Vulkan's framebuffer: Vulkan's clip space has y down, Metal's up (nvn_mtl.m: CCW when (front == CCW) != lower left), and the

@@ -5,6 +5,9 @@
 // switches backup off where it is on). Any other service name is refused with a red line, as sm refuses a service that is not registered.
 // The SDK's own client functions are taken over where they reach the kernel (their calls inside sdk go through its PLT): the session manager's CreateNewSession runs natively on
 // DuplicateSession, and ConvertToDomainImpl on QueryPointerBufferSize and ConvertSessionToDomain. DM_SF_TRACE=1 dumps every request.
+// Bluetooth clients also connect at boot (Pokémon Scarlet 4.0.0 aborts in InitializeBle without bt; upstream nx2android b925ca982). bt and btm:u expose no remote devices:
+// acquisition returns real, unsignalled kernel events, scans return no devices, and connection / GATT operations fail. The command layouts are libnx's bt.c / btmu.c; no Android
+// Bluetooth access is implied.
 // Message layout (Atmosphère / libnx): HIPC header {u16 type, counts of X / A / B / W descriptors; u32 data words, receive list, special header flag}, the special header and descriptors,
 // then the data words, whose CMIF part starts 16-byte aligned to the buffer: in a domain session the domain header {u8 type, u8 objects, u16 size, u32 object, u32, u32 token} first,
 // then {"SFCI", version, command, token} and the arguments. The response is the same with {u32 objects, 3 × u32} and {"SFCO", version, result, token}
@@ -13,11 +16,13 @@
 
 #define SF_H0 0xd0000u   // session handles: outside the kernel handle table (0x1000 + slot, 4096 slots, hle_thread.c)
 #define SF_MAX 64
-// A service's own answer to a command: its result, and a kernel handle to copy to the client in *copy (0: none). NULL: success, zeroed output (olsc:u)
-typedef Result (*sf_answer)(unsigned cmd, uint32_t *copy);
+// A service's own answer to a command on an object: its result, and in *r what it hands back (0: none): a kernel handle to copy, a session handle to move, a domain object, and
+// one output word after the result (has_word). NULL: success, zeroed output (olsc:u)
+typedef struct { uint32_t copy, move, child, word; int has_word; } sf_reply;
+typedef Result (*sf_answer)(unsigned obj, int dom, unsigned cmd, sf_reply *r);
 static struct { char name[16]; int used, domain; unsigned seen; sf_answer answer; } g_sf[SF_MAX];
 static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
-static const char *const sf_served[] = {"olsc:u", "caps:su", "caps:u", "caps:a", "caps:c", "caps:sc", "caps:ss"};
+static const char *const sf_served[] = {"olsc:u", "caps:su", "caps:u", "caps:a", "caps:c", "caps:sc", "caps:ss", "bt", "btm:u"};
 
 static int sf_slot(uint32_t h) {
     unsigned i = h - SF_H0;
@@ -42,9 +47,10 @@ static uint32_t sf_new(const char *name, int domain, sf_answer answer) {
 // never takes (main+0xba54e4c): a Switch 2 supports the camera whether or not one is plugged in. So command 3 succeeds here, and so does 4 from Finalize (the module aborts on any failure there,
 // subsdk3+0x200c); QueryDeviceConnection's 29 and any other command answer 0x7c4, which the module and the game read as "No camera device detected.", and the first unknown command logs its number.
 // Mario Kart World 1.8.0 is the game that took 0xdc4 for "no camera" above; that build is not on this Mac, so it has not been run with these answers
-static Result camera_answer(unsigned cmd, uint32_t *copy) {
+static Result camera_answer(unsigned obj, int dom, unsigned cmd, sf_reply *r) {
+    (void)obj; (void)dom;
     if (cmd == 3 || cmd == 4) return RES_OK;
-    if (cmd == 21) { *copy = hle_new_event(NULL); return RES_OK; }
+    if (cmd == 21) { r->copy = hle_new_event(NULL); return RES_OK; }
     if (cmd != 29) { static int once; if (!once++) LOG("sf: camera command %u answered 0x7c4 (no camera device)", cmd); }
     return 0x7c4u;
 }
@@ -60,12 +66,39 @@ HLE_FORCE("_ZN2nn6camera3sdk19CreateCameraContextEPNS_5gsdrv18UniqueNativeHandle
     return RES_OK;
 }
 
+// Bluetooth with no devices (upstream nx2android b925ca982, Pokémon Scarlet 4.0.0): bt answers RegisterBleEvent (9) with an event that never fires and fails the rest (no connected GATT
+// peers or pending LE events); btm:u's GetCore (0) gives the core as a domain object (2) in a domain session, else as a moved session; the core hands out its scan, connection, pairing,
+// discovery and MTU events (acquired), lets scans and registrations succeed with nothing found, and fails what would connect, pair or configure a device
+static Result btm_core_answer(unsigned obj, int dom, unsigned cmd, sf_reply *r) {
+    (void)obj; (void)dom;
+    switch (cmd) {
+    case 0: case 17: case 21: case 26: case 33: r->copy = hle_new_event(NULL); r->word = 1; r->has_word = 1; return RES_OK;
+    case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10:
+    case 20: case 25: case 27: case 28: case 29: case 30: case 31: case 32: case 36: case 37: return RES_OK;
+    default: return RES_FAIL;
+    }
+}
+static Result bt_answer(unsigned obj, int dom, unsigned cmd, sf_reply *r) {
+    (void)obj; (void)dom;
+    if (cmd == 9) { r->copy = hle_new_event(NULL); return RES_OK; }
+    return RES_FAIL;
+}
+static Result btm_answer(unsigned obj, int dom, unsigned cmd, sf_reply *r) {
+    if (dom && obj == 2) return btm_core_answer(obj, dom, cmd, r);   // the core object GetCore made in this domain
+    if (cmd != 0) return RES_FAIL;
+    if (dom) r->child = 2; else r->move = sf_new("btm:core", 0, btm_core_answer);
+    return RES_OK;
+}
+
 HLE_FORCE("_ZN2nn2sf4hipc31InitializeHipcServiceResolutionEv", "service name resolution (connects to sm); the host resolves the names it serves itself", Result, h_sf_InitRes, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn2sf4hipc29FinalizeHipcServiceResolutionEv", "service name resolution (sm)", void, h_sf_FinRes, void) {}
 HLE_FORCE("_ZN2nn2sf4hipc20ConnectToHipcServiceEPNS_3svc6HandleEPKc", "connect to a service through sm → a host session for the services the host serves", Result, h_sf_Connect,
           uint32_t *out, const char *name) {
     for (size_t k = 0; k < sizeof sf_served / sizeof *sf_served; k++)
-        if (!strncmp(name, sf_served[k], 8)) { *out = sf_new(sf_served[k], 0, NULL); LOG("sf: %s → host session %#x (every request succeeds with zeroed output)", sf_served[k], *out); return RES_OK; }
+        if (!strncmp(name, sf_served[k], 8)) {
+            sf_answer a = !strcmp(sf_served[k], "bt") ? bt_answer : !strcmp(sf_served[k], "btm:u") ? btm_answer : NULL;
+            *out = sf_new(sf_served[k], 0, a); LOG("sf: %s → host session %#x%s", sf_served[k], *out, a ? " (no devices)" : " (every request succeeds with zeroed output)"); return RES_OK;
+        }
     LOG("[RED] sf: the game connects to service %.8s itself, which the host does not serve", name);
     return 0xe15u;   // sm ResultNotRegistered
 }
@@ -117,15 +150,19 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     if (magic != 0x49434653) { LOG("[RED] sf: %s: request without SFCI (%#x)", g_sf[i].name, magic); return 0xe401u; }
     unsigned key = (obj & 0xff) << 16 | (cmd & 0xffff);   // log each object / command once
     pthread_mutex_lock(&g_sf_mu); int first = g_sf[i].seen != key; g_sf[i].seen = key; pthread_mutex_unlock(&g_sf_mu);
-    uint32_t copy = 0; Result res = g_sf[i].answer ? g_sf[i].answer(cmd & 0xffff, &copy) : RES_OK;
-    if (first || trace) LOG("sf: %s object %u command %u (%u data words in): %s%s", g_sf[i].name, obj, cmd, ndw, res ? "fails" : "success, zeroed output", copy ? ", a copied handle" : "");
-    // The response: no descriptors. Without a handle there is no special header, so the data words start at +8; a copied handle takes a special header (its copy count) and the handle,
-    // so they start at +0x10. The CMIF part starts at +0x10 either way (16-byte aligned); everything after the headers up to the buffer's end reads as zero
-    size_t end = size < 0x1000 ? size : 0x1000, dw = copy ? 0x10 : 8;
+    sf_reply rp = {0}; Result res = g_sf[i].answer ? g_sf[i].answer(obj, dom, cmd & 0xffff, &rp) : RES_OK;
+    if (first || trace) LOG("sf: %s object %u command %u (%u data words in): %s%s%s%s", g_sf[i].name, obj, cmd, ndw, res ? "fails" : "success",
+                            rp.copy ? ", a copied handle" : "", rp.move ? ", a moved handle" : "", rp.child ? ", a domain object" : "");
+    // The response: no descriptors. Without a handle there is no special header, so the data words start at +8; a copied or moved handle takes a special header (its count) and the
+    // handle, so they start at +0x10. The CMIF part starts at +0x10 either way (16-byte aligned); everything after the headers up to the buffer's end reads as zero
+    size_t end = size < 0x1000 ? size : 0x1000, dw = rp.copy || rp.move ? 0x10 : 8;
     memset(base, 0, end);
     m[1] = (uint32_t)((end - dw) / 4 < 0x3ff ? (end - dw) / 4 : 0x3ff);
-    if (copy) { m[1] |= 1u << 31; m[2] = 1u << 1; m[3] = copy; }   // special header: no process ID, 1 copy handle, 0 move handles
+    if (rp.copy) { m[1] |= 1u << 31; m[2] = 1u << 1; m[3] = rp.copy; }        // special header: no process ID, 1 copy handle, 0 move handles
+    else if (rp.move) { m[1] |= 1u << 31; m[2] = 1u << 5; m[3] = rp.move; }   // special header: no process ID, 0 copy handles, 1 move handle
     size_t out = 0x10 + (dom ? 16 : 0);
     uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653; o[1] = ver; o[2] = res; o[3] = 0;   // "SFCO"; a domain's out-object count before it stays 0
+    if (rp.child) { *(uint32_t *)(base + 0x10) = 1; o[4] = rp.child; }   // a domain object: the domain header's out-object count, and its ID after the result
+    if (rp.has_word) o[4] = rp.word;
     return RES_OK;
 }

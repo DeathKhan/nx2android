@@ -1,5 +1,7 @@
-# Pokémon Scarlet 1.0.0, Game Freak's Trinity engine, SDK 13.3.5.
-# Only 1.0.0 is registered; use -p v0 when the NSP folder also has updates.
+# Pokémon Scarlet 4.0.0 (dump metadata v1), Game Freak Trinity, SDK 13.3.13, NVN.
+# Experimental Android bring-up on RedMagic NX809J / Adreno 840 (2026-11-06).
+# Shader tables come from this build's own main and Trinity packs, not Violet's.
+# The supplied dump reports v1; its NACP and main build identify 4.0.0.
 
 # ---- Identity ----
 title_id	0100A3D008C5C000
@@ -7,38 +9,35 @@ program_id	0100A3D008C5C000
 
 # ---- App ----
 name	Pokémon Scarlet
-ipa	PokemonScarlet.ipa
+ipa	PokMonScarlet.ipa
 app_category	public.app-category.games
-# The 3D layout exposes the right stick for the camera and the D-pad.
 pad_layout	full
+fps_target	60
+fps_hold	off
 
 # ---- Versions ----
-build	v0	1.0.0	main=ca44e7dd62e61a2a4e8889b3319ae173	sdk=3644a6760469451cabc99f00c540acc2
-package	v0
-shader_versions	v0
-
-# The game calls nvnDeviceSetDepthMode(near=0); prepare the same main0_z bases
-# offline so the first run can use them instead of repeating the full prebuild.
-depth_mode	zero
+build	v1	4.0.0	main=421c5411b487eb4d049dd065fec95477	sdk=bb560bdfa85b4a97786ae2c3b7995df6
+package	v1
+shader_versions	v1
 
 # ---- Files ----
-# subsdk0 is NintendoSDK_movie; the host supplies its imported entry points.
+# The host supplies the movie API; main takes nothing else from subsdk0.
 modules	main sdk
 romfs_marker	arc/data.trpfs
 zip_store	.bk2:.bnk:.pck:.trpfd:.trpfs:.metallib
 
 # ---- Memory ----
-# The 4 GB allocator reservation (patches.py), 62 MB SDK node area and 32 MB
-# region alignment fit in the alias region. See README.md for the startup probes.
-mem_reserve	0x140000000
-mem_alias	0x118000000
+# The NPDM declares 16 MB of system resource. nninitStartup reserves a 12 GB
+# StandardAllocator region; 4.375 GB and 12.375 GB alias regions both refused
+# it (0x1803). The survey layout plus 24 GB of virtual headroom boots without
+# allocator/SDK binary cuts; the log places that region's end at alias +13 GB.
+mem_reserve	0x740000000
+mem_alias	0x718000000
 mem_stack	0x10000000
 app_pool	0xCD500000
 sys_resource	0x1000000
-# Startup allocates and frees everything allocatable. The SDK releases those
-# cached pages only after a map fails at the real application-pool limit.
-mem_map_limit	on
 
 # ---- Shader split ----
-shader_groups	#arc/system_resource=system #arc/ik_effect=effect #arc/ik_pokemon=pokemon #arc/ui=layout /arc/=arc
+# 35,937 shaders, including BNSH inside Oodle-compressed arc/data.trpfs entries.
+shader_groups	/audio/=audio /arc/=arc /demo/=demo /system/=system /event/=event
 shader_note	Pokémon Scarlet shaders
