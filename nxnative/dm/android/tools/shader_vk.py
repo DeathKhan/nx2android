@@ -8,6 +8,13 @@
 #   control section, code area), translated beside the package's; a file whose content does not hash to its name, or whose key the package has, is left out
 # Bundle (read by the Vulkan backend, dm/android/gfx_vk_shader.c): dmsv.py has the format and writes it. Each shader's SPIR-V and its binary reflection (refl_bin, below);
 #   version 2, the SPIR-V of each module zstd-compressed (--zstd, default dmsv.LEVEL; 0 or a Python without zstd: version 1, uncompressed).
+# Switch 2 (NVN2) shaders: a record whose control section is NVN2's (magic 0x98761234, version 0xc9; dmsh_ampere.py) holds Ampere code, which the translator decodes natively
+#   (job arch sm86, the job dmsh_build.py job_for builds): the instructions are control +0x38 bytes of the code area (a 0x80-byte SPH first in the graphics stages, none in compute),
+#   the c1 segment lies between control +0x40 and +0x44, a compute shader's per-shader c[0] layout comes from the control section (job nvn2_cs: the translator maps its push constants
+#   to c[24], its uniform and storage entries to NVN's compute tables at c0 0x210 / 0x310 and its handles to c[2], so the reflection reads as a Switch 1 shader's), and its thread
+#   group is at control +0x58 (+0x64 shared memory). A task (control +0x56 = 6) or mesh (7) shader is translated as a compute kernel with its stage memory in shared memory (job
+#   stage_memory, dmsh_meshstage.py); the bundle keeps it under stage 6 / 7 in the entry's stage word (the Vulkan backend has no task / mesh draw path yet and reads neither).
+#   NVN's VertexA + VertexB merge, transform feedback (+0x6dc) and early fragment tests (+0x718) are NVN control fields, read on the Switch 1 path only. The bundle format is unchanged.
 import argparse, collections, concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys, tempfile
 from pathlib import Path
 
@@ -15,6 +22,7 @@ HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent.parent / 'gfx/tools'
 sys.path[:0] = [str(TOOLS), str(HERE)]
 import dmsh_facts, dmsh_chain, dmsv   # noqa: E402  (DM_GAME picks the profile)
+import dmsh_ampere, dmsh_meshstage    # noqa: E402  NVN2 (Switch 2) control sections and task / mesh stage memory, the Mac chain's own modules (backend-neutral)
 from shader_split import glslc_stage   # the package reader also recognizes headerless compute code
 
 ap = argparse.ArgumentParser()
@@ -31,7 +39,8 @@ GAME = dmsh_chain.load_game()
 FACTS = dmsh_facts.load()
 MAP = str(GAME.table('shader_map.tsv'))
 XLATE_DLL = a.xlate or str(TOOLS / 'dmsh_xlate_bin/dmsh_xlate.dll')
-STAGES = {'vs': 0, 'ps': 1, 'gs': 2, 'hs': 3, 'ds': 4, 'cs': 5}   # NVN stage numbers
+STAGES = {'vs': 0, 'ps': 1, 'gs': 2, 'hs': 3, 'ds': 4, 'cs': 5, 'ts': 6, 'ms': 7}   # NVN stage numbers; 6 / 7: NVN2's task and mesh stages (control +0x56), translated as compute kernels
+NVN2_LOCAL, NVN2_SHARED = 0x58, 0x64   # an NVN2 compute shader's thread group and shared memory bytes in its control section (shader_split.py writes the same into shader_facts.tsv)
 # Storage buffers are bound from a 256-byte boundary below their address (gfx_vk_exec.c SB_ALIGN, the same number): Vulkan's largest minStorageBufferOffsetAlignment, so a multiple of
 # every device's; the translator offsets every storage access by the address's distance from that boundary (Program.cs QueryHostStorageBufferOffsetAlignment)
 SB_ALIGN = 256
@@ -105,8 +114,42 @@ def xfb_layout(key, ctl):
 def gs_variant_key(key, t):   # the bundle key of a geometry shader translated for input primitive t (0 points, 1 lines, 2 lines with adjacency, 4 triangles with adjacency)
     return key ^ ((t + 1) * 0x9E3779B97F4A7C15 & 0xFFFFFFFFFFFFFFFF)
 
+def job_common(key, stage, cp, c1, **extra):   # the job every shader gets (the translation options are the Android chain's; see dmsh_xlate/Program.cs), then the per-shader facts
+    return {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'debug': False, 'reduced': True, 'sb_align': SB_ALIGN, 'subgroup': SUBGROUP, 'gather_bias': GATHER_BIAS, 'gs_passthrough': False, **extra}
+
+nvn2_notes = collections.Counter()
+def nvn2_job(key, stage, rec, ci, w):
+    """dmsh_build.py job_for's NVN2 (Switch 2) branch: the record's control section is NVN2's (dmsh_ampere.is_nvn2). The code area holds Ampere code, control +0x38 bytes of it (the
+    0x80-byte SPH included in the graphics stages; compute has no header), and the shader's c1 segment between control +0x40 and +0x44 (dmsh_ampere.c1_segment); the translator's Ampere
+    frontend reads it (job arch sm86). Compute lays out its driver constants in c[0] per shader, which the control section counts: +0xa9 push constant words, +0xb1 uniform buffer
+    entries, +0xb2 storage buffer entries, +0xb3 texture handles, +0xb4 separate textures, +0xb5 separate samplers (images follow), +0xba the total bytes (job nvn2_cs, in the order
+    Program.cs QueryAmpereComputeC0Layout takes: the translator maps each range onto NVN's fixed tables, InstEmitAmpere.cs AMapC0); its thread group is at +0x58 and its shared memory
+    bytes at +0x64 (what shader_split.py writes into shader_facts.tsv; read here too for run-time captures, which have no row). A task (+0x56 = 6) or mesh (7) shader is translated as a
+    compute kernel with its SPH taken off and its stage memory in shared memory (dmsh_meshstage.info / memory → job stage_memory, local = its threads, shared = the memory's bytes); one
+    whose instructions use shared memory of their own would lie over that memory and is noted. NVN's fields (VertexA / B, transform feedback, early fragment tests) are not in an NVN2 section"""
+    ctl, area = rec[ci:], rec[0x38:ci]
+    c1 = dmsh_ampere.c1_segment(ctl, area)
+    code = area[:dmsh_ampere.inst_len(ctl)]
+    extra, facts = {'arch': 'sm86'}, True
+    if stage == 'cs':
+        extra['nvn2_cs'] = [ctl[0xb1], ctl[0xb2], ctl[0xb3], struct.unpack_from('<H', ctl, 0xba)[0], ctl[0xa9] * 4, ctl[0xb4], ctl[0xb5]]
+        x, y, z = struct.unpack_from('<3I', ctl, NVN2_LOCAL); shared = struct.unpack_from('<I', ctl, NVN2_SHARED)[0]
+        extra.update(local=[x, y, z], shared=(shared + 15) // 16 * 16)
+    elif stage in ('ts', 'ms'):
+        mesh = dmsh_meshstage.info(ctl, area)
+        lay, size = dmsh_meshstage.memory(mesh)
+        if dmsh_meshstage.own_shared(code[0x80:]): nvn2_notes[f'{stage}: shared memory of its own lies over the stage memory'] += 1
+        extra.update(stage_memory=lay, local=[mesh['threads'], 1, 1], shared=size); code = code[0x80:]; stage = 'cs'; facts = False   # its threads and memory come from its control section
+    cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
+    j = job_common(key, stage, cp, c1, **extra)
+    if not facts: return j, c1
+    if key in FACTS: j.update(FACTS[key])
+    else: j['no_facts'] = True
+    return j, c1
+
 def job_for(key, stage, rec, w):   # dmsh_build.py job_for; transform feedback is captured natively (xfb_layout), from the vertex or the geometry stage
     ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]
+    if dmsh_ampere.is_nvn2(rec[ci:]): return nvn2_job(key, stage, rec, ci, w)   # Switch 2: Ampere code, its own control layout; the NVN path below is unchanged
     c1o, c1t = struct.unpack_from('<2I', rec, ci + 0x700)
     c1 = rec[0x38 + c1o:0x38 + c1t]
     ab = vertex_ab(key, code, rec[ci:]) if stage == 'vs' else None
@@ -192,7 +235,7 @@ def spirv_bindings(spv):
 
 # Handle decoding: as dmsh_build.py decode_tex / decode_ubo_tex / reflect (names: <stage>_t<type>_cb<slot>_<handle>, <stage>_c<n>, <stage>_s<n>, <stage>_i…)
 TEX_BASE, IMG_BASE, IMG_SLOTS, SEPTEX_BASE, SEPTEX_SLOT0, SAMP_BASE = 0x20, 0x120, 8, 0x168, 128, 0x568
-SSBO = {'vs': 0x110, 'cs': 0x310, 'ps': 0x510}
+SSBO = {'vs': 0x110, 'cs': 0x310, 'ps': 0x510, 'ts': 0x670, 'ms': 0x770}   # each stage's storage buffer table in c0 (dmsh_abi.h DMSH_C0_SSBO_*; ts / ms: NVN2's task and mesh stages)
 def classify(stage, b, res):
     nm = b['name']; e = dict(b)
     # Dynamic pool arrays use driver c2 slot indices (as the Metal backend).
@@ -421,15 +464,21 @@ def main():
         if k in handle_remaps:
             spv = remap_handles(spv, *handle_remaps[k])
         st = stages[k]
+        if any(b['binding'] > 0xffff or b['count'] > 0xffff for b in binds):
+            # The translator could not resolve a handle to a slot and declared bindless arrays (2^20 textures, 4096 samplers; Welcome Tour's two Ampere compute shaders that index
+            # their textures at run time): the bindings past them do not fit refl_bin's 16-bit fields, and no device binds such arrays. Left out of the bundle, counted apart
+            fails['bindless arrays (reflection past 16 bits)'] += 1; print(f'[RED] {k} ({st}): bindless texture arrays, left out of the bundle', flush=True); continue
         cl = [classify(st, b, res) for b in binds]
         for e in cl: kinds_all[e['kind']] += 1
         # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
-        hdr3 = (local or jobs[k].get('local') or [1, 1, 1]) if st == 'cs' else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
+        hdr3 = (local or jobs[k].get('local') or [1, 1, 1]) if st in ('cs', 'ts', 'ms') else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
         entries.append((gs_var[k] if k in gs_var else int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3)))
     if a.zstd: print(f'compressing {len(entries)} shaders (zstd level {a.zstd}, {a.jobs} threads) ...', flush=True)
     ver, raw, stored = dmsv.write(a.out, entries, level=a.zstd, jobs=a.jobs)
     print(f'{len(entries)} of {len(keys)} shaders → {a.out} ({os.path.getsize(a.out) / 2**20:.1f} MB, version {ver}: SPIR-V {raw / 2**20:.1f} MB'
           f'{f", {stored / 2**20:.1f} MB compressed" if ver > 1 else ""}); failed: {dict(fails)}; binding kinds: {dict(kinds_all)}')
     for e, n in errs.most_common(8): print(f'  translator: {n:5d}  {e}')
+    arch = collections.Counter('sm86' if jobs[k].get('arch') == 'sm86' else 'maxwell' for k in keys)
+    if arch['sm86']: print(f'NVN2 (Switch 2) shaders: {arch["sm86"]} of {len(keys)} translated as Ampere' + ''.join(f'; {n} {e}' for e, n in nvn2_notes.most_common()), flush=True)
 
 main()
