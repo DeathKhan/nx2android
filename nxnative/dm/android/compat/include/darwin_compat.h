@@ -35,3 +35,13 @@ static inline int pthread_cond_timedwait_relative_np(pthread_cond_t *c, pthread_
     return pthread_cond_timedwait(c, m, &t);
 }
 #define MACH_PORT_NULL 0
+
+// struct stat's timespec fields under their BSD names (save_sync.c)
+#define st_atimespec st_atim
+#define st_mtimespec st_mtim
+#define st_ctimespec st_ctim
+// Code made at run time (hle_jit.c): Android lets an app map anonymous memory read + write + execute, so MAP_JIT adds nothing and the per-thread write-protect toggle is a no-op
+#ifndef MAP_JIT
+#define MAP_JIT 0
+#endif
+static inline void pthread_jit_write_protect_np(int enabled) { (void)enabled; }

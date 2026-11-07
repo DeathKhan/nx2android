@@ -1081,3 +1081,6 @@ int mtl_display_hz(void) { return 60; }
 int mtl_fps_target(void) { return DM_GAME_FPS_TARGET > 0 ? DM_GAME_FPS_TARGET : 60; }
 void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
 void mtl_prog_release(prog_t *p) { (void)p; }
+
+// hle_vi.c's frame history: presents queued and shown so far. The swapchain hands a frame on when mtl_present returns, so nothing stays queued
+void mtl_present_progress(uint64_t *queued, uint64_t *done) { *queued = *done = g_presents; }

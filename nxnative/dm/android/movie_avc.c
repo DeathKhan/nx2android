@@ -218,3 +218,6 @@ int mavc_take(mavc *a, int flush, uint8_t *dst, int w, int h, int64_t *pts_us) {
     free(pic);
     return 1;
 }
+
+// The stream's colour matrix (hle_movie.c): BT.709 as its SPS declares; MediaCodec does not expose the SPS's VUI here, so as upstream's undeclared case: from 720 lines up
+int mavc_bt709(const mavc *a, int h) { (void)a; return h >= 720; }

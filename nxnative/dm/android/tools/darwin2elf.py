@@ -14,6 +14,10 @@ for line in open(src, encoding='utf-8'):
     code = re.sub(SYM + r'@PAGEOFF', r':lo12:\1', code)
     code = re.sub(SYM + r'@PAGE', r'\1', code)
     code = code.replace('.private_extern', '.hidden')
+    m = re.match(r'^(\s*)\.zerofill\s+__DATA\s*,\s*__bss\s*,\s*' + SYM + r'\s*,\s*(\d+)\s*,\s*(\d+)\s*$', code.rstrip('\n'))
+    if m:   # .zerofill __DATA,__bss,_sym,size,align (align as a power of two) -> an object in .bss; the section in force before it is restored
+        ind, sym, size, align = m.groups()
+        code = f'{ind}.section .bss\n{ind}.hidden {sym}\n{ind}.p2align {align}\n{ind}{sym}:\n{ind}.skip {size}\n{ind}.previous\n'   # hidden: adrp reaches it directly in the shared library (as the Mach-O build does)
     for pat, rep in SECTIONS: code = re.sub(r'^(\s*)' + pat, lambda m: m.group(1) + rep, code)
     code = re.sub(r'(\.globl\s+|\.hidden\s+|\b(?:bl|b|b\.\w+|cbz\s+\w+,|cbnz\s+\w+,|tbz\s+\w+,\s*#\d+,|tbnz\s+\w+,\s*#\d+,|adr\s+\w+,)\s*)' + SYM + r'\b', r'\1\2', code)
     code = re.sub(r'^(\s*)' + SYM + r':', r'\1\2:', code)   # label definitions

@@ -953,7 +953,7 @@ static void motion_feed(const ASensorEvent *e, const double acc[3]) {   // a gyr
         switch (g_rot) { case 1: v[0] = -y; v[1] = x; break; case 2: v[0] = -x; v[1] = -y; break; case 3: v[0] = y; v[1] = -x; break; default: break; } }
     float fa[3], fg[3];
     for (int i = 0; i < 3; i++) { fg[i] = (float)(g[i] / (2 * M_PI)); fa[i] = (float)(-a[i] / ASENSOR_STANDARD_GRAVITY); }
-    dm_motion_set(fa, fg, e->timestamp);
+    dm_motion_set_device(fa, fg, e->timestamp);
     if (log && e->timestamp - logged >= 1000000000) { logged = e->timestamp;
         LOG("front end: motion (rotation %d) acc %+.2f %+.2f %+.2f G, gyro %+.3f %+.3f %+.3f rev/s", g_rot * 90, fa[0], fa[1], fa[2], fg[0], fg[1], fg[2]); }
 }
@@ -1127,3 +1127,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (pthread_create(&t, &at, host_thread, NULL)) LOG("[RED] cannot start the host thread"); else pthread_detach(t);
     pthread_attr_destroy(&at);
 }
+
+// The controller applet's prompt (front.h, ctrl_prompt.h; hle_hid.c ctrl_support): the game wants min..max players and sees fewer. No prompt on Android yet: -1, and the host answers
+// as the player closing it (ResultControllerSupportCanceled), as it did before the upsync. TODO(upsync): an overlay prompt while controllers join, as DmGamepad.m's
+int front_ctrl_support(int min, int max) { (void)min; (void)max; return -1; }

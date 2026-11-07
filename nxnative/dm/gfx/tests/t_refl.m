@@ -2,13 +2,14 @@
 // Dummy texture type MTLTextureType: 1D=0 1DArray=1 2D=2 2DArray=3 Cube=5 CubeArray=6 3D=7
 #import "../nvn/nvn_refl.h"
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
 #include "dmsh_chain.h"   // dm/gfx/nvn (-I from the Makefile)
 
 enum { C = NVN_RB_CBUF, S = NVN_RB_SAMP, T = NVN_RB_TEX, I = NVN_RB_IMG, TB = NVN_RB_TBUF };
 enum { F = NVN_DPF_FLOAT, U = NVN_DPF_UINT, D = NVN_DPF_DEPTH };
-static int fail, n;
+static int fail, n, skipped;
 static void check(const char *what, long want, long got) {
     n++; int ok = want == got; fail += !ok;
     if (!ok) printf("  %-40s expected %ld → got %ld ✗\n", what, want, got);
@@ -16,12 +17,41 @@ static void check(const char *what, long want, long got) {
 static NSDictionary *load(const char *key) {
     NSString *p = [NSString stringWithFormat:@"%s%s/build/cache/metal_shader_cache/b-%s/%s.json", getenv("DM_ROOT") ?: getenv("HOME"), getenv("DM_ROOT") ? "" : "/dm-work", DMSH_CHAIN, key];   // the library of the current translation chain version
     NSData *d = [NSData dataWithContentsOfFile:p];
-    if (!d) { printf("[RED] missing reflection sample %s\n", p.UTF8String); fail++; return nil; }
+    if (!d) { printf("SKIP: no reflection sample %s (the samples are translated shaders of Super Mario Bros. Wonder in the NSP script's build cache; DM_ROOT or ~/dm-work/build/cache/metal_shader_cache), the checks on it do not run\n", p.UTF8String); skipped++; return nil; }
     return [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
 }
 
 int main(void) { @autoreleasepool {
     nvn_refl r; char err[160] = "";
+    {   // native image atomics (dmsh_atomic.py): one read_write image, marked atomic by the build; an image the shader only stores to is not
+        NSDictionary *j = @{@"route": @"B", @"bindings": @[
+            @{@"kind": @"img", @"reg": @2, @"arg_id": @0, @"msl_name": @"cp_i_cb2_4C_r32ui", @"msl_type": @"texture_buffer<uint, access::read_write>", @"atomic": @YES},
+            @{@"kind": @"img", @"reg": @3, @"arg_id": @1, @"msl_name": @"cp_i_cb2_4E_r32ui", @"msl_type": @"texture3d<uint, access::write>"}]};
+        check("atomic image: conversion succeeds", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        check("atomic image: IMG kind", NVN_RB_IMG, r.b[0].kind);
+        check("atomic image: texture type", MTLTextureTypeTextureBuffer, r.b[0].dtt);
+        check("atomic image: unsigned format", NVN_DPF_UINT, r.b[0].dpf);
+        check("atomic image: written", 1, r.b[0].rw);
+        check("atomic image: atomic flag", 1, r.b[0].atom);
+        check("stored image: 3D texture type", MTLTextureType3D, r.b[1].dtt);
+        check("stored image: no atomic flag", 0, r.b[1].atom);
+    }
+    {   // readable-tile calls (dmsh_fetch.py): one at an interpolated output, one projective, one at the pixel position times c[6].xy (frag_pos, Splatoon Raiders' ink stamps)
+        NSDictionary *j = @{@"route": @"B", @"stage": @"ps", @"bindings": @[], @"fetch": @{@"calls": @[@{@"fc": @0, @"tex_reg": @1, @"varying_locn": @3},
+            @{@"fc": @1, @"tex_reg": @2, @"varying_locn": @4, @"proj": @1}, @{@"fc": @2, @"tex_reg": @3, @"frag_pos": @[@[@0, @6, @0], @[@0, @6, @1]]}]}};
+        check("fetch calls: conversion succeeds", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        check("fetch calls: three", 3, r.nfc);
+        check("fetch calls: projective bit", 2, r.fc_proj);
+        check("fetch calls: pixel-position bit", 4, r.fc_fpos);
+        check("fetch calls: pixel-position has no interpolated output", 0xff, r.fc_locn[2]);
+        check("fetch calls: x scale c[6].x", 6 << 2, r.fc_scale[2][0]);
+        check("fetch calls: y scale c[6].y", 6 << 2 | 1, r.fc_scale[2][1]);
+        NSDictionary *far = @{@"route": @"B", @"stage": @"ps", @"bindings": @[], @"fetch": @{@"calls": @[@{@"fc": @0, @"tex_reg": @6, @"frag_pos": @[@[@6, @989, @0], @[@6, @989, @1]]}]}};
+        check("fetch calls: a vector past c[x][63] converts (Mario Kart World's c6[989])", 0, nvn_refl_from_json(far, &r, err, sizeof err));
+        check("fetch calls: slot 6, vector 989, x", 6 << 16 | 989 << 2, r.fc_scale[0][0]);
+        NSDictionary *bad = @{@"route": @"B", @"stage": @"ps", @"bindings": @[], @"fetch": @{@"calls": @[@{@"fc": @0, @"tex_reg": @3, @"frag_pos": @[@[@16, @6, @0], @[@0, @6, @1]]}]}};
+        check("fetch calls: a uniform slot out of range is refused", 1, nvn_refl_from_json(bad, &r, err, sizeof err) != 0);
+    }
     {   int f0 = fail;   // Route A is retired: PC-chain reflection (no route = B) must be rejected
         NSDictionary *pc = @{@"arg_buffer_index": @0, @"bindings": @[@{@"type": @"cbuffer", @"reg": @10, @"arg_id": @0, @"access": @"constant", @"msl_type": @"constant cb1_struct*"}], @"vertex_inputs": @[]};
         check("PC chain reflection (no route = B) fails", 1, nvn_refl_from_json(pc, &r, err, sizeof err) != 0);
@@ -70,6 +100,18 @@ int main(void) { @autoreleasepool {
         check("B handle array: sampler kind", NVN_RB_SAMPU, r.b[3].kind); check("B handle array: sampler n", 32, r.b[3].n); check("B handle array: bindless", 1, r.bindless);
         printf("%-60s %s\n", "B array of 32 handles in uniform slot 11 (texture + sampler)", fail == f1 ? "✓" : "✗");
     }
+    {   int f1 = fail;   // handles in a uniform buffer beyond textures: Unreal Engine 5.4 on the Switch 2 keeps images and buffer textures there, and ORs a texture and a sampler word in either order
+        NSDictionary *j = @{@"route": @"B", @"bindings": @[
+            @{@"kind": @"img_ubo", @"reg": @0, @"off": @8, @"arg_id": @0, @"msl_name": @"cp_i_cb3_2_", @"msl_type": @"texture_buffer<float, access::write>", @"atomic": @YES},
+            @{@"kind": @"tbuf_ubo", @"reg": @1, @"off": @16, @"arg_id": @1, @"msl_name": @"cp_tb_cb4_4", @"msl_type": @"texture_buffer<uint>"},
+            @{@"kind": @"tex_ubo", @"reg": @0, @"off": @88, @"soff": @0, @"sreg": @2, @"arg_id": @2, @"msl_name": @"fp_t_cb262147_10000016", @"msl_type": @"texture2d<float>"},
+            @{@"kind": @"tex_ubo", @"reg": @0, @"off": @24, @"arg_id": @3, @"msl_name": @"fp_t_cb3_6", @"msl_type": @"texture2d<float>"}]};
+        check("B uniform handles: conversion succeeds", 0, nvn_refl_from_json(j, &r, err, sizeof err));
+        check("B uniform handles: image kind", NVN_RB_IMGU, r.b[0].kind); check("B uniform handles: image offset", 8, r.b[0].off); check("B uniform handles: image written", 1, r.b[0].rw); check("B uniform handles: image atomic", 1, r.b[0].atom);
+        check("B uniform handles: buffer texture kind", NVN_RB_TBUFU, r.b[1].kind); check("B uniform handles: buffer texture slot", 1, r.b[1].reg); check("B uniform handles: bindless", 1, r.bindless);
+        check("B uniform handles: other word at byte 0 of slot 2", 1, r.b[2].soff); check("B uniform handles: its slot", 2, r.b[2].sreg); check("B uniform handles: one word has no other", 0, r.b[3].soff);
+        printf("%-60s %s\n", "B images, buffer textures and two-word handles in uniform slots", fail == f1 ? "✓" : "✗");
+    }
     {   int f1 = fail;
         NSDictionary *b1 = @{@"route": @"B", @"bindings": @[@{@"kind": @"foo", @"arg_id": @0, @"msl_name": @"x", @"msl_type": @"constant _16*"}]};
         NSDictionary *b2 = @{@"route": @"B", @"bindings": @[@{@"kind": @"tex", @"reg": [NSNull null], @"arg_id": @0, @"msl_name": @"fp_t_x", @"msl_type": @"texture2d<float>"}]};
@@ -77,6 +119,6 @@ int main(void) { @autoreleasepool {
         check("B texture without a resolved slot fails", 1, nvn_refl_from_json(b2, &r, err, sizeof err) != 0);
         printf("%-60s %s\n", "B negative control: unknown kind / missing slot", fail == f1 ? "✓" : "✗");
     }
-    printf("== %d checks, %d failed ==\n", n, fail);
+    printf("== %d checks, %d failed, %d sample files missing (those checks skipped) ==\n", n, fail, skipped);
     return fail != 0;
 } }

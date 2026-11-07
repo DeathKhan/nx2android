@@ -122,3 +122,4 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     if (r && dst) for (int z = 0; z < (r->depth ? r->depth : 1); z++) for (int y = 0; y < r->height; y++) memset(dst + (size_t)z * img + (size_t)y * row, 0, row);
 }
 
+void mtl_present_progress(uint64_t *queued, uint64_t *done) { *queued = *done = 0; }

@@ -137,10 +137,21 @@ def lost_patches(builds, exefs, mods, table=None):
     return out
 
 
+def scan(folder, keys, env=None, want=None):
+    """The folder's packages grouped by game, as upstream's build_ipa_from_nsp does since its package_reader: every title ID and version comes from the packages' content metas
+    (nx_extract --contents), never from a file name. env must put dotnet on PATH (the Porter's env does; inspect builds one)"""
+    if env is None:
+        dotnet = toolchain.find_dotnet(config.load())
+        if not dotnet: raise BuildError('reading the packages needs the .NET SDK: `porter tools --download`')
+        env = dict(os.environ, PATH=os.pathsep.join([str(Path(dotnet).parent), os.environ.get('PATH', '')]), DOTNET_ROOT=str(toolchain.dotnet_root(Path(dotnet))), DOTNET_CLI_TELEMETRY_OPTOUT='1')
+    with nsp.package_reader(NXNATIVE, keys, env) as packages:
+        return nsp.scan_nsps(Path(folder), packages.contents, want)
+
+
 def inspect(folder, keys=None):
     """What a game folder holds, without extracting anything: the GUI's game card and `porter inspect`. keys: prod.keys (default: the configured one), which reads the title ID
     of a dump with neither a ticket nor a [title ID] tag (an untagged cartridge dump) from its NCA headers"""
-    app, fam = nsp.scan_nsps(Path(folder), dumps.EXTS, keys or config.load().get('keys'))
+    app, fam = scan(folder, keys or config.load().get('keys'))
     g, ap = profiles.by_title(app)
     files = [fam['base'], *(p for _, p in fam['updates']), *(p for _, _, p in fam['dlc'])]
     info = dict(title_id=f'{app:016X}', base=fam['base'].name, updates=[{'version': f'v{v}' if v is not None else None, 'file': p.name} for v, p in fam['updates']],
@@ -151,7 +162,7 @@ def inspect(folder, keys=None):
         info['reason'] = f'no game profile for {app:016X}: this game is not supported yet (an experimental port surveys it and guesses a profile; it may not start)'
         return info
     builds = g.builds()
-    have = nsp.nsp_versions(fam, builds)
+    have = nsp.nsp_versions(fam)
     pack = max(have, key=nsp.vnum)
     info.update(profile=g.id, name=g.get('name', g.id), versions=sorted(have, key=nsp.vnum), pack=pack,
                 registered={v: b.get('display', '') for v, b in builds.items()}, derived=pack not in builds)
@@ -226,7 +237,7 @@ class Port:
     def inputs(self):
         o = self.o
         say(f'game folder: {o.folder}')
-        self.app, self.fam = nsp.scan_nsps(o.folder, dumps.EXTS, o.keys)
+        self.app, self.fam = scan(o.folder, o.keys, self.env, getattr(o, 'title_id', None))
         tid = f'{self.app:016X}'
         self.work = o.folder / f'{tid}_build'
         g, ap = profiles.by_title(self.app)
@@ -240,7 +251,7 @@ class Port:
         if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+', self.package): raise BuildError(f'not a package name: {self.package}')
         say(f'game profile: {g.id} {g.get("name", "")} (Android: {ap.status}' + (f', tested on {ap.tested}' if ap.tested else '') + ')')
         builds, need = g.builds(), g.words('shader_versions')
-        have = nsp.nsp_versions(self.fam, builds)
+        have = nsp.nsp_versions(self.fam)
         self.derived, self.derived_mem, self.lost = '', '', []
         if self.provisional:   # the version the survey saw
             self.pkg_ver = o.version or g.get('package')
@@ -318,7 +329,7 @@ class Port:
         PROG.stage('build nx_extract')
         nx = nsp.build_nx_extract(NXNATIVE, self.work, self.logs, self.env)
         PROG.end()
-        self.dirs = {ver: nsp.extract(nx, o.keys, ex, ver, *picks[ver], None, self.logs, g) for ver in self.versions}
+        self.dirs = {ver: nsp.extract(nx, o.keys, ex, ver, *picks[ver], None, self.logs, g, self.app) for ver in self.versions}
         bad = [] if self.derived else [f'{v}: {x}' for v in self.versions for x in nsp.build_mismatch(self.dirs[v], v, g)]
         if bad and self.provisional: raise BuildError(f'not the builds the provisional profile registers: {"; ".join(bad)}')
         if bad:
@@ -626,7 +637,7 @@ class Port:
             if getattr(self, "ue_why", ""): self.device_ue()   # Unreal's shader code archives, decoded on the device into <version dir>/ue_shaders before the split reads them
             nsp.split_shaders(PY, NXNATIVE, [self.dirs[v] / 'RomFS' for v in sv], [self.dirs[v] / 'ExeFS/main' for v in sv], pkg, self.env, self.logs, self.g, bool(self.derived or self.provisional),
                                oodle=self.device_oodle if self.oodle_why else None,   # Oodle-compressed archives: the game's own decoder on the device
-                               aoc=self.aoc)   # DLC with shaders of its own (Xenoblade Chronicles 3's archives)
+                               dlc_roms=sorted(p for p in self.aoc.iterdir() if p.is_dir() or p.suffix == '.img') if self.aoc else ())   # DLC with shaders of its own (Xenoblade Chronicles 3's archives)
         finally: self.device_oodle_end()
         self.dmsv = self.aw / 'shaders.dmsv'; kf = self.aw / 'shaders.dmsv.key'; cap = self.aw / 'captured_shaders'
         PROG.stage('Vulkan shaders', step='building the translator')

@@ -1,19 +1,33 @@
 // Networking (out of scope: online play/friends/store/cloud saves): all hooked up as "network unavailable", the game takes the offline branch.
 // Cuts: ssl and friends are hooked up as failures when they come into use. nn::socket is in hle_socket.c, nifm in hle_ldn.c (both offline unless local play over the LAN is on).
 #include "hle.h"
+#include <pthread.h>
+#include <stdatomic.h>
 
+// TODO(upsync): upstream (seedds/nxnative main) added to the socket / nifm hooks that this fork moved to hle_socket.c and hle_ldn.c; port there (upstream's hle_net.c has the code):
+//  - nn::socket::internal::Initialize(int) (SDK 21 inlines Initialize(const Config &) into the game, Star Fox): succeed, no session
+//  - nifm: SubmitNetworkRequest leaves the request "on hold" for the first IsNetworkRequestOnHold query after the submission, then settled (Pikmin 4's BCAT thread; Hades' poller):
+//    `static _Atomic int g_nifm_hold`, Submit stores 1, Cancel 0, OnHold decrements and answers h > 0
+//  - HandleNetworkRequestErrorResult returns bool (`and w0, w0, #1`, Metroid Dread): 0 = not resolved, not a Result
 HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "offline: no proxy setting", Result, h_nifm_GetProxy, void *p) { (void)p; return RES_FAIL; }
 HLE_FORCE("nnsslInitialize", "connects to the ssl service; the network library's global init needs it to succeed, offline creates no session (cut)", Result, h_ssl_Initialize, void) { return RES_OK; }
 HLE_FORCE("nnsslFinalize", "pairs with nnsslInitialize (cut)", Result, h_ssl_Finalize, void) { return RES_OK; }
 
+// TODO(upsync): upstream also changed the offline socket layer, now in hle_socket.c here; port:
+//  - EventFd / EventFdRead / EventFdWrite as real host counters (fd 0x4000.., 64 of them, Horizon flags: bit 0 reads one at a time, bits 1|2 never block) with Close releasing them and
+//    Poll waiting on them with dm_guest_cond_wait_ns (gRPC in nn::npln, Ocarina of Time, aborts in grpc_init without a wake-up descriptor)
+//  - Poll of a descriptor the host never made: nothing ready at the timeout, 0 (not -1/ENETDOWN; Star Fox's HTTP thread takes any failure but EINTR as fatal)
+//  - SDK 21 overloads: GetPeerName(int, sockaddr *, u32 *), Shutdown(int, ShutdownMethod), Read, Write, GetHostEntByName(const char *), SetAllocator(MemoryResource *) ignored,
+//    and the C library's "poll" (nnmusl) routed to the host's Poll
 
-// ---------- ssl: offline, Initialize succeeds (the network library's global initialization depends on it), everything else that contacts the service fails ----------
+// ---------- ssl: offline, Initialize and a context's Create / Destroy succeed, everything else that contacts the service fails ----------
+// A context is a session of the local ssl service, so on Horizon Create works with no network and only a connection needs one; DRAGON QUEST BUILDERS 2 ends its startup when Create fails (main+0x861260).
 // Not cut: Context / Connection construction and destruction, Context::GetContextId (only read and write game objects).
 #define SSF(m, cname, ...) HLE_FORCE(m, "ssl service (cut): fails", Result, cname, __VA_ARGS__)
 HLE_FORCE("_ZN2nn3ssl10InitializeEv", "same as nnsslInitialize: succeeds, creates no session (cut)", Result, h_ssl_InitCpp, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn3ssl8FinalizeEv", "pairs with Initialize (cut)", Result, h_ssl_FinCpp, void) { return RES_OK; }
-SSF("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", h_ssl_CtxCreate, void *self, int v) { (void)self; (void)v; return RES_FAIL; }
-SSF("_ZN2nn3ssl7Context7DestroyEv", h_ssl_CtxDestroy, void *self) { (void)self; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", "a session of the local ssl service: succeeds offline, connects to nothing (cut)", Result, h_ssl_CtxCreate, void *self, int v) { (void)self; (void)v; return RES_OK; }
+HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "pairs with Create (cut)", Result, h_ssl_CtxDestroy, void *self) { (void)self; return RES_OK; }
 SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { (void)self; (void)id; (void)p; return RES_FAIL; }
 SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
 SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) { (void)ids; (void)n; if (o) *o = 0; return RES_FAIL; }
