@@ -107,6 +107,8 @@ HLE_FORCE("_ZN2nn3err23ShowNetworkServiceErrorENS0_9ErrorCodeE", "network servic
 // ---------- pdm: the system's play log ----------
 // Pokémon Sword asks at boot how often this user has launched two other games (main+0xc88074, one ID each call, 0x18 bytes {application ID, play time, launch count} per entry; the result is
 // not read, a launch count of at least 1 is): the host keeps no play log, so every one was never played. The SDK's own call opens the pdm service (null read at sdk+0x336ccc)
+// Kirby and the Forgotten Land asks the same right after its save mount, for Kirby Star Allies (01007E3006DDA000): SIGSEGV reading address 0 at sdk+0x359208
+// (QueryApplicationPlayStatistics+0xc8) on update 1.1.0 without this (upstream nx2android aa9a3f528)
 HLE_FORCE("_ZN2nn3pdm30QueryApplicationPlayStatisticsEPNS0_25ApplicationPlayStatisticsERKNS_7account3UidEPKNS_13ApplicationIdEi", "play statistics of other games: never played (the host keeps no play log)",
           Result, h_pdm_QueryStats, uint64_t *out, const void *uid, const uint64_t *ids, int n) {
     (void)uid; for (int i = 0; out && ids && i < n; i++) { out[3 * i] = ids[i]; out[3 * i + 1] = 0; out[3 * i + 2] = 0; }
