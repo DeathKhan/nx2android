@@ -241,6 +241,10 @@ void vk_init(void) {
     // imageless framebuffers need render pass 2 (gfx_vk_exec.c rp_get): core in 1.2, else its extension
     V.has_imageless = v12 ? f12.imagelessFramebuffer : featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES)[0] && is_on(on, non, "VK_KHR_create_renderpass2");
     if (!V.has_imageless && !V.has_dynrender) die("[vk] the device has neither dynamic rendering nor imageless framebuffers with render pass 2: passes cannot be begun");
+    // buffer device addresses: the shaders' raw global memory (PhysicalStorageBuffer pointers through the pool table, vk_gmem_map) needs the pools' buffers to have one. DM_VK_NO_BDA=1 (start-up): off
+    { const char *e = getenv("DM_VK_NO_BDA");
+      V.has_bda = (v12 ? f12.bufferDeviceAddress : featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)[0]) && !(e && atoi(e));
+      if (!V.has_bda) VKLOG("[RED] no buffer device addresses (Vulkan 1.2 bufferDeviceAddress or VK_KHR_buffer_device_address): shaders that access memory through loaded addresses reach nothing"); }
     if (!v13) VKLOG("Vulkan %u.%u device: %u extensions enabled for the features promoted to 1.2 / 1.3; dynamic rendering %s", VK_API_VERSION_MAJOR(V.props.apiVersion),
                     VK_API_VERSION_MINOR(V.props.apiVersion), npromo, V.has_dynrender ? "yes" : "no (render pass objects only)");
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR fbc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
@@ -377,7 +381,13 @@ static int recv_fds(int sock, int *fds, int max) {
 static const VkBufferUsageFlags POOL_USAGE0 = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
     VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-#define POOL_USAGE (POOL_USAGE0 | (V.has_xfb ? VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT : 0))   // any pool range may be a transform feedback buffer
+#define POOL_USAGE (POOL_USAGE0 | (V.has_xfb ? VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT : 0) | (V.has_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0))   // any pool range may be a transform feedback buffer, or reached through a raw global memory pointer (vk_gmem_map)
+// A buffer made with the device-address usage must have its memory allocated with this flag (VUID-vkBindBufferMemory-bufferDeviceAddress-03339): every POOL_USAGE allocation's chain starts here
+#define BDA_ALLOC_FLAGS(next) VkMemoryAllocateFlagsInfo bda_fl = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, (next), VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0}; void *bda_next = V.has_bda ? (void *)&bda_fl : (void *)(next)
+static uint64_t buf_gpu_addr(VkBuffer b) {   // the buffer's device address, 0 without the feature
+    if (!V.has_bda || !vkGetBufferDeviceAddress) return 0;
+    VkBufferDeviceAddressInfo i = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, b}; return vkGetBufferDeviceAddress(V.dev, &i);
+}
 static VkResult pool_copied_alloc(vkpool_t *p, uint64_t size, int cached) {
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, POOL_USAGE, VK_SHARING_MODE_EXCLUSIVE};
     VkBuffer b; VkResult r = vkCreateBuffer(V.dev, &bi, NULL, &b); if (r) return r;
@@ -385,13 +395,14 @@ static VkResult pool_copied_alloc(vkpool_t *p, uint64_t size, int cached) {
     uint32_t type = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         (cached ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT), 0);
     if (type == UINT32_MAX) { vkDestroyBuffer(V.dev, b, NULL); return VK_ERROR_FEATURE_NOT_PRESENT; }
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, type};
+    BDA_ALLOC_FLAGS(NULL);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, bda_next, req.size, type};
     VkDeviceMemory m; r = vkAllocateMemory(V.dev, &ai, NULL, &m);
     if (r) { vkDestroyBuffer(V.dev, b, NULL); return r; }
     void *map; r = vkBindBufferMemory(V.dev, b, m, 0);
     if (!r) r = vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &map);
     if (r) { vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL); return r; }
-    p->buf = b; p->mem = m; p->shadow = map;
+    p->buf = b; p->mem = m; p->shadow = map; p->gpu = buf_gpu_addr(b);
     p->noncoherent = !(V.mem.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     mem_diag_pool(size, req.memoryTypeBits, type); return VK_SUCCESS;
 }
@@ -442,13 +453,14 @@ static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size) {
     vr = vkCreateBuffer(V.dev, &bi, NULL, &p->buf);
     if (vr) { mem_diag_zc(8, "vkCreateBuffer", size, "VkResult", vr); AHardwareBuffer_release(ahb); return -2; }
     VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, p->buf};   // the driver requires a dedicated allocation for an imported AHardwareBuffer
-    VkImportAndroidHardwareBufferInfoANDROID imp = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, &ded, ahb};
+    BDA_ALLOC_FLAGS(&ded);
+    VkImportAndroidHardwareBufferInfoANDROID imp = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, bda_next, ahb};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, ap.allocationSize, vk_mem_type(ap.memoryTypeBits, 0, 0)};
     vr = vkAllocateMemory(V.dev, &ai, NULL, &p->mem);
     if (!vr) { vr = vkBindBufferMemory(V.dev, p->buf, p->mem, 0); if (vr) mem_diag_zc(10, "vkBindBufferMemory", size, "VkResult", vr); }
     else mem_diag_zc(9, "vkAllocateMemory", size, "VkResult", vr);
     if (vr) { vkDestroyBuffer(V.dev, p->buf, NULL); AHardwareBuffer_release(ahb); return -2; }
-    p->ahb = ahb; p->zero_copy = 1;
+    p->ahb = ahb; p->zero_copy = 1; p->gpu = buf_gpu_addr(p->buf);
     return 0;
 }
 // A zero-copy pool's dma-buf mapped again over [mem, mem+len) in one piece per chunk, read-only (nvn_dirty_defrag: the mappings its protection split never merge). 0 = done
@@ -858,10 +870,66 @@ void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, b->size, POOL_USAGE, VK_SHARING_MODE_EXCLUSIVE};
     VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &b->b));
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b->b, &req);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
+    BDA_ALLOC_FLAGS(NULL);   // (POOL_USAGE carries the device-address usage)
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, bda_next, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
     VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &b->m)); VKCHK(vkBindBufferMemory(V.dev, b->b, b->m, 0));
     void *m; VKCHK(vkMapMemory(V.dev, b->m, 0, VK_WHOLE_SIZE, 0, &m)); b->p = m;
     b->used = n; *buf = b->b; *off = 0; return b->p;
+}
+// Raw global memory (gfx_vk.h RK_GMEM_MAP): a shader that loads or stores at an address it read from memory, which the translator could tie to no storage buffer (Ryujinx
+// GlobalToStorage.TryGenerateRawStorageOp), finds the pool holding the address in this table and goes through a PhysicalStorageBuffer pointer to the pool buffer's device address.
+// Donkey Kong Bananza: gsys's vertex shader c9a56f796ea4a4cd writes {count 0, instances 1} into each terrain indirect draw record whose address its storage buffer lists, every frame
+// before the culling geometry shader refills them; with the stores dropped the terrain's walls and floor were never drawn (instance count 0).
+// Layout (dmsh_abi.h DMSH_GMEM_MAP_*, as nvn_mtl.m gmem_map builds it for Metal): DMSH_GMEM_MAP_ENTRIES entries of DMSH_GMEM_MAP_ENTRY bytes, {start, end (exclusive), delta} as
+// 64-bit words then a 32-bit hint word and 4 bytes of padding, sorted by start; entry 0 is empty (0, 0), unused entries start at ~0. The pools (every chunk of a game pool is a buffer
+// of its own, g_pool_ord lists them by lo) go in as disjoint ranges: a chunk overlapping an earlier one keeps only its part past that one's end. delta = the buffer's device address
+// minus the chunk's guest address lo, so guest address + delta is the GPU address of the same bytes, in a zero-copy pool (the same memory) and in a copied one (its GPU copy, as the
+// pre-submission sync left it). Each 2 MiB chunk (DMSH_GMEM_HINT_SHIFT) lying wholly inside an entry gets a hint in entry (chunk & (entries - 1)): the chunk in the high bits, the
+// entry's index in the low DMSH_GMEM_MAP_LOG2 bits, 0 = none; the shader checks the tag and searches on a collision (GlobalToStorage.cs). Rebuilt when a pool comes or goes
+// (vk_pool_gen); the replaced table is freed once the GPU has passed the current submission, which may still read it. Host-visible, written by the CPU before the submission.
+#include "dmsh_abi.h"
+#define GMEM_MAP_LOG2 13   // GlobalToStorage.GmemMapLog2: log2 of DMSH_GMEM_MAP_ENTRIES
+_Static_assert(DMSH_GMEM_MAP_ENTRIES == 1 << GMEM_MAP_LOG2, "gmem table size");
+static VkBuffer g_gmem_buf; static VkDeviceMemory g_gmem_mem; static uint32_t g_gmem_gen; static int g_gmem_n;
+VkBuffer vk_gmem_map(VkDeviceSize *len) {
+    *len = (VkDeviceSize)DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY;
+    if (g_gmem_buf && g_gmem_gen == vk_pool_gen()) return g_gmem_buf;
+    VkBuffer b; VkDeviceMemory m; uint8_t *t;
+    { VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, *len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
+      VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &b)); VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b, &req);
+      VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
+      VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, b, m, 0));
+      void *mp; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &mp)); t = mp; }
+    memset(t, 0, *len);
+    for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
+    int n = 1, over = 0, noaddr = 0; uint64_t end = 0; uint32_t gen;
+    pthread_rwlock_rdlock(&g_pool_mu);
+    gen = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE);
+    for (int k = 0; k < g_npool; k++) {
+        const vkpool_t *p = &g_pool[g_pool_ord[k]];
+        if (!p->gpu) { noaddr++; continue; }
+        uint64_t lo = p->lo > end ? p->lo : end, hi = p->hi;
+        if (lo >= hi) continue;
+        if (n == DMSH_GMEM_MAP_ENTRIES) { over++; continue; }
+        uint64_t e[3] = {lo, hi, p->gpu - p->lo}; memcpy(t + (size_t)n++ * DMSH_GMEM_MAP_ENTRY, e, sizeof e); end = hi;
+    }
+    pthread_rwlock_unlock(&g_pool_mu);
+    // the hints: each 2 MiB chunk wholly inside an entry, with the chunk as a tag (a later entry's colliding chunk replaces it; the shader's tag check sends the other to the search).
+    // Chunks at or above 1 << (32 - GMEM_MAP_LOG2) do not fit the tag, and the shader does not try the hint for an address that high (addrHigh >= 1 << (DMSH_GMEM_HINT_SHIFT - GMEM_MAP_LOG2))
+    for (int k = 1; k < n; k++) {
+        const uint64_t *e = (const uint64_t *)(t + (size_t)k * DMSH_GMEM_MAP_ENTRY);
+        uint64_t size = 1ull << DMSH_GMEM_HINT_SHIFT, first = (e[0] + size - 1) >> DMSH_GMEM_HINT_SHIFT, last = e[1] >> DMSH_GMEM_HINT_SHIFT;
+        for (uint64_t c = first; c < last && c < (1ull << (32 - GMEM_MAP_LOG2)); c++) {
+            uint32_t hint = (uint32_t)(c << GMEM_MAP_LOG2 | (unsigned)k);
+            memcpy(t + (size_t)(c % DMSH_GMEM_MAP_ENTRIES) * DMSH_GMEM_MAP_ENTRY + 24, &hint, sizeof hint);
+        }
+    }
+    if (over) VKRED_ONCE(140, "raw global memory: %d more memory pool chunks than the %d entries of the pool table; addresses in them are not reached", over, DMSH_GMEM_MAP_ENTRIES - 1);
+    if (noaddr) VKRED_ONCE(141, "raw global memory: %d memory pool chunks have no device address; addresses in them are not reached", noaddr);
+    if (g_gmem_buf) vk_defer_free_buffer(g_gmem_buf, g_gmem_mem);
+    g_gmem_buf = b; g_gmem_mem = m; g_gmem_gen = gen; g_gmem_n = n - 1;
+    { static int said; if (!said++) VKLOG("raw global memory: pool table of %d ranges (pool generation %u), rebuilt whenever a pool comes or goes", n - 1, gen); }
+    return b;
 }
 static void df_add(int kind, void *a, void *b) {
     if (g_cur < 0) {   // outside a submission (a pool finalized between frames): after everything submitted so far
