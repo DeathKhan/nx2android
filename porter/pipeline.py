@@ -801,7 +801,14 @@ class Port:
         (Android 8+ launchers draw a plain icon small on a white disc): the icon fills the 72 dp the launcher's mask shows, over a blurred copy that fills
         the 108 dp layer. [] without Pillow or an icon"""
         src = next((d / 'icon.jpg' for d in (self.game, self.base) if (d / 'icon.jpg').exists()), None)
-        if not src: say('[RED] no game icon in the extraction: the app gets the system\'s default icon'); return []
+        if getattr(self.o, 'icon', ''): src = Path(self.o.icon).expanduser()   # --icon: the player's own image wins
+        elif not src:   # no control data (a NUP or a dump folder packed without it): an image beside the package or in the icon folder, by the game's name
+            names = [self.nup.stem] if self.nup else []; names += [self.app_name, self.g.get('name', ''), 'icon']
+            dirs = [self.o.folder] + ([Path(self.cfg['icons']).expanduser()] if self.cfg.get('icons') else [])
+            src = next((d / f'{n}{ext}' for d in dirs for n in names if n for ext in ('.png', '.jpg', '.jpeg') if (d / f'{n}{ext}').is_file()), None)
+            if src: say(f'app icon: {src}')
+        if not src: say('[RED] no game icon in the extraction, none beside the package, none in the icon folder (porter config icons <folder>): the app gets the system\'s default icon'); return []
+        if not src.is_file(): raise BuildError(f'--icon: no such image: {src}')
         try: from PIL import Image, ImageFilter
         except ImportError: say('[RED] no Pillow (pip install pillow): the app gets the system\'s default icon'); return []
         art = Image.open(src).convert('RGB'); plain, fg, bg = self.aw / 'icon.png', self.aw / 'icon_fg.png', self.aw / 'icon_bg.png'

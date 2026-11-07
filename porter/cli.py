@@ -17,6 +17,8 @@ def _parser():
     po.add_argument('-p', '--version', default='', help='version to pack, v<N> (default: the newest in the folder)')
     po.add_argument('-l', '--language', default='', help='game language, a code or a name (default: English)')
     po.add_argument('--app-name', default='', help='the app\'s name on the device (default: the game\'s name)')
+    po.add_argument('--icon', default='', help='an image for the app icon (PNG / JPEG). Default: the game\'s own icon from its control data; without one (a NUP or dump without control data), '
+                                                 '<game>.png / .jpg beside the package, icon.png / .jpg in its folder, or <name>.png / .jpg in the folder set with `porter config icons <folder>`')
     po.add_argument('--install', action='store_true', help='install on the connected device afterwards')
     po.add_argument('--device', default='', help='adb serial of the device to install on')
     po.add_argument('--replace-signer', action='store_true', help='uninstall an app of the same package signed with another key first (deletes its saves)')
