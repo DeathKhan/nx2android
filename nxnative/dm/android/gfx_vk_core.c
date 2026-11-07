@@ -864,7 +864,8 @@ static int g_pool_lazy = -1, g_gmem_used;
 static uint64_t g_pool_chunks, g_pool_backed, g_pool_bytes, g_pool_backed_bytes, g_pool_lazy_backed;   // chunks and bytes made / backed, chunks backed after creation
 static int pool_lazy_on(void) { if (g_pool_lazy < 0) { const char *e = getenv("DM_VK_EAGER_POOLS"); g_pool_lazy = !(e && atoi(e)); } return g_pool_lazy; }
 void vk_pool_stats(uint64_t *pools, uint64_t *backed, uint64_t *bytes, uint64_t *backed_bytes) { *pools = g_pool_chunks; *backed = g_pool_backed; *bytes = g_pool_bytes; *backed_bytes = g_pool_backed_bytes; }
-// The chunk's buffer: zero-copy where it can be, else a GPU copy refreshed before each submission. Under the write lock. late: after creation (the game may be writing it)
+// The chunk's buffer: zero-copy where it can be, else a GPU copy refreshed before each submission. Under the write lock, or on a pool not published yet (pool_add_one).
+// late: after creation (the game may be writing it)
 static void pool_back_locked(vkpool_t *p, int late) {
     uint8_t *mem = (uint8_t *)(uintptr_t)p->lo; uint64_t size = p->hi - p->lo;
     int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : getenv("DM_VK_NO_ZEROCOPY") ? -4 : zc_over(p->end - p->base) ? -5 : 0, frozen = 0, held = 0;
@@ -890,14 +891,20 @@ static void pool_back_locked(vkpool_t *p, int late) {
     static uint64_t zc_bytes, cp_bytes; if (zc) cp_bytes += size; else zc_bytes += size;
     static int nlog; if (nlog++ < 24) VKLOG("memory pool %p +%#llx: %s%s (zero-copy %.1f MB, copied %.1f MB)", (void *)mem, (unsigned long long)size, zc ? "copied" : "zero-copy", late ? ", backed at its first GPU use" : "", zc_bytes / 1048576.0, cp_bytes / 1048576.0);
 }
+// A pool backed at creation (DM_VK_EAGER_POOLS=1, or once shaders use raw global memory) gets its buffer before the write lock is taken, on a copy of its entry no lookup can
+// see yet, and only the entry is put in under the lock (upstream nx2android 8a41d0413): the hardware buffer (a binder call to the allocator service), the copy into it and the
+// driver's import take milliseconds each, and every lookup waits on the lock (vk_pool_of: each buffer binding of each draw on the replay thread, and the game threads'
+// mtl_addr). Pokémon Scarlet makes and drops pools on three threads at once while a thrown ball flies (~180 MB of capture assets in 1.5 s): the replay thread stood almost
+// still for a second with the GPU idle. A lazy chunk (the default) is backed at its first GPU use instead (vk_pool_of)
 static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end) {
+    vkpool_t q; memset(&q, 0, sizeof q);
+    q.lo = (uint64_t)(uintptr_t)mem; q.hi = q.lo + size; q.base = base; q.end = end;
+    if (!pool_lazy_on() || __atomic_load_n(&g_gmem_used, __ATOMIC_ACQUIRE)) pool_back_locked(&q, 0);
     pthread_rwlock_wrlock(&g_pool_mu);
     if (g_npool == MAXPOOL) { pthread_rwlock_unlock(&g_pool_mu); die("[vk] too many memory pools"); }
-    vkpool_t *p = &g_pool[g_npool]; memset(p, 0, sizeof *p);
-    p->lo = (uint64_t)(uintptr_t)mem; p->hi = p->lo + size; p->base = base; p->end = end; { static uint64_t ser; p->serial = ++ser; }
+    { static uint64_t ser; q.serial = ++ser; }
     g_pool_chunks++; g_pool_bytes += size;
-    if (!pool_lazy_on() || g_gmem_used) pool_back_locked(p, 0);
-    pool_ord_insert(g_npool++); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+    g_pool[g_npool] = q; pool_ord_insert(g_npool++); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
     int np = g_npool;
     pthread_rwlock_unlock(&g_pool_mu);
     if (np >= 1024 && !(np & (np - 1))) VKLOG("%d memory pools live; %llu chunks made so far (%.1f GB), %llu backed (%.1f GB; %llu of them at their first GPU use)", np, (unsigned long long)g_pool_chunks, g_pool_bytes / 1073741824.0, (unsigned long long)g_pool_backed, g_pool_backed_bytes / 1073741824.0, (unsigned long long)g_pool_lazy_backed);
