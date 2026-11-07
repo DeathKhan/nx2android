@@ -15,6 +15,11 @@
 #   group is at control +0x58 (+0x64 shared memory). A task (control +0x56 = 6) or mesh (7) shader is translated as a compute kernel with its stage memory in shared memory (job
 #   stage_memory, dmsh_meshstage.py); the bundle keeps it under stage 6 / 7 in the entry's stage word (the Vulkan backend has no task / mesh draw path yet and reads neither).
 #   NVN's VertexA + VertexB merge, transform feedback (+0x6dc) and early fragment tests (+0x718) are NVN control fields, read on the Switch 1 path only. The bundle format is unchanged.
+# Raw global memory (dm/gfx/nvn/dmsh_abi.h DMSH_KIND_GMEM_MAP / DMSH_KIND_GMEM_LOG): a load or store at an address the shader read from memory, which the translator could tie to no
+#   storage buffer (Ryujinx GlobalToStorage.TryGenerateRawStorageOp), goes through the host's memory pool table, a storage buffer the translator reserves under the sentinel constant
+#   buffer slot 0xff (DMSH_GMEM_MAP_CB_SLOT) at offset 0, and its write log at offset DMSH_GMEM_LOG_CB_OFFSET (1). They are binding kinds gmem_map (17) and gmem_log (18) here, as
+#   dmsh_build.py classifies them for Metal; the Vulkan backend builds the table from its pools (gfx_vk_core.c vk_gmem_map) and hands each set a cleared log (gfx_vk_exec.c stage_set).
+#   Before that they were read as sbuf_ubo of uniform slot 0xff - 3 and bound to zeros: Donkey Kong Bananza's terrain (gsys vertex shader c9a56f796ea4a4cd) wrote its draw records nowhere.
 import argparse, collections, concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys, tempfile
 from pathlib import Path
 
@@ -22,6 +27,7 @@ HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent.parent / 'gfx/tools'
 sys.path[:0] = [str(TOOLS), str(HERE)]
 import dmsh_facts, dmsh_chain, dmsv   # noqa: E402  (DM_GAME picks the profile)
+import dmsh_abi as abi              # noqa: E402  the shader library ABI (dm/gfx/nvn/dmsh_abi.h): the raw global memory slot
 import dmsh_ampere, dmsh_meshstage    # noqa: E402  NVN2 (Switch 2) control sections and task / mesh stage memory, the Mac chain's own modules (backend-neutral)
 from shader_split import glslc_stage   # the package reader also recognizes headerless compute code
 
@@ -236,6 +242,7 @@ def spirv_bindings(spv):
 # Handle decoding: as dmsh_build.py decode_tex / decode_ubo_tex / reflect (names: <stage>_t<type>_cb<slot>_<handle>, <stage>_c<n>, <stage>_s<n>, <stage>_i…)
 TEX_BASE, IMG_BASE, IMG_SLOTS, SEPTEX_BASE, SEPTEX_SLOT0, SAMP_BASE = 0x20, 0x120, 8, 0x168, 128, 0x568
 SSBO = {'vs': 0x110, 'cs': 0x310, 'ps': 0x510, 'ts': 0x670, 'ms': 0x770}   # each stage's storage buffer table in c0 (dmsh_abi.h DMSH_C0_SSBO_*; ts / ms: NVN2's task and mesh stages)
+GMEM_MAP_CB_SLOT, GMEM_LOG_CB_OFFSET = abi.GMEM_MAP_CB_SLOT, abi.GMEM_LOG_CB_OFFSET   # dmsh_abi.h: the sentinel constant buffer slot of the raw global memory table, and the write log's offset under it (GlobalToStorage.GmemMapCbSlot / GmemLogCbOffset)
 def classify(stage, b, res):
     nm = b['name']; e = dict(b)
     # Dynamic pool arrays use driver c2 slot indices (as the Metal backend).
@@ -251,7 +258,10 @@ def classify(stage, b, res):
         idx = int(m.group(1)); sb = sorted(res.get('sbufs', []), key=lambda x: x['binding'])
         s = sb[idx] if idx < len(sb) else None; off = s['cb_offset'] * 4 if s and s['cb_slot'] == 0 else None; base = SSBO.get(stage)
         e.update(kind='sbuf', rw=bool(s and s['flags'] & 2))
-        if stage == 'cs' and off is not None and 0x210 <= off < 0x310 and (off - 0x210) % 16 == 0: e.update(kind='ubo_ptr', reg=(off - 0x210) // 16)
+        if s and s['cb_slot'] == GMEM_MAP_CB_SLOT:   # not a game buffer: the host's pool table for addresses traced to no storage buffer (offset 0), or the write log of those stores (dmsh_build.py does the same)
+            if s['cb_offset'] == GMEM_LOG_CB_OFFSET: e.update(kind='gmem_log', rw=True)
+            else: e.update(kind='gmem_map', rw=any(re.search(r'operation "(Store|Atomic\w*)" traced to no storage buffer', n) for n in res.get('notes', ())))   # rw: one of those accesses writes
+        elif stage == 'cs' and off is not None and 0x210 <= off < 0x310 and (off - 0x210) % 16 == 0: e.update(kind='ubo_ptr', reg=(off - 0x210) // 16)
         elif s and s['cb_slot'] >= 3: e.update(kind='sbuf_ubo', reg=s['cb_slot'] - 3, off=s['cb_offset'] * 4)
         else: e['reg'] = (off - base) // 16 if off is not None and base is not None and 0 <= off - base < 0x100 and (off - base) % 16 == 0 else None
         return e
@@ -297,7 +307,7 @@ def classify(stage, b, res):
 # binding: u8 kind, u8 desc (descriptor type), u8 dim (SPIR-V Dim, 0xff none), u8 flags (1 arrayed, 2 multisampled, 4 written), u16 binding, u16 count,
 #          i16 reg, u8 samp (sampler source), u8 fmt (SPIR-V image format), i32 off, i32 samp_arg
 KIND = {'support': 0, 'cbuf': 1, 'c1': 2, 'drvcb': 3, 'sbuf': 4, 'ubo_ptr': 5, 'sbuf_ubo': 6, 'tex': 7, 'tbuf': 8, 'img': 9, 'img_tbuf': 10, 'tex_c2a': 11,
-        'tex_ubo': 12, 'tbuf_ubo': 13, 'img_ubo': 14, 'texd': 15, 'sampd': 16, '?': 255}
+        'tex_ubo': 12, 'tbuf_ubo': 13, 'img_ubo': 14, 'texd': 15, 'sampd': 16, 'gmem_map': 17, 'gmem_log': 18, '?': 255}   # in step with gfx_vk.h RK_*
 DESC = {'ubo': 0, 'ssbo': 1, 'sampled': 2, 'storage': 3, 'tbuf': 4, 'storage_tbuf': 5, 'image': 6, 'sampler': 7, '?': 255}
 SAMP_NONE, SAMP_TEX, SAMP_SLOT, SAMP_ID, SAMP_UBO = 0, 1, 2, 3, 4
 kinds_all = collections.Counter()

@@ -5,6 +5,7 @@
 // Version 1 orders everything with whole-pipeline barriers around passes, copies and dispatches.
 #include "gfx_vk.h"
 #include "gfx_vk_slot.h"
+#include "dmsh_abi.h"   // DMSH_GMEM_MAP_ENTRIES: the raw global memory write log's bits (stage_set RK_GMEM_LOG)
 #include "nvn_hmap.h"
 #include "game_profile.h"
 #include <math.h>
@@ -1248,7 +1249,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
     if (vk_readback_ranges()) for (int i = 0; i < s->nbind; i++) {
         int d = s->b[i].desc;
         int k = s->b[i].kind;
-        if (k == RK_SBUF || k == RK_SBUF_UBO || k == RK_IMG || k == RK_IMG_UBO || k == RK_IMG_TBUF) { vk_readback_unknown(); break; }
+        if (k == RK_SBUF || k == RK_SBUF_UBO || k == RK_IMG || k == RK_IMG_UBO || k == RK_IMG_TBUF || (k == RK_GMEM_MAP && (s->b[i].flags & 4))) { vk_readback_unknown(); break; }   // (a raw global memory store lands in any pool)
         if (d != RD_UBO && d != RD_SAMPLED && d != RD_TBUF && d != RD_IMAGE && d != RD_SAMPLER) { vk_readback_unknown(); break; }
     }
     int memo = st < 3 && !g_x_nosetmemo && !g_tracing && !g_var_now && !g_x_nosetc && !g_x_nodrvc && !g_ubolog_key && g_td_off < 0 && set_memo_ok(s), verify = 0;
@@ -1273,6 +1274,11 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
         case RK_C1: vk_shader_c1(s, &buf, &off, &len); bi[nw] = (VkDescriptorBufferInfo){buf, off, len}; break;
         case RK_CBUF: cbuf_desc(st, s, b, &bi[nw]); if (ncb < MEMO_CB) { mci[ncb] = (uint8_t)i; mcd[ncb++] = bi[nw]; } break;
         case RK_DRV: { VkBuffer sb; VkDeviceSize so; drv_shared(st, b->reg, &sb, &so, dynslots); bi[nw] = (VkDescriptorBufferInfo){sb, so, 0x1000}; break; }
+        // raw global memory (gfx_vk_core.c vk_gmem_map): the pool table, the same for every stage of a draw or dispatch, and for the stores through it a write log of one bit per table
+        // entry, cleared, from this submission's scratch memory. The log is not read back yet (the stores count as a write anywhere: vk_readback_unknown above); the Metal host learns
+        // the pools written from it (nvn_mtl.m gml_take). A set the memo reuses keeps its slice: harmless while nothing reads it
+        case RK_GMEM_MAP: { VkDeviceSize n; VkBuffer gb = vk_gmem_map(&n); bi[nw] = (VkDescriptorBufferInfo){gb, 0, n}; break; }
+        case RK_GMEM_LOG: { VkBuffer lb; VkDeviceSize lo, n = DMSH_GMEM_MAP_ENTRIES / 8; uint8_t *z = vk_scratch(n, SB_ALIGN, &lb, &lo); memset(z, 0, n); bi[nw] = (VkDescriptorBufferInfo){lb, lo, n}; break; }
         case RK_SBUF: case RK_UBO_PTR: case RK_SBUF_UBO: {
             uint64_t a = 0, n = 0;
             if (b->kind == RK_SBUF && b->reg >= 0 && b->reg < 16) { a = S.ssbo[st][b->reg].addr; n = S.ssbo[st][b->reg].size; }
