@@ -299,6 +299,22 @@ HLE_FORCE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", "graphics s
 // The frame length the game aims at (Switch 2 SDKs): oe::SetGraphicsTargetFrameRate maps up to 59 fps to mode 1, up to 119 to mode 2 and above to mode 3, SetGraphicsTargetFrameRateAuto
 // to mode 0, and both call this, which locks the gs graphics server's context and sends it the mode. The host has no graphics server (nv::InitializeGraphics), so the context is null and
 // the lock crashed: Hyrule Warriors: Age of Imprisonment sets 60 / its present interval at boot (main+0x1e5d244). The host paces by the window's present interval, so the mode is only noted
+// The Switch 2 SDK's GPU time of a frame (nn::oe → nn::gs::sdk::QueryApplicationGpuTimeSpan; Nintendo Switch 2 Welcome Tour asks every frame for its dynamic resolution):
+// the SDK's reaches the gs service's session lock through null (sdk+0x151fb0). The host answers its own GPU time of the latest frame when the backend measured one, else 8 ms.
+// TODO(switch2): which frame the two words name, and the span's exact meaning (one frame's GPU busy time is the reading here)
+double mtl_gpu_ms(uint64_t frame);
+HLE_FORCE("_ZN2nn2oe27QueryApplicationGpuTimeSpanEPNS_8TimeSpanEmm", "GPU time of a frame (Switch 2, gs): the host's measurement, else 8 ms", Result, h_oe_GpuTimeSpan, int64_t *out, uint64_t a, uint64_t b) {
+    (void)a; (void)b; double ms = mtl_gpu_ms(0); if (!(ms > 0 && ms < 1000)) ms = 8; if (out) *out = (int64_t)(ms * 1e6);
+    static atomic_int once; if (!atomic_exchange(&once, 1)) LOG("oe::QueryApplicationGpuTimeSpan(%#llx, %#llx): answered from the host's GPU time (%.1f ms now)", (unsigned long long)a, (unsigned long long)b, ms);
+    return RES_OK; }
+// Native memory handles of the Switch 2's gs (CreateNativeMemory: a game memory range the graphics system may use; Welcome Tour imports both): the host's graphics layer reads game
+// memory in place, so the handle is the range's address and nothing is registered. TODO(switch2): seen only as imports so far, not called yet
+HLE_FORCE("_ZN2nn2gs3sdk18CreateNativeMemoryEPNS0_18NativeMemoryHandleEPvmNS_2os16MemoryPermissionENS0_3cpu18MemoryCacheabilityE", "gs native memory handle: the range itself (Switch 2)",
+          Result, h_gs_NativeMem, uint64_t *handle, void *mem, uint64_t size, int perm, int cache) {
+    (void)size; (void)perm; (void)cache; if (handle) *handle = (uint64_t)(uintptr_t)mem;
+    static atomic_int once; if (!atomic_exchange(&once, 1)) LOG("gs::sdk::CreateNativeMemory %p +%#llx: the handle is the address (nothing to register on the host)", mem, (unsigned long long)size);
+    return RES_OK; }
+HLE_FORCE("_ZN2nn2gs3sdk19DestroyNativeMemoryENS0_18NativeMemoryHandleE", "gs native memory handle released: nothing was registered", Result, h_gs_NativeMemFree, uint64_t handle) { (void)handle; return RES_OK; }
 HLE_FORCE("_ZN2nn2gs3sdk26SetGraphicsFrameLengthModeENS1_23GraphicsFrameLengthModeE", "target frame length (Switch 2, gs): noted; the host paces by the present interval",
           void, h_gs_FrameLength, int mode) {
     static int last = -1; if (mode != last) { LOG("gs: graphics frame length mode %d (0 auto, 1 30 fps, 2 60 fps, 3 120 fps)", mode); last = mode; }

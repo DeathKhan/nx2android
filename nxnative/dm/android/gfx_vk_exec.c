@@ -2284,7 +2284,15 @@ static void exec_ops(const uint8_t *p) {
             else { p_draw_idx d = {m->prim, m->itype, 0, 0, 0, 0, m->ibuf, m->ind, m->cnt, 0, 0}; draw_idx(&d); }
             break; }
         case OP_DRAW_TEX: VKRED_ONCE(113, "DrawTexture: not replayed on Android yet (upstream records it since the upsync; before it the call was not taken over)"); break;
-        case OP_DLSS: VKRED_ONCE(114, "an NVN2 DLSS evaluation recorded by the game: not replayed (no DLSS on Android; the picture stays at the render resolution)"); break;
+        case OP_DLSS: {   // an NVN2 DLSS evaluation (hle_nvn.c "NVN2's DLSS"): no neural network here, and none wanted: the colour input is scaled bilinearly into the output
+            // texture, as the Metal replay does where MetalFX has no scaler. The game then composes from the output as it would; the picture is the render resolution's, upscaled
+            const p_dlss *e = (const p_dlss *)a; if (g_rc_skip) break;
+            if (!e->tex[DLSS_COLOR] || !e->tex[DLSS_OUTPUT]) { VKRED_ONCE(114, "DLSS evaluation without a colour input or an output texture: skipped"); break; }
+            static int said; if (!said++) VKLOG("DLSS evaluation: %dx%d colour scaled into the %dx%d output (bilinear; no DLSS on Android)", e->iw, e->ih, e->ow, e->oh);
+            p_copy_t2t k = {.src = e->tex[DLSS_COLOR], .dst = e->tex[DLSS_OUTPUT], .flags = NVN_COPY_FLAGS_LINEAR_FILTER_BIT};
+            k.sr = (NVNcopyRegion){e->base[DLSS_COLOR][0], e->base[DLSS_COLOR][1], 0, e->iw, e->ih, 1};
+            k.dr = (NVNcopyRegion){e->base[DLSS_OUTPUT][0], e->base[DLSS_OUTPUT][1], 0, e->ow, e->oh, 1};
+            copy_t2t(&k); break; }
         case OP_BLEND_COLOR: memcpy(S.blendc, ((const p_blend_color *)a)->rgba, 16); break;
         case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; break;
         case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; break;
