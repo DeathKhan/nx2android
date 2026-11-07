@@ -42,6 +42,10 @@ def device_romfs(env_text):   # the folder an earlier --romfs-at install wrote i
     return out
 
 
+PAD_MARK = '# porter install: this device labels its face buttons in Nintendo\'s places'   # the DM_PAD_LABELS row under it (front_android.c pad_labels)
+PAD_LABEL_MODELS = ('odin',)   # ro.product.model (lowercased) substrings of devices whose pads carry Nintendo's labels and report them by label: the AYN Odin 2 / 3
+def pad_labels_for(model): return any(m in (model or '').lower() for m in PAD_LABEL_MODELS)
+def env_with_pad_labels(env_text): return env_text.rstrip('\n') + f'\n{PAD_MARK}\nDM_PAD_LABELS=1\n'
 def env_with_romfs(pack_env, folder):   # the pack's env.txt with the installer's row last: the app applies the rows in order (front_android.c env_file), so it wins
     return pack_env.rstrip('\n') + f'\n{ROMFS_MARK}: the game\'s RomFS is read from this folder (later installs keep it; --romfs-at app moves it into the files folder)\nDM_ROMFS={folder}\n'
 
@@ -103,7 +107,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
     pushing = False
     try:
         dev = adb.pick(); adb.keep_awake()
-        model = adb.prop('ro.product.model')
+        model = adb.prop('ro.product.model'); labels = pad_labels_for(model)
         say(f'device: {model or dev} ({dev}), GPU {adb.gpu() or "unknown"}')
         if 'bcn' in man.get('requires', []):   # the profile's requires: BC-compressed textures
             bc = adb.bc_textures()
@@ -162,7 +166,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
             say(f'{state}: the app reads its RomFS from {target}')
         PROG.set(step='pushing the game data', done=0, total=man['bytes'] - sum(rom.values()), unit='B'); pushing = True
         have = adb.remote_sizes(files)   # again: an install with --replace-signer uninstalls first, and Android deletes the files folder with the app
-        adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=(datapack.MANIFEST,) + (('env.txt',) if target else ()), exclude=(datapack.ROMFS,) if target else (),
+        adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=(datapack.MANIFEST,) + (('env.txt',) if target or labels else ()), exclude=(datapack.ROMFS,) if target else (),
                       verify=lambda rel: rel.split('/', 1)[0] not in ('RomFS', 'aoc'),   # the game's own files change only with their version
                       progress=lambda d, t, note: PROG.set(done=d, total=t, note=note), have=have)
         if target and (missing or other or changed):   # --romfs-push: the pack's RomFS into the folder (changed: pushed again when their MD5 differs), then the folder checked again
@@ -171,9 +175,12 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
             adb.push_tree(data / datapack.ROMFS, target, verify=lambda rel: rel in again, progress=lambda d, t, note: PROG.set(done=d, total=t, note=note), have=there)
             now = adb.remote_sizes(target)
             if bad := romfs_mismatch(target, rom, now, changed=romfs_changed(adb, data, target, rom, now) or []): raise BuildError(f'after the push, {bad}')
-        if target:   # the pack's env.txt with the installer's row
+        if target or labels:   # the pack's env.txt with the installer's rows
+            env_text = (data / 'env.txt').read_text(encoding='utf-8')
+            if target: env_text = env_with_romfs(env_text, target)
+            if labels: env_text = env_with_pad_labels(env_text); say(f'{model}: face buttons by their labels (DM_PAD_LABELS=1 in env.txt)')
             with tempfile.TemporaryDirectory(prefix='nx2a_env_') as t:
-                env = Path(t) / 'env.txt'; env.write_text(env_with_romfs((data / 'env.txt').read_text(encoding='utf-8'), target), encoding='utf-8', newline='\n')
+                env = Path(t) / 'env.txt'; env.write_text(env_text, encoding='utf-8', newline='\n')
                 adb.push_file(env, f'{files}/env.txt')
         elif was and romfs_at == APP: say(f'the app reads its RomFS from its files folder again; {was} is left as it is')
         stale = [rel for rel in have if rel.split('/', 1)[0] in datapack.OWNED and not (target and rel.startswith(datapack.ROMFS + '/')) and not (data / rel).is_file()]   # the push only adds the pack's own files, which are never stale
