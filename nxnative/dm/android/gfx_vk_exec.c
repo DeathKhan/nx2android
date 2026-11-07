@@ -1942,9 +1942,53 @@ static void compute_warm_start(void) {
     if (getenv("DM_VK_NOPREWARM")) return;
     pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, compute_warm, NULL); pthread_attr_destroy(&a);
 }
+// ---- a game's DLSS-style upscaler network run as compute shaders (Donkey Kong Bananza: agl's NDSR pack, 27 tensor-core kernels a frame). No DLSS on Android, by decision: the
+// network's dispatches are skipped and its colour input is scaled bilinearly into its output texture instead (as the emulator's replacement did), so the composite that reads the
+// output gets the rendered frame at the render resolution, upscaled. The kernels are named by their shader keys in DM_VK_UPSCALER_CS (env.txt, from the profile's env rows), comma-separated hex.
+// Output: the largest colour image a kernel writes; input: the smallest colour image it only reads, 64 px or wider, no larger than the output (not a history image) and not the output itself
+static uint64_t g_ups_keys[64]; static int g_ups_n = -1;
+static int upscaler_kernel(uint64_t key) {
+    if (g_ups_n < 0) { g_ups_n = 0; const char *e = getenv("DM_VK_UPSCALER_CS");
+        for (const char *q = e; q && *q && g_ups_n < 64; ) { char *end; uint64_t k = strtoull(q, &end, 16); if (end == q) break; g_ups_keys[g_ups_n++] = k; q = *end == ',' ? end + 1 : end; }
+        if (g_ups_n) VKLOG("upscaler network: %d compute kernels named (DM_VK_UPSCALER_CS): their dispatches are replaced by a bilinear scale of the colour input into the output", g_ups_n); }
+    for (int i = 0; i < g_ups_n; i++) if (g_ups_keys[i] == key) return 1;
+    return 0;
+}
+static vkimg_t *binding_image(int st, const dmsv_bind *b) {   // the image a texture or storage-image binding names now (its first element), NULL when none
+    uint64_t h = 0;
+    switch (b->kind) {
+    case RK_TEX: h = vk_tex_slot_handle(S.tex[st], S.img[st], (unsigned)b->reg); break;
+    case RK_TEX_UBO: h = mem_handle(ubo_word(st, b->reg, b->off)); break;
+    case RK_TEX_C2A: h = b->off >= 0 ? c2_handle(st, b->off) : 0; break;
+    case RK_IMG: h = b->reg >= 0 && b->reg < 32 ? S.img[st][b->reg] : 0; break;
+    case RK_IMG_UBO: h = mem_handle(ubo_word(st, b->reg, b->off)); break;
+    default: return NULL;
+    }
+    int tid = (int)(h & 0xfffff); const view_t *v = NULL; const tex_t *t = NULL;
+    if (!tid || !vk_tex_by_id(tid, &v, &t) || !t) return NULL;
+    return vk_tex(t);
+}
+static int colour_image(const vkimg_t *im) { return im && (im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && im->w >= 64 && im->h >= 64 && im->layers == 1 && im->target != NVN_TEXTURE_TARGET_BUFFER; }
+static void upscaler_replace(vkshader_t *cs) {
+    vkimg_t *out = NULL, *in = NULL;
+    for (int i = 0; i < cs->nbind; i++) { const dmsv_bind *b = &cs->b[i]; if (b->kind != RK_IMG && b->kind != RK_IMG_UBO) continue;
+        vkimg_t *im = binding_image(5, b); if (colour_image(im) && (!out || (uint64_t)im->w * im->h > (uint64_t)out->w * out->h)) out = im; }
+    if (!out) return;
+    for (int i = 0; i < cs->nbind; i++) { const dmsv_bind *b = &cs->b[i]; if (b->kind != RK_TEX && b->kind != RK_TEX_UBO && b->kind != RK_TEX_C2A) continue;
+        vkimg_t *im = binding_image(5, b); if (!colour_image(im) || im == out || im->w > out->w || im->h > out->h) continue;
+        if (!in || (uint64_t)im->w * im->h < (uint64_t)in->w * in->h) in = im; }
+    if (!in) return;
+    static int said; if (!said++) VKLOG("upscaler network %016llx: %ux%u colour input scaled into the %ux%u output (bilinear) in place of the network", (unsigned long long)cs->key, in->w, in->h, out->w, out->h);
+    vk_end_pass_land(); VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, in); vk_tex_prepare(cb, out); vk_img_barrier_all(cb);
+    VkImageSubresourceLayers ss = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, ds = ss;
+    VkImageBlit bl = {ss, {{0, 0, 0}, {(int32_t)in->w, (int32_t)in->h, 1}}, ds, {{0, 0, 0}, {(int32_t)out->w, (int32_t)out->h, 1}}};
+    vkCmdBlitImage(cb, in->img, VK_IMAGE_LAYOUT_GENERAL, out->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+    out->gpu_w = 1; vk_img_barrier_all(cb);
+}
 static void dispatch(const p_dispatch *d) {
     vkshader_t *cs = S.sh[5];
     if (!cs) { VKRED_ONCE(60, "dispatch with no compute shader in the bundle: skipped"); return; }
+    if (g_ups_n && upscaler_kernel(cs->key)) { upscaler_replace(cs); return; }
     g_vkst.dispatches++;
     vk_end_pass_land();
     VkCommandBuffer cb = vk_cmd();
