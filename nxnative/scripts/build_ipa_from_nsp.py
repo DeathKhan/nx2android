@@ -2236,8 +2236,11 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
     inputs += [item for r in dlc_roms for item in (('dlc', Path(r).name), ('stat', r))]   # DLC has no registered module build to pin its contents: include its index and re-extraction times, even when file sizes stay the same
     if oodle:   # a host or rewriter fix can change what the game's decoder produces
         PROG.set(step="setting up the game's Oodle decoder"); env = dict(env, **oodle())   # the Mac host, or the porter's decode on the Android device (porter/pipeline.py device_oodle)
-        host = Path(env['DM_OODLE_HOST'])
-        inputs += [('decoder', decoder_host_key(host) or fingerprint(('files', [host]))), ('modules', package_key(Path(env['DM_OODLE_MODULES'])))]
+        if 'DM_OODLE_HOST' in env:   # the Mac host decodes during the split
+            host = Path(env['DM_OODLE_HOST'])
+            inputs += [('decoder', decoder_host_key(host) or fingerprint(('files', [host]))), ('modules', package_key(Path(env['DM_OODLE_MODULES'])))]
+        else:   # porter: the entries were decoded on the Android device beforehand (DM_GFPAK_DECODED, shader_split.py gfpak_decoded / trpfs_decoded); that folder is the input
+            inputs += [('decoded', k, str(env[k])) for k in ('DM_GFPAK_DECODED', 'DM_TRPFS_DECODED') if env.get(k)]
     key = None if ALLOW_DAMAGED else fingerprint(*inputs, *split_profile_inputs(g))
     dlckf, dlckey = pkg.with_name(pkg.name + '.dlc.key'), None
     cskf, cskey, promoted = pkg.with_name(pkg.name + '.compute.key'), None, None
