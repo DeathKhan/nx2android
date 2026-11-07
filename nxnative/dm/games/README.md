@@ -98,7 +98,10 @@ One row per profile; the notes are each profile's `README.md`.
 | [Fire Emblem Engage](0100A6301214E000/README.md) | `0100A6301214E000` | 2.0.0 | 12.3.7 | Unity 2020.3.18f1 IL2CPP, Wwise | NVN |
 | [Fire Emblem Fortune's Weave](04007EF01F8AE000/README.md) | `04007EF01F8AE000` | v131072 (Switch 2) | 22.2.0 (Ounce) | Intelligent Systems' engine, NintendoWare | NVN2 |
 | [Fire Emblem: Three Houses](010055D009F78000/README.md) | `010055D009F78000` | 1.2.0 | 6.5.0 | Koei Tecmo's KTGL | NVN |
+| [FM24 Touch](01008B101B87A000/README.md) | `01008B101B87A000` | 1.0.1 | 16 | Sports Interactive's own engine (OpenGL ES 3.1) | OpenGL |
+| [Football Manager 26 Touch](0100D4A023450000/README.md) | `0100D4A023450000` | 1.0.2 | 20.5.14 | Unity IL2CPP (Sports Interactive), FMOD | NVN |
 | [Ghost Trick: Phantom Detective](010029B018432000/README.md) | `010029B018432000` | 1.0.0 (base) | 13.3.0 | Capcom's RE Engine, Wwise | NVN |
+| [Graveyard Keeper 2](0100005027A18000/README.md) | `0100005027A18000` | 1.0.4 | 21.4.4 | Unity 6000.3.9f1 IL2CPP, FMOD | NVN |
 | [Hades](0100535012974000/README.md) | `0100535012974000` | 1.0.38233 | 9.3.0 | Supergiant Games' engine (The Forge) | Vulkan |
 | [Hades II](0100A00019DE0000/README.md) | `0100A00019DE0000` | base game | 19.3.9 | Supergiant Games' engine | NVN |
 | [Hollow Knight](0100633007D48000/README.md) | `0100633007D48000` | 1.5.12620 | 20.5.21 | Unity 6000.0.61f1 IL2CPP, FMOD | NVN |
@@ -109,6 +112,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [Kirby Air Riders](040077201BE50000/README.md) | `040077201BE50000` | v458752 (Switch 2) | 20.5.26 (Ounce) | Its own engine (`phx`, `Aurora`) | NVN2 |
 | [Kirby and the Forgotten Land](01004D300C5AE000/README.md) | `01004D300C5AE000` | 1.1.0 | 11.4.0 | HAL Laboratory's engine (NintendoWare) | NVN |
 | [Kirby Star Allies](01007E3006DDA000/README.md) | `01007E3006DDA000` | 4.0.0a | 4.4.1 | HAL Laboratory's engine (NintendoWare) | NVN |
+| [Lonely Mountains: Downhill](0100A0C00E0DE000/README.md) | `0100A0C00E0DE000` | 1.0.5 (base) | 9.3.1 | Unity 2018.4.14f1 IL2CPP, FMOD | NVN |
 | [Luigi's Mansion 3](0100DCA0064A6000/README.md) | `0100DCA0064A6000` | 1.4.0 | 7.3.2 | Next Level Games' engine | NVN |
 | [Mario & Luigi: Brothership](01006D0017F7A000/README.md) | `01006D0017F7A000` | 1.0.0 | 12.3.2 | Unreal Engine 4.27.2, Wwise | NVN |
 | [Mario Kart World](0400C3F00006E000/README.md) | `0400C3F00006E000` | v0 (Switch 2) | 19.3.3 (Ounce) | Nintendo EPD (sead / agl / gsys, Pia) | NVN2 |
@@ -124,6 +128,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [Monster Hunter Rise](0100B04011742000/README.md) | `0100B04011742000` | 16.0.2 | 11.4.3 | Capcom's RE Engine | NVN |
 | [Monster Train 2](010051701FB46000/README.md) | `010051701FB46000` | 1.1.1 | 18.3.5 | Unity 2022.3.54f1 IL2CPP | NVN |
 | [Need for Speed: Hot Pursuit Remastered](010029B0118E8000/README.md) | `010029B0118E8000` | 1.0.3 | 10.4.1 | Criterion's engine (Stellar Entertainment port) | NVN |
+| [NEO: The World Ends with You](010043B013C5C000/README.md) | `010043B013C5C000` | 1.03 | 10 | Unity 2019.4 IL2CPP, CRIWARE | NVN |
 | [NieR:Automata The End of YoRHa Edition](010056B015FE8000/README.md) | `010056B015FE8000` | 1.0.3 | 12.3.9 | PlatinumGames' engine | NVN |
 | [NieR:Automata The End of YoRHa Edition, Asian release](0100B8E016F76000/README.md) | `0100B8E016F76000` | 1.0.3 | 12.3.9 | PlatinumGames' engine | NVN |
 | [OCTOPATH TRAVELER](010057D006492000/README.md) | `010057D006492000` | 1.0.5 | 3.5.1 | Unreal Engine 4.18 | NVN |
@@ -155,6 +160,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [SHIN MEGAMI TENSEI V: Vengeance](010069C01AB82000/README.md) | `010069C01AB82000` | 1.0.3 | 15.3.2 | Unreal Engine 4.27 | NVN |
 | [Silver Pines](0100D5B026844000/README.md) | `0100D5B026844000` | 1.0.0 (base) | 21.4.7 | Unity 6000.3.15f1 IL2CPP | NVN |
 | [Sonic Superstars](01008F701C074000/README.md) | `01008F701C074000` | 1.1.8 | 16.2.0 | Unity 2021.3.25f1 IL2CPP, CRIWARE, FMOD | NVN |
+| [South Park™: The Stick Of Truth™](010043600B6A6000/README.md) | `010043600B6A6000` | 1.0.0 (base) | 4.5.0 | Obsidian's engine (its own GLSLC shaders) | NVN |
 | [STEINS;GATE RE:BOOT](01008BC024FDE000/README.md) | `01008BC024FDE000` | 1.0.3 | 20.5.17 | M2's ADV engine | NVN |
 | [Stardew Valley](0100E65002BB8000/README.md) | `0100E65002BB8000` | 1.6.15.13 | 20.5.27 | MonoGame (C# → C++ by BRUTE) | NVN |
 | [SteamWorld Dig](01009320084A4000/README.md) | `01009320084A4000` | 1.12.0 | 3.4.0 | Image & Form's own engine (SteamWorld) | NVN |
@@ -176,6 +182,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [SUPER ROBOT WARS Y](010063301BD50000/README.md) | `010063301BD50000` | 1.4.1 | 18.3.5 | Unity 2022.3.44f1 IL2CPP, CRIWARE | NVN |
 | [Super Smash Bros. Ultimate](01006A800016E000/README.md) | `01006A800016E000` | 13.0.5 | 8.2.1 | Bandai Namco / Sora's engine | NVN |
 | [Taiko Risshiden V DX](0100346017304000/README.md) | `0100346017304000` | 1.1.1 | 12.3.3 | Koei Tecmo's KTGL | NVN |
+| [Tales of Eternia Remastered](010006E0230AC000/README.md) | `010006E0230AC000` | 2.0.0 | 21.4.4 | Unity 6000.0.66f2 IL2CPP, CRIWARE | NVN |
 | [Team Sonic Racing](010092B0091D0000/README.md) | `010092B0091D0000` | 1.0.3 | 5.6.0 | Sumo Digital's engine, Wwise | NVN |
 | [The Great Ace Attorney Chronicles](010036E00FB20000/README.md) | `010036E00FB20000` | 1.0.0 (base) | 10.4.1 | Capcom's MT Framework | NVN |
 | [The Legend of Zelda: Breath of the Wild](01007EF00011E000/README.md) | `01007EF00011E000` | 1.9.0 | 20.5.22 | Nintendo EPD (sead / agl / gsys / ksys, Havok) | NVN |
@@ -184,9 +191,16 @@ One row per profile; the notes are each profile's `README.md`.
 | [The Legend of Zelda: Ocarina of Time](0400486024DEC000/README.md) | `0400486024DEC000` | v131072 (Switch 2) | 22.2.8 (Ounce) | Nintendo EPD's sead, agl, gsys, Havok, CRIWARE | NVN2 |
 | [The Legend of Zelda: Skyward Sword HD](01002DA013484000/README.md) | `01002DA013484000` | 1.0.1 | 11.4.0 | Nintendo's Wii-era engine, ported by Tantalus | NVN |
 | [The Legend of Zelda: Tears of the Kingdom](0100F2C0115B6000/README.md) | `0100F2C0115B6000` | 1.4.3 | 20.5.22 | Nintendo EPD (sead / agl / gsys) | NVN |
+| [The World Ends with You -Final Remix-](0100C1500B82E000/README.md) | `0100C1500B82E000` | 1.0.0 (base) | 4.4.1 | Unity 2017.2 IL2CPP, FMOD | NVN |
+| [Tomodachi Life: Living the Dream](010051F0207B2000/README.md) | `010051F0207B2000` | 1.0.4 | 20.5.3 | Nintendo EPD (sead / agl / gsys, NintendoWare, Havok) | NVN |
 | [TRIANGLE STRATEGY](0100CC80140F8000/README.md) | `0100CC80140F8000` | 1.1.1 | 12.3.2 | Unreal Engine 4.27 | NVN |
+| [UNDER NIGHT IN-BIRTH Exe:Late&#91;cl-r&#93;](010038C00EC34000/README.md) | `010038C00EC34000` | 1.0.3 | 6.4.2 | French-Bread's own engine | NVN |
+| [UNDER NIGHT IN-BIRTH II Sys:Celes](0100BD401D18A000/README.md) | `0100BD401D18A000` | 1.42 | 15.3.2 | French-Bread's own engine | NVN |
 | [Unicorn Overlord](010069401ADB8000/README.md) | `010069401ADB8000` | 1.05 | 16.2.4 | Vanillaware's engine | NVN |
 | [Unicorn Overlord, Asian release](010054B01AD92000/README.md) | `010054B01AD92000` | 1.05 | 16.2.4 | Vanillaware's engine | NVN |
+| [Unpacking](0100701015846000/README.md) | `0100701015846000` | 2.01 | 13.3.2 | Unity 2019.4.34f1 IL2CPP, Wwise | NVN |
+| [Untitled Goose Game](010082400BCC6000/README.md) | `010082400BCC6000` | 1.1.2 | 8.2.0 | Unity 2018.4.1f1 IL2CPP, FMOD | NVN |
+| [Viractal](0100FD501F95A000/README.md) | `0100FD501F95A000` | 1.4.5 | 21.4.4 | Unity 6000.3 IL2CPP | NVN |
 | [Well Dweller](0100217023F6C000/README.md) | `0100217023F6C000` | 1.0.0 | 22.2.0 | GameMaker Studio 2 (its runner) | OpenGL |
 | [Xenoblade Chronicles: Definitive Edition](0100FF500E34A000/README.md) | `0100FF500E34A000` | 1.1.2 | 9.3.1 | Monolith's engine | NVN |
 | [Xenoblade Chronicles 2](0100E95004038000/README.md) | `0100E95004038000` | 2.1.0 | 3.5.0 | Monolith's engine | NVN |

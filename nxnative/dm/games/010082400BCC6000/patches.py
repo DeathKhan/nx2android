@@ -18,3 +18,11 @@ CUTS = {
     (0x1b2a428, '089d42f9', '000040f9', 'deferred sampler slot: ldr x8,[x8,#0x538] → ldr x0,[x0] (the device)'),
   ],
 }
+
+# How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),
+# purpose, why; blocked or kept: why the gap stays open (cannot close yet, or left open on purpose); checked: what was checked on game files (else a judgement)
+BINDING = [
+    {'what': 'deferred sampler slot: an empty slot is skipped instead of read', 'now': 'build', 'goal': 'engine', 'purpose': 'runtime',
+     'why': "Unity 2018.4's NVN texture binding (an uncleared local array of ready textures) is the engine's code, which other Unity 2018 games on NVN ship",
+     'blocked': 'one Unity 2018.4 game here; the function has not been looked for in another build'},
+]

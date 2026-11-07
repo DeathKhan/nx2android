@@ -147,6 +147,32 @@ def scan(folder, keys, env=None, want=None):
     with nsp.package_reader(NXNATIVE, keys, env) as packages:
         return nsp.scan_nsps(Path(folder), packages.contents, want)
 
+def unpack_romfs_image(d):
+    """nxnative's extraction writes the RomFS as one image (RomFS.img, dm/tools/romfs_image.py: header, the files' bytes, then the index), which its hosts mount in place
+    (hle_fs.c). The Android pack, porter install and the device decode of Oodle archives read a RomFS folder (datapack.py, front_android.c DM_ROMFS = files/RomFS), so the image is
+    unpacked into RomFS/ beside the modules and removed; a later run finds the folder (the extract stage's fresh test) and skips nx_extract.
+    TODO(upsync): ship the image itself, as iOS does: hle_fs.c mounts a file named by DM_ROMFS, and one 6 GB file pushes faster through the adb shim than 18,000 small ones"""
+    import romfs_image
+    img, out, tmp = d / 'RomFS.img', d / 'RomFS', d / 'RomFS.unpack'
+    if not img.is_file(): return
+    PROG.stage(f'unpack {d.name} RomFS')
+    idx = romfs_image.read_index(img)
+    if tmp.exists(): shutil.rmtree(tmp)
+    files = sorted((off, size, path) for path, (isdir, off, size) in idx.items() if not isdir)
+    for path, (isdir, _, _) in idx.items():
+        if isdir: (tmp / path).mkdir(parents=True, exist_ok=True)
+    with open(img, 'rb') as f:
+        for off, size, path in files:   # in image order: one sequential read of the 6 GB
+            dst = tmp / path; dst.parent.mkdir(parents=True, exist_ok=True)
+            f.seek(off); left = size
+            with open(dst, 'wb') as o:
+                while left:
+                    chunk = f.read(min(left, 1 << 24)); o.write(chunk); left -= len(chunk)
+                    if not chunk: raise BuildError(f'{img.name} is cut short at {path}')
+    if out.exists(): shutil.rmtree(out)
+    tmp.rename(out); img.unlink()
+    PROG.end(f'{len(files):,} files')
+
 
 def inspect(folder, keys=None):
     """What a game folder holds, without extracting anything: the GUI's game card and `porter inspect`. keys: prod.keys (default: the configured one), which reads the title ID
@@ -329,7 +355,8 @@ class Port:
         PROG.stage('build nx_extract')
         nx = nsp.build_nx_extract(NXNATIVE, self.work, self.logs, self.env)
         PROG.end()
-        self.dirs = {ver: nsp.extract(nx, o.keys, ex, ver, *picks[ver], None, self.logs, g, self.app) for ver in self.versions}
+        self.dirs = {ver: ex / ver if fresh(ver) else nsp.extract(nx, o.keys, ex, ver, *picks[ver], None, self.logs, g, self.app) for ver in self.versions}   # fresh: unpacked already (below)
+        for d in self.dirs.values(): unpack_romfs_image(d)
         bad = [] if self.derived else [f'{v}: {x}' for v in self.versions for x in nsp.build_mismatch(self.dirs[v], v, g)]
         if bad and self.provisional: raise BuildError(f'not the builds the provisional profile registers: {"; ".join(bad)}')
         if bad:

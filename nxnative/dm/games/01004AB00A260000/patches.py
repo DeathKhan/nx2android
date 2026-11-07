@@ -11,3 +11,11 @@
 # DM_NVN_ASYNC=1, did not help: the game's own CPU work is the limit), and the adaptive governor stepped to 40 fps, where a fixed 1/60 step runs the whole game at two thirds speed (a long
 # run stayed at 40 for minutes). Climbing ladders also misplays at 60 (known with the community's 60 fps cheat for this build too).
 CUTS = {}
+
+# How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),
+# purpose, why; blocked or kept: why the gap stays open (cannot close yet, or left open on purpose); checked: what was checked on game files (else a judgement)
+BINDING = [
+    {'what': 'frame limiter 30 → 60 fps and the 1/60 update step', 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "the game's own limiter constant and fixed step",
+     'kept': 'withdrawn on Android (above): the frame work sits at the 60 fps limit and the governor\'s 40 fps step runs the fixed-step game at two thirds speed; the cut and its reasoning stay here for a device that holds 60'},
+]

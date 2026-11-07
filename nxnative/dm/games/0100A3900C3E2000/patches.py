@@ -34,3 +34,14 @@ def frame_step(ctx):
     fs_put(0x43eb04, [B(0x43eb04, start)], 'frame step: the base clock steps by the host\'s vsyncs (state page target fps; 0 = the game\'s measured step)')
 
 FRAME_STEP = {'e74395f066fd8ccb51ec17b39b3da2c8': frame_step}
+
+# How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),
+# purpose, why; blocked or kept: why the gap stays open (cannot close yet, or left open on purpose); checked: what was checked on game files (else a judgement)
+BINDING = [
+    {'what': 'present interval field read → 1 (60 fps)', 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "the game's own renderer hands the window its interval from a field of its graphics object; the function could be matched, as The Thousand-Year Door's clock is"},
+    {'what': 'frame step floor 2 → 1 vsync', 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "the game's own clock update clamps its step to two vsyncs; the same function as the frame step stub's"},
+    {'what': "frame step: the base clock steps by the host's vsyncs (FRAME_STEP)", 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "the game's own clock update stores the measured step; the host's step keeps game time equal to real time at any rate"},
+]

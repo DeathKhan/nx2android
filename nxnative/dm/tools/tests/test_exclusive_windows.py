@@ -20,8 +20,8 @@ md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
 md.detail = True
 scope = dict(vars(nso_asm), re=re, struct=struct, combinations=combinations, md=md,
              patch=bytearray(), PATCH_BASE=0x10000, KEY_PAGE_OFF=0x8000,
-             KEY_INDEX={'K18': 0}, fix=[])
-names = {'here', 'emit', 'emit_key_addr', 'emit_slot_addr', 'dis', 'regset', 'num',
+             KEY_INDEX={'K18': 0}, fix=[], TARGET='apple')   # TARGET: emit_tp's thread-pointer form (the Android port's DM_TARGET)
+names = {'here', 'emit', 'emit_tp', 'emit_key_addr', 'emit_slot_addr', 'dis', 'regset', 'num',
          'has18', 'regs_in', 'pick', 'subst', 'find_windows', 'window_adrp', 'check_window_branches', 'site_window', 'site_retry_window'}
 tree = ast.parse((TOOLS / 'patch_nso.py').read_text())
 exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names],

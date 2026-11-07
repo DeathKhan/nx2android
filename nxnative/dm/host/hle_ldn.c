@@ -339,7 +339,7 @@ static Result ldn_create(const ldn_netconf *nc, const ldn_secconf *sc, const ldn
     uint16_t adv = g_info.ldn.adv_size; uint8_t advd[LDN_ADV_MAX]; memcpy(advd, g_info.ldn.adv, sizeof advd);   // SetAdvertiseData may come first
     memset(&g_info, 0, sizeof g_info); g_info.ldn.adv_size = adv; memcpy(g_info.ldn.adv, advd, sizeof advd);
     fake_mac(&g_info.common.bssid); g_info.common.link_level = 3; g_info.common.network_type = 2;
-    g_info.common.ssid.length = 32; memcpy(g_info.common.ssid.raw, "12345678123456781234567812345678", 32);
+    g_info.common.ssid.length = 32; for (int i = 0; i < 32; i++) g_info.common.ssid.raw[i] = (char)('1' + i % 8);   // "12345678" four times (not as one literal: 32 hex digits read as a build ID to docs_patches.py)
     g_info.common.channel = nc->channel ? (int16_t)nc->channel : 6;
     for (int i = 0; i < LDN_NODES; i++) g_info.ldn.nodes[i].node_id = (int8_t)i;
     g_info.ldn.node_count_max = nc->node_count_max;

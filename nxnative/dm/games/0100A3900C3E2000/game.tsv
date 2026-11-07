@@ -42,6 +42,10 @@ sys_resource	0x800000
 # screen: 1 at 60 fps, 2 when 60 does not hold, so game time = real time. DM_FPS_TARGET=30 keeps the game's 30 fps
 fps_target	60
 
+# ---- Graphics ----
+# The registered build selects near-zero NVN depth (the NSP script's region check, 2026-10-28: one nvnDeviceSetDepthMode call, near = 0); offline pipeline bases use main0_z.
+depth_mode	zero
+
 # ---- Shader split (shader_split.py: BNSH in the zstd .bfsha and .ptcl files) ----
 shader_groups	/shaders/=shaders /effect/=effect
 shader_note	Paper Mario: The Origami King shaders
