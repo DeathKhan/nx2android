@@ -1066,13 +1066,17 @@ static uint64_t mem_handle(uint64_t h) {
 }
 static uint32_t g_dispatch[3], g_draw_binst;
 #define SB_ALIGN 256   // storage buffers are bound from this boundary below their address (dm/android/tools/shader_vk.py SB_ALIGN, which the shaders were translated for)
+int dm_sdk_ounce(void);   // loader.c: the game's sdk is built for the Switch 2 (NVN2)
 static void drv_segment(int st, int bank, uint8_t *d, int dyn) {
     memset(d, 0, 0x1000);
     if (bank == 0) {
         int base = st == 0 ? 0x110 : st == 5 ? 0x310 : st == 1 ? 0x510 : -1;
         if (base >= 0) for (int r = 0; r < 16; r++) { uint64_t a = S.ssbo[st][r].addr; uint32_t n = (uint32_t)S.ssbo[st][r].size; memcpy(d + base + 16 * r, &a, 8); memcpy(d + base + 16 * r + 8, &n, 4); }
         if (st != 5) { const float mp = 2047.0f; memcpy(d + 0x610, &mp, 4); memcpy(d + 0x644, &g_draw_binst, 4); }
-        else { memcpy(d + 0x200, g_dispatch, 12); for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); } }
+        else { memcpy(d + 0x200, g_dispatch, 12); if (dm_sdk_ounce()) memcpy(d + 4, g_dispatch, 12);   // NVN2 compute reads the workgroup counts at +4 (DMSH_C0_DISPATCH_NVN2), below its per-shader layout
+               for (int r = 0; r < 16; r++) { uint64_t a = S.ubo[5][r].addr; uint32_t n = (uint32_t)S.ubo[5][r].size; memcpy(d + 0x210 + 16 * r, &a, 8); memcpy(d + 0x210 + 16 * r + 8, &n, 4); } }
+    } else if (bank == 24) {   // NVN2 push constants (DMSH_PUSH_BANK): the graphics stages' block, or compute's (OP_PUSH_CONST)
+        memcpy(d, S.push[st == 5], sizeof S.push[0]);
     } else if (!dyn) {
         for (int off = 0x20; off < 0x968; off += 8) { uint64_t h = c2_handle(st, off); memcpy(d + off, &h, 8); }
     } else {
@@ -1166,7 +1170,7 @@ static inline uint64_t fnv(uint64_t h, const void *p, size_t n) {
 static void drv_shared(int st, int bank, VkBuffer *buf, VkDeviceSize *off, int dyn) {   // the driver segment: built, then one copy per distinct content in the submission
     uint8_t d[0x1000]; drv_segment(st, bank, d, dyn);
     // only the bytes drv_segment can write are hashed (bank 0 ends at 0x648, the c2 table at 0x968; the rest is always zero): 4 KB was 512 hash steps a segment
-    uint64_t h = fnv(0xcbf29ce484222325ull, d, bank ? 0x968 : 0x648); unsigned k = (unsigned)(h % DRVC);
+    uint64_t h = fnv(0xcbf29ce484222325ull, d, bank == 24 ? 0x100 : bank ? 0x968 : 0x648) ^ (uint64_t)bank << 56; unsigned k = (unsigned)(h % DRVC);
     if (g_drvc[k].epoch == g_set_epoch && g_drvc[k].h == h && !g_x_nodrvc) { *buf = g_drvc[k].b; *off = g_drvc[k].o; return; }
     uint8_t *p = vk_scratch(0x1000, V.props.limits.minUniformBufferOffsetAlignment, buf, off); memcpy(p, d, sizeof d);
     g_drvc[k].h = h; g_drvc[k].epoch = g_set_epoch; g_drvc[k].b = *buf; g_drvc[k].o = *off;

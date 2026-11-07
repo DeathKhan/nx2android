@@ -357,7 +357,7 @@ class Port:
             if nsp.free_gb(self.work) < need and not all(fresh(v) for v in self.versions): raise BuildError(f'less than {need:.0f} GB free on the volume of {self.work}')
             self.dirs = {ver: ex / ver if fresh(ver) else nsp.extract_nup(ex, ver, picks[ver][1] or picks[ver][0], picks[ver][0], self.app, n) for ver in self.versions}
             for d in self.dirs.values(): unpack_romfs_image(d)
-            self.extract_checked(); return
+            self.extract_checked(picks, nx=None, m={}, zdlc=[], dkf=None, dkey=None, dlc_reused=False); return
         need = sum(dumps.size(p) * (2 if dumps.compressed(p) else 1) for p in {p for b, u in picks.values() for p in (b, u) if p}) / 2**30 + 6
         if nsp.free_gb(self.work) < need and not all((ex / v).exists() for v in self.versions): raise BuildError(f'less than {need:.0f} GB free on the volume of {self.work}')
         # NSZ / XCZ: only what a stage will read is decompressed, all in one stage before nx_extract runs (a version nsp.extract reuses reads nothing)
@@ -374,9 +374,9 @@ class Port:
         PROG.end()
         self.dirs = {ver: ex / ver if fresh(ver) else nsp.extract(nx, o.keys, ex, ver, *picks[ver], None, self.logs, g, self.app) for ver in self.versions}   # fresh: unpacked already (below)
         for d in self.dirs.values(): unpack_romfs_image(d)
-        self.extract_checked()
+        self.extract_checked(picks, nx, m, zdlc, dkf, dkey, dlc_reused)
 
-    def extract_checked(self):
+    def extract_checked(self, picks, nx, m, zdlc, dkf, dkey, dlc_reused):
         """After the versions are extracted: the modules' build IDs against the profile's (a derived profile otherwise), the version packed, the DLC and the control data"""
         o, g = self.o, self.g
         bad = [] if self.derived else [f'{v}: {x}' for v in self.versions for x in nsp.build_mismatch(self.dirs[v], v, g)]
@@ -405,10 +405,13 @@ class Port:
         else: self.mem_profile()
         if dlc_reused:
             PROG.stage('extract DLC'); self.aoc = self.work / 'aoc'; PROG.end(f'{len(self.fam["dlc"])} DLC, reused (inputs unchanged)')
+        elif not self.fam['dlc']: self.aoc = None   # none (or a NUP's, not packed yet)
         else:
             self.aoc = nsp.extract_aoc(nx, o.keys, NXNATIVE, self.work, self.app, dict(self.fam, dlc=[(t, v, m.get(p, p)) for t, v, p in self.fam['dlc']]), self.logs)
             if zdlc: dkf.write_text(f'{dkey}\n')
-            else: nsp.rmtree(dkf)
+            elif dkf: nsp.rmtree(dkf)
+        if nx is None and o.firmware and self.ap.sysdata:   # a NUP needs no nx_extract for the game, but the firmware's system data titles do
+            PROG.stage('build nx_extract'); nx = nsp.build_nx_extract(NXNATIVE, self.work, self.logs, self.env); PROG.end()
         self.sysdata = self.extract_sysdata(nx)
         self.drop_unpacked()   # everything that reads them has run, and the shader stages that follow need the room
         self.base = next((self.dirs[v] for v in self.versions if picks[v][1] is None), self.dirs[self.versions[0]])
