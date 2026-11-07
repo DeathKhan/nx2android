@@ -84,7 +84,7 @@ Left out because they have an official Android release: Unpacking (ported here a
 - [x] South Park™: The Stick Of Truth™ · `010043600B6A6000` · needs a Vulkan 1.3 driver or imageless framebuffers with render pass 2 (Turnip packed on the Adreno 640)
 - [ ] SteamWorld Heist II · `010089C01E9CA000` · upstream profile
 - [ ] STEINS;GATE RE:BOOT · `01008BC024FDE000` · profile here
-- [ ] Super Mario 3D World + Bowser's Fury · `010028600EBDA000` · profile here
+- [x] Super Mario 3D World + Bowser's Fury · `010028600EBDA000`
 - [x] Super Mario Bros. Wonder · `010015100B514000`
 - [ ] Super Mario Galaxy · `010099C022B96000` · profile here
 - [ ] Super Mario Galaxy 2 · `0100FD8022DAA000` · profile here
