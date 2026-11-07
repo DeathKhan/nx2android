@@ -559,8 +559,26 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 spvType = context.TypeArray(spvType, context.Constant(context.TypeU32(), context.Definitions.ThreadsPerInputPrimitive));
             }
 
+            // nxnative: a fragment input Ampere's LDTRAM reads per vertex (InstEmitAmpereMem.ALdtram) is an array of the primitive's three vertices, PerVertexKHR
+            // (SPV_KHR_fragment_shader_barycentric: the Spv.Generator names are the NV ones, the same values); it takes no interpolation qualifier
+            bool perVertexFragment = !isOutput && !isPerPatch && ioVariable == IoVariable.UserDefined &&
+                context.Definitions.Stage == ShaderStage.Fragment && context.AttributeUsage.IsPerVertexInput(ioDefinition.Location);
+
+            if (perVertexFragment)
+            {
+                spvType = context.TypeArray(spvType, context.Constant(context.TypeU32(), 3));
+                iq = PixelImap.Unused;
+            }
+
             SpvInstruction spvPointerType = context.TypePointer(storageClass, spvType);
             SpvInstruction spvVar = context.Variable(spvPointerType, storageClass);
+
+            if (perVertexFragment)
+            {
+                context.AddCapability(Capability.FragmentBarycentricNV);
+                context.AddExtension("SPV_KHR_fragment_shader_barycentric");
+                context.Decorate(spvVar, Decoration.PerVertexNV);
+            }
 
             if (builtInPassthrough)
             {

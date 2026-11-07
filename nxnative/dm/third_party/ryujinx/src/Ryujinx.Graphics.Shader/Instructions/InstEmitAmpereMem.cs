@@ -20,6 +20,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(AmpereOpcodes.IpaIdx, InstName.Ipa, AIpa, N);
             x(AmpereOpcodes.Ald, InstName.Ald, AAld, N);
             x(AmpereOpcodes.Ast, InstName.Ast, AAst, N, writesRd: false);
+            x(AmpereOpcodes.Ldtram, InstName.Ald, ALdtram, N);
 
             x(0x981, InstName.Ldg, ALdg, N);
             x(0x381, InstName.Ldg, ALdg, N);
@@ -88,6 +89,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
 
             IpaOp ipaOp = x.Bits(78, 80) == 1 ? IpaOp.Constant : IpaOp.Pass;
+
+            // An input LDTRAM reads per vertex is declared as an array of the vertices (ALdtram), which an interpolated read cannot share
+            if (idxAddress == null && addr is >= AttributeConsts.UserAttributeBase and < AttributeConsts.UserAttributeEnd &&
+                context.TranslatorContext.AttributeUsage.IsPerVertexInput((addr - AttributeConsts.UserAttributeBase) >> 4))
+            {
+                throw AFail(context, $"IPA of a[0x{addr:x}], which LDTRAM reads per vertex");
+            }
 
             EmitIpa(context, idxAddress, addr, ipaOp, RegisterConsts.RegisterZeroIndex, false, x.Rd);
         }
@@ -207,10 +215,72 @@ namespace Ryujinx.Graphics.Shader.Instructions
             EmitAld(context, x.Rd, x.Ra, x.Rb, x.Bits(40, 50), x.Bits(74, 76), x.Bit(76), x.Bit(79), x.Bit(77));
         }
 
+        // LDTRAM Rd, a[addr] (0x3ad): a fragment input's values at the primitive's own vertices, from the triangle RAM the interpolator reads. With .ab (bit 72 clear) Rd and
+        // Rd + 1 are vertex 0's and vertex 1's values; with .c (bit 72 set) Rd is vertex 2's. Fields: the attribute's word (addr >> 2) at 64..72, URZ at 24..30, bit 91 always set
+        // (Mesa NAK sm70_encode.rs OpLdTram); the meaning is NAK's lowering of load_input_vertex, the per-vertex inputs of VK_KHR_fragment_shader_barycentric, to channel
+        // (vertex & 1) of ldtram, .c for vertex 2 (nak_nir_lower_fs_inputs.c). Nintendo Switch 2 Welcome Tour's pixel shaders (0dd74971b7a2abff +0x80 and 26 more) read
+        // a[0x1e0], a[0x1e4] and a[0x1e8] that way, each with .ab into a pair and .c into one register, and take the three pairwise differences of the values per component
+        // (R9 - R15, R8 - R15, R8 - R9), squared and summed: the triangle's edge lengths, as a wireframe needs. The input is declared as an array of the three vertices with
+        // PerVertexKHR (Declarations.cs), which needs VK_KHR_fragment_shader_barycentric from the host; an attribute IPA also interpolates is refused there (AIpa), as one
+        // declaration cannot be both, and so is a shader that indexes its inputs (one array of them all).
+        public static void ALdtram(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+            int addr = x.Bits(64, 72) << 2;
+            bool c = x.Bit(72);
+
+            if (x.Bits(24, 30) != RegisterConsts.UniformZeroIndex || !x.Bit(91) || addr is < AttributeConsts.UserAttributeBase or >= AttributeConsts.UserAttributeEnd)
+            {
+                throw AFail(context, $"LDTRAM of a[0x{addr:x}] in a form not known");
+            }
+
+            if (context.TranslatorContext.Definitions.IaIndexing)
+            {
+                throw AFail(context, "LDTRAM in a shader that indexes its inputs");
+            }
+
+            int location = (addr - AttributeConsts.UserAttributeBase) >> 4;
+            int component = (addr >> 2) & 3;
+
+            for (int i = 0; i < (c ? 1 : 2); i++)
+            {
+                if (x.Rd + i >= RegisterConsts.RegisterZeroIndex)
+                {
+                    break;
+                }
+
+                Operand value = context.Load(StorageKind.Input, IoVariable.UserDefined, Const(location), Const(c ? 2 : i), Const(component));
+
+                context.Copy(Register(x.Rd + i, RegisterType.Gpr), value);
+            }
+        }
+
         // AST a[Ra + addr], data (32..40), vtx (64..72)
         public static void AAst(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
+            int addr = x.Bits(40, 50), count = x.Bits(74, 76) + 1;
+
+            // A patch store through an offset register below the user patch attributes: a tessellation level the invocation picks (Nintendo Switch 2 Welcome Tour's hull shader
+            // 0b9e5d475e9afd21 +0x6d0: AST a[R7].patch, R2 with R7 = SR_INVOCATION_ID << 2, each of the patch's three invocations writing one outer level). The IR has no
+            // indexed store of the levels, so each level word takes the value where the index names it and keeps its own otherwise.
+            if (!x.Bit(77) && x.Ra != RegisterConsts.RegisterZeroIndex && x.Bit(76) && addr + count * 4 <= AttributeConsts.UserAttributePerPatchBase)
+            {
+                for (int i = 0; i < count && x.Rb + i < RegisterConsts.RegisterZeroIndex; i++)
+                {
+                    Operand index = context.IAdd(AGpr(x.Ra), Const(addr + i * 4));
+
+                    for (int word = 0; word < AttributeConsts.UserAttributePerPatchBase; word += 4)
+                    {
+                        Operand old = AttributeMap.GenerateAttributeLoad(context, null, word, isOutput: true, isPerPatch: true);
+                        Operand value = context.ConditionalSelect(context.ICompareEqual(index, Const(word)), Register(x.Rb + i, RegisterType.Gpr), old);
+
+                        AttributeMap.GenerateAttributeStore(context, word, true, value);
+                    }
+                }
+
+                return;
+            }
 
             if (!x.Bit(77) && x.Ra != RegisterConsts.RegisterZeroIndex)
             {

@@ -23,6 +23,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
         public const int IpaIdx = 0x526;
         public const int Ald = 0x321;
         public const int Ast = 0x322;
+        public const int Ldtram = 0x3ad;   // a fragment input's value at each of the primitive's vertices
         public const int Ldc = 0xb82;
         public const int Ldl = 0x983;
     }

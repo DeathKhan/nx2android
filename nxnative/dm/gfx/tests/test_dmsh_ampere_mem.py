@@ -205,6 +205,88 @@ class PixelCovered(unittest.TestCase):
         self.assertIn('0x925 form 2', log)
 
 
+def spirv_ops(spv):   # a module's instructions as (opcode, operands) from the words after its header
+    w = struct.unpack(f'<{len(spv) // 4}I', spv); i = 5; out = []
+    while i < len(w):
+        n = w[i] >> 16; out.append((w[i] & 0xffff, w[i + 1:i + n])); i += n
+    return out
+
+
+@unittest.skipUnless(os.environ.get('DMSH_TEST_XLATE'), 'set DMSH_TEST_XLATE to the offline translator')
+class AmpereProgram(unittest.TestCase):
+    """A graphics-stage program (SPH, instructions, EXIT) through the translator: the SPIR-V, or None, and the log"""
+    SPH = PixelCovered.SPH
+
+    def spv(self, *ops, stage='ps'):
+        with tempfile.TemporaryDirectory(prefix='ampere_prog_') as d:
+            work = Path(d); (work / 'k.bin').write_bytes(self.SPH + b''.join(inst(*op) for op in ops) + inst(*EXIT))
+            (work / 'jobs.json').write_text(json.dumps([dict(key='k', stage=stage, arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, debug=True)]))
+            r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
+            return ((work / 'k.spv').read_bytes() if (work / 'k.spv').exists() else None), r.stdout + r.stderr
+
+
+class Ldtram(AmpereProgram):
+    """LDTRAM (0x3ad) as Nintendo Switch 2 Welcome Tour's pixel shader 0dd74971b7a2abff encodes it (+0x80, +0xa0): a[0x1e4] at the primitive's vertices, .c (bit 72) vertex 2 into R15,
+    .ab vertices 0 and 1 into R8 and R9; the shader takes their differences. The input is one array of the three vertices, PerVertexKHR (VK_KHR_fragment_shader_barycentric)"""
+    C, AB = (0x000fe20008000179, 0x000000003f0f73ad), (0x000e680008000079, 0x000000003f0873ad)
+    SUB1, SUB2 = (0x102fe20000010000, 0x8000000f09127221), (0x102fe20000010000, 0x8000000f08137221)   # R18 = R9 - R15, R19 = R8 - R15, waiting on the pair's barrier as the shader's +0xf0 does
+    OUT = (0x000fe20000010000, 0x0000001312007221)   # R0 = R18 + R19: colour 0
+    IPA = (0x000fe200000e0079, 0x000000ff00047326)   # IPA R4, a[0x1e4]: the same attribute interpolated
+
+    def test_the_input_is_an_array_of_the_three_vertices(self):
+        spv, log = self.spv(self.C, self.AB, self.SUB1, self.SUB2, self.OUT)
+        self.assertIsNotNone(spv, log)
+        ops = spirv_ops(spv)
+        self.assertIn((17, (5284,)), ops)   # OpCapability FragmentBarycentricKHR
+        self.assertTrue(any(op == 10 and b'SPV_KHR_fragment_shader_barycentric' in struct.pack(f'<{len(o)}I', *o) for op, o in ops))   # OpExtension
+        per_vertex = [o[0] for op, o in ops if op == 71 and o[1:] == (5285,)]   # OpDecorate PerVertexKHR
+        self.assertEqual(len(per_vertex), 1, per_vertex)
+        self.assertIn((71, (per_vertex[0], 30, 22)), ops)   # Location 22: a[0x1e0] is user attribute 22
+        consts = {o[1]: o[2] for op, o in ops if op == 43 and len(o) == 3}   # OpConstant
+        chains = sorted((consts[o[3]], consts[o[4]]) for op, o in ops if op == 65 and o[2] == per_vertex[0])   # OpAccessChain: (vertex, component)
+        self.assertEqual(chains, [(0, 1), (1, 1), (2, 1)])
+
+    def test_an_interpolated_read_of_the_same_attribute_is_refused(self):
+        spv, log = self.spv(self.C, self.IPA, self.OUT)
+        self.assertIsNone(spv)
+        self.assertIn('LDTRAM reads per vertex', log)
+
+    def test_an_unknown_form_is_refused(self):
+        spv, log = self.spv((0x000fe20000000179, 0x000000003f0f73ad), self.OUT)   # bit 91 clear
+        self.assertIsNone(spv)
+        self.assertIn('form not known', log)
+
+
+class PatchLevelIndexed(AmpereProgram):
+    """AST a[R7].patch, R2 with R7 = SR_INVOCATION_ID << 2, then a[0x10].patch, R2: Welcome Tour's hull shader 0b9e5d475e9afd21 (+0x0, +0x20, +0x6d0, +0x6e0), each invocation writing
+    one outer tessellation level. Each level word takes the value where the index names it (one comparison a word: 4 outer, 2 inner)"""
+    SPH = struct.pack('<32I', *[0x000c0881, 0x80000000, 0x03000000, 0, 0x008ff000, 0, 0x7ff33333, 0x3f70000f, 0xffffff1f, 0xff, 0, 0, 0, 0x33330000, 0x000f7ff3, 0xff1f3f70, 0x00ffffff] + [0] * 15)
+    S2R, SHF = (0x000e280000001100, 0x00000000003c7919), (0x041fe400000006ff, 0x000000023c077819)
+    AST, AST_INNER = (0x000fe800000010ff, 0x0000000207007322), (0x000fe200000010ff, 0x00001002ff007322)
+
+    def test_each_level_word_compares_the_index(self):
+        spv, log = self.spv(self.S2R, self.SHF, self.AST, self.AST_INNER, stage='hs')
+        self.assertIsNotNone(spv, log)
+        ops = spirv_ops(spv)
+        self.assertTrue(any(op == 71 and o[1:] == (11, 11) for op, o in ops))   # BuiltIn TessLevelOuter
+        self.assertTrue(any(op == 71 and o[1:] == (11, 12) for op, o in ops))   # BuiltIn TessLevelInner
+        self.assertEqual(sum(1 for op, _ in ops if op == 170), 6)   # OpIEqual
+
+    def test_an_offset_register_on_a_user_patch_attribute_is_still_refused(self):
+        spv, log = self.spv(self.S2R, self.SHF, (0x000fe800000010ff, 0x0000180207007322), stage='hs')   # a[R7 + 0x18].patch
+        self.assertIsNone(spv)
+        self.assertIn('offset register', log)
+
+
+class GuardCullForms(AmpereProgram):
+    """0x80d's first form with Welcome Tour's immediate (3d843c041bd9c6de +0x16410: 0xc0043211, where Kirby Air Riders has 0xc4321111), then the EXIT guard form"""
+    SPH = struct.pack('<32I', *[0x000d0481, 0, 0, 0, 0, 0, 0xffff7ff7, 0xffffffff, 0, 0, 0xc0000000, 0, 0, 0x0000f800] + [0] * 18)
+
+    def test_another_immediate_translates(self):
+        spv, log = self.spv((0x000fc80003fe0000, 0xc00432110000780d), (0x000fda0003f06000, 0x800000000000780d), stage='vs')
+        self.assertIsNotNone(spv, log)
+
+
 @unittest.skipUnless(os.environ.get('DMSH_TEST_XLATE'), 'set DMSH_TEST_XLATE to the offline translator')
 class DepthRegister(unittest.TestCase):
     """A pixel shader's depth output follows its colours at four registers per enabled render target, then the sample mask register. Ocarina of Time's agl_common depth pass

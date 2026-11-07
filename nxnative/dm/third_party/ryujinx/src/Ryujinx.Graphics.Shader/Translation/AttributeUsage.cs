@@ -13,6 +13,8 @@ namespace Ryujinx.Graphics.Shader.Translation
         public HashSet<int> UsedOutputAttributesPerPatch { get; }
         public HashSet<int> NextUsedInputAttributesPerPatch { get; private set; }
         public int PassthroughAttributes { get; private set; }
+        // nxnative: the fragment inputs Ampere's LDTRAM reads per vertex (InstEmitAmpereMem.ALdtram): declared as arrays of the primitive's three vertices (SPIR-V PerVertexKHR)
+        public int PerVertexInputAttributes { get; private set; }
         private int _nextUsedInputAttributes;
         private int _thisUsedInputAttributes;
         private Dictionary<int, int> _perPatchAttributeLocations;
@@ -37,6 +39,13 @@ namespace Ryujinx.Graphics.Shader.Translation
             _thisUsedInputAttributes |= mask;
             ThisInputAttributesComponents |= UInt128.One << (index * 4 + component);
         }
+
+        public void SetInputUserAttributePerVertex(int index)
+        {
+            PerVertexInputAttributes |= 1 << index;
+        }
+
+        public bool IsPerVertexInput(int index) => (PerVertexInputAttributes & (1 << index)) != 0;
 
         public void SetInputUserAttributePerPatch(int index)
         {

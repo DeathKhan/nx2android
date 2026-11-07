@@ -252,6 +252,18 @@ namespace Ryujinx.Graphics.Shader.Decoders
                     case AmpereOpcodes.Ast:
                         SetUserAttributeUses(definitions, context, a.Bits(40, 50), a.Bits(74, 76) + 1, true, a.Ra != RegisterConsts.RegisterZeroIndex, a.Bit(76));
                         break;
+                    case AmpereOpcodes.Ldtram:   // LDTRAM a[addr]: the input is read per vertex (InstEmitAmpereMem.ALdtram), so it is declared as an array of the three
+                        {
+                            int addr = a.Bits(64, 72) << 2;
+
+                            SetUserAttributeUses(definitions, context, addr, 1, false, false, false);
+
+                            if (addr is >= AttributeConsts.UserAttributeBase and < AttributeConsts.UserAttributeEnd)
+                            {
+                                context.AttributeUsage.SetInputUserAttributePerVertex((addr - AttributeConsts.UserAttributeBase) >> 4);
+                            }
+                        }
+                        break;
                     case 0x389:
                     case 0x589:
                     case 0x989:

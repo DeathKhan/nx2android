@@ -742,6 +742,17 @@ HLE_FORCE("_ZN2nn3hid9StartJcmsERKNS0_10JcmsHandleE", "Joy-Con mouse sensor: no 
 HLE_FORCE("_ZN2nn3hid8StopJcmsERKNS0_10JcmsHandleE", "Joy-Con mouse sensor: no sensor on the host", void, h_hid_JcmsStop, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid13GetJcmsStatesEPNS0_9JcmsStateEiRKNS0_10JcmsHandleE", "Joy-Con mouse sensor states: none (no sensor on the host)",
           int, h_hid_JcmsStates, void *out, int n, const uint32_t *h) { (void)out; (void)n; (void)h; return 0; }
+// Switch 2 SDK calls of Nintendo Switch 2 Welcome Tour the SDK answers from the hid service (which the host does not serve: sf abort 0xe15 at sdk+0x65cfdc):
+// the system's mouse pointer speed (a float the game clamps to 0.6..1.4, tcn::WorkModule::GetMouseSensitivityByConsole): 1, the middle; the GL / GR buttons' configuration
+// state (Switch 2 Pro Controller back buttons): none assigned; the private-app scene id: nothing to tell
+HLE_FORCE("_ZN2nn3hid25GetMousePointerSpeedScaleEv", "system mouse pointer speed scale: 1 (no system setting on the host)", float, h_hid_MouseSpeed, void) { return 1.0f; }
+HLE_FORCE("_ZN2nn3hid24GetGlGrButtonConfigStateEPbS1_j", "GL / GR button configuration (Switch 2 Pro Controller): not assigned", Result, h_hid_GlGr, uint8_t *gl, uint8_t *gr, uint32_t npad) {
+    (void)npad; if (gl) *gl = 0; if (gr) *gr = 0; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid23SetSceneIdForPrivateAppEi", "scene id for a private app: nothing to tell on the host", void, h_hid_SceneId, int id) { (void)id; }
+// The one-state form (Nintendo Switch 2 Welcome Tour, every frame once its controllers are set up): the SDK's reaches hid::detail::GetJcmsStates, whose service object is null here
+// (sdk+0x659990). A JcmsState at rest: zeros (no sample, no buttons, no delta)
+HLE_FORCE("_ZN2nn3hid12GetJcmsStateEPNS0_9JcmsStateERKNS0_10JcmsHandleE", "Joy-Con mouse sensor state: at rest (no sensor on the host)",
+          void, h_hid_JcmsState, void *out, const uint32_t *h) { (void)h; if (out) memset(out, 0, 32); }
 // The Switch 2's pointer on top of those sensors (Nmouse; Fire Emblem Fortune's Weave initializes it at boot with the 1920x1080 screen it maps the pointer to, main+0x650a24). InitializeNmouse opens the
 // hid service as InitializeJcms does (its Result aborts: sdk+0x6d5340). No controller of the host has the sensor, so there are no handles, and the calls on a handle have nothing to do
 HLE_FORCE("_ZN2nn3hid16InitializeNmouseEPvmii", "Joy-Con mouse pointer: no hid service; no sensor on the host", void, h_hid_NmouseInit, void *work, uint64_t size, int w, int h) { (void)work; (void)size; (void)w; (void)h; }

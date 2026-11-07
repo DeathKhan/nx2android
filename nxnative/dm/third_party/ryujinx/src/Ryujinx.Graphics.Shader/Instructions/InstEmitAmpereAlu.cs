@@ -901,7 +901,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
             int pd = x.Bits(81, 84), pd2 = x.Bits(84, 87), ps = x.Bits(87, 90), cmp = x.Bits(76, 79);
             bool plain = pd2 == RegisterConsts.PredicateTrueIndex && ps == RegisterConsts.PredicateTrueIndex && context.TranslatorContext.Definitions.Stage == ShaderStage.Vertex;
 
-            if (!plain || !(imm == 0xc4321111 && pd == RegisterConsts.PredicateTrueIndex && cmp == 0 || imm == 0x80000000 && cmp == 6))
+            // The first's immediate differs by game (Kirby 0xc4321111; Nintendo Switch 2 Welcome Tour's 3d843c041bd9c6de +0x16410 0xc0043211): with no predicate result it changes nothing here
+            if (!plain || !(pd == RegisterConsts.PredicateTrueIndex && cmp == 0 || imm == 0x80000000 && cmp == 6))
             {
                 throw AFail(context, "a 0x80d not of the guard band cull");
             }
