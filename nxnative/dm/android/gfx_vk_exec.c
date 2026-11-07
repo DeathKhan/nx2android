@@ -25,6 +25,7 @@ static struct {
     uint64_t tex[6][256], samp[6][128], img[6][32], tex_sseq[6][256], samp_sseq[6][128];   // *_sseq: the sampler registrations made before the bind (gfx_vk_tex.c vk_samp_at)
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
     uint32_t vattr[16]; vs_st vstream[16]; NVNbufferRange vbuf[16];
+    uint8_t push[2][0x100];   // NVN2 push constants of the graphics stages [0] and compute [1] (OP_PUSH_CONST; DMSH_PUSH_SIZE bytes each)
     float vp[16][4]; float dnear, dfar; p_scissor sc; int sc_set; uint8_t vp_sw[16][4];   // vp_sw: viewport swizzles XOR the identity (p_vp_swizzle)
     int sref[2], smask[2], swmask[2];
     p_poly_offset pofs; float blendc[4]; int depth_clamp, rast_discard, prim_restart;
@@ -2261,14 +2262,25 @@ static void exec_ops(const uint8_t *p) {
             break; }
         case OP_BIND_VATTR: { const p_bind_vattr *v = (const p_bind_vattr *)a; memset(S.vattr, 0, sizeof S.vattr); for (int i = 0; i < v->n && i < 16; i++) S.vattr[v->first + i] = v->st[i]; break; }
         case OP_BIND_VSTREAM: { const p_bind_vstream *v = (const p_bind_vstream *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) S.vstream[v->first + i] = v->st[i]; break; }
-        case OP_BIND_VBUF: { const p_bind_vbuf *v = (const p_bind_vbuf *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) S.vbuf[v->first + i] = v->r[i]; break; }
-        case OP_BIND_UBO: { const p_bind_buf *b = (const p_bind_buf *)a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16 && memcmp(&S.ubo[b->stage][b->index], b, sizeof *b)) { S.ubo[b->stage][b->index] = *b; g_ubo_gen[b->stage]++; } break; }
+        case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf t1; const p_bind_vbuf *v = vbuf_rec(h.op, a, &t1); for (int i = 0; i < v->n && v->first + i < 16; i++) S.vbuf[v->first + i] = v->r[i]; break; }   // VBUF1: upstream's 24-byte one-buffer record
+        case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf t1; const p_bind_buf *b = bind_buf_rec(h.op, a, &t1); if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16 && memcmp(&S.ubo[b->stage][b->index], b, sizeof *b)) { S.ubo[b->stage][b->index] = *b; g_ubo_gen[b->stage]++; } break; }
         case OP_BIND_SSBO: { const p_bind_buf *b = (const p_bind_buf *)a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16 && memcmp(&S.ssbo[b->stage][b->index], b, sizeof *b)) { S.ssbo[b->stage][b->index] = *b; g_bind_gen[b->stage]++; } break; }
         case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_BIND_TEX1: bind_handles_rec(h.op, a); break;
         case OP_STENCIL: { const p_stencil *s = (const p_stencil *)a;
             for (int f = 0; f < 2; f++) if (s->face & (1 << f)) { if (s->which == 0) S.smask[f] = s->value_mask; else if (s->which == 1) S.swmask[f] = s->mask; else S.sref[f] = s->ref; }
             break; }
         case OP_POLY_OFFSET: S.pofs = *(const p_poly_offset *)a; break;
+        // ---- records upstream added (upsync 2026-11-07) ----
+        case OP_ALPHA_REF: break;   // SetAlphaRef: the Android replay has no alpha test (ColorStateSetAlphaTest is recorded only, as before the upsync); nvn_mtl.m at_bind has one. TODO(upsync)
+        case OP_PUSH_CONST: { const p_push_const *r = (const p_push_const *)a;   // NVN2 push constants (c[24], DMSH_PUSH_BANK): kept per group; TODO(switch2): bound as constant bank 24 of the stages / compute
+            if (r->compute < 2 && r->offset + r->size <= sizeof S.push[0]) memcpy(S.push[r->compute] + r->offset, r->data, r->size); break; }
+        case OP_MULTI_DRAW: {   // MultiDraw*IndirectCount with more than MDI_INLINE draws: one record (hle_nvn.c); drawn as the inline form was, once (draw / draw_idx say so). TODO(switch2): vkCmdDraw*IndirectCount
+            const p_multi_draw *m = (const p_multi_draw *)a; if (g_rc_skip) break;
+            if (m->itype < 0) { p_draw d = {m->prim, 0, 0, 0, 0, m->ind, m->cnt, 0, 0}; draw(&d); }
+            else { p_draw_idx d = {m->prim, m->itype, 0, 0, 0, 0, m->ibuf, m->ind, m->cnt, 0, 0}; draw_idx(&d); }
+            break; }
+        case OP_DRAW_TEX: VKRED_ONCE(113, "DrawTexture: not replayed on Android yet (upstream records it since the upsync; before it the call was not taken over)"); break;
+        case OP_DLSS: VKRED_ONCE(114, "an NVN2 DLSS evaluation recorded by the game: not replayed (no DLSS on Android; the picture stays at the render resolution)"); break;
         case OP_BLEND_COLOR: memcpy(S.blendc, ((const p_blend_color *)a)->rgba, 16); break;
         case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; break;
         case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; break;
