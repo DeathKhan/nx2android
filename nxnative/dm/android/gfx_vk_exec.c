@@ -2597,7 +2597,7 @@ static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescrip
     if (g_ubo_bounds && st >= 0 && st < 3 && !g_spv_alt && u && s->ubo_extent[b->reg] && s->ubo_extent[b->reg] < shadow_n) shadow_n = s->ubo_extent[b->reg];
     if (vk_ubd_shadow(u->addr, shadow_n, &buf, &off)) { *bi = (VkDescriptorBufferInfo){buf, off, shadow_n}; return; }
     VkDeviceSize al = V.props.limits.minUniformBufferOffsetAlignment; if (off % al) VKRED_ONCE(40, "uniform buffer at an offset not aligned to %llu", (unsigned long long)al);
-    *bi = (VkDescriptorBufferInfo){buf, off - off % al, n + off % al};
+    *bi = (VkDescriptorBufferInfo){buf, p->boff + off - off % al, n + off % al};   // (off is from the pool's start, its buffer starts boff before it)
 }
 // Shared by collection and memo refresh, including range clipping and compute dirty tracking.
 static void sbuf_desc(int st, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
@@ -2621,7 +2621,7 @@ static void sbuf_desc(int st, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
         if (!n || off + n > p->hi - p->lo) n = p->hi - p->lo - off;
         // bound from the 256-byte boundary below it, the boundary the translator offsets every access from (shader_vk.py SB_ALIGN; a multiple of any device's minimum alignment)
         const VkDeviceSize al = SB_ALIGN; if (V.props.limits.minStorageBufferOffsetAlignment > al) VKRED_ONCE(41, "storage buffer alignment %llu above %llu", (unsigned long long)V.props.limits.minStorageBufferOffsetAlignment, (unsigned long long)al);
-        *bi = (VkDescriptorBufferInfo){buf, off - off % al, n + off % al};
+        *bi = (VkDescriptorBufferInfo){buf, p->boff + off - off % al, n + off % al};   // (off is from the pool's start, its buffer starts boff before it)
         if (st == 5 && b->kind != RK_UBO_PTR) { void vk_gpu_wrote(uint64_t a, uint64_t n); vk_gpu_wrote(a, n); }   // a dispatch's storage buffers: taken as written
     } else *bi = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536};
 }
@@ -3727,7 +3727,7 @@ static int xfb_begin(VkCommandBuffer cb) {   // inside the pass, after the pipel
         uint64_t from = gs ? 0 : g_tf_off[k];   // a counted capture is bound at the buffer's start: the counter says where it goes on
         vkpool_t *p = g_tf[k].addr ? vk_pool_of(g_tf[k].addr + from, 4) : NULL;
         if (vs->xfb_stride[k] && p && from < g_tf[k].size && vk_buf_at(g_tf[k].addr + from, 4, &b[k], &o[k])) {
-            n[k] = g_tf[k].size - from; if (o[k] + n[k] > p->hi - p->lo) n[k] = p->hi - p->lo - o[k];
+            n[k] = g_tf[k].size - from; if (o[k] - p->boff + n[k] > p->hi - p->lo) n[k] = p->hi - p->lo - (o[k] - p->boff);   // (o is the buffer's offset: a slab slot's starts at boff)
         } else { vk_scratch(64, 64, &b[k], &o[k]); n[k] = 64; if (vs->xfb_stride[k]) VKRED_ONCE(83, "transform feedback buffer %d unbound, full or outside the memory pools: its capture is dropped", k); }
     }
     vkCmdBindTransformFeedbackBuffersEXT(cb, 0, 4, b, o, n);
