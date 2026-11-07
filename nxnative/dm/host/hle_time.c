@@ -118,16 +118,14 @@ HLE_FORCE("_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_", "sna
     return RES_OK;
 }
 // The adjustable user clock already reads host time, so both snapshots share the fill path.
-// Its SDK entry otherwise dereferences the time-service session, which the host never opens.
+// Its SDK entry otherwise dereferences the time-service session, which the host never opens (Tomodachi Life: Living the Dream, SDK 20: Adjust, then this, at main+0x5082d4 during boot;
+// the SDK asked the time service and aborted with Result 0 at sdk+0x4406f8). Upstream registers this entry twice (a second copy returning a type 1 snapshot); the host refuses a
+// duplicate forced take-over (FATAL duplicate entry), so only this one, with the adjustable type, is kept
 HLE_FORCE("_ZN2nn4time13ClockSnapshot31CreateWithAdjustableSystemClockEPS1_", "adjustable clock snapshot from host time; the host has no time service session", Result, h_time_AdjSnapshot, uint8_t *s) {
     h_time_Snapshot(s);
     s[0xcd] = 2;
     return RES_OK;
 }
-// The same from the adjustable user clock (Tomodachi Life: Living the Dream, SDK 20: Adjust, then this, at main+0x5082d4 during boot; the SDK asked the time service and aborted
-// with Result 0 at sdk+0x4406f8). On the host the adjustable clock is the user clock (above), so the snapshot is the standard one
-HLE_FORCE("_ZN2nn4time13ClockSnapshot31CreateWithAdjustableSystemClockEPS1_", "snapshot of the adjustable user clock (time service): the host's user clock, as the standard snapshot",
-          Result, h_time_SnapshotAdj, uint8_t *s) { return h_time_Snapshot(s); }
 // Arithmetic on two snapshots: the SDK hands both to the time service (a call through its session, AbortImpl when there is none: STEINS;GATE RE:BOOT's and Tears of the Kingdom's SDK;
 // Tears of the Kingdom imports both); the host computes what the service does (as Ryujinx's time service). TimeSpan is nanoseconds. CalculateSpanBetween returns bool, not a Result:
 // true when the span was stored (SDK 12 to 20 end it with `cset w0, eq` on the service's result, Metroid Dread's sdk+0x3ab540, Tears of the Kingdom's sdk+0x440f60); a Result 0 read as false

@@ -87,6 +87,11 @@ class Adb:
         self.serial = ready[0]
         return self.serial
 
+    # A dozing device (screen off for a while) throttles its Wi-Fi: a 93 MB push ran at 0.3 MB/s and timed out, 4 MB/s awake. A kernel wake lock (root through the shim; harmless
+    # without root: the write fails) and a key press keep it awake while the port pushes; released when the device work ends
+    def keep_awake(self): self.shell("input keyevent KEYCODE_WAKEUP; echo nx2a > /sys/power/wake_lock 2>/dev/null; true", check=False)
+    def release_awake(self): self.shell("echo nx2a > /sys/power/wake_unlock 2>/dev/null; true", check=False)
+
     def prop(self, name): return self.shell(f'getprop {shlex.quote(name)}').strip()
 
     def gpu(self):   # the GPU's name as SurfaceFlinger reports it ("Qualcomm, Adreno (TM) 830, OpenGL ES 3.2 ..."), '' when unknown

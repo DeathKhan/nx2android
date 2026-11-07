@@ -102,7 +102,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
     PROG.stage('install', step='finding the device')
     pushing = False
     try:
-        dev = adb.pick()
+        dev = adb.pick(); adb.keep_awake()
         model = adb.prop('ro.product.model')
         say(f'device: {model or dev} ({dev}), GPU {adb.gpu() or "unknown"}')
         if 'bcn' in man.get('requires', []):   # the profile's requires: BC-compressed textures

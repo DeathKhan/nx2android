@@ -532,7 +532,7 @@ class Port:
         go to the device once a port (device_oodle_end removes them). bnsh: only the entries that hold a BNSH shader come back (DM_OODLE_JOB_BNSH)"""
         adb = getattr(self, 'oodle_adb', None)
         if not adb:
-            adb = Adb(self.tools['adb'], self.o.device or self.cfg.get('device'), log=say); adb.pick()
+            adb = Adb(self.tools['adb'], self.o.device or self.cfg.get('device'), log=say); adb.pick(); adb.keep_awake()
             host = self.aw / ('host-debug' if self.o.debug else 'host')   # the host stage's own folder: its objects serve both
             PROG.set(step="building the host as a tool for the game's Oodle decoder")
             nsp.run([PY, DM / 'android/build.py', '--game', self.g.id, '--ndk', self.tools['ndk'], '--out', host, '--exe', '--jobs', str(self.o.jobs)] + ([] if self.o.debug else ['--release']),
@@ -609,7 +609,7 @@ class Port:
         adb = getattr(self, 'oodle_adb', None)
         if not adb: return
         self.oodle_adb = None
-        try: adb.shell(f'rm -rf {self.ODEV}', check=False)
+        try: adb.shell(f'rm -rf {self.ODEV}', check=False); adb.release_awake()
         except AdbError as e: say(f'the Oodle decoder left on the device ({e}): {self.ODEV}')
 
     # ---- 60 fps (--fps60): the profile's own cap (fps_target: frame-step stubs or hle_fpslock.c's rows), else the community's FPSLocker config of the build ----
