@@ -8,13 +8,16 @@
 #include "dm.h"
 #include "nvn_obj.h"
 #include "nvn_mtl.h"
+#include "../gfx/nvn/nvn_timestamp.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 
 uint64_t guest_ns(void);
-static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; } return g * 12 / 625; }
+// Report timestamps are NVN's raw 614.4 MHz unit (nvn_timestamp.h), which nvnDeviceGetTimestampInNanoseconds converts back; they were written in 19.2 MHz CPU ticks, 32 times too
+// small, so a game's frame-rate controller saw its GPU finish at once (Donkey Kong Bananza stayed at present interval 1 while its frames took 33 ms: half speed)
+static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; } return nvn_timestamp_from_ns(g); }
 
 // ---------------- memory pools: GPU address = CPU address ----------------
 typedef struct { uint64_t lo, hi; } pool_ent;

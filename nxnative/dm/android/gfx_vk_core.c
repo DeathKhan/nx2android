@@ -888,6 +888,7 @@ void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize
 // entry's index in the low DMSH_GMEM_MAP_LOG2 bits, 0 = none; the shader checks the tag and searches on a collision (GlobalToStorage.cs). Rebuilt when a pool comes or goes
 // (vk_pool_gen); the replaced table is freed once the GPU has passed the current submission, which may still read it. Host-visible, written by the CPU before the submission.
 #include "dmsh_abi.h"
+#include "../gfx/nvn/nvn_timestamp.h"
 #define GMEM_MAP_LOG2 13   // GlobalToStorage.GmemMapLog2: log2 of DMSH_GMEM_MAP_ENTRIES
 _Static_assert(DMSH_GMEM_MAP_ENTRIES == 1 << GMEM_MAP_LOG2, "gmem table size");
 static VkBuffer g_gmem_buf; static VkDeviceMemory g_gmem_mem; static uint32_t g_gmem_gen; static int g_gmem_n;
@@ -1209,7 +1210,9 @@ void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 typedef struct cpend { uint64_t fence, frame; post_op *ops; int n; int slot, rslot; int npass; pass_meta pmeta[PASSQ]; struct cpend *next; } cpend;
 static cpend *g_ch, *g_ct; static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
 uint64_t guest_ns(void);
-static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; } return g * 12 / 625; }
+// Report timestamps are NVN's raw 614.4 MHz unit (nvn_timestamp.h), which nvnDeviceGetTimestampInNanoseconds converts back; they were written in 19.2 MHz CPU ticks, 32 times too
+// small, so a game's frame-rate controller saw its GPU finish at once (Donkey Kong Bananza stayed at present interval 1 while its frames took 33 ms: half speed)
+static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; } return nvn_timestamp_from_ns(g); }
 // GPU time per NVN frame (the sum of its submissions' timestamp spans), for the timing line's GPU column: the frame a submission belongs to is the one being replayed
 static uint64_t g_cur_frame, g_frame_gpu[64], g_frame_gpu_of[64];
 void mtl_set_frame(uint64_t f) { __atomic_store_n(&g_cur_frame, f, __ATOMIC_RELAXED); }
@@ -1260,7 +1263,7 @@ static void *completion_main(void *a) {
             if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; continue; }
             uint64_t ts = now, tq;
             if (o->q >= 0 && tend && vkGetQueryPoolResults(V.dev, g_cq, (uint32_t)o->q, 1, 8, &tq, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && tq <= tend) {
-                uint64_t back = (uint64_t)((double)(tend - tq) * V.props.limits.timestampPeriod * 12 / 625); if (back < now) ts = now - back; }
+                uint64_t back = nvn_timestamp_from_ns((uint64_t)((double)(tend - tq) * V.props.limits.timestampPeriod)); if (back < now) ts = now - back; }   // the span before the submission's end, in the same unit
             // render_cond: a timestamp report's counter field is 0, as on the GPU (gfx_vk_exec.c render_cond evaluates conditions on it)
             uint64_t rec[2] = {o->type == 0 || o->type == 0x10 ? (DM_GAME_RENDER_COND ? 0 : ts) : o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (1u << 20) : 0, ts}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
         }
