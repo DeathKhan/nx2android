@@ -243,6 +243,14 @@ typedef struct { VkRenderPass rp; uint32_t w, h, layers, n; struct { uint32_t us
 static nvn_hmap g_rps = {.klen = sizeof(rpkey)}, g_fbs = {.klen = sizeof(fbkey)}; static pthread_mutex_t g_rp_mu = PTHREAD_MUTEX_INITIALIZER;
 // Without dynamic rendering (a Vulkan 1.1 / 1.2 device, V.has_dynrender) passes must be render pass objects, whatever DM_VK_RP says (vk_init refuses a device with neither)
 static int rp_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_RP"); on = V.has_imageless && (!V.has_dynrender || !(e && !atoi(e))); VKLOG("passes: %s", on ? "render pass objects with imageless framebuffers" : "dynamic rendering"); } return on; }
+// A pass with no attachments at all (begin_pass, DM_VK_NOATT) is begun with dynamic rendering even where passes are render pass objects (an imageless framebuffer
+// with no attachments was the first suspect for the hang below; it hung either way). Its pipelines are made the same way
+static int noatt_dyn(uint32_t ncol, uint32_t dfmt) { return !ncol && !dfmt && V.has_dynrender; }
+// DM_VK_NOATT=1 (start-up) runs them; off by default: with them run, Welcome Tour hung the GPU the same way as soon as its lobby began (both pass kinds; kgsl fault
+// ids 2, the game alive at "-- FPS"), so the fault is in the draws themselves: vertex shaders be816c4f2431b602 / afe80dc02de844a6 (subgroup operations emulated as
+// one-invocation subgroups) writing memory under rasterizer discard, 96x54, 2048x2048 and 1312x1312 viewports, about 76 draws a frame. Skipped, the lobby draws
+// without visible loss, so what they compute (culling or skinning records, most likely) is not needed by what the host draws, or is covered by a fallback
+static int noatt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NOATT"); on = e ? atoi(e) : 0; } return on; }
 static int fmt_has_depth(uint32_t f) { return f && f != VK_FORMAT_S8_UINT; }
 static int fmt_has_stencil(uint32_t f) { return f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_S8_UINT || f == VK_FORMAT_D16_UNORM_S8_UINT; }
 static VkRenderPass rp_get(const rpkey *k) {
@@ -323,7 +331,7 @@ static int pass_commit(void) {
     if (dim) g_lrz_prev = dim;
     if ((g_lrz_touch & LRZ_READ) && dim && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) lrz_touch(dim, 0);
     void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);
-    if (rp_on()) {
+    if (rp_on() && !noatt_dyn(P_ri.colorAttachmentCount, P_ri.pDepthAttachment || P_ri.pStencilAttachment ? 1u : 0u)) {
         rpkey k; memset(&k, 0, sizeof k); k.ncol = P_ri.colorAttachmentCount; k.samples = S.samples ? S.samples : 1;
         fbkey fk; memset(&fk, 0, sizeof fk); VkImageView views[9]; VkClearValue cv[9]; uint32_t na = 0;
         for (uint32_t i = 0; i < k.ncol; i++) if (P_ca[i].imageView) {
@@ -643,7 +651,20 @@ static int begin_pass(void) {
             if (im->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) sa = da;
         }
     }
-    if (!have) { VKRED_ONCE(30, "draw with no usable render target: skipped"); return 0; }
+    if (!have) {
+        // No target at all was set (NVN allows it: vertex shaders that write memory under rasterizer discard, fragment shaders with image stores). Nintendo Switch 2 Welcome
+        // Tour draws about 76 a frame that way in its expo lobby (skipped before, 4 % of its draws); Vulkan has passes with no attachments too, sized here by the viewport. A
+        // target that was set but has no usable image (a view that failed) is still skipped: such a draw would put nothing anywhere
+        int bound = S.rt_has_dep; for (int i = 0; i < S.rt_n; i++) bound |= S.rt_has_col[i];
+        if (bound) { VKRED_ONCE(30, "draw with no usable render target: skipped"); return 0; }
+        if (!noatt_on()) { static int n; if (n++ < 4) VKLOG("[RED] draw with no render target set (rasterizer discard %d, vertex %016llx, fragment %016llx): skipped (DM_VK_NOATT=1 runs such draws; they hung the Adreno 830 in Welcome Tour)",
+                                                           S.rast_discard, S.sh[0] ? (unsigned long long)S.sh[0]->key : 0ull, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull); return 0; }
+        float vx = S.vp[0][0] > 0 ? S.vp[0][0] : 0, vy = S.vp[0][1] > 0 ? S.vp[0][1] : 0, vw = S.vp[0][2], vh = S.vp[0][3];
+        w = vw > 0 ? (uint32_t)(vx + vw + 0.5f) : 1; h = vh > 0 ? (uint32_t)(vy + vh + 0.5f) : 1;
+        if (w > 16384) w = 16384; if (h > 16384) h = 16384; if (!w) w = 1; if (!h) h = 1; layers = 1; samples = 1; ncol = 0;
+        static int n; if (n++ < 6) VKLOG("pass with no attachments (%d target slots set, none a texture): rasterizer discard %d, vertex %016llx, fragment %016llx, %ux%u from the viewport", S.rt_n, S.rast_discard,
+                                         S.sh[0] ? (unsigned long long)S.sh[0]->key : 0ull, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull, w, h);
+    }
     // The cut (DM_VK_CB_DRAWS): only before a pass whose depth attachment no earlier pass of this submission drew with. Adreno keeps a low-resolution copy of a depth
     // attachment (LRZ) that it trusts within a command buffer; a pass that goes on with a depth buffer begun in an earlier command buffer had whole 8x8 blocks of its
     // nearest objects rejected in some frames (NEO: bushes, trees and the phone booth near the camera flickered light blue). DM_VK_X_CUTANY=1 cuts before any pass.
@@ -1096,7 +1117,7 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     VkFormat df = (VkFormat)k->dfmt;
     int has_stencil = df == VK_FORMAT_D24_UNORM_S8_UINT || df == VK_FORMAT_D32_SFLOAT_S8_UINT || df == VK_FORMAT_S8_UINT;
     VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k->ncol, cf, df == VK_FORMAT_S8_UINT ? VK_FORMAT_UNDEFINED : df, has_stencil ? df : VK_FORMAT_UNDEFINED};
-    VkRenderPass prp = rp_on() ? rp_compat(k->ncol, k->cfmt, k->dfmt, k->samples) : VK_NULL_HANDLE;   // with render passes, pipelines are made against a compatible one
+    VkRenderPass prp = rp_on() && !noatt_dyn(k->ncol, k->dfmt) ? rp_compat(k->ncol, k->cfmt, k->dfmt, k->samples) : VK_NULL_HANDLE;   // with render passes, pipelines are made against a compatible one (noatt_dyn: none)
     if (!prp && !V.has_dynrender) { build_end(bs); return (VkPipeline)1; }   // no compatible render pass and no dynamic rendering: no valid pipeline (pass_commit skips such passes)
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, prp ? NULL : &rci, 0, ns, ss, &vi, &ia, NULL, &vs, &rs, &ms, &ds, &cb, &dy, layout, prp, 0, VK_NULL_HANDLE, -1};
     if (bs >= 0) g_build[bs].phase = 2;
