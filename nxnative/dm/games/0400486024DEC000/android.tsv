@@ -1,0 +1,22 @@
+# The Legend of Zelda: Ocarina of Time (Nintendo Switch 2 Edition; NVN2, Ampere shaders) on Android: an untested first profile written with the nxnative upsync of 2026-11-08
+# (upstream to 7f5022200). Rows are those of the other Switch 2 profiles (Donkey Kong Bananza, Welcome Tour) whose reason holds for any Switch 2 game on the Odin 3; nothing here is
+# tuned for this game yet. Upstream's Ocarina fixes that reach Android: the frame step stubs (patches.py, MATCH_FRAME_STEP), the dynamic-resolution stub (DM_DYNAMIC_RESOLUTION),
+# raw 128-bit global loads as one vector load (translator), the colour write mask from the pixel shader's output map (gfx_vk_exec.c, needs a rebuilt shader bundle),
+# timestamp reports known until they land for its conditional rendering (render_cond on in game.tsv)
+status	experimental
+package	org.nx2a.t0400486024dec000
+orientation	landscape
+# Handheld mode: on the Odin's 1080p screen the game targets its handheld resolution instead of the docked one (as Bananza and Welcome Tour)
+setting	docked=0
+setting	overlay=1
+setting	fps=1
+# The replay on its own thread (as Bananza)
+env	DM_NVN_ASYNC=1
+# The host's adaptive frame rate off, as the other Switch 2 profiles. Proposal to check: with upstream's frame step stubs this game's step is the host's, so a 40 fps step may run at
+# the right speed here, unlike Bananza
+env	DM_ADAPTIVE_FPS=0
+# DM_VK_PART_PACE: the backend default (on)
+# Proposals for an A/B on the device, not set:
+#   env DM_DYNAMIC_RESOLUTION=1   the game's dynamic resolution through upstream's climbing stub (0, the default, holds 1536x864)
+#   env DM_VK_RC_QUEUE=1          render-enable state kept per NVN queue across submissions, as upstream's logical queues do (the queue-ordering fix for its flashes is Apple-only)
+#   env DM_GPU_MIN_FREQ=967000000 the GPU clock floor the other Switch 2 profiles use (through su)
