@@ -1031,6 +1031,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         VKLOG("descriptor allocation per frame (last 600, timing %s): %.3f ms, %.1f driver calls, %.1f sets allocated (includes absent-stage sets)",
               g_desc_timing ? "on" : "off; DM_VK_DESC_TIMING=1", (g_desc_alloc_ns - pda) / 6e8, (g_desc_alloc_calls - pdc) / 600.0, (g_desc_alloc_sets - pds) / 600.0);
         pda = g_desc_alloc_ns; pdc = g_desc_alloc_calls; pds = g_desc_alloc_sets;
+        { extern uint64_t g_vk_nbar, g_vk_nlrz; static uint64_t pbar, plrz, ppa, pdi, pfo;   // what costs the GPU a fixed amount per pass: barriers drain it, LRZ touches are a copy and barriers each
+          VKLOG("pass work per frame (last 600): %.1f passes, %.1f dispatches, %.1f clears folded, %.1f full barriers, %.1f LRZ touches", (g_vkst.passes - ppa) / 600.0, (g_vkst.dispatches - pdi) / 600.0, (g_vkst.folded - pfo) / 600.0, (g_vk_nbar - pbar) / 600.0, (g_vk_nlrz - plrz) / 600.0);
+          pbar = g_vk_nbar; plrz = g_vk_nlrz; ppa = g_vkst.passes; pdi = g_vkst.dispatches; pfo = g_vkst.folded; }
         void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }

@@ -60,6 +60,7 @@ static void state_reset(void) {
 static void prewarm_start(void); static void compute_warm_start(void); static void build_dump(void);
 static uint64_t g_set_epoch = 1;   // the submission the descriptor set cache belongs to (stage_set)
 static int32_t g_pass_bb[4];   // bounding box of the scissors the open pass's draws used (x0 y0 x1 y1)
+static int g_pace; static uint64_t g_sub_d0, g_sub_hist[8]; static unsigned g_sub_hn;   // DM_VK_PART_PACE (part_pace)
 static int g_cb_draws;   // draws in the command buffer being recorded (vk_cmd_split after DM_VK_CB_DRAWS draws, 0 = never)
 static int g_psplit, g_psplit_depth, g_psplit_now, g_ord_parts, g_setsplit;   // DM_VK_PASS_SPLIT / _DEPTH (prepare_draw); g_psplit_now: the pass being begun goes on with the one just ended (begin_pass cuts before it);
                                                                     // g_ord_parts: ordinary DM_VK_CB_DRAWS cuts in this submission, kept to the old 15 (MAIN_CBS was 16): the extra parts are for pass splits
@@ -168,7 +169,7 @@ static void x_read(void) { original_index_read(); set_profile_poll(); const char
       if (!key) func = 0;
       if (key != g_depth_func_fs || func != g_depth_func) { g_depth_func_fs = key; g_depth_func = func; VKLOG("depth function diagnostic: %016llx func %d (depth enable/write unchanged)", (unsigned long long)key, func); } }
     g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : 1; if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
-    g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 0; g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e); g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) && atoi(e);
+    g_pace = !((e = getenv("DM_VK_PART_PACE")) && !atoi(e)); g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 0; g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e); g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) && atoi(e);
     g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_vbound = !((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_x_nflat = 0; if ((e = getenv("DM_VK_X_FLAT_VS"))) for (char *q = (char *)e; *q && g_x_nflat < 8; ) { char *nx; uint64_t v = strtoull(q, &nx, 16); if (nx == q) break; int m = 7; if (*nx == ':') m = (int)strtol(nx + 1, &nx, 10); g_x_flat_mode[g_x_nflat] = m; g_x_flat[g_x_nflat++] = v; q = *nx ? nx + 1 : nx; } g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = !((e = getenv("DM_VK_ASYNC_PIPE")) && !atoi(e)); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log; if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } } g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
     g_x_nskipvs = 0; for (const char *q = getenv("DM_VK_X_SKIPVS"); q && *q && g_x_nskipvs < 8;) { char *n; uint64_t v = strtoull(q, &n, 16); if (n == q) break; if (v) g_x_skipvs[g_x_nskipvs++] = v; q = *n ? n + 1 : n; } }
 // ---------------- conditional rendering (profile render_cond) ----------------
@@ -203,6 +204,7 @@ void vk_exec_reset(void) {   // a new submission: NVN state does not carry over 
     static int inited; if (!inited) { inited = 1; state_reset(); crash_add_note_hook(build_dump); prewarm_start(); compute_warm_start(); }
     g_rc_npend = 0; g_rc_skip = 0;
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_cb_draws = 0; g_ord_parts = 0; g_psplit_now = 0; g_set_epoch++; x_read();
+    g_sub_hist[g_sub_hn++ % 8] = g_vkst.draws - g_sub_d0; g_sub_d0 = g_vkst.draws;   // (part_pace: the submission just ended)
     if (g_prof_on) { extern uint64_t g_pkg_ns, g_pkg_n; memset(g_prof_ns, 0, sizeof g_prof_ns); g_prof_t0 = tick(); g_prof_pkg0 = g_pkg_ns; g_prof_npkg0 = g_pkg_n; g_prof_pipes0 = g_vkst.pipes_built; }
     { extern volatile int g_vk_samp_log; if (g_vk_samp_log > 0) VKLOG("submission begins (present %llu, thread %d)", (unsigned long long)g_tex_frame, (int)gettid()); }
 }
@@ -308,6 +310,7 @@ static void lrz_touch(vkimg_t *im, int write) {
         VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &b)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, b, &rq);
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
         VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, b, m, 0)); }
+    extern uint64_t g_vk_nlrz; g_vk_nlrz++;
     VkCommandBuffer cb = vk_cmd();
     VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {1, 1, 1}};
     if ((g_lrz_touch & LRZ_CORNER) && im->w && im->h) c.imageOffset = (VkOffset3D){(int32_t)im->w - 1, (int32_t)im->h - 1, 0};
@@ -595,6 +598,20 @@ void vk_end_pass_land(void) { vk_end_pass(); if (vk_sub_open()) vk_ubd_land(vk_c
 static int pass_whole(VkRect2D r) { return !r.offset.x && !r.offset.y && r.extent.width >= S.pass_w && r.extent.height >= S.pass_h; }
 // Only a native command-buffer boundary advances the depth/LRZ cut generation.
 // A refused ordinary budget or exhausted slot must retain the current draw count.
+// DM_VK_PART_PACE (live, default 1; 0 = the fixed thresholds alone): the parts of a long submission are spread over its draws. A submission has MAIN_CBS parts; cut
+// at every DM_VK_CB_DRAWS / DM_VK_PASS_SPLIT draws, Donkey Kong Bananza's outdoor frames (about 12,000 draws) spent all of them in the first 3.6 ms of the replay on
+// 128-draw slices of one cheap pass, and the other ~80 passes (about 14 ms of GPU work) went to the GPU together at the commit: the GPU idled 11 ms of the
+// replay and then ran 15 ms after it (the DM_VK_PASS_TIMES "chain" line), which the game's frame-rate controller (its frame start to the GPU's end) read as a 30 ms frame
+// and dropped to 30 / 20 fps. With pacing a cut also waits until the submission's remaining draws (estimated by the largest of the last eight submissions) shared
+// over the parts left reach the threshold, so the parts last to the end of the frame and the GPU works while the replay records
+static uint64_t part_pace(uint64_t floor) {
+    if (!g_pace) return floor;
+    uint64_t est = 0; for (int i = 0; i < 8; i++) if (g_sub_hist[i] > est) est = g_sub_hist[i];
+    uint64_t done = g_vkst.draws - g_sub_d0; int left = vk_cmd_parts_left();
+    if (left < 1 || est <= done) return floor;
+    uint64_t per = (est - done) / (uint64_t)(left + 1);   // (the commit sends the last part)
+    return per > floor ? per : floor;
+}
 static int pass_cut(int interior, uint64_t *cuts) {
     if (!interior && g_ord_parts >= 15) { vk_cmd_split_refused(0); return 0; }
     if (vk_cmd_parts_left() <= 0) { vk_cmd_split_refused(1); return 0; }
@@ -678,7 +695,7 @@ static int begin_pass(void) {
     static uint64_t g_cuts; int cut_touch = 0;
     // The attachment lookups above already resolved and marked these images written for this pass.
     vkimg_t *dim = P_att[8].im;
-    if (psplit || (g_x_cbdraws > 0 && g_cb_draws >= g_x_cbdraws && (!dim || dim->depth_sub != g_set_epoch || g_x_cutany))) {   // (a pass split: prepare_draw checked the depth rule and the part budget)
+    if (psplit || (g_x_cbdraws > 0 && g_cb_draws >= part_pace((uint64_t)g_x_cbdraws) && (!dim || dim->depth_sub != g_set_epoch || g_x_cutany))) {   // (a pass split: prepare_draw checked the depth rule and the part budget)
         if (pass_cut(psplit, &g_cuts)) cb = vk_cmd();   // deferred uniform updates stay deferred unless explicitly requested above
     }
     if (dim) { cut_touch = (g_lrz_touch & (LRZ_CUT | LRZ_CUT_RD)) && dim->depth_sub == g_set_epoch && dim->depth_cut != g_cuts; dim->depth_sub = g_set_epoch; dim->depth_cut = g_cuts; }
@@ -1847,7 +1864,7 @@ static int prepare_draw(int prim, int indexed) {
     // depth buffer begun in an earlier command buffer meets Adreno's stale LRZ (begin_pass). DM_VK_PASS_SPLIT_DEPTH=1 (live, A/B) splits those too, with begin_pass's
     // write-back of a depth texel (lrz_touch) before the second part. The pipeline, dynamic state, sets and buffers are bound again (vk_end_pass, g_cmd_gen); deferred
     // uniform updates stay deferred (the draws read their shadows), as at any cut. Only while vk_cmd_split can still begin a part: otherwise the pass would be cut for nothing
-    if (g_psplit > 0 && g_x_cbdraws > 0 && S.pass_open == 1 && g_pass_draws >= (uint64_t)g_psplit && !S.rast_discard && (!S.daspect || g_psplit_depth)) {
+    if (g_psplit > 0 && g_x_cbdraws > 0 && S.pass_open == 1 && g_pass_draws >= (uint64_t)g_psplit && (uint64_t)g_cb_draws >= part_pace((uint64_t)g_psplit) && !S.rast_discard && (!S.daspect || g_psplit_depth)) {
         if (vk_cmd_parts_left() > 0) { { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) after %llu draws, depth %d", g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, S.dfmt); }
             vk_end_pass(); g_psplit_now = 1; } else vk_cmd_split_refused(1); }
     else if (g_psplit > 0 && S.pass_open == 1 && g_pass_draws == (uint64_t)g_psplit && S.daspect && !g_psplit_depth) { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) has depth (format %d): not split", g_sub_pass - 1, S.pass_w, S.pass_h, S.dfmt); }

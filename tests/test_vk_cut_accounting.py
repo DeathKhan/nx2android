@@ -42,6 +42,7 @@ typedef struct {
 } vksub_t;
 static vksub_t slot;
 static vksub_t *cur(void){return &slot;}
+static void part_sent(vksub_t *s){(void)s;}
 static struct { VkDevice dev;VkQueue q; } V;
 static int g_prof_on,clock_calls,end_calls,begin_calls,queue_calls,readbacks,lands,log_calls;
 static uint64_t g_prof_ns[8],g_cmd_gen;
