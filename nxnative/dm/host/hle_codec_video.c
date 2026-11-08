@@ -24,7 +24,13 @@
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
 #include "hle_movie_av1.h"   // AV1 on VideoToolbox
 #ifdef __ANDROID__
-#include "movie_zc.h"        // Android: H.264 pictures stay in the codec's buffers and the GPU converts them into the game's native-image texture (zero copy; dm/android/movie_zc*.c)
+#include "movie_zc.h"        // Android: H.264 and AV1 pictures stay in the codec's buffers and the GPU converts them into the game's native-image texture (zero copy; dm/android/movie_zc*.c)
+#include "movie_av1.h"       // Android: AV1 through the H.264 decoder's MediaCodec machinery (mavc_new_av1, dm/android/movie_av1.c)
+#define CV_MC(c) ((c) == CV_H264 || (c) == CV_AV1)   // the codecs decoded by MediaCodec (mavc), pictures in presentation order a few packets after their input
+#define CV_HOST_NAME(c) ((c) == CV_AV1 || (c) == CV_H264 ? "MediaCodec" : "libvpx")
+#else
+#define CV_MC(c) ((c) == CV_H264)
+#define CV_HOST_NAME(c) ((c) == CV_H264 ? "VideoToolbox" : "libvpx")
 #endif
 
 #define CV_MAGIC 0x56436d44u        // 'DmCV'
@@ -54,7 +60,7 @@ typedef struct {
     int eos_pending;
 #ifdef __ANDROID__
     zc_frame *held_zc[CV_HOLD];   // zero copy: the held picture is a frame (held[i] NULL)
-    int zc, zc_off;               // the H.264 decoder's pictures are frames; a CPU read of a pool asked for the CPU path (the next packet switches)
+    int zc, zc_off;               // the H.264 / AV1 decoder's pictures are frames; a CPU read of a pool asked for the CPU path (the next packet switches)
 #endif
 } cv_dec;
 #ifdef __ANDROID__
@@ -283,17 +289,26 @@ HLE_FORCE("_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoo
 // One host decoder for every codec the SDK has a decoder type for (Vp8 / Vp9 / H264 / Av1DecoderType: the same layout, its event at +8 in the SDK, all calls taken over here):
 // VP8 and VP9 through libvpx, H.264 through VideoToolbox and AV1 through VideoToolbox or dav1d (hle_movie_avc.c, hle_movie_av1.c, whose NV12 pictures are copied into the pool as I420)
 static void cv_open(cv_dec *d) {   // (re)creates the codec state: a new stream starts at the next key frame
+#ifndef __ANDROID__   // (Android: AV1 on MediaCodec, as H.264 below)
     if (d->codec == CV_AV1) {
         if (!d->av1) d->av1 = mav1_new(); else mav1_reset(d->av1);
         d->vpx_ok = 1;
         return;
     }
-    if (d->codec == CV_H264) { if (!d->avc) d->avc = mavc_new(); else mavc_drop(d->avc); if (d->csd_n) mavc_param_sets(d->avc, d->csd, d->csd_n); d->vpx_ok = 1;
+#endif
+    if (CV_MC(d->codec)) {
+#ifdef __ANDROID__
+        if (!d->avc) d->avc = d->codec == CV_AV1 ? mavc_new_av1() : mavc_new(); else mavc_drop(d->avc);
+#else
+        if (!d->avc) d->avc = mavc_new(); else mavc_drop(d->avc);
+#endif
+        if (d->csd_n && d->codec == CV_H264) mavc_param_sets(d->avc, d->csd, d->csd_n);
+        d->vpx_ok = 1;
 #ifdef __ANDROID__
         // Android: pictures stay in MediaCodec's buffers, imported into Vulkan and converted into the game's native-image texture (the Switch 2's 4K movies; Welcome Tour's intro at 3840x2160).
         // Not when the game asked for the CPU path (zc_off), or DM_MOVIE_ZEROCOPY=0
         if (d->zc_off && d->zc) d->zc = mavc_set_zero_copy(d->avc, 0, d->w, d->h);
-        else if (zc_wanted() && !d->zc_off) { int was = d->zc; d->zc = mavc_set_zero_copy(d->avc, 1, d->w, d->h); if (d->zc && !was) LOG("[codec] H.264 decoder %u: zero-copy pictures (MediaCodec → AImageReader → Vulkan Y'CbCr sampling → the game's texture)", d->id); }
+        else if (zc_wanted() && !d->zc_off) { int was = d->zc; d->zc = mavc_set_zero_copy(d->avc, 1, d->w, d->h); if (d->zc && !was) LOG("[codec] %s decoder %u: zero-copy pictures (MediaCodec → AImageReader → Vulkan Y'CbCr sampling → the game's texture)", k_cv_name[d->codec], d->id); }
 #endif
         return; }
     if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
@@ -313,7 +328,7 @@ static Result cv_dec_init(void *t, int codec, uint16_t w, uint16_t h, uint32_t i
     d->event = (uint8_t *)t + CV_EVENT_OFF; hle_bind_system_event(d->event, 0); hle_signal_system_event(d->event);
     *(cv_dec **)t = d;
     LOG("[codec] %s decoder %u: %ux%u, input format %u, output format %u%s (%s on the host)", k_cv_name[codec], d->id, w, h, in, out,
-        d->csd_n ? ", with parameter sets" : "", codec == CV_AV1 ? mav1_backend(d->av1) : codec == CV_H264 ? "VideoToolbox" : "libvpx");
+        d->csd_n ? ", with parameter sets" : "", codec == CV_AV1 && d->av1 ? mav1_backend(d->av1) : CV_HOST_NAME(codec));
     return 0;
 }
 static Result cv_dec_fin(void *t) {
@@ -321,7 +336,9 @@ static Result cv_dec_fin(void *t) {
     pthread_mutex_lock(&g_cv_mu); g_cv[d->id - 1] = NULL; pthread_mutex_lock(&d->mu); pthread_mutex_unlock(&d->mu); pthread_mutex_unlock(&g_cv_mu);   // no sync handle lookup is still inside
     if (d->codec != CV_H264 && d->codec != CV_AV1 && d->vpx_ok) vpx_codec_destroy(&d->vpx);
     if (d->avc) mavc_free(d->avc);
+#ifndef __ANDROID__
     if (d->av1) mav1_free(d->av1);
+#endif
 #ifdef __ANDROID__
     cv_held_zc_drop(d);
 #endif
@@ -411,15 +428,18 @@ static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t s
     pthread_mutex_lock(&d->mu);
     if (d->nheld >= CV_HOLD) { static int n; if (n++ < 4) LOG("nn::codec %s: busy (result 3603), a packet refused with %d pictures waiting for a released buffer",k_cv_name[d->codec], d->nheld); if (d->event) hle_clear_system_event(d->event); pthread_mutex_unlock(&d->mu); return CV_BUSY; }
     int got = 0;
-    if (d->codec == CV_H264 && d->avc) {   // VideoToolbox reorders: pictures leave in presentation order, all of them at the end of the stream
+    if (CV_MC(d->codec) && d->avc) {   // VideoToolbox reorders: pictures leave in presentation order, all of them at the end of the stream
 #ifdef __ANDROID__
         if (d->zc && d->zc_off) { cv_held_zc_drop(d); for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]); d->nheld = 0; cv_open(d); }   // the game reads on the CPU: the codec opens again in the CPU mode
-        if (size && mavc_decode(d->avc, data, (int)size, ts / 1000) < 0) { static int n; if (n++ < 4) LOG("[RED] nn::codec H.264: MediaCodec could not decode a packet"); }
+        if (size && mavc_decode(d->avc, data, (int)size, ts / 1000) < 0) { static int n; if (n++ < 4) LOG("[RED] nn::codec %s: MediaCodec could not decode a packet", k_cv_name[d->codec]); }
         if (d->zc) { zc_frame *zf; int64_t pts = 0;
             while (d->nheld < CV_HOLD && mavc_take_frame(d->avc, eos, &zf, &pts) == 1) { d->held[d->nheld] = NULL; d->held_zc[d->nheld] = zf; d->held_ts[d->nheld] = pts * 1000; d->held_eos[d->nheld] = 0; d->nheld++; got++; }
         } else {
         uint8_t *nv12 = malloc((size_t)d->w * d->h * 3 / 2); int64_t pts = 0;
-        while (nv12 && d->nheld < CV_HOLD && mavc_take(d->avc, eos, nv12, d->w, d->h, &pts) == 1) { vpx_image_t *c = nv12_to_i420(nv12, d->w, d->h); if (c) got += cv_hold(d, c, pts * 1000); }
+        while (nv12 && d->nheld < CV_HOLD && mavc_take(d->avc, eos, nv12, d->w, d->h, &pts) == 1) {
+            vpx_image_t *c = nv12_to_i420(nv12, d->w, d->h);
+            if (c) { c->cs = mavc_bt709(d->avc, d->h) ? VPX_CS_BT_709 : VPX_CS_BT_601; got += cv_hold(d, c, pts * 1000); }   // (AV1: its sequence header's matrix)
+        }
         free(nv12);
         }
 #else
@@ -428,12 +448,16 @@ static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t s
         while (nv12 && d->nheld < CV_HOLD && mavc_take(d->avc, eos, nv12, d->w, d->h, &pts) == 1) { vpx_image_t *c = nv12_to_i420(nv12, d->w, d->h); if (c) got += cv_hold(d, c, pts * 1000); }
         free(nv12);
 #endif
-    } else if (d->codec == CV_AV1) {
+    }
+#ifndef __ANDROID__
+    else if (d->codec == CV_AV1) {
         if (size) {
             mav1_picture pic;
             if (mav1_decode(d->av1, data, (size_t)size, &pic) == 1) { vpx_image_t *c = av1_to_i420(&pic); if (c) got += cv_hold(d, c, ts); }
         }
-    } else if (size && d->vpx_ok) {
+    }
+#endif
+    else if (size && d->vpx_ok) {
         if (vpx_codec_decode(&d->vpx, data, (unsigned)size, NULL, 0) != VPX_CODEC_OK) { static int n; if (n++ < 4) LOG("[RED] nn::codec %s: %s (%s)", k_cv_name[d->codec], vpx_codec_error(&d->vpx), vpx_codec_error_detail(&d->vpx) ? vpx_codec_error_detail(&d->vpx) : ""); }
         vpx_codec_iter_t it = NULL; const vpx_image_t *im;
         while ((im = vpx_codec_get_frame(&d->vpx, &it))) { vpx_image_t *c = img_copy(im); if (c) got += cv_hold(d, c, ts); }
