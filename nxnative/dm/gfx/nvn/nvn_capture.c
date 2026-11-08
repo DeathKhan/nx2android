@@ -22,8 +22,8 @@ CAP_SIZE(p_bind_buf, 24); CAP_OFF(p_bind_buf, addr, 8); CAP_OFF(p_bind_buf, size
 CAP_SIZE(p_bind_ubo_small, 16); CAP_OFF(p_bind_ubo_small, size, 4); CAP_OFF(p_bind_ubo_small, addr, 8);
 CAP_SIZE(p_bind_handles, 288);   // 280 upstream: the Android host adds sseq (the sampler registrations before the bind) after src CAP_OFF(p_bind_handles, n, 8); CAP_OFF(p_bind_handles, defer, 12); CAP_OFF(p_bind_handles, src, 16);
 CAP_SIZE(p_bind_tex1, 32);   // 24 upstream: sseq after sbase; the NOBASE short record still ends at tbase (16) _Static_assert(BIND_TEX1_NOBASE == 0x100, "nvn_capture.c: BIND_TEX1_NOBASE changed: update cap_layout");
-CAP_SIZE(p_draw, 48); CAP_OFF(p_draw, ind, 24); CAP_OFF(p_draw, mdi_cnt, 32);
-CAP_SIZE(p_draw_idx, 56); CAP_OFF(p_draw_idx, ibuf, 24); CAP_OFF(p_draw_idx, ind, 32); CAP_OFF(p_draw_idx, mdi_cnt, 40);
+CAP_SIZE(p_draw, 56); CAP_OFF(p_draw, ind, 24); CAP_OFF(p_draw, mdi_cnt, 32);
+CAP_SIZE(p_draw_idx, 64); CAP_OFF(p_draw_idx, ibuf, 24); CAP_OFF(p_draw_idx, ind, 32); CAP_OFF(p_draw_idx, mdi_cnt, 40);
 CAP_SIZE(p_dispatch, 32); CAP_OFF(p_dispatch, ind, 24);
 CAP_SIZE(p_set_pool, 8); CAP_OFF(p_set_pool, pool, 0);
 CAP_SIZE(p_copy_b2t, 64); CAP_OFF(p_copy_b2t, src, 0); CAP_OFF(p_copy_b2t, tex, 8);
@@ -54,7 +54,7 @@ const char *cap_layout(void) {
     if (!text[0]) snprintf(text, sizeof text, "format 1\nops 54\n"
            "tex_t 128 mem 88 pool 96 serial 120\npool_t 40\ndpool_t 24\nprog_t 112\nsync_t 16\nsamp_par 40\nview_t 16\n"
            "p_set_rt 240 color 8 depth 208\np_bind_program 16\np_bind_vbuf 264 r 8\np_bind_vbuf1 16 addr 8\np_bind_buf 24 addr 8\np_bind_ubo_small 16 addr 8\n"
-           "p_bind_handles %zu src 16\np_bind_tex1 %zu nobase 0x100 short 16\np_bind_state short\np_draw 48 ind 24 mdi_cnt 32\np_draw_idx 56 ibuf 24 ind 32 mdi_cnt 40\np_dispatch 32 ind 24\np_set_pool 8\n"
+           "p_bind_handles %zu src 16\np_bind_tex1 %zu nobase 0x100 short 16\np_bind_state short\np_draw 56 ind 24 mdi_cnt 32\np_draw_idx 64 ibuf 24 ind 32 mdi_cnt 40\np_dispatch 32 ind 24\np_set_pool 8\n"
            "p_copy_b2t 64 src 0 tex 8\np_copy_t2t 104 src 0 dst 8\np_clear_tex 72 tex 0\np_clear_buf 24 addr 0\np_tf_bind 24 addr 8\np_tf_state 16 ctl 8\np_render_cond 16 addr 8\n"
            "signal_event 16 val 0\nreport_counter 16 addr 8\ncopy_b2b 24 src 0 dst 8\nupdate_ub dst 0\nfence_sync 8 sync 0\njump 8\ncall 8\n"
            MULTI_DRAW_LAYOUT COPY_STRIDES_LAYOUT DRAW_TF_LAYOUT, sizeof(p_bind_handles), sizeof(p_bind_tex1));
