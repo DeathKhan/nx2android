@@ -11,6 +11,7 @@
 #include "nvn_hmap.h"
 #include "gfx_vk_cpu_storage.h"   // storage the GPU writes, uncompressed textures taken from storage (nvn_mtl.m gws_span / cpu_unc)
 #include <string.h>
+#include <sys/mman.h>
 #include "../gfx/tex/nvn_bc.h"
 
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp);
@@ -322,6 +323,41 @@ static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     for (int j = 0; j < n; j++) { vkimg_t *o = nvn_hm_get(&g_by_key, &ks[j]); if (!o) continue; nvn_hm_del(&g_by_key, &ks[j]); img_drop(o); g_img_evicted++; }
 }
 static vkimg_t *vk_tex_(const tex_t *t);
+// The pool tables (gfx_vk_exec.c tbl_set) bind every registered texture ID, so they must not make a texture's first use out of its being registered: Ocarina of Time registers
+// 1,475 packaged textures at a scene load (one 12288x12288 of 290 MB) and frees or remaps the storage of some before their IDs are rewritten; a table fill that looked one up
+// uploaded it from pages that were gone (pkg_hash, SIGSEGV on the replay thread). 2: its image has its contents (a real bind looked it up inside a submission; vk_tex bumps
+// g_tex_gen at that first use, so the tables are built again with it) and, if packaged, its storage is in a live pool chunk and mapped (mincore over the range, checked again
+// when the pools change); 1: no contents yet, and the fill may give it its first use: storage in a live pool chunk, mapped, at most DM_VK_POOL_UPLOAD_MB (16) so no fill hashes
+// and deswizzles a huge texture (the 290 MB one waits for a real bind); 0: the dummy. The fill bounds how many first uses it makes (tbl_set), the rest wait for the next submission
+static __thread int t_pool_fill; extern uint64_t g_tex_gen; uint32_t vk_pool_gen(void);
+void vk_tex_pool_fill(int on) { t_pool_fill = on; }
+static int range_mapped(const uint8_t *mem, size_t len) {
+    uintptr_t a = (uintptr_t)mem & ~(uintptr_t)4095, e = ((uintptr_t)mem + len + 4095) & ~(uintptr_t)4095; size_t np = (e - a) / 4096;
+    static __thread unsigned char *vec; static __thread size_t cap;
+    if (np > cap) { free(vec); vec = malloc(np); cap = vec ? np : 0; if (!vec) return 0; }
+    return mincore((void *)a, e - a, vec) == 0;
+}
+int vk_tex_pool_ok(const tex_t *t) {
+    if (!t || !t->mem || !t->L.size || t->magic != MAGIC('T', 'E', 'X', 0) || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    if (!vk_pool_peek((uint64_t)(uintptr_t)t->mem, t->L.size)) return 0;   // its pool chunk is gone (mtl_pool_del)
+    const vkfmt_t *f = vk_fmt(t->d.format); if (!f) return 0;
+    akey k; memset(&k, 0, sizeof k); k.pool = (uint64_t)(uintptr_t)t->pool; k.off = t->off; k.d = t->d;   // the storage key, as vk_tex makes it
+    k.d.flags &= NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT | (f->depth || f->stencil ? 0 : NVN_TEXTURE_FLAGS_IMAGE);
+    pthread_mutex_lock(&g_img_mu);
+    vkimg_t *im = t->pool ? nvn_hm_get(&g_by_key, &k) : nvn_hm_get(&g_by_serial, &t->serial);
+    int looked = im && __atomic_load_n(&im->looked, __ATOMIC_ACQUIRE), pk = im && im->packaged; uint32_t ck = im ? im->pool_ck : 0;
+    pthread_mutex_unlock(&g_img_mu);
+    uint32_t g = vk_pool_gen();
+    if (looked) {
+        if (!pk || ck == g) return 2;
+        if (!range_mapped(t->mem, t->L.size)) return 0;
+        pthread_mutex_lock(&g_img_mu); if ((t->pool ? nvn_hm_get(&g_by_key, &k) : nvn_hm_get(&g_by_serial, &t->serial)) == im) im->pool_ck = g; pthread_mutex_unlock(&g_img_mu);
+        return 2;
+    }
+    static long cap = -1; if (cap < 0) { const char *e = getenv("DM_VK_POOL_UPLOAD_MB"); cap = (e ? atol(e) : 16) << 20; }
+    if ((long)t->L.size > cap) return 0;
+    return range_mapped(t->mem, t->L.size) ? 1 : 0;
+}
 vkimg_t *vk_tex(const tex_t *t) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
     vkimg_t *im = vk_tex_(t); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[1] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return im; }
 static vkimg_t *vk_tex_(const tex_t *t) {
@@ -350,6 +386,7 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     if (!vk_sub_open()) return __atomic_load_n(&im->looked, __ATOMIC_ACQUIRE) ? im : NULL;   // looked up outside a submission (present): nothing can be recorded, a new image has no contents yet
     if (unc_rule()) vcs_unc_drop(cpu_unc_dropped);   // taken uncompressed textures over storage the GPU wrote since: GPU textures from now on (nvn_mtl.m cpu_unc_drop)
     int first = !__atomic_exchange_n(&im->looked, 1, __ATOMIC_ACQ_REL);   // its first use is the first lookup inside a submission, not its creation (which may have been outside one)
+    if (first && !t_pool_fill) g_tex_gen++;   // the pool tables (gfx_vk_exec.c tbl_set) bind only images with contents: a real bind's first use has them built again with this one
     // a texture's first use: written by the CPU since it was registered (profile tex_dirty_upload), it is CPU-written from now on, as at nvn_mtl.m's first resolution;
     // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
     int nvn_ft_written(const tex_t *);

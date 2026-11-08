@@ -1799,7 +1799,11 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, int pool) {   // s: the sh
     if (!ii) ii = calloc((size_t)TBL_SLOTS * (size_t)(N ? N : 1) + (size_t)POOL_TEX_SLOTS * (size_t)(NP ? NP : 1) + (size_t)(NS ? NS : 1), sizeof *ii);
     VkDescriptorSet set = vk_alloc_set(vk_tbl_dsl()); VkWriteDescriptorSet w[SET0_BINDINGS]; uint32_t nwr = 0;
     if (pool && NP && NS) {   // the pool tables (written before the handle tables: those bindings follow in w[])
-        VkDescriptorImageInfo *d = ii + (size_t)TBL_SLOTS * (size_t)(N ? N : 1); uint32_t filled[POOL_TEX_SLOTS + 1] = {0};
+        VkDescriptorImageInfo *d = ii + (size_t)TBL_SLOTS * (size_t)(N ? N : 1); uint32_t filled[POOL_TEX_SLOTS + 1] = {0}, skipped = 0, deferred = 0;
+        // textures bound only from the registry (vk_tex_pool_ok): those with contents, and at most POOL_LAZY_N first uses of POOL_LAZY_B bytes a fill (the rest the next submission's);
+        // the others get the dummy and the tables are built again when a real bind gives them contents
+        enum { POOL_LAZY_N = 64 }; const uint64_t POOL_LAZY_B = 64u << 20; int lazy_n = 0; uint64_t lazy_b = 0;
+        vk_tex_pool_fill(1);
         for (int ps = 0; ps < POOL_TEX_SLOTS; ps++, d += NP) {
             dmsv_bind vb = {.kind = RK_TEXP, .desc = RD_IMAGE, .dim = (uint8_t)(ps == 2 ? 3 : ps == 3 ? 2 : 1), .flags = (uint8_t)(ps == 1 ? 1 : 0), .samp = RS_NONE, .reg = -1, .off = -1};
             VkDescriptorImageInfo dummy = {VK_NULL_HANDLE, vk_dummy_view(vb.dim, vb.flags & 1, 0, 0, 0), VK_IMAGE_LAYOUT_GENERAL}; d[0] = dummy;
@@ -1807,17 +1811,21 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, int pool) {   // s: the sh
                 uint64_t hh = mem_handle((uint64_t)k); const view_t *v = NULL; const tex_t *t = NULL; int fits = 0;
                 if (vk_tex_by_id((int)(hh & 0xfffff), &v, &t) && t) { int target = v && v->set_target ? v->target : t->d.target;
                     fits = ps == 2 ? (t->d.width == t->d.height && (target == 8 || target == 9 || (target == 4 && t->d.depth >= 6))) : ps == 3 ? target == 2 : (target == 1 || target == 4 || target == 8 || target == 9);
-                    if (fits && view_num(t, v)) fits = 0; }   // (the arrays declare floating-point texels)
+                    if (fits && view_num(t, v)) fits = 0;   // (the arrays declare floating-point texels)
+                    if (fits) { int ok = vk_tex_pool_ok(t);
+                        if (ok == 1) { if (lazy_n < POOL_LAZY_N && lazy_b < POOL_LAZY_B) { lazy_n++; lazy_b += t->L.size; } else { ok = 0; deferred++; } }
+                        if (!ok) { fits = 0; skipped++; } } }
                 if (fits) { tex_desc_for(st, &vb, hh, &d[k], 0); d[k].sampler = VK_NULL_HANDLE; if (!d[k].imageView) d[k] = dummy; else filled[ps]++; } else d[k] = dummy;
             }
             w[nwr++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)(POOL_B0 + ps), 0, (uint32_t)NP, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, d, NULL, NULL};
         }
+        vk_tex_pool_fill(0);
         d[0] = (VkDescriptorImageInfo){vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
         for (int k = 1; k < NS; k++) { VkSampler sm = vk_samp_by_id((int)(mem_handle((uint64_t)k << 20) >> 20 & 0xfff)); if (sm) filled[POOL_TEX_SLOTS]++; d[k] = (VkDescriptorImageInfo){sm ? sm : vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; }
         w[nwr++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, POOL_SAMP_B, 0, (uint32_t)NS, VK_DESCRIPTOR_TYPE_SAMPLER, d, NULL, NULL};
         g_pool_builds++;
-        if (g_pool_builds <= 4 || !(g_pool_builds & (g_pool_builds - 1))) VKLOG("texture pool tables: build %llu (stage %d shader %016llx): %u 2D, %u 2D-array, %u cube, %u 3D textures of %d entries, %u samplers of %d; the highest IDs registered %d / %d (pool bases %d / %d)",
-            (unsigned long long)g_pool_builds, st, (unsigned long long)(s ? s->key : 0), filled[0], filled[1], filled[2], filled[3], NP, filled[4], NS, vk_tex_id_max(), vk_samp_id_max(), g_pool_tex_base, g_pool_samp_base);
+        if (g_pool_builds <= 4 || !(g_pool_builds & (g_pool_builds - 1))) VKLOG("texture pool tables: build %llu (stage %d shader %016llx): %u 2D, %u 2D-array, %u cube, %u 3D textures of %d entries, %u samplers of %d; %d first uses made (%u deferred to a later fill, %u left the dummy: no contents and too large, or storage gone); the highest IDs registered %d / %d (pool bases %d / %d)",
+            (unsigned long long)g_pool_builds, st, (unsigned long long)(s ? s->key : 0), filled[0], filled[1], filled[2], filled[3], NP, filled[4], NS, lazy_n, deferred, skipped, vk_tex_id_max(), vk_samp_id_max(), g_pool_tex_base, g_pool_samp_base);
         if (vk_tex_id_max() - g_pool_tex_base >= NP) VKRED_ONCE(101, "texture pool table: a texture ID (%d) is registered past the table's %d entries: reads of it take the last entry (DM_VK_POOL_N raises the length)", vk_tex_id_max() - g_pool_tex_base, NP);
         if (vk_samp_id_max() - g_pool_samp_base >= NS) VKRED_ONCE(102, "sampler pool table: a sampler ID (%d) is registered past the table's %d entries", vk_samp_id_max() - g_pool_samp_base, NS);
     }

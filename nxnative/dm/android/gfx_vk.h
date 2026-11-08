@@ -136,6 +136,7 @@ struct vkimg {
     const uint8_t *pkg_mem; size_t pkg_len; uint64_t pkg_used; int pkg_released;   // its storage, the present it was last drawn at, protection given up (vk_tex_sweep)
     uint64_t used;                  // the present it was last looked up at (vk_tex: evict_overlaps)
     int looked;                     // looked up inside a submission once (vk_tex: its first use, when its content is decided; a lookup outside one records nothing)
+    uint32_t pool_ck;               // the pool generation (vk_pool_gen) at which its packaged storage was last found mapped for the pool tables (vk_tex_pool_ok)
     uint64_t rt_last, rt_frames;     // as an attachment: 1 + the present it was last drawn in, and in how many presents in a row up to it (gfx_vk_exec.c async_pipe)
     uint64_t fdz_frame;             // depth images: 1 + the present at which a fragment shader that replaces depth last wrote it (gfx_vk_exec.c fdz)
     int gpu_w;                      // the GPU wrote it: an attachment, a storage image, a copy or clear destination (gfx_vk_exec.c); lin_copy keeps that until the CPU writes its storage
@@ -231,6 +232,8 @@ VkDescriptorSetLayout vk_tbl_dsl(void);
 int vk_tbl_n(void);
 int vk_pool_n(void); int vk_pool_samp_n(void);
 int vk_tex_id_max(void); int vk_samp_id_max(void);   // the highest texture / sampler ID registered so far (gfx_vk_tex.c)
+int vk_tex_pool_ok(const tex_t *t);   // may the pool tables bind this registered texture: 2 its image has its contents, 1 the table may give it its first use (small, storage mapped), 0 the dummy (gfx_vk_tex.c)
+void vk_tex_pool_fill(int on);        // around a pool-table fill: first uses made by it do not bump g_tex_gen (a real bind's first use does, so the tables are built again with it)
 vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo);   // the geometry shader translated for the draw's input primitive (shader_vk.py gs_variant_key); gs when there is none
 enum { VK_ATEST_SPEC_FUNC = 0x7a00, VK_ATEST_SPEC_REF = 0x7a01 };   // the alpha test variant's specialization constants (gfx_vk_shader.c spv_alpha_test)
 VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd);   // the module, or its variant (integer views; extra outputs; fragment depth written)
