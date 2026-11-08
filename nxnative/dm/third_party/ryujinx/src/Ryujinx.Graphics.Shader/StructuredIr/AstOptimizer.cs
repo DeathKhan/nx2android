@@ -33,6 +33,8 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                         // (GPU 9 → 70 ms a frame within minutes on both the Adreno driver and Turnip)
                         // A memory read can be removed when unused, but moving its evaluation past a store or helper call changes the value.
                         // Raw vector helpers overwrite gmem_vec: keep each caller's component snapshots at their original position.
+                        // (upstream nx2android 2ca10690d, the same bug: Final Fantasy Resonance's radix sort scatter 98dee7b8a8eb9f9f and scan 5854663e6002c250 read the
+                        // last count back from the word just stored; moved to its use, the load read it after the store, and the fog boxes blinked on both Adreno drivers)
                         if (propVar.Defs.Count == 1 && isWorthPropagating && !UsedByCall(propVar) &&
                             !HasSideEffects(assignment.Source) && !ReadsMutableMemory(assignment.Source))
                         {
@@ -70,6 +72,11 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             if (source is not AstOperation operation)
             {
                 return false;
+            }
+
+            if ((operation.Inst & Instruction.Mask) == Instruction.ImageLoad)   // an image the shader may store to (upstream nx2android 2ca10690d)
+            {
+                return true;
             }
 
             if ((operation.Inst & Instruction.Mask) == Instruction.Load &&
