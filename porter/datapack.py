@@ -1,7 +1,7 @@
 # The data pack: everything the app reads from its files folder on the device (/sdcard/Android/data/<package>/files, front_android.c), as a folder beside the APK:
 #   mods/          the rewritten code modules (patch_nso.py's outputs)
 #   RomFS/         the game's files (the packed version's merged RomFS)
-#   aoc/<index>/   the DLC the player has
+#   aoc/<index>.img  the DLC the player has, one RomFS image per index (nx_extract's from DLC NSPs, pack_nup's from a NUP container); the host mounts an image or a legacy aoc/<index>/ folder (hle_fs.c aoc_dir)
 #   sysdata/<title ID>/  system data from the player's firmware dump that the game reads (android.tsv sysdata, porter --firmware; env.txt's DM_SYSDATA)
 #   shaders.dmsv   the Vulkan shaders (dm/android/tools/shader_vk.py)
 #   nintendo_ext.ttf  the button-icon font, the stand-in for the Nintendo extension shared font (dm/tools/make_ext_font.py; env.txt's DM_SHARED_FONT_EXT)
@@ -26,10 +26,11 @@ def link_or_copy(src, dst):
     except OSError: shutil.copy2(src, dst)
 
 
-def link_tree(src, dst):   # (files, bytes)
+def link_tree(src, dst, skip=lambda name: False):   # (files, bytes); skip(name): files left out
     n = b = 0
     for root, _, files in os.walk(src):
         for f in files:
+            if skip(f): continue
             s = Path(root) / f
             link_or_copy(s, dst / s.relative_to(src)); n += 1; b += s.stat().st_size
     return n, b
@@ -54,7 +55,7 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
     for what, src, sub in (('the rewritten modules', patched, 'mods'), ('the RomFS', romfs, 'RomFS'), ('the DLC', aoc, 'aoc'), ('the system data', sysdata, 'sysdata')):
         if not src: continue
         if progress: progress(what)
-        dn, db = link_tree(src, tmp / sub); n += dn; b += db
+        dn, db = link_tree(src, tmp / sub, skip=lambda name: name.endswith('.inputs.json')); n += dn; b += db   # the image packers' reuse stamps (romfs_image.stamp) stay in the build folder
     if shaders: link_or_copy(shaders, tmp / 'shaders.dmsv'); n += 1; b += shaders.stat().st_size   # none for an OpenGL ES game
     for name, src in (files or {}).items(): shutil.copyfile(src, tmp / name); n += 1; b += Path(src).stat().st_size
     rows = [f'# Written by nx2android\'s porter for {profile.name} ({profile.id}); KEY=VALUE per line, read by the app at launch',
@@ -65,7 +66,7 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
     (tmp / 'env.txt').write_text('\n'.join(rows) + '\n', encoding='utf-8', newline='\n')
     if sets := {**profile.settings, **(settings or {})}: (tmp / 'settings.txt').write_text(''.join(f'{k}={v}\n' for k, v in sets.items()), encoding='utf-8', newline='\n')
     man = dict(title_id=profile.id, name=profile.name, package=package, version=version, display=display, language=language, requires=profile.requires,
-               files=n, bytes=b, dlc=sorted(int(p.name) for p in aoc.iterdir() if p.is_dir() and p.name.isdigit()) if aoc else [],
+               files=n, bytes=b, dlc=sorted({int(p.name.removesuffix('.img')) for p in aoc.iterdir() if p.name.removesuffix('.img').isdigit() and (p.is_dir() or p.suffix == '.img')}) if aoc else [],   # the indices the host will report (hle_misc.c aoc_load)
                sysdata=sorted(p.name for p in sysdata.iterdir() if p.is_dir()) if sysdata else [], made=time.strftime('%Y-%m-%d %H:%M:%S'))
     (tmp / MANIFEST).write_text(json.dumps(man, indent=2), encoding='utf-8')
     if dst.exists(): shutil.rmtree(dst)

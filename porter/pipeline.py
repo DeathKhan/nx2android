@@ -259,6 +259,7 @@ class Port:
         say(f'done: {self.result["apk"]} and {self.result["data"]}')
         if self.derived: say(f'[RED] {self.derived}: the port is built from a derived profile and may not run as the profile\'s tested version does'
                              + (f'; {self.derived_mem}' if self.derived_mem else ''))
+        if self.derived_shaders: say(f'{self.derived_shaders}: the shader tables were made from this folder\'s files (a shader-only derived profile; the registered module fixes and settings are preserved)')
         for x in self.lost: say(f'[RED] {x}')
         return self.result
 
@@ -271,8 +272,6 @@ class Port:
         if self.fam.get('nup'):
             say(f'a NUP: {self.nup.name}, {len(self.fam["updates"])} update(s), {len(self.fam["dlc"])} DLC')
             if self.fam['base'] is None: say(nsp.pack_nup.NO_BASE)
-            if self.fam['dlc']: say(f'[RED] the NUP\'s {len(self.fam["dlc"])} DLC package(s) are not packed yet: the port runs without them (TODO: pack_nup.pack_dlc → aoc images)')
-            self.fam = dict(self.fam, dlc=[])
         tid = f'{self.app:016X}'
         self.work = o.folder / f'{tid}_build'
         g, ap = profiles.by_title(self.app)
@@ -287,7 +286,7 @@ class Port:
         say(f'game profile: {g.id} {g.get("name", "")} (Android: {ap.status}' + (f', tested on {ap.tested}' if ap.tested else '') + ')')
         builds, need = g.builds(), g.words('shader_versions')
         have = nsp.nsp_versions(self.fam)
-        self.derived, self.derived_mem, self.lost = '', '', []
+        self.derived, self.derived_mem, self.derived_shaders, self.lost = '', '', '', []
         if self.provisional:   # the version the survey saw
             self.pkg_ver = o.version or g.get('package')
             if self.pkg_ver not in builds: raise BuildError(f'the version to pack must be one the provisional profile registers: {", ".join(builds)}')
@@ -403,9 +402,10 @@ class Port:
                          f'profile registers' for x in lost_patches(g.builds(), self.game / 'ExeFS', g.words('modules'))]
             for x in self.lost: say(f'[RED] {x}')
         else: self.mem_profile()
-        if dlc_reused:
+        if not self.fam['dlc']: self.aoc = None
+        elif self.fam.get('nup'): self.aoc = self.pack_nup_dlc()   # the container's DLC packages → aoc/<index>.img
+        elif dlc_reused:
             PROG.stage('extract DLC'); self.aoc = self.work / 'aoc'; PROG.end(f'{len(self.fam["dlc"])} DLC, reused (inputs unchanged)')
-        elif not self.fam['dlc']: self.aoc = None   # none (or a NUP's, not packed yet)
         else:
             self.aoc = nsp.extract_aoc(nx, o.keys, NXNATIVE, self.work, self.app, dict(self.fam, dlc=[(t, v, m.get(p, p)) for t, v, p in self.fam['dlc']]), self.logs)
             if zdlc: dkf.write_text(f'{dkey}\n')
@@ -457,6 +457,29 @@ class Port:
     def drop_unpacked(self):
         if getattr(self, 'work', None): nsp.rmtree(self.work / 'tmp/dumps')
         self.unpacked = {}
+
+    def pack_nup_dlc(self):
+        """A NUP's DLC packages → <build folder>/aoc/<index>.img, one RomFS image per DLC (index = title ID − base − 0x1000, as nsp.extract_aoc names an NSP's), with
+        scripts/pack_nup.py's packer: an image whose stamp says it was made from the container's tree is kept, one from another packer is checked against the container's
+        hashes, and images of DLC no longer in the container go (pack_nup.pack_dlc, mirrored here for the per-DLC log lines). The images ship as they are: the host mounts
+        DM_AOC_DIR/<index>.img like a folder (dm/host/hle_fs.c aoc_dir, hle_misc.c aoc_load lists them as owned), as an NSP port's nx_extract images do"""
+        n, aoc = self.fam['nup'], self.work / 'aoc'
+        want = {f'{tid - self.app - 0x1000}.img': k for tid, _, k in self.fam['dlc']}
+        PROG.stage('pack DLC', step='packing')
+        if aoc.is_dir():
+            for f in aoc.iterdir():
+                if f.name.removesuffix('.inputs.json') not in want: f.unlink(); say(f'DLC: removed {f.name} (not in {n.path.name})')
+        how = {}
+        try:
+            for i, (name, k) in enumerate(sorted(want.items(), key=lambda kv: int(kv[0].split('.')[0]))):
+                PROG.set(step=name, done=i, total=len(want), unit='DLC')
+                how[name] = nsp.pack_nup.pack(n, k.romfs, aoc / name, say=lambda s: None, step=lambda s, name=name: PROG.set(step=f'{name}: {s}'))
+                say(f'DLC index {name.removesuffix(".img")}: {k.name} → aoc/{name}, {(aoc / name).stat().st_size / 2**20:,.1f} MB'
+                    + {'kept': ', reused (inputs unchanged)', 'verified': ', reused (image checked)'}.get(how[name], ''))
+        except nsp.pack_nup.Error as e: raise BuildError(str(e)) from e
+        kept = sum(1 for h in how.values() if h != 'packed')
+        PROG.end(f'{len(want)} DLC' + (f', {kept} reused' if kept else ''))
+        return aoc
 
     def extract_sysdata(self, nx):
         """The profile's system data titles (android.tsv sysdata), each a RomFS from the player's firmware dump (--firmware) into <work>/sysdata/<title ID>, which the
@@ -677,6 +700,19 @@ class Port:
             if self.provisional and profile_guess.heap_check_needed(self.game / 'ExeFS') and not nsp.heap_checked(self.g):
                 say('[RED] no heap check: it boots the game in the Mac host; the provisional profile keeps its guessed heap keys')
 
+    def derive_shader_tables(self):
+        """Upstream's derive_dlc hook for split_shaders: the split's tables differ from the registered ones only in DLC shaders (/aoc/<index>/ sources; dlc_only_shader_change
+        checked it), as when the player's DLC is not the set the profile's tables were split with (Donkey Kong Bananza's NUP holds its DLC, the profile was split without it). The
+        registered game.tsv, its patches and android.tsv are kept and only the shader tables are made again, in <build folder>/profile-shaders/<id>/, which every later tool takes
+        first (the Vulkan shader build keys on the profile's files). Returns the derived profile"""
+        g = self.g; pdir = self.work / 'profile-shaders'
+        nsp.derive_profile(g, pdir / g.id, self.pkg_ver, self.game, g.words('modules'), self.app, shader_only=True)
+        self.use_profile_dir(pdir, first=True)
+        self.g = game.load(g.id); self.ap = android_profile.AndroidProfile(self.g)
+        self.derived_shaders = f'the DLC\'s shaders are not in game profile {g.id}\'s tables'
+        say(f'{self.derived_shaders}: using a shader-only derived profile at {self.g.dir}; registered module fixes are preserved')
+        return self.g
+
     # ---- shaders: upstream's split, then SPIR-V for the Vulkan backend ----
     def shaders(self):
         if getattr(self, 'gl', False):   # an OpenGL ES game: the driver compiles its shaders on the device
@@ -687,9 +723,11 @@ class Port:
         pkg = self.work / 'shader' / 'pkg'
         try:
             if getattr(self, "ue_why", ""): self.device_ue()   # Unreal's shader code archives, decoded on the device into <version dir>/ue_shaders before the split reads them
-            nsp.split_shaders(PY, NXNATIVE, [self.dirs[v] / 'RomFS' for v in sv], [self.dirs[v] / 'ExeFS/main' for v in sv], pkg, self.env, self.logs, self.g, bool(self.derived or self.provisional),
+            own = bool(self.derived or self.provisional)
+            nsp.split_shaders(PY, NXNATIVE, [self.dirs[v] / 'RomFS' for v in sv], [self.dirs[v] / 'ExeFS/main' for v in sv], pkg, self.env, self.logs, self.g, own,
                                oodle=self.device_oodle if self.oodle_why else None,   # Oodle-compressed archives: the game's own decoder on the device
-                               dlc_roms=sorted(p for p in self.aoc.iterdir() if p.is_dir() or p.suffix == '.img') if self.aoc else ())   # DLC with shaders of its own (Xenoblade Chronicles 3's archives)
+                               dlc_roms=sorted(p for p in self.aoc.iterdir() if p.is_dir() or p.suffix == '.img') if self.aoc else (),   # the DLC roots, aoc/<index>.img images (or legacy folders): DLC with shaders of its own (Xenoblade Chronicles 3's archives)
+                               derive_dlc=None if own else self.derive_shader_tables)   # the player's DLC is not the set the profile's tables were split with: a shader-only derived profile (upstream's derive_dlc)
         finally: self.device_oodle_end()
         self.dmsv = self.aw / 'shaders.dmsv'; kf = self.aw / 'shaders.dmsv.key'; cap = self.aw / 'captured_shaders'
         PROG.stage('Vulkan shaders', step='building the translator')
