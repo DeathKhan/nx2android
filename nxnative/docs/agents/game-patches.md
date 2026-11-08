@@ -85,7 +85,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Need For Speed™ Hot Pursuit Remastered](#need-for-speed-hot-pursuit-remastered) | 1 | 0 | 0 | 0 | 5 | `build` → `game`, `build` → `engine` |
 | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](#nierautomata-the-end-of-yorha-edition-010056b015fe8000) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](#nierautomata-the-end-of-yorha-edition-0100b8e016f76000) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
-| [Nintendo Switch 2 Welcome Tour](#nintendo-switch-2-welcome-tour) | 0 | 4 | 0 | 0 | 0 | `build` |
+| [Nintendo Switch 2 Welcome Tour](#nintendo-switch-2-welcome-tour) | 0 | 1 | 0 | 0 | 0 | `build` |
 | [Paper Mario: The Origami King](#paper-mario-the-origami-king) | 2 | 0 | 1 | 0 | 0 | `build` → `game` ×3 |
 | [Paper Mario: The Thousand-Year Door](#paper-mario-the-thousand-year-door) | 1 | 0 | 1 | 0 | 0 | `build` → `game` |
 | [Pokémon Brilliant Diamond](#pokémon-brilliant-diamond) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
@@ -461,14 +461,10 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 [Nintendo Switch 2 Welcome Tour](../../dm/games/040057C02159A000/README.md), `040057C02159A000`, [patches.py](../../dm/games/040057C02159A000/patches.py).
 
-- **`build`**, runtime, at goal, judgement: OBS_REGS gates at the Bezel GPU-block constructor and the SDK page allocator. Bring-up instrumentation (registers at a site, logged); the addresses are these builds' own and the gates patch nothing
+- **`build`**, runtime, at goal, judgement: OBS_REGS gate at the Bezel GPU-block constructor. Bring-up instrumentation (registers at a site, logged); the addresses are these builds' own and the gates patch nothing
 
-- **? `main`** `6e3d1176…` ([patches.py:6](../../dm/games/040057C02159A000/patches.py#L6))
+- **1.0.4 `main`** `6e3d1176…` ([patches.py:6](../../dm/games/040057C02159A000/patches.py#L6))
   - gate 2075 at `+0x5e80d8`: GPU memory block: CoreSystem::Allocate result in x0, size x21, alignment x23 (OBS_REGS)
-- **? `sdk`** `d7439464…` ([patches.py:11](../../dm/games/040057C02159A000/patches.py#L11))
-  - gate 2075 at `+0x138b1c`: TlsHeapCentral::AllocPages_: SearchFreeSpan_ result in x0, pages wanted in x20 (OBS_REGS)
-  - gate 1051 at `+0x138b40`: TlsHeapCentral::AllocPages_: before AllocPhy_ (x1 address, x2 bytes) (OBS_REGS)
-  - gate 2075 at `+0x138f4c`: TlsHeapCentral::AllocPages_: failure tail, x0 = AllocPhy_ result or the null span page (OBS_REGS)
 
 ### Paper Mario: The Origami King
 

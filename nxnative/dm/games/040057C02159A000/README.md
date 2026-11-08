@@ -11,7 +11,7 @@ Update 1.0.4 (v262144), SDK 20.5.29 built for the Switch 2 (`sdk` spec `Ounce`),
 | `nvnDeviceCalculateAccelerationStructureMemoryRequirements` answered | `dm/gfx/nvn/hle_nvn.c` | the red stub left the game's three result words uninitialised; their sum (0x100000001) became a 4 GB "acceleration structure pool" committed before the first frame |
 | `vi::InitializeWithVrrLfcEnabled`, the refresh-rate queries (RefreshRate is one 32-bit Hz word), `SetDisplay120HzRefreshRateCapability` | `dm/gfx/hle_vi.c` | Switch 2 vi calls the host had not taken over (null service locks) |
 | `hid::GetJcmsState`, `GetMousePointerSpeedScale` (a float), `GetGlGrButtonConfigState`, `SetSceneIdForPrivateApp`; `oe::QueryApplicationGpuTimeSpan`, `gs::sdk::CreateNativeMemory` | `dm/host/hle_hid.c`, `hle_oe.c` | the same for hid, oe and gs |
-| OBS_REGS gates in [patches.py](patches.py) | `dm/tools/patch_nso.py` | bring-up instrumentation: registers at the Bezel GPU-block constructor and the SDK's page allocator (logged for the first hits and every null result) |
+| OBS_REGS gates in [patches.py](patches.py) | `dm/tools/patch_nso.py` | bring-up instrumentation: registers at the Bezel GPU-block constructor (logged for the first hits and every null result) |
 
 ## Shaders
 

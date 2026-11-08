@@ -6,18 +6,11 @@ OBS = {
   '6e3d11763a988c6b947510e0ae08ad00': [
     (0x5e80d8, 27 | 8 << 8, 'aa0003f6', 'GPU memory block: CoreSystem::Allocate result in x0, size x21, alignment x23 (OBS_REGS)'),
   ],
-  # the SDK 20 sdk: nn::mem::StandardAllocator's page allocator (nlib TlsHeapCentral::AllocPages_), Bezel's 8.39 GB heap on this game. Where its refusal comes from:
-  # the free-span search (x0 = the span, 0 = none of x20 pages), the lazy page commit (AllocPhy_(x1 = address, x2 = bytes)) and the one failure tail
-  'd743946430d5252672cb63013b73a0ea': [
-    (0x138b1c, 27 | 8 << 8, 'aa0003f5', 'TlsHeapCentral::AllocPages_: SearchFreeSpan_ result in x0, pages wanted in x20 (OBS_REGS)'),
-    (0x138b40, 27 | 4 << 8, 'aa1303e0', 'TlsHeapCentral::AllocPages_: before AllocPhy_ (x1 address, x2 bytes) (OBS_REGS)'),
-    (0x138f4c, 27 | 8 << 8, 'aa1f03f5', 'TlsHeapCentral::AllocPages_: failure tail, x0 = AllocPhy_ result or the null span page (OBS_REGS)'),
-  ],
 }
 
 # How general each entry is (dm/tools/docs_patches.py "Binding"): these are observation gates, bound to the builds they read registers from
 BINDING = [
-    {'what': 'OBS_REGS gates at the Bezel GPU-block constructor and the SDK page allocator', 'now': 'build', 'goal': 'build', 'purpose': 'runtime',
+    {'what': 'OBS_REGS gate at the Bezel GPU-block constructor', 'now': 'build', 'goal': 'build', 'purpose': 'runtime',
      'why': 'bring-up instrumentation (registers at a site, logged); the addresses are these builds\' own and the gates patch nothing'},
 ]
 
