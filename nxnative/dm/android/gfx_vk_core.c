@@ -1282,7 +1282,7 @@ extern struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, d
 extern uint64_t g_set_new, g_pkg_n, g_pkg_bytes;
 static struct { uint64_t draws, passes, dispatches, sets, pkg_n, pkg_bytes, kgsl, pipes, pipe_kgsl; int parts; } g_sub0;   // at this submission's start (sub_stats)
 static void sub_stats(const char *what, int part) {   // the submission so far: what a long one is made of (Nintendo Switch 2 Welcome Tour's scene load: GPU memory the driver allocates grows by gigabytes in one submission)
-    static int nl; if (nl++ >= 48 && part >= 0) return;
+    static int nl, nend; if (part >= 0 ? nl++ >= 48 : nend++ >= 48) return;   // the first 48 of each kind: Bananza's outdoor frames are single submissions of 4000+ draws, logged every frame before
     VKLOG("%s: part %d; so far %llu draws, %llu passes, %llu dispatches, %llu pipelines built (%.0f MB of GPU memory around their creation), %llu new descriptor sets, %llu texture uploads (%.0f MB); %.0f MB of GPU memory mapped (%.0f at the start)", what, part,
           (unsigned long long)(g_vkst.draws - g_sub0.draws), (unsigned long long)(g_vkst.passes - g_sub0.passes), (unsigned long long)(g_vkst.dispatches - g_sub0.dispatches), (unsigned long long)(g_vkst.pipes_built - g_sub0.pipes), (g_pipe_kgsl - g_sub0.pipe_kgsl) / 1048576.0, (unsigned long long)(g_set_new - g_sub0.sets),
           (unsigned long long)(g_pkg_n - g_sub0.pkg_n), (g_pkg_bytes - g_sub0.pkg_bytes) / 1048576.0, kgsl_mapped() / 1048576.0, g_sub0.kgsl / 1048576.0);
@@ -1664,7 +1664,7 @@ void mtl_sub_begin(void) {
     { const char *e = getenv("DM_VK_POOL_READBACK_RANGES"); s->readback_ranges = e && atoi(e); }
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     s->main = s->mains[0]; s->nmain_used = 1; s->cb_err = 0; s->up = s->ups[0]; s->nup_used = 1; s->nmain_sent = 0;
-    g_sub0.draws = g_vkst.draws; g_sub0.passes = g_vkst.passes; g_sub0.dispatches = g_vkst.dispatches; g_sub0.sets = g_set_new; g_sub0.pkg_n = g_pkg_n; g_sub0.pkg_bytes = g_pkg_bytes; g_sub0.kgsl = kgsl_mapped(); g_sub0.pipes = g_vkst.pipes_built; g_sub0.pipe_kgsl = g_pipe_kgsl;
+    g_sub0.draws = g_vkst.draws; g_sub0.passes = g_vkst.passes; g_sub0.dispatches = g_vkst.dispatches; g_sub0.sets = g_set_new; g_sub0.pkg_n = g_pkg_n; g_sub0.pkg_bytes = g_pkg_bytes; { static unsigned nb; if (!(nb++ & 63)) g_sub0.kgsl = kgsl_mapped(); }   /* a sysfs read: every 64th submission */ g_sub0.pipes = g_vkst.pipes_built; g_sub0.pipe_kgsl = g_pipe_kgsl;
     VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++;
     // copied pools: what the game wrote before submitting goes into the GPU copy before any part of the submission can reach the GPU (DM_VK_CB_DRAWS sends
     // parts early; synced at the commit, those parts read the copy as the last submission left it), and only once no earlier submission still reads it
@@ -2037,7 +2037,8 @@ uint64_t mtl_sub_commit(void) {
     else vk_bisect_result(1);
     { extern uint32_t g_sub_ops[64]; memset(g_sub_ops, 0, sizeof g_sub_ops); }
     vk_stage_flush();   // staged uploads (vk_stage_alloc) complete before this submission reads them
-    if (s->nmain_used > 2 || g_vkst.draws - g_sub0.draws > 4000 || kgsl_mapped() > g_sub0.kgsl + (512u << 20)) { sub_stats("submission ends", -1); kt_table(); }
+    { static unsigned nsub; static int nlog;   // a long submission's summary: the GPU memory reading is a sysfs read, so every 64th submission only, and 48 lines at most
+      if (nlog < 48 && (s->nmain_used > 2 || g_vkst.draws - g_sub0.draws > 4000 || (!(nsub++ & 63) && kgsl_mapped() > g_sub0.kgsl + (512u << 20)))) { nlog++; sub_stats("submission ends", -1); kt_table(); } }
     if (s->up_used) { vk_img_barrier_all(s->up); VKCHK(vkEndCommandBuffer(s->up)); }
     uint64_t f = ++g_fence;
     VkCommandBuffer cbs[1 + MAIN_CBS]; uint32_t ncb = 0; if (s->up_used) cbs[ncb++] = s->up; for (int i = s->nmain_sent; i < s->nmain_used; i++) cbs[ncb++] = s->mains[i];
