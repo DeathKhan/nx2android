@@ -79,6 +79,10 @@ __attribute__((weak)) float dm_overlay_opacity(void) { return 0.6f; }
 __attribute__((weak)) int dm_overlay_layout(void) { return 0; }
 __attribute__((weak)) int dm_menu_value(int item) { (void)item; return 0; }   // front_android.c: the pause menu's rows' values, colour and header
 __attribute__((weak)) unsigned dm_menu_accent(void) { return 0xFF3C8E; }
+__attribute__((weak)) const char *dm_menu_choice_name(int item, int v) {
+    if (item < 0 || item >= OVM_N) return "";
+    return v == OVM_NA ? (OVM_ROW[item].na ? OVM_ROW[item].na : "") : v >= 0 && v < OVM_ROW[item].n ? OVM_ROW[item].choices[v] : "Custom";
+}
 __attribute__((weak)) int dm_pad_labels(void) { return 1; }
 __attribute__((weak)) int dm_game_title(char *out, int cap) { if (cap > 0) out[0] = 0; return 0; }
 __attribute__((weak)) int dm_text_entry(char *title, int tcap, char *text, int xcap, int *sel, int *shift) { (void)title; (void)tcap; (void)text; (void)xcap; (void)sel; (void)shift; return 0; }
@@ -596,11 +600,14 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
                 if (i == v) { cv_ring(cv, sx, c[1], sr * 1.62f, fmaxf(2.5f, sr * 0.22f), C_WHITE); cv_disc(cv, sx, c[1], sr * 1.18f, col); }
                 else cv_disc(cv, sx, c[1], sr, col);
             }
+        } else if (k == OVR_CHOICE && v == OVM_NA) {   // the game cannot take it: its note, greyed, in place of the value box
+            const char *name = dm_menu_choice_name(it, v); float npx = tx_fit(name, vp, 1, r[2] * 0.40f);
+            tx_r(cv, x1, cy, name, npx, 1, C_DIM);
         } else if (k == OVR_CHOICE) {   // "< value >": the arrows the accent's when the row is chosen; the colour row shows its swatch
             float c[3]; ov_menu_choice(p, row, c); float bh = rh * 0.56f, ch = bh * 0.40f, cx0 = c[0] + bh * 0.42f, cx1 = c[0] + c[2] - bh * 0.42f;
             cv_rrect(cv, c[0], c[1] - bh / 2, c[0] + c[2], c[1] + bh / 2, bh / 2, hi ? C_FILL2 : C_FILL);
             ov_chevron(cv, cx0, c[1], ch, -1, hi ? C_ACCENT : C_DIM); ov_chevron(cv, cx1, c[1], ch, 1, hi ? C_ACCENT : C_DIM);
-            const char *name = v >= 0 && v < d->n ? d->choices[v] : "Custom";
+            const char *name = dm_menu_choice_name(it, v);
             float vroom = c[2] - bh * 1.6f, sw = it == OVM_ACCENT ? bh * 0.42f : 0, gap = sw ? bh * 0.22f : 0;
             float npx = tx_fit(name, vp, 1, vroom - sw - gap), nw = tx_w(name, npx, 1), nx = c[0] + (c[2] - nw - sw - gap) / 2;
             if (sw) { cv_disc(cv, nx + sw / 2, c[1], sw / 2, C_ACCENT); cv_ring(cv, nx + sw / 2, c[1], sw / 2, 1.2f, C_RIM); }

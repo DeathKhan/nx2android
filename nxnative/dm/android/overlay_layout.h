@@ -112,14 +112,20 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
 // rows (OVM_TAB_ITEMS). front_android.c keeps each row's value (dm_menu_value) and changes it (menu_set); gfx_vk_present.c draws a row by its kind.
 // A new choice row (one that cycles through values with left and right, "< value >"): an OVM_* item, its OVM_ROW entry, its place in a tab, and its value
 // in front_android.c dm_menu_value and menu_set ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_ACCENT, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
-            // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
-            // OVM_ACCENT: the menu's highlight colour (OVM_ACCENTS)
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_ACCENT, OVM_FRAMECAP, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+            // OVM_EDIT: the layout editor; OVM_MODE: Resolution, the level (host/dm.h DM_RES_*: Max is docked, the others handheld; a game without its own
+            // dynamic-resolution settings has two, Balanced = handheld and Max = docked); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
+            // OVM_ACCENT: the menu's highlight colour (OVM_ACCENTS); OVM_FRAMECAP: the frame cap (Off, 60, 30 fps: OVM_CAPS; host/hle_framecap.c)
 enum { OVR_TOGGLE, OVR_SLIDER, OVR_CHOICE, OVR_ACTION, OVR_TABS, OVR_RESUME };   // a switch; a slider (Opacity); values cycled with left and right; a button
                                                                                  // (its word: button); the tabs; Resume
-typedef struct { int kind; const char *label, *sub; const char *const *choices; int n; const char *button; const unsigned *swatches; } ov_mrow;
-            // sub: a line under the label, or NULL; swatches: a choice of colours (0xRRGGBB, n of them), shown as a row of them, the chosen one's name under the label
-static const char *const OVM_MODE_NAMES[] = {"Handheld", "Docked"};
+typedef struct { int kind; const char *label, *sub; const char *const *choices; int n; const char *button; const unsigned *swatches; const char *na; } ov_mrow;
+            // sub: a line under the label, or NULL; swatches: a choice of colours (0xRRGGBB, n of them), shown as a row of them, the chosen one's name under the label;
+            // na: what a choice shows, greyed and without its arrows, when the game cannot take it (dm_menu_value OVM_NA)
+#define OVM_NA (-2)   // dm_menu_value: the row does not apply to this game (its na text is shown; left, right and A do nothing)
+static const char *const OVM_RES_NAMES[] = {"Performance", "Balanced", "Quality", "Max"};   // DM_RES_* (front_android.c dm_menu_choice_name: Handheld, Docked for two)
+#define OVM_NCAPS 3
+static const int OVM_CAPS[OVM_NCAPS] = {0, 60, 30};   // the frame cap's values, fps (0 = off: the game's own rate; settings.txt fpscap=)
+static const char *const OVM_CAP_NAMES[OVM_NCAPS] = {"Off", "60 fps", "30 fps"};
 // the highlight colours (settings.txt accent=RRGGBB; another value is kept and shown as Custom): the first is the menu's colour before there was a choice
 #define OVM_ACCENTS_N 9
 static const unsigned OVM_ACCENTS[OVM_ACCENTS_N] = {0xFF3C8E, 0xE4002B, 0xFF7A1A, 0xF6C431, 0x2FC46B, 0x16B8AE, 0x3B82F6, 0x8B5CF6, 0xE9E9EF};
@@ -130,16 +136,17 @@ static const ov_mrow OVM_ROW[OVM_N] = {
     [OVM_EDIT]    = {OVR_ACTION, "Edit layout", "Move and resize the touch controls", NULL, 0, "Edit"},
     [OVM_RUMBLE]  = {OVR_TOGGLE, "Rumble", "Vibration and tap feedback"},
     [OVM_FPS]     = {OVR_TOGGLE, "Show FPS", "Frame rate in the corner"},
-    [OVM_MODE]    = {OVR_CHOICE, "Console mode", "Docked renders at a higher resolution", OVM_MODE_NAMES, 2},
+    [OVM_MODE]    = {OVR_CHOICE, "Resolution", "Render size; Max renders as docked", OVM_RES_NAMES, 4},
     [OVM_EXPORT]  = {OVR_ACTION, "Export save", "Copy the save to the files folder", NULL, 0, "Export"},
     [OVM_IMPORT]  = {OVR_ACTION, "Import save", "Replace the save with an exported one", NULL, 0, "Import"},
     [OVM_ACCENT]  = {OVR_CHOICE, "Highlight colour", NULL, OVM_ACCENT_NAMES, OVM_ACCENTS_N, NULL, OVM_ACCENTS},
+    [OVM_FRAMECAP] = {OVR_CHOICE, "Frame cap", "Hold the game to a steady rate", OVM_CAP_NAMES, OVM_NCAPS, NULL, NULL, "Not for this game"},
     [OVM_RESUME]  = {OVR_RESUME, "Resume"},
     [OVM_TAB]     = {OVR_TABS, ""},
 };
 #define OVM_TABS 3
 #define OVM_PER_TAB 4   // the most rows a tab has (every tab's panel is as tall); -1: no row there
-static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_MODE, OVM_FPS, -1, -1}, {OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE}, {OVM_ACCENT, OVM_EXPORT, OVM_IMPORT, -1}};
+static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_FPS, OVM_FRAMECAP, OVM_MODE, -1}, {OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE}, {OVM_ACCENT, OVM_EXPORT, OVM_IMPORT, -1}};
 static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Game", "Controls", "System"};
 #define OVM_ROWS (OVM_PER_TAB + 2)   // the tabs, a tab's rows, Resume
 static inline int ov_menu_item(int tab, int row) {
@@ -147,7 +154,9 @@ static inline int ov_menu_item(int tab, int row) {
     return row == 0 ? OVM_TAB : row == OVM_ROWS - 1 ? OVM_RESUME : row > 0 && row < OVM_ROWS - 1 ? OVM_TAB_ITEMS[tab][row - 1] : -1;
 }
 static inline int ov_menu_kind(int item) { return item >= 0 && item < OVM_N ? OVM_ROW[item].kind : -1; }
-int dm_menu_value(int item);   // front_android.c: a row's value: a switch 0 or 1, the slider's percent, a choice's index (-1: none of them, e.g. a custom colour)
+int dm_menu_value(int item);   // front_android.c: a row's value: a switch 0 or 1, the slider's percent, a choice's index (-1: none of them, e.g. a custom colour;
+                               // OVM_NA: the row does not apply to the game)
+const char *dm_menu_choice_name(int item, int v);   // front_android.c: the name a choice row shows for value v (the table's, or the game's own: Resolution's two)
 unsigned dm_menu_accent(void); // front_android.c: the highlight colour, 0xRRGGBB
 int dm_game_title(char *out, int cap);   // front_android.c: the app's name (the menu's header), 0 when there is none
 // The panel's parts, of the window's height (times ov_menu_scale): the padding, the header, the tabs, the gap around the rows, a row, the key hints' line

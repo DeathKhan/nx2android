@@ -72,6 +72,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [ASTRAL CHAIN](#astral-chain) | 0 | 0 | 112 | 0 | 0 | `build` → `game` |
 | [Batman: Arkham Knight](#batman-arkham-knight) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [DARK SOULS: REMASTERED](#dark-souls-remastered) | 0 | 0 | 0 | 0 | 0 | `build` → `game` |
+| [Donkey Kong Bananza](#donkey-kong-bananza) | 0 | 5 | 0 | 0 | 0 | `build` ×2 |
 | [EA SPORTS FC 27](#ea-sports-fc-27) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition](#final-fantasy-crystal-chronicles-remastered-edition) | 8 | 0 | 0 | 0 | 0 | `build` → `engine` |
 | [FINAL FANTASY TACTICS - The Ivalice Chronicles](#final-fantasy-tactics---the-ivalice-chronicles) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
@@ -288,6 +289,20 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **`build` → `game`**, frame rate, kept: withdrawn on Android (above): the frame work sits at the 60 fps limit and the governor's 40 fps step runs the fixed-step game at two thirds speed; the cut and its reasoning stay here for a device that holds 60, judgement: frame limiter 30 → 60 fps and the 1/60 update step. The game's own limiter constant and fixed step
 
+
+### Donkey Kong Bananza
+
+[Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md), `040074A01BF12000`, [patches.py](../../dm/games/040074A01BF12000/patches.py).
+
+- **`build`**, runtime, at goal, judgement: OBS_FRAME_CAP gate at the frame-rate controller. The controller's address is this build's own; the gate changes the frame time it reads only while the pause menu's frame cap is on
+- **`build`**, runtime, at goal, judgement: OBS_RES_PARAM gates at the renderer settings. The settings constructor is this build's own; the gates only report the objects; the pause menu's Resolution level writes the GPU target and the upscale floor
+
+- **v458752 `main`** `e25c90c1…` ([patches.py:8](../../dm/games/040074A01BF12000/patches.py#L8))
+  - gate 2076 at `+0x204a44`: frame-rate controller: its frame time in x8 (ticks), lengthened to the frame cap (OBS_FRAME_CAP)
+  - gate 82205 at `+0x4ca58c`: renderer setting MaintainGpuPercentage (87.5): its object in x20 (OBS_RES_PARAM)
+  - gate 82461 at `+0x4ca610`: renderer setting FrameBufferMinScale (0.6): its object in x20 (OBS_RES_PARAM)
+  - gate 82717 at `+0x4ca8b8`: renderer setting NdsrUpscaleMinRate (1.375): its object in x20 (OBS_RES_PARAM)
+  - gate 82973 at `+0x4ca93c`: renderer setting NdsrUpscaleMaxRate (1.9): its object in x20 (OBS_RES_PARAM)
 
 ### EA SPORTS FC 27
 

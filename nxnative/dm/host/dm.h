@@ -141,10 +141,29 @@ enum { OBS_UE_MALLOC = 21,                                       // Unreal's FMa
        OBS_STDALLOC_INIT = 25,                                         // StandardAllocator::Initialize's entry, the same way: its callback writes the size (hle_svc.c)
        OBS_UE_REGION = 26,                                             // the store of Unreal's engine region size before nninitStartup reserves it: the register its upper bits name (dm/tools/ue_region.py, hle_svc.c)
        OBS_REGS = 27,                                                  // a scratch gate for bring-up: logs x0-x28 at its site, the first N hits (N in the gate number's upper bits, 16 without) and every hit whose x0 is 0 (hle.c obs_regs; a profile's patches.py OBS table places it)
-       OBS_MAX = 28 };
+       OBS_FRAME_CAP = 28,                                             // a game's own frame-rate controller reading its frame time, the register in the gate number's upper bits: the pause
+                                                                       // menu's frame cap lengthens what it reads to the capped period, so the game picks that present interval itself (hle_framecap.c)
+       OBS_RES_PARAM = 29,                                             // a game's own dynamic-resolution setting object made (its value a float at +0x64): the gate number's bits 8..11 name
+                                                                       // which (DM_RES_P_*), bits 12..16 the register that holds it; the menu's Resolution level sets it (hle_framecap.c)
+       OBS_MAX = 30 };
 // A gate number's bits from 8 up are a parameter for its callback (OBS_REGION_GOT: the register that holds the address). Callbacks read the registers; a write to x0–x29 takes
 // effect when the gate returns (entry.S restores them from the frame), which OBS_STDALLOC_INIT and OBS_UE_REGION do
 void gate_obs_set(int id, void (*fn)(uint64_t *regs, int param));
+// The pause menu's frame cap (hle_framecap.c): 0 = off (the game's own rate), 60 or 30 fps. How a game is held to it: DM_FRAME_CAP_GAME, its own frame-rate controller
+// through an OBS_FRAME_CAP gate (the game picks the interval and steps by it); DM_FRAME_CAP_PACE, the host lengthens the present period (a game whose time follows the
+// clock, profile env DM_FRAME_CAP_MODE=pace); DM_FRAME_CAP_NONE, neither: the cap is not offered, as presenting a frame-stepped game slower would slow the game down
+enum { DM_FRAME_CAP_NONE, DM_FRAME_CAP_GAME, DM_FRAME_CAP_PACE };
+int dm_frame_cap_how(void);
+int dm_frame_cap(void);
+void dm_frame_cap_set(int fps);
+uint64_t dm_frame_cap_period(uint64_t period);
+// The pause menu's Resolution (hle_framecap.c): DM_RES_PERF, DM_RES_BALANCED (handheld, the game's own dynamic resolution), DM_RES_QUALITY (handheld, rendering up to the
+// screen's size allowed), DM_RES_MAX (docked). The mode is the operation mode the game sees (hle_oe.c dm_set_opmode, the front end sets it); Performance and Quality move the
+// game's own dynamic-resolution settings where OBS_RES_PARAM gates show them (dm_res_levels() 4), else there are only the two modes (2: Balanced = handheld, Max = docked)
+enum { DM_RES_PERF, DM_RES_BALANCED, DM_RES_QUALITY, DM_RES_MAX, DM_RES_N };
+enum { DM_RES_P_GPU_PCT = 1, DM_RES_P_MIN_SCALE, DM_RES_P_NDSR_MIN, DM_RES_P_NDSR_MAX, DM_RES_P_N };
+int dm_res_levels(void);
+void dm_res_set(int level);   // DM_FRAME_CAP_PACE: the present period, no shorter than the cap's (hle_nvn.c present_period)
 int gate_obs_present(int id);
 uint64_t now_ns(void);
 uint64_t guest_ns(void);              // Guest clock (hle_os.c; does not advance while frozen, guest_clock_freeze)

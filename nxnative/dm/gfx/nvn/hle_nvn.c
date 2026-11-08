@@ -1750,6 +1750,7 @@ __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *
 __attribute__((weak)) void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { (void)pace_ns; (void)pq_ns; }
 __attribute__((weak)) void dm_perf_frame_start_id(uint64_t frame, uint64_t pace_ns, uint64_t pq_ns) { (void)frame; dm_perf_frame_start(pace_ns, pq_ns); }   // Android (perf_android.c): a frame's work starts, for the CPU performance hint
 __attribute__((weak)) uint64_t dm_present_period_adapt(uint64_t period) { return period; }   // Android (perf_android.c): a longer period the frames can hold steadily
+__attribute__((weak)) uint64_t dm_frame_cap_period(uint64_t period) { return period; }   // the pause menu's frame cap for a game paced by the host (hle_framecap.c); graphics unit tests have none
 int mtl_probe_ramp_on(void);   // nvn_mtl.m: DM_FSTEP_PROBE_RAMP (default on; ab with DM_AB)
 __attribute__((weak)) void dm_yield_top(char *out, size_t n) { if (n) snprintf(out, n, "-"); }   // hle_thread.c: the threads that yielded most since the last call; none in graphics unit tests
 __attribute__((weak)) void dm_thread_cpu(char *out, size_t n, double secs) { (void)secs; if (n) snprintf(out, n, "-"); }   // hle_thread.c: guest-thread CPU by Switch priority band since the last call
@@ -2165,6 +2166,7 @@ static nvn_fstep g_fs;   // present thread only
 static nvn_fgpu g_fg;   // the GPU time at kmin and at the current hold (nvn_fstep_gpu_slowed)
 static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided yet)
 // The display link runs at 30 Hz at a 30 cap, except while the game fixes its own step at 1 (BotW's VFR override)
+int nvn_game_interval(void) { return atomic_load(&g_game_itv); }   // the present interval the game asks for now (hle_framecap.c's game-time count)
 int nvn_fps_high_now(void) { return atomic_load(&g_fs_k) == 1 ? 120 : 60; }   // hle_fpslock.c: the target of the next game frame, from the hold in force
 int nvn_game_fps(void) { int c = fps_present_cap(); if (c) return c == 30 && atomic_load(&g_fs_k) == 1 && fstep_on() ? 60 : c; uint64_t s = atomic_load(&g_itv2_since); return g_hz > 0 && !g_display_mode && s && now_ns() >= s + 1000000000ull ? 30 : 60; }
 static void present_cfg(const win_t *o) {
@@ -2207,7 +2209,7 @@ static uint64_t present_period(const win_t *o) {
         else if (was < 2 || was % 2) atomic_store(&g_itv2_since, now_ns() | 1);   // | 1: the start is never 0
     }
     int itv = present_itv(o), hz = g_hz;
-    return dm_present_period_adapt(hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0);
+    return dm_frame_cap_period(dm_present_period_adapt(hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0));
 }
 // The period the acquire thread declares to the scheduler (set_time_constraint): the present period, except that a hold the frame step raised for late frames keeps the cap's deadline.
 // Declaring the longer hold let the performance controller move the game to the efficiency cores at half the clock (TOTK on an iPhone: 3.4 → 1.5 GHz and 65% → 5% on performance
