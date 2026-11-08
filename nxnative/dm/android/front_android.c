@@ -142,7 +142,8 @@ static void act_finish(ANativeActivity *a) {
     if (!m || (*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); LOG("[RED] Activity.finish() failed: the app ends itself"); _exit(0); }
 }
 static void on_resume(ANativeActivity *a) { if (g_quit) { act_finish(a); return; } go_foreground(); }
-static void on_destroy(ANativeActivity *a) { (void)a; _exit(0); }   // one game per process
+static void gpu_floor_restore(void);
+static void on_destroy(ANativeActivity *a) { (void)a; gpu_floor_restore(); _exit(0); }   // one game per process
 
 // ---- input ----
 static AInputQueue *g_queue; static ALooper *g_ilooper;
@@ -1036,6 +1037,29 @@ static void *host_thread(void *a) {
     LOG("host returned %d", rc);
     _exit(rc);
 }
+// GPU clock floor (env.txt DM_GPU_MIN_FREQ=<Hz>, a profile env row): Adreno's governor parks at 660 MHz under a steady 30 fps load on the AYN Odin 3 (available
+// frequencies up to 1.1 GHz), and the game's frame-rate controller then steps its present interval down; the same floor (967 MHz) in the emulator took its cave from 21 to 29 fps,
+// and here p95 frame time 47 → 36 ms. The sysfs node is root's: written through su (Magisk grants the app once; without a grant the write fails and is logged once). The
+// previous floor is restored when the activity is destroyed
+static char g_gpu_floor_prev[32]; static const char *GPU_MIN_FREQ = "/sys/class/kgsl/kgsl-3d0/devfreq/min_freq";
+static int su_run(const char *cmd, char *out, size_t n) {   // su -c <cmd>; out: its first line (optional); 0 on success
+    char full[1024]; snprintf(full, sizeof full, "su -c '%s' 2>/dev/null", cmd);
+    FILE *f = popen(full, "r"); if (!f) return -1;
+    if (out && n) { out[0] = 0; if (fgets(out, (int)n, f)) out[strcspn(out, "\n")] = 0; }
+    int rc = pclose(f); return rc == 0 ? 0 : -1;
+}
+static void gpu_floor_apply(void) {
+    const char *e = getenv("DM_GPU_MIN_FREQ"); if (!e || !atol(e)) return;
+    char cmd[256]; snprintf(cmd, sizeof cmd, "cat %s", GPU_MIN_FREQ);
+    if (su_run(cmd, g_gpu_floor_prev, sizeof g_gpu_floor_prev)) { LOG("[RED] GPU clock floor %s Hz: su refused (grant the app root in Magisk, or leave DM_GPU_MIN_FREQ out)", e); g_gpu_floor_prev[0] = 0; return; }
+    snprintf(cmd, sizeof cmd, "echo %ld > %s", atol(e), GPU_MIN_FREQ);
+    if (su_run(cmd, NULL, 0)) { LOG("[RED] GPU clock floor: writing %s failed", GPU_MIN_FREQ); g_gpu_floor_prev[0] = 0; return; }
+    LOG("GPU clock floor %ld Hz (was %s; restored when the game ends)", atol(e), g_gpu_floor_prev);
+}
+static void gpu_floor_restore(void) {
+    if (!g_gpu_floor_prev[0]) return;
+    char cmd[256]; snprintf(cmd, sizeof cmd, "echo %s > %s", g_gpu_floor_prev, GPU_MIN_FREQ); su_run(cmd, NULL, 0); g_gpu_floor_prev[0] = 0;
+}
 static void env_file(const char *path) {   // KEY=VALUE per line (# comments): switches without rebuilding, as the iOS app's Documents/env.txt
     FILE *f = fopen(path, "r"); char line[1024];
     if (!f) return;
@@ -1112,6 +1136,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
+    gpu_floor_apply();
 #ifdef DM_RELEASE
     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
 #endif

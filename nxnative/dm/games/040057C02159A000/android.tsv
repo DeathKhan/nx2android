@@ -6,3 +6,12 @@ status	wip
 tested	v262144 AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, Android 15)
 package	org.nx2a.t040057c02159a000
 orientation	landscape
+# Handheld mode: the game then targets 1080p (Bananza: a 1920x1080 window with a 1048x590 render target) instead of its docked 2880x1620 / 2304x1296 on this 1080p screen.
+# Odin 3, Bananza tunnel: frame time p50 33 → 17 ms, p95 36 → 35 ms (with the GPU floor below)
+setting	docked=0
+setting	overlay=1
+setting	rumble=1
+setting	fps=1
+# The Adreno governor parks at 660 MHz under a steady load; the 967 MHz floor (through su, Magisk) cut p95 frame time 47 → 36 ms in the docked tunnel
+env	DM_GPU_MIN_FREQ=967000000
+
