@@ -253,6 +253,20 @@ static int noatt_dyn(uint32_t ncol, uint32_t dfmt) { return !ncol && !dfmt && V.
 // one-invocation subgroups) writing memory under rasterizer discard, 96x54, 2048x2048 and 1312x1312 viewports, about 76 draws a frame. Skipped, the lobby draws
 // without visible loss, so what they compute (culling or skinning records, most likely) is not needed by what the host draws, or is covered by a fallback
 static int noatt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NOATT"); on = e ? atoi(e) : 0; } return on; }
+// What those draws are (shaders read from the bundle, 2026-11-08): be816c4f2431b602 (and its variant 7ff0cbe988494368) culls one 80-byte instance record per vertex
+// (s0 at c0 0x110) against the view, picks a bucket (clamped to c5[8].y) and appends the record to that bucket's list: a counter per bucket in s1 (c0 0x150, an atomic
+// add, warp-aggregated with MATCH and a ballot) gives the slot, written at s2 (c0 0x160) + (bucket * c5[7].z + slot) * 80. afe80dc02de844a6 then copies the N = c5[8].x
+// counters into the instance counts (+4) of N 20-byte indexed indirect records per vertex (s1 at c0 0x150), which the following indirect draws of the pass use. Neither has
+// a loop that does not end (be816 has none, afe80's runs N times) and the one-invocation subgroup rewrite is exact for them (spirv-val clean): the GPU's view of what they
+// address is what can fault: a counter never reset or counted more than once (slots past a bucket's room, instance counts past the records), a range outside the pools
+// (bound to the 64 KB zero buffer), or the counters' reset not yet landed. So with DM_VK_NOATT=1 each such draw gets a pass of its own, with the deferred uniform updates
+// landed before it (a draw sees them only through uniform bindings, not through storage buffers or indirect arguments) and a full barrier after it, as NVN runs them in order
+// (DM_VK_NOATT_ISO=0, start-up: as before, the draws of a run share a pass and the updates stay deferred). DM_VK_NOATT_LOG=<n> (start-up): the first n such draws, and the
+// first n indirect draws after them, logged with their storage and constant buffers as the CPU sees them (noatt_log). DM_VK_ROBUST=1 (gfx_vk_core.c): out-of-range accesses
+// do not fault, to tell an out-of-range address from the rest
+static int noatt_iso(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NOATT_ISO"); on = e ? atoi(e) : 1; } return on; }
+static int noatt_log_n(void) { static int n = -1; if (n < 0) { const char *e = getenv("DM_VK_NOATT_LOG"); n = e ? atoi(e) : 0; } return n; }
+static int g_noatt_open, g_noatt_logged, g_noatt_ind_logged;   // the open pass has no attachments (and is to end after its draw); draws logged so far
 static int fmt_has_depth(uint32_t f) { return f && f != VK_FORMAT_S8_UINT; }
 static int fmt_has_stencil(uint32_t f) { return f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_S8_UINT || f == VK_FORMAT_D16_UNORM_S8_UINT; }
 static VkRenderPass rp_get(const rpkey *k) {
@@ -679,6 +693,7 @@ static int begin_pass(void) {
                                                            S.rast_discard, S.sh[0] ? (unsigned long long)S.sh[0]->key : 0ull, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull); return 0; }
         float vx = S.vp[0][0] > 0 ? S.vp[0][0] : 0, vy = S.vp[0][1] > 0 ? S.vp[0][1] : 0, vw = S.vp[0][2], vh = S.vp[0][3];
         w = vw > 0 ? (uint32_t)(vx + vw + 0.5f) : 1; h = vh > 0 ? (uint32_t)(vy + vh + 0.5f) : 1;
+        if (noatt_iso()) { vk_end_pass_land(); cb = vk_cmd(); }   // the updates recorded before the draw land before it (no pass is open here; see noatt_on)
         if (w > 16384) w = 16384; if (h > 16384) h = 16384; if (!w) w = 1; if (!h) h = 1; layers = 1; samples = 1; ncol = 0;
         static int n; if (n++ < 6) VKLOG("pass with no attachments (%d target slots set, none a texture): rasterizer discard %d, vertex %016llx, fragment %016llx, %ux%u from the viewport", S.rt_n, S.rast_discard,
                                          S.sh[0] ? (unsigned long long)S.sh[0]->key : 0ull, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull, w, h);
@@ -712,6 +727,7 @@ static int begin_pass(void) {
     P_ri = (VkRenderingInfo){VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, layers, 0, (uint32_t)ncol, P_ca,
                              (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? &P_da : NULL, (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? &P_sa : NULL};
     S.pass_open = 2; S.pass_w = w; S.pass_h = h; S.samples = samples; S.ncol = ncol; S.bound_pipe = VK_NULL_HANDLE;
+    g_noatt_open = !have && noatt_iso();
     return 1;
 }
 static VkRect2D scissor_rect(void) {
@@ -1834,6 +1850,7 @@ static int prepare_draw(int prim, int indexed) {
     int var = g_bis_trace >= 0 && g_draw_i >= g_bis_trace ? g_bis_var : 0; if (g_bis_var) g_tracing = 0;   // full logs only the first time
     g_var_now = 0;
     if (var == 6) vk_end_pass();   // a new pass for this draw
+    if (g_noatt_open && S.pass_open) vk_end_pass();   // a pass with no attachments holds one draw (noatt_on): the next pass begins with a barrier after it
     // A program may have no fragment stage (a depth-only draw: NVN binds by stage mask, and Metroid Dread draws about nine a frame so in its intro; nvn_mtl.m makes them vertex-only pipelines):
     // drawn with no fragment shader and no colour written (Vulkan leaves colour outputs undefined without one), as before only rasterizer-discard draws were
     if (!S.sh[0]) { g_vkst.skip_prog++; VKRED_ONCE(50, "draw with a program whose shaders are not in the bundle: skipped"); return 0; }
@@ -2197,6 +2214,41 @@ static void vbuf_bound(VkCommandBuffer cb, uint32_t first, uint32_t nvert, uint3
     }
 }
 static void mesh_draw(const p_draw *d);   // NVN2 task / mesh draws (below, after dispatch)
+// DM_VK_NOATT_LOG (see noatt_on): a draw in a pass with no attachments, with each storage buffer of its vertex shader (address, size, the pool chunk it lies in, a deferred
+// update over it, its first 8 words) and words 0x70-0x8f of each constant buffer (c[7] and c[8], the bucket room and counts of be816c4f2431b602 / afe80dc02de844a6), as the
+// CPU sees them now: memory the GPU wrote in submissions that completed, with the deferred updates applied. Across frames a counter that only grows is one never reset
+static void noatt_log(const char *kind, uint32_t count, uint32_t inst, int64_t first, uint64_t ind) {
+    void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst); int vk_ubd_overlaps(uint64_t a, uint64_t n);
+    if (g_noatt_logged >= noatt_log_n()) return;
+    g_noatt_logged++; g_noatt_ind_logged = 0;
+    const vkshader_t *s = S.sh[0];
+    VKLOG("noatt %d: %s present %llu vertex %016llx count %u instances %u first %lld indirect %#llx", g_noatt_logged, kind, (unsigned long long)g_tex_frame, s ? (unsigned long long)s->key : 0ull,
+          count, inst, (long long)first, (unsigned long long)ind);
+    for (int i = 0; s && i < s->nbind; i++) {
+        const dmsv_bind *b = &s->b[i]; uint32_t w[8] = {0}; char t[160]; int k = 0;
+        if (b->kind == RK_SBUF && b->reg >= 0 && b->reg < 16) {
+            const p_bind_buf *u = &S.ssbo[0][b->reg]; vkpool_t *p = u->addr ? vk_pool_peek(u->addr, 1) : NULL;
+            uint64_t n = u->size && u->size < 32 ? u->size : 32; if (p && u->addr + n > p->hi) n = p->hi - u->addr;
+            if (p) vk_ubd_read(u->addr, n & ~3ull, (uint8_t *)w);
+            for (uint64_t j = 0; j < n / 4; j++) k += snprintf(t + k, sizeof t - k, " %#x", w[j]);
+            if (p) VKLOG("  storage %d (binding %u): %#llx +%#llx, pool chunk %#llx..%#llx (%s, %s), %s; words%s", b->reg, b->binding, (unsigned long long)u->addr, (unsigned long long)u->size,
+                         (unsigned long long)p->lo, (unsigned long long)p->hi, p->backed ? "backed" : "not backed yet", p->zero_copy ? "zero-copy" : "copied",
+                         vk_ubd_overlaps(u->addr, u->size ? u->size : 4) ? "a deferred update over it" : "no deferred update over it", t);
+            else VKLOG("  [RED] storage %d (binding %u): %#llx +%#llx in no memory pool: bound to the 64 KB zero buffer, which the shader then writes", b->reg, b->binding, (unsigned long long)u->addr, (unsigned long long)u->size);
+        } else if (b->kind == RK_CBUF && b->reg >= 0 && b->reg < 16) {
+            const p_bind_buf *u = &S.ubo[0][b->reg];
+            if (u->addr && u->size >= 0x90 && vk_pool_peek(u->addr, 0x90)) { vk_ubd_read(u->addr + 0x70, 32, (uint8_t *)w); for (int j = 0; j < 8; j++) k += snprintf(t + k, sizeof t - k, " %#x", w[j]); }
+            VKLOG("  uniform %d (binding %u): %#llx +%#llx; words at 0x70%s", b->reg, b->binding, (unsigned long long)u->addr, (unsigned long long)u->size, k ? t : ": (none)");
+        }
+    }
+}
+// and an indirect draw after one, with its arguments as the CPU sees them (instance counts there are those afe80dc02de844a6 wrote in completed submissions)
+static void noatt_log_ind(const char *kind, uint64_t ind, int words) {
+    void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst);
+    if (!ind || !g_noatt_logged || g_noatt_ind_logged >= noatt_log_n() || !vk_pool_peek(ind, (uint64_t)words * 4)) return;
+    g_noatt_ind_logged++; uint32_t w[5] = {0}; vk_ubd_read(ind, (uint64_t)words * 4, (uint8_t *)w);
+    VKLOG("  after noatt %d: %s, vertex %016llx, arguments at %#llx: %u %u %u %d %u", g_noatt_logged, kind, S.sh[0] ? (unsigned long long)S.sh[0]->key : 0ull, (unsigned long long)ind, w[0], w[1], w[2], (int)w[3], words > 4 ? w[4] : 0);
+}
 static void draw(const p_draw *d) {
     if (d->prim == DM_PRIM_MESH_TASKS) { mesh_draw(d); return; }
     if (d->mdi_cnt) VKRED_ONCE(52, "multi-draw indirect with a count: drawn once");
@@ -2207,6 +2259,7 @@ static void draw(const p_draw *d) {
     // Read only a word from the arguments into scratch, outside the pass. This diagnoses stale GPU buffer visibility without modifying guest bytes.
     if (g_indirect_touch && d->ind) { uint64_t a = d->ind & ~3ull; vk_end_pass(); if (g_indirect_touch == 1) rd_read(&a, 1); }
     if (!prepare_draw(prim == 7 ? 4 : prim, prim == 7)) return;
+    if (g_noatt_open) noatt_log("draw", (uint32_t)d->count, (uint32_t)d->instances, d->first, d->ind); else if (d->ind) noatt_log_ind("draw", d->ind, 4);
     VkCommandBuffer cb = vk_cmd();
     int g_ok = draw_allowed(); if (g_ok == 2 || (g_tracing && g_x_tracepass >= 0)) trace_draw("draw", d->prim, (uint32_t)d->count, (uint32_t)d->instances, -1);
     if (g_tracing && g_x_tracepass >= 0 && !d->ind && S.vbuf[0].address) {   // the first vertices stream 0 gives the draw (with the deferred updates), every word as a float
@@ -2401,6 +2454,7 @@ static void draw_idx(const p_draw_idx *d) {
     // Both the indirect count and the generated indices may have been written by a prior shader. Four bytes touch each backing buffer; no unknown index extent is copied.
     if (g_indirect_touch && d->ind) { uint64_t a[2] = {d->ind & ~3ull, d->ibuf & ~3ull}; vk_end_pass(); if (g_indirect_touch == 1) rd_read(a, 2); }
     if (!prepare_draw(prim == 7 ? 4 : prim, 1)) return;
+    if (g_noatt_open) noatt_log("indexed draw", (uint32_t)d->count, (uint32_t)d->instances, d->base_vertex, d->ind); else if (d->ind) noatt_log_ind("indexed draw", d->ind, 5);
     VkCommandBuffer cb = vk_cmd();
     int g_ok = draw_allowed(); if (g_ok == 2 || (g_tracing && g_x_tracepass >= 0)) trace_draw("indexed draw", d->prim, (uint32_t)d->count, (uint32_t)d->instances, d->itype);
     if (d->ind && g_tracing && g_x_tracepass >= 0) { uint32_t w[5]; vk_ubd_read(d->ind, 20, (uint8_t *)w);   // the arguments as the CPU sees them now (a GPU writer's last merged copy)

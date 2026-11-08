@@ -609,6 +609,10 @@ void vk_init(void) {
                       VKLOG("subgroups: stages %#x pinned to %u lanes (DM_VK_SUBGROUP_PIN)", st, pin); } }
     // enable: everything the shaders may use that the device has
     VkPhysicalDeviceFeatures en = ff.features; en.robustBufferAccess = 0; en.shaderFloat64 = 0;
+    // DM_VK_ROBUST=1 (start-up, A/B): robust buffer access on, where the device has it: a shader's access past its bound range does not fault (writes stay in the range or
+    // are dropped, reads give values from the range or zeros). Off by default (it costs bounds checks on every access); for telling an out-of-range address from other
+    // GPU faults (Welcome Tour's no-attachment draws, gfx_vk_exec.c noatt_on)
+    { const char *e = getenv("DM_VK_ROBUST"); if (e && atoi(e)) { en.robustBufferAccess = ff.features.robustBufferAccess; VKLOG("%srobust buffer access %s (DM_VK_ROBUST)", en.robustBufferAccess ? "" : "[RED] ", en.robustBufferAccess ? "on" : "not offered by the device"); } }
     f12.bufferDeviceAddressCaptureReplay = 0; f12.bufferDeviceAddressMultiDevice = 0;
     featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)[1] = featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)[2] = 0;   // (its extension's: the same two)
     f13.robustImageAccess = 0;
