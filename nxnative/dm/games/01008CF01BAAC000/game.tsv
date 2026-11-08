@@ -11,6 +11,8 @@ ipa	TheLegendOfZeldaEchoesOfWisdom.ipa
 app_category	public.app-category.adventure-games
 # The right stick rotates the dungeon camera (checked on the Mac).
 pad_layout	full
+# Android (upstream nx2android #141, Retroid Pocket 6): the present interval follows the display
+present_interval	display
 
 # ---- Versions ----
 build	v196608	1.1.0	main=9f221e1afa65ba5443e955158ab97da8	subsdk0=d6ad4f66925e3458f012915646501b4d	subsdk1=a4108e77b80cd0a9221b085a8e2c42d4	sdk=aa65d75ae1f61b1a2276f52a59f07d42
