@@ -7,11 +7,16 @@
 
 // What a sequence header OBU says (AV1 5.5): the size, profile and level, and its colour description as mav1_picture gives it (matrix: BT.601 = 1, BT.709 = 2, BT.2020 = 5; unspecified:
 // BT.601 below 720 lines, BT.709 from there, as the Mac's backends take it)
-typedef struct { int w, h, profile, level, tier, bits, mono, matrix, full_range; } mav1_seq;
+// reduced: reduced_still_picture_header (every frame a shown key frame, frame headers without the type bits)
+typedef struct { int w, h, profile, level, tier, bits, mono, matrix, full_range, reduced; } mav1_seq;
 // A sequence header OBU (with its header and size field) read: 1, the av1C record's 4 bytes in c (ISO-BMFF AV1 binding 2.3.3; csd-0 is these and then the OBU) and *s; 0 when it cannot be read
 int mav1_seq_parse(const uint8_t *obu, size_t n, uint8_t c[4], mav1_seq *s);
 // The sequence header OBU of a temporal unit in the low-overhead format, or NULL
 const uint8_t *mav1_find_seq(const uint8_t *p, size_t n, size_t *len);
+// Whether a temporal unit in the low-overhead format (mav1_tu's output) starts a decodable stream: 1 when its first frame header says KEY_FRAME (AV1 5.9.2: show_existing_frame 0,
+// frame_type 0; with reduced every frame is one), 0 when it is an inter / intra-only frame or shows an existing one, -1 when it has no frame header to read (a sequence header alone).
+// A decoder opened mid-stream gives nothing until a key frame (movie_avc.c keeps the units since the last one for that)
+int mav1_tu_key(const uint8_t *p, size_t n, int reduced);
 
 // How the SDK's packets were framed (mav1_tu)
 enum { MAV1_LOW_OVERHEAD = 1, MAV1_ANNEXB = 2, MAV1_IVF = 3 };
