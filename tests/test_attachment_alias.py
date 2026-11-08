@@ -27,7 +27,8 @@ typedef struct {int is_int,is_sint;} vkfmt_t;
 static struct {int pass_open,ncol;struct {uint32_t mask;} chmask;VkFormat cfmt[8];
  int rt_has_cview[8];struct {int set_format,format;} rt_cview[8];struct {struct {int format;} d;} rt_col[8];} S;
 static VkImageView P_alias_views[8];static uint8_t P_alias[8];
-static VkRenderingAttachmentInfo P_ca[8];static int P_cleared,ended,clears;static uint32_t cleared_slot;
+static VkRenderingAttachmentInfo P_ca[8];static VkRenderingInfo P_ri;
+static int P_cleared,ended,clears;static uint32_t cleared_slot,cleared_base_layer,cleared_layers;
 static struct {unsigned folded;} g_vkst;
 static void vk_end_pass(void) {ended++;S.pass_open=0;}
 static int begin_pass(void) {return 1;}
@@ -38,7 +39,8 @@ static int pass_whole(VkRect2D r) {return r.extent.width==100;}
 static const vkfmt_t *vk_fmt(int format) {(void)format;return NULL;}
 static VkCommandBuffer vk_cmd(void) {return VK_NULL_HANDLE;}
 static void fake_clear(VkCommandBuffer cb,uint32_t na,const VkClearAttachment *a,uint32_t nr,const VkClearRect *r) {
- (void)cb;(void)nr;(void)r;assert(na==1);clears++;cleared_slot=a->colorAttachment;
+ (void)cb;assert(na==1 && nr==1);clears++;cleared_slot=a->colorAttachment;
+ cleared_base_layer=r->baseArrayLayer;cleared_layers=r->layerCount;
 }
 #define vkCmdClearAttachments fake_clear
 #define VKRED_ONCE(...) ((void)0)
@@ -64,11 +66,19 @@ int main(void) {
  // both when folded into the load op and after rendering has begun.
  S.ncol=5;S.chmask.mask=0x0000f000u;color_alias_map(5,views,S.chmask.mask,P_alias);
  S.cfmt[3]=VK_FORMAT_A2B10G10R10_UNORM_PACK32;S.cfmt[4]=VK_FORMAT_UNDEFINED;S.pass_open=2;
+ P_ri.layerCount=32;
  p_clear_color c={4,15,{.25f,.5f,.75f,1}};clear_color(&c);
  assert(P_ca[3].loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR && P_ca[3].clearValue.color.float32[1]==.5f);
  assert(P_cleared && g_vkst.folded==1 && clears==0 && c.index==4);
- S.pass_open=1;clear_color(&c);assert(clears==1 && cleared_slot==3);
- c.index=-1;clear_color(&c);c.index=8;clear_color(&c);assert(clears==1);
+ // Explicit clears cover the whole bound target, including all volume slices.
+ // A zero layer count retains the single-layer fallback used before a pass is configured.
+ S.pass_open=1;uint32_t layers[]={0,1,6,32};
+ for(unsigned i=0;i<sizeof layers/sizeof *layers;i++) {
+  P_ri.layerCount=layers[i];clear_color(&c);
+  assert(clears==(int)i+1 && cleared_slot==3 && cleared_base_layer==0);
+  assert(cleared_layers==(layers[i] ? layers[i] : 1));
+ }
+ c.index=-1;clear_color(&c);c.index=8;clear_color(&c);assert(clears==4);
  return 0;
 }
 '''

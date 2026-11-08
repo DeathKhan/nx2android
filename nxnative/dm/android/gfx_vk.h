@@ -38,7 +38,7 @@
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateComputePipelines) X(vkCreatePipelineCache) \
     X(vkGetPipelineCacheData) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
     X(vkCreateBufferView) X(vkDestroyBufferView) X(vkGetAndroidHardwareBufferPropertiesANDROID) X(vkGetBufferDeviceAddress) \
-    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
+    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
     X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT) X(vkCmdDrawIndirectByteCountEXT) \
     X(vkGetRefreshCycleDurationGOOGLE) X(vkGetPastPresentationTimingGOOGLE) \
@@ -52,7 +52,10 @@ typedef struct {
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mem;
     VkPipelineCache pcache;
     int has_bc, has_astc, has_gs, has_depth_clip_ctl, has_custom_border, has_robust2, has_xfb, has_imageless, has_dtiming, has_dynrender, has_timeline;
+    int has_filter_cubic; // EXT filter_cubic enabled; each blit still checks the source format capability
+    int has_occ_precise;  // exact samples-passed query counts (used as a ratio by Bananza, not only a visibility Boolean)
     int has_barycentric;   // VK_KHR_fragment_shader_barycentric: per-vertex fragment inputs (Ampere LDTRAM)
+    int dyn_ssbo;          // DM_VK_DYN_SSBO=1 at startup: direct graphics storage buffers use dynamic offsets within device limits
     int has_bda;           // bufferDeviceAddress (Vulkan 1.2 or VK_KHR_buffer_device_address): the pools' buffers get GPU addresses for raw global memory (vk_gmem_map)
     float max_aniso;
     // subgroups (vk_init): VkPhysicalDeviceSubgroupProperties' size, stages, operations and quadOperationsInAllStages; VkPhysicalDeviceSubgroupSizeControlProperties'
@@ -81,6 +84,9 @@ void vk_pools_sync(VkCommandBuffer cb);
 // ---- submissions (gfx_vk_core.c) ----
 typedef struct vksub vksub_t;
 VkCommandBuffer vk_cmd(void);          // the current submission's main command buffer (recording)
+int vk_cmd_split(void);               //1 only if a new command-buffer part began
+int vk_cmd_parts_left(void);
+void vk_cmd_split_refused(int capacity);
 int vk_readback_ranges(void);
 void vk_readback_unknown(void);   // force full cached-pool merge for this submission
 int vk_sub_open(void);                 // a submission is being recorded
@@ -101,7 +107,17 @@ void vk_defer_free_image_sub(VkImage i, void *sub);
 void vk_defer_free_view(VkImageView v);
 void vk_defer_free_bview(VkBufferView v);   // a texel buffer view, destroyed when this submission completes
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l);    // from this submission's descriptor pools
+// Samples-passed is cumulative across passes/submissions until ResetCounter. Only guest draws are counted.
+int vk_occ_counting(void); // a skipped rasterizing draw may change a later samples-passed report
+void vk_occ_draw(void);   // immediately before an actual guest draw, inside its render pass
+void vk_occ_end(void);    // before ending a render pass (also used by reports/resets inside a pass)
+void vk_occ_reset(void);  // NVN samples-passed ResetCounter, preserving command order
 uint64_t vk_fence_done(void);   // the highest submission fence the GPU has completed
+uint64_t vk_frame_current(void); // frame identity of the job currently replaying
+void vk_perf_frame_seal(uint64_t frame); // after the frame's last submission; no later submission may use this identity
+// Calibrated CLOCK_MONOTONIC endpoints, only after every sealed submission completes.
+// 1: complete valid timing; 0: pending/unknown/expired; -1: dropped or invalid timing.
+int vk_perf_frame_gpu(uint64_t frame, uint64_t *begin, uint64_t *end, uint64_t *busy);
 
 // ---- formats and textures (gfx_vk_tex.c) ----
 // dec: a BC format the device lacks, decoded on the CPU (gfx_vk_tex.c bc_decode) into vk, dbpp bytes a texel; bw, bh and bpb stay the guest's blocks
@@ -139,9 +155,10 @@ struct vkimg {
     uint64_t zc_gen;                  // a texture over a movie picture slot (movie_zc_vk.c zc_tex_refresh): the slot's change count last converted into it
 };
 vkimg_t *vk_tex(const tex_t *t);                                 // the image of a texture object (created, uploaded or refreshed as needed)
+int vk_tex_storage_prepare(const tex_t *t);                    // before descriptor collection/render pass: preserve contents when adding storage usage
 void vk_lrz_forget(vkimg_t *im);                                 // an image is being dropped: the pass code forgets it (gfx_vk_exec.c)
 int vk_window_bottom_up(void);                                   // the game draws in lower-left origin mode: its window image is stored bottom-up (gfx_vk_exec.c)
-VkImageView vk_tex_view(const tex_t *t, const view_t *v, int dim, int arrayed, int as_attachment, vkimg_t **img_out);   // a view for sampling / storage / rendering
+VkImageView vk_tex_view(const tex_t *t, const view_t *v, int dim, int arrayed, int view_kind, vkimg_t **img_out);   // 0 sampled, 1 attachment, 2 storage (identity, one mip)
 void vk_watch(const vkimg_t *im, const char *what);   // DM_VK_WATCH (gfx_vk_exec.c)
 vkimg_t *vk_tex_by_id(int tid, const view_t **view_out, const tex_t **tex_out);   // registered texture ID → image (NULL if none)
 VkSampler vk_samp_by_id(int sid);
@@ -164,6 +181,7 @@ void vk_img_budget_stats(uint64_t *budget, uint64_t *evicted, uint64_t *evicted_
 enum { RK_SUPPORT, RK_CBUF, RK_C1, RK_DRV, RK_SBUF, RK_UBO_PTR, RK_SBUF_UBO, RK_TEX, RK_TBUF, RK_IMG, RK_IMG_TBUF, RK_TEX_C2A, RK_TEX_UBO, RK_TBUF_UBO, RK_IMG_UBO, RK_TEXD, RK_SAMPD,
        RK_GMEM_MAP, RK_GMEM_LOG,   // raw global memory (dmsh_abi.h DMSH_KIND_GMEM_MAP / _LOG): the pool table (vk_gmem_map) and the write log of the stores through it (stage_set); ids in step with shader_vk.py KIND
        RK_MESH_CTL, RK_MESH_TASKOUT, RK_MESH_LAUNCH, RK_MESH_VTX, RK_MESH_IDX,   // the mesh emulation's buffers (shader_meshwrap.py dm_mesh_*; gfx_vk_exec.c mesh_draw sets them before stage_set)
+       RK_GS_CLAIM = 240,        // synthetic runtime-only per-draw geometry side-effect claim storage; not an on-disk KIND
        RK_UNKNOWN = 255 };
 enum { RD_UBO, RD_SSBO, RD_SAMPLED, RD_STORAGE, RD_TBUF, RD_STORAGE_TBUF, RD_IMAGE, RD_SAMPLER };
 enum { RS_NONE, RS_TEX, RS_SLOT, RS_ID, RS_UBO };
@@ -177,13 +195,16 @@ typedef struct {
     uint8_t tbl[96]; int ntbl, tbl_reg, tbl_off;   // bindings moved to the texture table set (1 + slot: 2D, 2D array, cube; gfx_vk_exec.c tbl_set), their count, and the uniform buffer (register, byte offset) the handles come from
     const uint8_t *c1; uint32_t c1_len; VkBuffer c1_buf; VkDeviceSize c1_off;
     uint32_t local[3];
-    uint8_t dyn[96]; int ndyn;          // bindings of uniform buffers bound with a dynamic offset (gfx_vk_exec.c stage_set), and their count
+    uint32_t ubo_extent[16];           // proven base-module read extents by guest uniform slot; zero means unknown (graphics shadow copies only)
+    uint8_t dyn[96]; int ndyn;          // 0 static, 1 dynamic uniform, 2 dynamic storage; ndyn includes both, sorted by binding at each bind
     int xfb; uint32_t xfb_stride[4];    // a vertex shader that captures transform feedback (its SPIR-V has the Xfb execution mode), and each buffer's stride
     uint32_t *spv, nspv;                // its SPIR-V as the module was made from it, for the variants below
     struct { uint64_t um, im; uint32_t xo; int fd; VkShaderModule mod; } var[8]; int nvar;   // variants whose sampled bindings (bit = index in b) of an integer view read uint (um) / int (im) texels,
                                                                                     // that declare the vec4 outputs xo (bit = location) the next stage reads, and (fd) that write gl_FragDepth = gl_FragCoord.z
     int depth_repl;                     // a fragment shader that writes gl_FragDepth (DepthReplacing / DepthGreater / DepthLess)
     uint32_t in_locs, out_locs;         // the vec4 (or per-vertex vec4) inputs and outputs it declares, by location
+    uint32_t gs_claim_invocations;     // transformed geometry shader: claim slots per input primitive, zero when unchanged
+    int storage_images;                 // replay preflight: 0 unknown, 1 has reflected storage images, 2 none
     int setmemo;                        // gfx_vk_exec.c stage_set: 1 its set may be memoized per stage, 2 not (it reads handles or addresses from uniform buffer memory), 0 not known yet
     int pv_gs;   // a geometry shader shader_vk.py generated for a fragment shader that reads inputs per vertex (shader_pvgs.py): bound in place of a program's missing geometry stage
     // an NVN2 task (1) or mesh (2) kernel (bundle stage 6 / 7; shader_meshwrap.facts in its header words): its workgroup's threads, its payload's words, whether the mesh shader has a task,
@@ -204,6 +225,7 @@ VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_
 void vk_shaders_open(const char *path);
 VkBuffer vk_support_buffer(void);
 VkBuffer vk_zero_buffer(void);
+VkBuffer vk_gmem_log_disabled(void);   // all bits set: the translated log guard skips its atomic; real stores still run
 
 // ---- replay (gfx_vk_exec.c) ----
 void vk_exec_reset(void);   // per submission

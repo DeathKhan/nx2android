@@ -955,13 +955,19 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     Operand bitOffset = HelperFunctionManager.GetBitOffset(context, addrLow);
 
                     Operand lblLoopHead = Label();
+                    Operand lblDone = Label();
+                    // The containing word is shared with adjacent subword stores. Every access
+                    // must be atomic, and a failed CAS already returns the next observed word.
+                    Operand oldValue = context.AtomicOr(StorageKind.GlobalMemory, hostLow, hostHigh, Const(0));
                     context.MarkLabel(lblLoopHead);
 
-                    Operand oldValue = context.Load(StorageKind.GlobalMemory, hostLow, hostHigh);
                     Operand newValue = context.BitfieldInsert(oldValue, value, bitOffset, Const(bitSize));
                     Operand casResult = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, hostLow, hostHigh, oldValue, newValue);
-
-                    context.BranchIfTrue(lblLoopHead, context.ICompareNotEqual(casResult, oldValue));
+                    Operand casFail = context.ICompareNotEqual(casResult, oldValue);
+                    context.BranchIfFalse(lblDone, casFail);
+                    context.Copy(oldValue, casResult);
+                    context.Branch(lblLoopHead);
+                    context.MarkLabel(lblDone);
                 }
                 else
                 {
@@ -1198,10 +1204,13 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         private static Operand GenerateAtomicCasLoop(EmitterContext context, Operand wordOffset, int binding, Func<Operand, Operand> opCallback)
         {
             Operand lblLoopHead = Label();
+            Operand lblDone = Label();
 
+            // OR with zero obtains an atomic initial observation without changing the word.
+            // A plain load can race with another packed subword writer's compare-exchange.
+            Operand oldValue = context.AtomicOr(StorageKind.StorageBuffer, binding, Const(0), wordOffset, Const(0));
             context.MarkLabel(lblLoopHead);
 
-            Operand oldValue = context.Load(StorageKind.StorageBuffer, binding, Const(0), wordOffset);
             Operand newValue = opCallback(oldValue);
 
             Operand casResult = context.AtomicCompareAndSwap(
@@ -1213,8 +1222,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 newValue);
 
             Operand casFail = context.ICompareNotEqual(casResult, oldValue);
-
-            context.BranchIfTrue(lblLoopHead, casFail);
+            // Test before updating: the code generator may inline the comparison at its branch.
+            context.BranchIfFalse(lblDone, casFail);
+            context.Copy(oldValue, casResult);
+            context.Branch(lblLoopHead);
+            context.MarkLabel(lblDone);
 
             return oldValue;
         }

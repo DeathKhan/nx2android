@@ -111,6 +111,9 @@ static void probe_dump_once(void) {
 static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the SIGTRAP branch of crash.c
     uint64_t pc = DM_UC_SS(uc)->__pc;
     for (int i = 0; i < g_nprobe; i++) if (g_probe[i].at == pc) {
+        // DM_PROBE_CAPTURE=0 (live): keep the installed probes silent without consuming hit limits; unset preserves the normal behavior.
+        const char *capture = getenv("DM_PROBE_CAPTURE");
+        if (capture && !atoi(capture)) { DM_UC_SS(uc)->__pc = (uint64_t)g_probe[i].slot; return 1; }
         if (g_probe[i].fn) { g_probe[i].hits++; g_probe[i].fn(uc); DM_UC_SS(uc)->__pc = (uint64_t)g_probe[i].slot; return 1; }
         uint64_t frame = dm_guest_frame();
         if (g_probe_every && frame >= g_probe_frame_first && frame <= g_probe_frame_last && ++g_probe[i].seen % g_probe_every) { DM_UC_SS(uc)->__pc = (uint64_t)g_probe[i].slot; return 1; }

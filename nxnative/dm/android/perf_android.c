@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include "dm.h"
+#include "perf_frame.h"
 
 typedef struct APerformanceHintManager APerformanceHintManager;
 typedef struct APerformanceHintSession APerformanceHintSession;
@@ -39,8 +40,25 @@ static struct {
 } H;
 static APerformanceHintSession *g_hint; static int64_t g_hint_target; static int32_t g_hint_tids[8]; static int g_hint_n;
 static AWorkDuration *g_wd;   // made once, its fields set for each frame's report
+static int32_t g_acquire_tid;   // frame_start's guest render thread; presents may instead run on nvn replay
+static int hint_known_threads(int32_t self, int32_t *tids) {
+    tids[0] = self; int32_t acquire = __atomic_load_n(&g_acquire_tid, __ATOMIC_RELAXED);
+    if (acquire > 0 && acquire != self) { tids[1] = acquire; return 2; }
+    return 1;
+}
 
 static int64_t perf_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
+static perf_frame_state g_perf_frames = {.mutex = PTHREAD_MUTEX_INITIALIZER};
+static int perf_completed_enabled(void) {
+    static int configured = -1;
+    int on = __atomic_load_n(&configured, __ATOMIC_ACQUIRE);
+    if (on < 0) { const char *e = getenv("DM_ADPF_COMPLETE"); on = e && atoi(e) != 0; __atomic_store_n(&configured, on, __ATOMIC_RELEASE); }
+    return on;
+}
+void dm_perf_replay_work(uint64_t frame, uint64_t begin, uint64_t end) {
+    if (perf_completed_enabled()) perf_frame_replay_record(&g_perf_frames, frame, begin, end);
+}
+
 
 // DM_GPU_TURBO=1 (live, read every 60 presents): Adreno's GPU at its highest clock (thermal limits still apply) through the KGSL property libadrenotools'
 // adrenotools_set_turbo sets: power control off on /dev/kgsl-3d0; 0 gives it back. A frame held at 30 fps lets the GPU governor lower the clock until the work
@@ -73,14 +91,49 @@ static void hint_init(int64_t target) {
     H.increase = dlsym(lib, "APerformanceHint_notifyWorkloadIncrease");   // Android 16
     if (!H.get || !H.create || !H.report) { LOG("[perf] no APerformanceHint on this Android: CPU hints off"); return; }
     APerformanceHintManager *m = H.get(); if (!m) return;
-    g_hint_tids[0] = (int32_t)gettid(); g_hint_n = 1;
+    g_hint_n = hint_known_threads((int32_t)gettid(), g_hint_tids);
     g_hint = H.create(m, g_hint_tids, (size_t)g_hint_n, target); g_hint_target = target;
-    LOG("[perf] ADPF session %s (target %.2f ms, thread %d; GPU time %s, load increases %s)", g_hint ? "open" : "refused", target / 1e6, g_hint_tids[0],
+    LOG("[perf] ADPF session %s (target %.2f ms, presenting thread %d, acquire thread %d; GPU time %s, load increases %s)", g_hint ? "open" : "refused", target / 1e6, g_hint_tids[0], g_hint_n > 1 ? g_hint_tids[1] : g_hint_tids[0],
         H.report2 ? "reported" : "not reported", H.increase ? "signalled" : "not signalled");
 }
-// The other threads that do frame work: the presenting thread is the game's render thread, and its main thread (the simulation) and job workers set
-// the pace as much. Every 300 frames the threads that used at least 15% of a core since the last look join the session (up to 5 besides the
-// presenting one), the ones that went idle leave it. Without them NEO's main thread ran on mid cores at 1.9 of 3.5 GHz and its bursts made
+// A work-completion target is independent of presentation cadence. Opt-in DM_ADPF_TARGET_FPS=60 (live) asks ADPF for 16.67 ms work
+// even if a game temporarily presents every second vsync; it changes neither the game's interval nor the display-rate request.
+static int hint_target_fps(const char *value) {
+    if (!value || !*value) return 0;
+    char *end; long fps = strtol(value, &end, 10);
+    return end != value && !*end && fps >= 1 && fps <= 240 ? (int)fps : 0;
+}
+static int64_t hint_target_ns(int64_t period, uint64_t game_period, int fps) {
+    if (fps > 0 && fps <= 240) return (1000000000ll + fps / 2) / fps;
+    return game_period && game_period < (uint64_t)period ? (int64_t)game_period : period;
+}
+static struct {
+    uint64_t target_ok, target_failed, report2_calls, report2_failed, fallback, legacy_calls, legacy_failed;
+    uint64_t report2_cpu_ns, report2_gpu_ns;
+} g_hint_stats;
+static void hint_update_target(int64_t target, int mode_changed) {
+    if (!g_hint || target == g_hint_target) return;
+    int r = H.update ? H.update(g_hint, target) : ENOSYS;
+    if (!r) { g_hint_target = target; g_hint_stats.target_ok++; }
+    else g_hint_stats.target_failed++;
+    static unsigned logs;
+    if (mode_changed || logs++ < 8) LOG("[perf] ADPF target %.3f ms %s (result %d, active %.3f ms)", target / 1e6,
+        r ? "refused" : "applied", r, g_hint_target / 1e6);
+}
+static void hint_stats_report(void) {
+    static uint64_t p2, p2fail, pfallback, pleg, plegfail, pok, pfail, pcpu, pgpu;
+    uint64_t n = g_hint_stats.report2_calls - p2, failed = g_hint_stats.report2_failed - p2fail;
+    LOG("[perf] ADPF last 600 presents: active target %.3f ms; target updates %llu applied/%llu refused; report2 %llu/%llu accepted (CPU %.2f ms, GPU %.2f ms); legacy %llu calls/%llu failed, fallbacks %llu",
+        g_hint_target / 1e6, (unsigned long long)(g_hint_stats.target_ok - pok), (unsigned long long)(g_hint_stats.target_failed - pfail),
+        (unsigned long long)(n - failed), (unsigned long long)n, n ? (g_hint_stats.report2_cpu_ns - pcpu) / (double)n / 1e6 : 0,
+        n ? (g_hint_stats.report2_gpu_ns - pgpu) / (double)n / 1e6 : 0, (unsigned long long)(g_hint_stats.legacy_calls - pleg),
+        (unsigned long long)(g_hint_stats.legacy_failed - plegfail), (unsigned long long)(g_hint_stats.fallback - pfallback));
+    p2 = g_hint_stats.report2_calls; p2fail = g_hint_stats.report2_failed; pfallback = g_hint_stats.fallback; pleg = g_hint_stats.legacy_calls; plegfail = g_hint_stats.legacy_failed;
+    pok = g_hint_stats.target_ok; pfail = g_hint_stats.target_failed; pcpu = g_hint_stats.report2_cpu_ns; pgpu = g_hint_stats.report2_gpu_ns;
+}
+// Keep both known frame threads in the session: with DM_NVN_ASYNC the presenting thread is nvn replay and the acquire thread is the game's render
+// thread. Every 300 frames other threads that used at least 15% of a core since the last look join the session (up to 5 besides those known threads);
+// other workers that went idle leave it. Without them NEO's main thread ran on mid cores at 1.9 of 3.5 GHz and its bursts made
 // 45 to 80 ms frames. Needs APerformanceHint_setThreads (Android 14)
 static uint64_t task_ticks(int tid) {
     char p[64], b[512]; snprintf(p, sizeof p, "/proc/self/task/%d/stat", tid);
@@ -98,7 +151,7 @@ static void hint_threads_scan(int32_t self) {
     struct { int tid; uint64_t used; } cur[512]; int nc = 0; struct dirent *e;
     while ((e = readdir(d)) && nc < 512) { int tid = atoi(e->d_name); if (tid <= 0) continue; cur[nc].tid = tid; cur[nc].used = task_ticks(tid); nc++; }
     closedir(d);
-    int32_t pick[8]; int npick = 0; pick[npick++] = self;
+    int32_t pick[8]; int npick = hint_known_threads(self, pick);
     if (secs > 0) {
         long hz = sysconf(_SC_CLK_TCK); double need = 0.15 * secs * (double)(hz > 0 ? hz : 100);
         for (int k = 0; k < 5; k++) {   // the busiest first
@@ -170,25 +223,93 @@ static int fps_pin(void) {   // a DM_CTL "env DM_FPS_PIN=40" line holds that ste
 // The frame's replay and GPU time (gfx_vk_present.c, before dm_perf_frame): the rate is judged on the largest of them and the presenting thread's work. With the
 // replay on a thread of its own (DM_NVN_ASYNC) Xenoblade Chronicles 3's presenting thread worked ~8 ms a frame, the rate stepped up to 40 fps for frames
 // of ~24 ms GPU time, and the display's switch to 120 Hz and the missed frames made 80-550 ms frames
-static int64_t g_frame_cost, g_frame_gpu;
-void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns) { g_frame_cost = replay_ns > gpu_ns ? replay_ns : gpu_ns; g_frame_gpu = gpu_ns; }
+static int64_t g_frame_cost, g_frame_gpu, g_frame_replay;
+void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns) {
+    g_frame_replay = replay_ns > 0 ? replay_ns : 0;
+    g_frame_gpu = gpu_ns > 0 ? gpu_ns : 0;
+    g_frame_cost = g_frame_replay > g_frame_gpu ? g_frame_replay : g_frame_gpu;
+}
 // The frame's work to the CPU hint: with the GPU's time where Android 15 takes it, and a load increase signalled (Android 16) when 3 frames in a row run over
 // the period, at most every 0.5 s: the clocks then follow the whole frame and not only its CPU half. (Super Mario Odyssey on the Red Magic Astra fell from 60
 // to 30-45 fps with the GPU at 222-443 MHz in the same scene; that device's GPU clock moved only with its FULL performance mode or its game menu, hints or not)
-// pq: the wait for the present thread, left out of the CPU time where the GPU's time goes beside it (blocked, not CPU work); pace: the part of it that is a
-// longer step's pacing, left out of the work judged over the period (counted, every frame at 40 or 30 fps was over the game's period and signalled)
-static void hint_report(int64_t w, int64_t pq, int64_t pace, int64_t now, int64_t target) {
-    if (H.report2) {
+// pq is the guest's wait for replay/presentation. Subtract it from the guest estimate, but retain the separately measured replay wall time:
+// that CPU work runs while the guest waits. AWorkDuration describes wall time, not summed CPU time across parallel threads, so take the larger
+// measurement. Total spans at least each measured component; the GPU timing is the existing latest completed frame's estimate. Pacing is unchanged.
+// https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/core/java/android/os/WorkDuration.java
+static void hint_report_values(int64_t start, int64_t total, int64_t cpu, int64_t gpu,
+    int64_t w, int64_t pace, int64_t now, int64_t target) {
+    if (H.report2 && (cpu > 0 || gpu > 0)) {   // report2 rejects a breakdown with neither component measured
         AWorkDuration *d = g_wd;
-        H.wd_start(d, now - w); H.wd_total(d, w); H.wd_cpu(d, w > pq ? w - pq : 0); H.wd_gpu(d, g_frame_gpu > 0 ? g_frame_gpu : 0); if (H.report2(g_hint, d)) H.report(g_hint, w);
-    } else H.report(g_hint, w);
+        H.wd_start(d, start); H.wd_total(d, total); H.wd_cpu(d, cpu); H.wd_gpu(d, gpu);
+        g_hint_stats.report2_calls++; g_hint_stats.report2_cpu_ns += (uint64_t)cpu; g_hint_stats.report2_gpu_ns += (uint64_t)gpu;
+        if (H.report2(g_hint, d)) { g_hint_stats.report2_failed++; g_hint_stats.fallback++; g_hint_stats.legacy_calls++;
+            if (H.report(g_hint, total)) g_hint_stats.legacy_failed++; }
+    } else { g_hint_stats.legacy_calls++; if (H.report(g_hint, total)) g_hint_stats.legacy_failed++; }
     static int over; static int64_t last;
-    int64_t worst = w - pace > g_frame_gpu ? w - pace : g_frame_gpu;
+    int64_t worst = w - pace > gpu ? w - pace : gpu;
     over = worst > target * 105 / 100 ? over + 1 : 0;
     if (H.increase && over >= 3 && now - last > 500000000ll) {
-        last = now; int r = H.increase(g_hint, true, g_frame_gpu > target * 70 / 100, "frame over its period");
-        static int n; if (n++ < 5) LOG("[perf] ADPF load increase signalled (work %.1f ms, GPU %.1f ms, target %.1f ms)%s", w / 1e6, g_frame_gpu / 1e6, target / 1e6, r ? " refused" : "");
+        last = now; int r = H.increase(g_hint, true, gpu > target * 70 / 100, "frame over its period");
+        static int n; if (n++ < 5) LOG("[perf] ADPF load increase signalled (work %.1f ms, GPU %.1f ms, target %.1f ms)%s", w / 1e6, gpu / 1e6, target / 1e6, r ? " refused" : "");
     }
+}
+
+static void hint_report(int64_t w, int64_t pq, int64_t pace, int64_t now, int64_t target) {
+    int64_t cpu = w > pq ? w - pq : 0, gpu = g_frame_gpu;
+    if (g_frame_replay > cpu) cpu = g_frame_replay;
+    int64_t total = w > cpu ? w : cpu; if (gpu > total) total = gpu;
+    hint_report_values(now - total, total, cpu, gpu, w, pace, now, target);
+}
+
+// Keep framework calls on the presenting thread. Initially retain the existing estimate;
+// once a fully matched record proves calibration is available, report each later frame
+// after completion. A previously estimated bootstrap frame is never reported twice.
+__attribute__((weak)) int vk_perf_frame_gpu(uint64_t frame, uint64_t *begin, uint64_t *end, uint64_t *busy) { (void)frame; (void)begin; (void)end; (void)busy; return -1; }
+static int hint_completed_frame(uint64_t frame, int64_t now, int64_t target) {
+    static int active, previous_budget = -1, left;
+    static uint64_t matched, invalid_fallback, bootstrap, waiting;
+    if (!perf_completed_enabled() || frame == UINT64_MAX) return 0;
+    const char *e = getenv("DM_ADPF_COMPLETE_DIAG"); int budget = e ? atoi(e) : 8;
+    if (budget < 0) budget = 0; if (budget > 64) budget = 64;
+    if (budget != previous_budget) { previous_budget = budget; left = budget; }
+    uint64_t first = frame >= PERF_FRAME_COUNT ? frame - PERF_FRAME_COUNT + 1 : 0;
+    for (uint64_t id = first; id < frame; id++) {
+        perf_frame_record r;
+        if (!perf_frame_copy_record(&g_perf_frames, id, &r) || (active && r.reported)) continue;
+        uint64_t begin = 0, end = 0, busy = 0; int64_t start = 0, total = 0;
+        int ready = vk_perf_frame_gpu(id, &begin, &end, &busy);
+        int valid = ready == 1 && perf_frame_values(&r, begin, end, busy, &start, &total);
+        if (valid) {
+            if (!active) { active = 1; LOG("[perf] ADPF completed-frame timing active from matched frame %llu", (unsigned long long)id); }
+            if (r.reported) continue;
+            if (!perf_frame_mark_reported(&g_perf_frames, id)) continue;
+            matched++;
+            hint_report_values(start, total, r.cpu, (int64_t)busy, total, 0, now, target);
+            if (left > 0) { left--;
+                LOG("[perf] ADPF matched frame %llu: CPU endpoints %llu..%llu ns, GPU %llu..%llu ns; total %.3f ms, CPU %.3f, GPU %.3f",
+                    (unsigned long long)id, (unsigned long long)r.start, (unsigned long long)r.end,
+                    (unsigned long long)begin, (unsigned long long)end, total / 1e6, r.cpu / 1e6, busy / 1e6);
+            }
+        } else if (active && !r.reported && (ready < 0 || ready == 1 || r.invalid || frame - id >= 8)) {
+            if (!perf_frame_mark_reported(&g_perf_frames, id)) continue;
+            invalid_fallback++;
+            int64_t total_old = r.work > r.cpu ? r.work : r.cpu;
+            if (r.gpu_estimate > total_old) total_old = r.gpu_estimate;
+            if (r.work > 0 && r.work < 250000000 && total_old > 0 && total_old < 250000000 && (uint64_t)total_old < r.end)
+                hint_report_values((int64_t)r.end - total_old, total_old, r.cpu, r.gpu_estimate,
+                    r.work, 0, now, target);
+        } else if (active && !r.reported) waiting++;
+    }
+    if (!active) bootstrap++;
+    if (!(frame % 600)) {
+        pthread_mutex_lock(&g_perf_frames.mutex);
+        uint64_t duplicates = g_perf_frames.duplicate, stale = g_perf_frames.stale, bad = g_perf_frames.invalid;
+        pthread_mutex_unlock(&g_perf_frames.mutex);
+        LOG("[perf] ADPF completed records: matched %llu, invalid/aged fallback %llu, bootstrap estimates %llu, pending polls %llu, duplicate %llu, stale %llu, invalid CPU %llu",
+            (unsigned long long)matched, (unsigned long long)invalid_fallback, (unsigned long long)bootstrap,
+            (unsigned long long)waiting, (unsigned long long)duplicates, (unsigned long long)stale, (unsigned long long)bad);
+    }
+    return active;
 }
 // The frames' time on screen (hle_nvn.c, 8 presents late; ms, -1 = discarded by the system, 0 = no reading): a frame shown longer than 1.5 periods of the step,
 // or discarded, missed the display. Work over the period alone does not mean that: the swapchain holds a frame or two, so a frame a little over the period
@@ -254,26 +375,58 @@ static void adapt_frame(int64_t work, int64_t now) {
 // left out, Super Mario Odyssey's hint saw light frames and the clocks stayed at 1-2 GHz). At 60 fps it is not a pace but the display or the swapchain
 // holding the frames back, and it stays in the work, or the rate could not step down for it
 static int64_t g_prev_present, g_pace, g_pq;
-void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { g_work_start = perf_now(); g_pace = (int64_t)pace_ns; g_pq = (int64_t)pq_ns; }
+void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { __atomic_store_n(&g_acquire_tid, (int32_t)gettid(), __ATOMIC_RELAXED); g_work_start = perf_now(); g_pace = (int64_t)pace_ns; g_pq = (int64_t)pq_ns; }
+void dm_perf_frame_start_id(uint64_t frame, uint64_t pace_ns, uint64_t pq_ns) {
+    uint64_t start = (uint64_t)perf_now();   // Keep this frame's timestamp local across an older async present.
+    dm_perf_frame_start(pace_ns, pq_ns);
+    if (perf_completed_enabled()) perf_frame_start_record(&g_perf_frames, frame, start, pace_ns, pq_ns);
+}
 // Called on the presenting thread right before a present; period in seconds (1/60, 1/30, ...).
-void dm_perf_frame(double period) {
+void dm_perf_frame_id(uint64_t frame, double period) {
     int64_t p = period > 0 && period < 1 ? (int64_t)(period * 1e9) : 16666667, t = perf_now();
     // the CPU hint's target is the game's own period, not the adaptive one: with the longer target the CPU clocks drop until the work fills it,
     // and the work then never shows the room to step back up (NEO stayed at 30 fps with frames of 31 to 48 ms)
-    if (g_game_period && (int64_t)g_game_period < p) p = (int64_t)g_game_period;
+    int fps = hint_target_fps(getenv("DM_ADPF_TARGET_FPS"));
+    p = hint_target_ns(p, g_game_period, fps);
+    static int last_fps; int mode_changed = fps != last_fps;
+    if (mode_changed) { last_fps = fps; LOG("[perf] ADPF work target override %s (%d fps; game pacing and display unchanged)", fps ? "enabled" : "disabled", fps); }
     hint_init(p);
+    hint_update_target(p, mode_changed);   // report against the target the framework actually accepted
     { static unsigned n; if (++n % 60 == 0) gpu_turbo(); }
-    if (g_work_start) {   // (a longer span: the game was held, by the pause menu or the background)
-        int64_t w = g_prev_present ? t - g_prev_present - g_pace : t - g_work_start;
-        int64_t pq = g_prev_present ? g_pq : 0, pace = g_step > 0 ? pq : 0;   // (t - g_work_start starts after the wait already)
-        if (w > 0 && w < 250000000) { adapt_frame(w - pace > 0 ? w - pace : 0, t); if (g_hint) hint_report(w, pq, pace, t, g_hint_target); }
+    int legacy_start = g_work_start != 0;
+    int64_t w = legacy_start ? (g_prev_present ? t - g_prev_present - g_pace : t - g_work_start) : 0;
+    int64_t pq = g_prev_present ? g_pq : 0, pace = g_step > 0 ? pq : 0;
+    perf_frame_record record;
+    int recorded = perf_completed_enabled() && frame != UINT64_MAX &&
+        perf_frame_peek_record(&g_perf_frames, frame, &record) && !record.closed;
+    int64_t span = recorded && record.start && (uint64_t)t >= record.start && (uint64_t)t - record.start <= INT64_MAX ?
+        (int64_t)((uint64_t)t - record.start) : 0;
+    if (recorded)
+        perf_frame_close_record(&g_perf_frames, frame, (uint64_t)t, legacy_start && w > 0 && w < 250000000 ? w : span,
+            span, record.replay <= INT64_MAX ? (int64_t)record.replay : 0, g_frame_gpu);
+    if (legacy_start) {
+        if (w > 0 && w < 250000000) adapt_frame(w - pace > 0 ? w - pace : 0, t);
         g_work_start = 0;
+    }
+    // Completed records and polling do not depend on the shared legacy start flag.
+    int handled = g_hint && hint_completed_frame(frame, t, g_hint_target);
+    if (g_hint && !handled) {
+        if (legacy_start && w > 0 && w < 250000000) {
+            hint_report(w, pq, pace, t, g_hint_target);
+            if (recorded) perf_frame_mark_reported(&g_perf_frames, frame);
+        } else if (recorded && span > 0 && span < 250000000) {
+            int64_t total = span > g_frame_gpu ? span : g_frame_gpu;
+            hint_report_values(t - total, total, span, g_frame_gpu, span, 0, t, g_hint_target);
+            perf_frame_mark_reported(&g_perf_frames, frame);
+        }
     }
     g_prev_present = t;
     static unsigned frames; if (frames++ % 300 == 0) hint_threads_scan((int32_t)gettid());
     if (!g_hint) return;
-    if (p != g_hint_target && H.update) { H.update(g_hint, p); g_hint_target = p; }
+    if (!(frames % 600)) hint_stats_report();
 }
+
+void dm_perf_frame(double period) { dm_perf_frame_id(UINT64_MAX, period); }
 
 // The window's frame rate: the game's rate, so the display can pick a mode it divides (60 / 120 Hz rather than 144 Hz for a 60 fps game).
 void dm_perf_window(ANativeWindow *w, double fps) {

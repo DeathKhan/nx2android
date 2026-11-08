@@ -3,7 +3,7 @@
 # the rewrite for DM_TARGET=android, the Vulkan shader bundle, the host built with the player's NDK, the APK, the data pack and the install.
 # Work files go where upstream's NSP script puts them, <game folder>/<title ID>_build/ (extract/, aoc/, shader/, logs/ are shared with an iOS build of the same folder),
 # with the Android ones in its android/ folder.
-import importlib.util, os, re, shutil, sys
+import hashlib, importlib.util, json, os, re, shutil, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -202,6 +202,38 @@ def inspect(folder, keys=None):
     if pack not in builds:
         info['reason'] = (info['reason'] + '; ' if info['reason'] else '') + f'{pack} is not a version the profile was brought up on ({", ".join(builds)}): it is packed from a derived profile, without that version\'s fixes'
     return info
+
+
+def build_translator(dotnet, out, log, env):
+    """Build the Android compiler from source, with isolated intermediates and
+    a SHA256 manifest. This is shared by the porter and developer shader builds;
+    the separate Mac pinned compiler/Metal lock is not changed."""
+    src = DM / 'gfx/tools/dmsh_xlate'; ryu = DM / 'third_party/ryujinx'
+    files = sorted([*src.glob('*.cs'), *src.glob('*.csproj'), *ryu.glob('*.props')] + [p for p in (ryu / 'src').rglob('*') if p.suffix in ('.cs', '.csproj', '.props')
+                                                                                     and not {'bin', 'obj'} & set(p.relative_to(ryu).parts)])
+    key = nsp.fingerprint(('files', files), ('cmd', [str(dotnet), '--version']), env=env)
+    out = Path(out); kf = out.with_name('dmsh_xlate.key'); dll = out / 'dmsh_xlate.dll'
+    modules = ('dmsh_xlate.dll', 'Ryujinx.Graphics.Shader.dll', 'Ryujinx.Common.dll', 'Spv.Generator.dll')
+    def stamped():
+        # The shader cache keys the actual compiler binaries as well as their
+        # source/SDK inputs; the manifest makes a bundle's compiler reviewable.
+        hashes = {name: hashlib.sha256((out / name).read_bytes()).hexdigest() for name in modules}
+        tool_key = nsp.fingerprint(key, ('files', [out / name for name in modules]))
+        (out / 'build-manifest.json').write_text(json.dumps({'source_key': key, 'tool_key': tool_key, 'sha256': hashes}, indent=2) + '\n')
+        return dll, tool_key
+    if all((out / name).is_file() for name in modules) and nsp.reused(kf, key) is not None: return stamped()
+    tmp = out.with_name('dmsh_xlate.partial'); artifacts = out.with_name('dmsh_xlate.artifacts')
+    nsp.rmtree(tmp); nsp.rmtree(kf)
+    try:
+        # Keep obj/bin out of the source checkout (also works in a packaged,
+        # read-only source tree). NX2A_HOME may place the cache under dist.
+        nsp.run([dotnet, 'build', src, '-c', 'Release', '-o', tmp, '--artifacts-path', artifacts,
+                 '-p:GeneratePackageOnBuild=false', '-nologo', '-v', 'quiet'], log, env=env)
+        if not all((tmp / name).is_file() for name in modules):
+            raise BuildError(f'the translator build is incomplete (see {log})')
+        nsp.swap_in(tmp, out); kf.write_text(f'{key}\n')
+    finally: nsp.rmtree(artifacts)
+    return stamped()
 
 
 class Port:
@@ -762,20 +794,10 @@ class Port:
         if got: say(f'{len(got)} shader(s) missing from the bundle, captured on the device: {" ".join(n[:16] for n in got)}')
 
     def translator(self):
-        """The shader translator (dm/gfx/tools/dmsh_xlate over dm/third_party/ryujinx) built from the repository's source with the player's .NET SDK, once for every game,
-        in <user dir>/tools/dmsh_xlate: (dmsh_xlate.dll, the source's key). Not the iOS chain's prebuilt dm/gfx/tools/dmsh_xlate_bin, which only a Mac can rebuild
-        (its lock fingerprints Apple's Metal compiler): Android takes a translator fix as soon as it is in the source"""
-        src = DM / 'gfx/tools/dmsh_xlate'; ryu = DM / 'third_party/ryujinx'
-        files = sorted([*src.glob('*.cs'), *src.glob('*.csproj'), *ryu.glob('*.props')] + [p for p in (ryu / 'src').rglob('*') if p.suffix in ('.cs', '.csproj', '.props')
-                                                                                         and not {'bin', 'obj'} & set(p.relative_to(ryu).parts)])
-        key = nsp.fingerprint(('files', files), ('cmd', [str(self.tools['dotnet']), '--version']), env=self.env)
-        out = paths.user_dir() / 'tools/dmsh_xlate'; kf = out.with_name('dmsh_xlate.key'); dll = out / 'dmsh_xlate.dll'
-        if dll.is_file() and nsp.reused(kf, key) is not None: return dll, key
-        tmp = out.with_name('dmsh_xlate.partial'); nsp.rmtree(tmp); nsp.rmtree(kf)
-        nsp.run([self.tools['dotnet'], 'build', src, '-c', 'Release', '-o', tmp, '-nologo', '-v', 'quiet'], self.logs / 'android_translator_build.log', env=self.env)
-        if not (tmp / 'dmsh_xlate.dll').is_file(): raise BuildError(f'the translator built without dmsh_xlate.dll (see {self.logs / "android_translator_build.log"})')
-        nsp.swap_in(tmp, out); kf.write_text(f'{key}\n')
-        return dll, key
+        """Android builds its compiler from current source, independently of the
+        Mac pinned binary. Reuse requires matching source and SDK fingerprints."""
+        return build_translator(self.tools['dotnet'], paths.user_dir() / 'tools/dmsh_xlate',
+                                self.logs / 'android_translator_build.log', self.env)
 
     # ---- host: the Android host built for this profile with the player's NDK ----
     def host(self):

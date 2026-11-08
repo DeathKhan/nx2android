@@ -1,21 +1,34 @@
 # Donkey Kong Bananza on Android (keys in docs/ARCHITECTURE.md "Game profiles on Android"). A Switch 2 game (NVN2, Ampere shaders, SDK 20.5.19 Ounce) packed from its NUP.
-# 2026-11-07, AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver 512.800.72): boots from the NUP without a heap check, resumes its save into the mining tunnel; DK, the loose rocks, HUD and
-# prompts draw at 30-40 fps (frame work about 21 ms, GPU about 26 ms). Open: the terrain colour pass (raw global memory stores, shaders.md), the main menu art, the game's 9 GB pool on a 12 GB device.
+# 2026-11-07, AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver 512.800.72): native boot and cave gameplay validated.
+# Real visibility queries fix pink skin; geometry primitive ownership fixes the captured terrain gaps. Full-game coverage remains open.
+# Handheld mode (docked=0 below): the game then targets 1080p (a 1920x1080 window with a 1048x590 render target) instead of its docked 2880x1620 / 2304x1296 on this 1080p screen.
 status	wip
 tested	v458752 AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, Android 15)
 package	org.nx2a.t040074a01bf12000
 orientation	landscape
-# agl's NDSR upscaler network (24 tensor-core compute kernels, shader_map.tsv agl_ndsr.pck): no DLSS on Android. The replay skips their dispatches and scales the 1536x864 colour input
-# into the 2304x1296 output bilinearly (gfx_vk_exec.c upscaler_replace); the game composes from that output. The network left the output untouched here: a flat (0.3, 0.3, 1) frame
+# agl NDSR: 24 spatial neural upscaler alternatives. Native compute is corrected but remains much slower on Adreno.
+# Compatible dispatches use a spatial blit; DM_VK_UPSCALER_CUBIC=1 selects hardware Catmull-Rom only for audited linear-output keys.
+# Original SASS and translated SPIR-V classify 16 linear-output variants and 8 encoded-output variants (README.md).
 env	DM_VK_UPSCALER_CS=131d7dcc054f92b9,c56db3d5a0f1b5af,7629d857a0a93833,eb0af4c68c522092,75e2ecd80c1e9fb8,5e0110401b4a3d8f,0e351bd8ef324466,7a8dcb28fa38987d,3b716012fcd10575,446761e211ec30d8,5c5876712b1ebd78,9e5597e2fcfc3c2f,8df4d4ba8fa94292,06946f57dd8833c3,a9fed0568668bf97,1c144a902af468de,7ae23d53ffb1c2ff,14a8aaf3e0a9edbd,c8910045dc5b59af,1a4c427f99c58569,f8a6a2e42fe156a6,d19ea940b265456f,f585ba048398f697,f13b72178b0d5e9f
-# Handheld mode: the game then targets 1080p (Bananza: a 1920x1080 window with a 1048x590 render target) instead of its docked 2880x1620 / 2304x1296 on this 1080p screen.
-# Odin 3, Bananza tunnel: frame time p50 33 → 17 ms, p95 36 → 35 ms (with the GPU floor below)
+env	DM_VK_UPSCALER_LINEAR_CS=c56db3d5a0f1b5af,7629d857a0a93833,75e2ecd80c1e9fb8,5e0110401b4a3d8f,7a8dcb28fa38987d,3b716012fcd10575,5c5876712b1ebd78,9e5597e2fcfc3c2f,06946f57dd8833c3,a9fed0568668bf97,7ae23d53ffb1c2ff,14a8aaf3e0a9edbd,1a4c427f99c58569,f8a6a2e42fe156a6,f585ba048398f697,f13b72178b0d5e9f
+# First-launch setting only: use handheld mode on the physical 1080p display. Existing device/user settings are preserved on install.
 setting	docked=0
 setting	overlay=1
 setting	rumble=1
 setting	fps=1
-# The Adreno governor parks at 660 MHz under a steady load; the 967 MHz floor (through su, Magisk) cut p95 frame time 47 → 36 ms in the docked tunnel
+# The Adreno governor parks at 660 MHz under a steady load; the 967 MHz floor (through su, Magisk) cut p95 frame time 47 → 36 ms in the docked tunnel. Without su it is refused and logged, nothing else
 env	DM_GPU_MIN_FREQ=967000000
+# Cave tuning (2026-11-07, handheld). ADPF 90 is an 11.11 ms CPU work hint, independent of game pacing/display rate. Completed-frame accounting remains off after its latency/throughput A/B.
+# DM_VK_PASS_SPLIT=128 measured best in handheld (frame work p50 16.66 ms against 17.4 ms unsplit; 256 was between)
+env	DM_NVN_ASYNC=1
+env	DM_VK_DYN_SSBO=1
+env	DM_ADPF_TARGET_FPS=90
+env	DM_ADPF_COMPLETE=0
+env	DM_VK_CB_DRAWS=512
+env	DM_VK_PASS_SPLIT=128
+env	DM_VK_PASS_SPLIT_DEPTH=1
+env	DM_VK_GS_CLAIM_BUCKET=1
+env	DM_VK_UPSCALER_CUBIC=1
 
 # The host's adaptive frame rate (60 → 40 → 30 fps steps, perf_android.c) is off: the game paces itself by whole 60 Hz vsyncs (present interval 1, 2, 3) and steps its clock by them, so a
 # 40 fps presentation it cannot name ran it in slow motion. With it off the frames stay on screen exactly the interval the game set

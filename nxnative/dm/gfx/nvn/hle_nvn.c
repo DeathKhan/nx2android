@@ -763,8 +763,13 @@ NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
 NVN(nvnProgramFinalize, void, NVNprogram *p) {
-    pthread_mutex_lock(&g_sub_mu); mtl_prog_forget((const prog_t *)p); pthread_mutex_unlock(&g_sub_mu);
-    mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0;
+    // Submitted binds retain this CPU object until replay. Wait before taking the
+    // submission lock: queued jobs need that lock to consume the program's keys.
+    // GPU pipelines own their compiled shaders after replay; no GPU idle is needed.
+    nvn_drain();
+    pthread_mutex_lock(&g_sub_mu);
+    mtl_prog_forget((const prog_t *)p); mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0;
+    pthread_mutex_unlock(&g_sub_mu);
 }
 // A program's per-stage keys, one record per SetShaders, found by prog_t.serial (bit i of ok = stage i computed). A game may copy an NVNprogram after SetShaders and draw with
 // the copy, as on the console the struct holds the whole program: Unity does (Ori and the Will of the Wisps: 135 single-stage programs a boot). The copy carries the serial
@@ -829,6 +834,10 @@ int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("[RED] ProgramSetShaders stage count %d", n); return 0; }
+    // Replacing a live program has the same queued-pointer lifetime as finalizing
+    // it. First-time initialization has no prior users and keeps the fast path.
+    int replacing = o->serial != 0;
+    if (replacing) { nvn_drain(); pthread_mutex_lock(&g_sub_mu); }
     mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
     // The keys are computed here (see prog_key in nvn_obj.h): the control section is only guaranteed valid during this call; the code area lives in a memory pool and stays valid while the program is in use
     static int dump = -1; if (dump < 0) dump = getenv("DM_NVN_SHDUMP") != NULL;
@@ -856,6 +865,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     }
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     mtl_prog_prefetch(o);   // its libraries load in the background now, not at its first draw
+    if (replacing) pthread_mutex_unlock(&g_sub_mu);
     return 1;
 }
 
@@ -865,7 +875,7 @@ NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
 static uint64_t nvn_fence_now(void); static int nvn_fence_wait(uint64_t f, uint64_t timeout_ns, int kind);
-static uint64_t g_frame;
+static _Atomic uint64_t g_frame;
 // DM_NVN_SEQ=N (live, a DM_CTL env line): the next N frames' submissions, fences, acquires, sync waits and presents in order, with thread and time
 // (how Xenoblade Chronicles 3's render thread was found waiting in SyncWait on the acquire sync for its whole frame's GPU work)
 static int seq_on(void) { static uint64_t until; const char *e = getenv("DM_NVN_SEQ"); if (e && atoi(e)) { until = g_frame + (uint64_t)atoi(e); setenv("DM_NVN_SEQ", "0", 1); } return g_frame < until; }
@@ -1506,7 +1516,7 @@ void dm_gfx_suspend(int on) {
 // Whatever else touches the replay's state from the game's threads (memory pools made and destroyed, CPU texel readback) takes g_sub_mu, which the replay thread holds per job
 enum { JOB_SUBMIT, JOB_PRESENT }; enum { JOB_RING = 4096 };
 #define ASYNC_FENCE (1ull << 63)
-typedef struct { int kind, n; uint64_t *h; NVNqueue *q; const tex_t *tex; double period; int crop[4]; uint64_t *ticket; uint64_t t_enq; } nvn_job;
+typedef struct { int kind, n; uint64_t *h; NVNqueue *q; const tex_t *tex; double period; int crop[4]; uint64_t *ticket; uint64_t t_enq, frame; } nvn_job;
 // The frame's timeline under asynchronous replay, logged every 300 waits: from a sync wait's return to the next submission (the game), the job's wait in the queue,
 // its replay, and what the GPU still had to do after it (Xenoblade Chronicles 3 waits for each frame's GPU work before submitting the next, so its frame is all four)
 static uint64_t g_tl_enq, g_tl_start, g_tl_end, g_tl_wret, g_tl_sum[4], g_tl_n, g_tl_jobs, g_tl_lastjob;
@@ -1515,16 +1525,21 @@ static uint64_t g_replaying;   // the job being replayed (nvn_replaying_job)
 static uint64_t g_job_enq, g_job_done, g_job_fence[JOB_RING];   // jobs queued and replayed so far; the commit fence each left (by job number)
 static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_job_cv = PTHREAD_COND_INITIALIZER, g_jobdone_cv = PTHREAD_COND_INITIALIZER;
 static int nvn_async(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_ASYNC"); on = e && atoi(e); } return on; }
-static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h);
+static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h, uint64_t frame);
+__attribute__((weak)) void dm_perf_replay_work(uint64_t frame, uint64_t begin, uint64_t end) { (void)frame; (void)begin; (void)end; }
 static void *replay_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "nvn replay"); dm_perf_replay_thread();
     for (;;) {
         pthread_mutex_lock(&g_job_mu); while (!g_njob) pthread_cond_wait(&g_job_cv, &g_job_mu);
         nvn_job j = g_jobs[0]; pthread_mutex_unlock(&g_job_mu);
-        if (j.kind == JOB_SUBMIT) { uint64_t ts = now_ns(); __atomic_store_n(&g_replaying, g_job_done + 1, __ATOMIC_RELAXED); submit_now(j.q, j.n, (const NVNcommandHandle *)j.h); __atomic_store_n(&g_replaying, 0, __ATOMIC_RELAXED);
+        if (j.kind == JOB_SUBMIT) { uint64_t ts = now_ns(); __atomic_store_n(&g_replaying, g_job_done + 1, __ATOMIC_RELAXED); submit_now(j.q, j.n, (const NVNcommandHandle *)j.h, j.frame); __atomic_store_n(&g_replaying, 0, __ATOMIC_RELAXED);
             static nvn_job prev; if (prev.h) { for (int i = 0; i < prev.n; i++) free((void *)(uintptr_t)prev.h[i]); free(prev.h); }   // the copies (sub_copy) go one submission later
             prev = j; g_tl_enq = j.t_enq; g_tl_start = ts; g_tl_end = now_ns(); }
-        else { gfx_enter(); uint64_t t0 = now_ns(); uint64_t tk = mtl_present(j.tex, j.period, j.crop); __atomic_store_n(j.ticket, tk, __ATOMIC_RELEASE); gfx_leave(); atomic_fetch_add(&g_nvn_ns, now_ns() - t0); }
+        else { gfx_enter();
+#ifdef __ANDROID__
+            mtl_set_frame(j.frame);   // The queued present closes the frame it captured, not the guest's newer frame.
+#endif
+            uint64_t t0 = now_ns(); uint64_t tk = mtl_present(j.tex, j.period, j.crop); __atomic_store_n(j.ticket, tk, __ATOMIC_RELEASE); gfx_leave(); atomic_fetch_add(&g_nvn_ns, now_ns() - t0); }
         pthread_mutex_lock(&g_job_mu);
         memmove(g_jobs, g_jobs + 1, sizeof *g_jobs * (size_t)--g_njob); g_job_done++; g_job_fence[g_job_done % JOB_RING] = mtl_last_fence();
         pthread_cond_broadcast(&g_jobdone_cv); pthread_mutex_unlock(&g_job_mu);
@@ -1538,7 +1553,7 @@ static uint64_t job_push(nvn_job j) {   // → the job's number
     static pthread_once_t once = PTHREAD_ONCE_INIT; void replay_start(void); pthread_once(&once, replay_start);
     pthread_mutex_lock(&g_job_mu);
     if (g_njob == g_capjob) { g_capjob = g_capjob ? 2 * g_capjob : 64; g_jobs = realloc(g_jobs, sizeof *g_jobs * (size_t)g_capjob); }
-    j.t_enq = now_ns(); g_jobs[g_njob++] = j; uint64_t id = ++g_job_enq;
+    j.t_enq = now_ns(); j.frame = dm_nvn_frame_count(); g_jobs[g_njob++] = j; uint64_t id = ++g_job_enq;
     pthread_cond_signal(&g_job_cv); pthread_mutex_unlock(&g_job_mu);
     return id;
 }
@@ -1571,7 +1586,12 @@ static int nvn_fence_wait(uint64_t f, uint64_t timeout_ns, int kind) {
         if (g_tl_n == 300) { LOG("[timeline] per frame: game gap %.1f ms, queue delay %.1f, replay %.1f, GPU tail %.1f; %.1f jobs", g_tl_sum[0] / 3e8, g_tl_sum[1] / 3e8, g_tl_sum[2] / 3e8, g_tl_sum[3] / 3e8, g_tl_jobs / 300.0); memset(g_tl_sum, 0, sizeof g_tl_sum); g_tl_n = 0; g_tl_jobs = 0; } }
     return r;
 }
-static void nvn_drain(void) { if (nvn_async()) job_wait(g_job_enq, ~0ull); }   // every job queued so far replayed
+static void nvn_drain(void) {   // every job queued before this guest-thread lifecycle call has replayed
+    if (nvn_async()) {
+        pthread_mutex_lock(&g_job_mu); uint64_t target = g_job_enq; pthread_mutex_unlock(&g_job_mu);
+        job_wait(target, ~0ull);   // no submission/job lock held while the replay worker progresses
+    }
+}
 static void replay_lock(void) { if (nvn_async()) pthread_mutex_lock(&g_sub_mu); }
 static void replay_unlock(void) { if (nvn_async()) pthread_mutex_unlock(&g_sub_mu); }
 // Under asynchronous replay the game may record into its command memory again before the replay thread reaches what it submitted (Unicorn Overlord's skipped
@@ -1604,15 +1624,18 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     if (nvn_async()) { uint64_t *c = malloc(sizeof *c * (size_t)(n > 0 ? n : 1)); for (int i = 0; i < n; i++) c[i] = sub_copy(h[i]); ((queue_t *)q)->submits++;
         static uint64_t ns, last; if (++ns % 600 == 0) { LOG("[nvn] submissions copied for the replay thread: %.2f MB each (last 600)", (g_flat_bytes - last) / 600.0 / 1048576); last = g_flat_bytes; }
         job_push((nvn_job){JOB_SUBMIT, n, c, q}); return; }
-    submit_now(q, n, h);
+    submit_now(q, n, h, dm_nvn_frame_count());
 }
-static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h) {
+static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h, uint64_t frame) {
     SEQ("submit %d handles", n);
     dm_host_mutex_lock(&g_sub_mu);
     dm_host_work++; mtl_prepare(); dm_host_work--;
     gfx_enter();
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     if (!nvn_async()) ((queue_t *)q)->submits++;   // (counted at the hand-off under asynchronous replay)
+#ifdef __ANDROID__
+    mtl_set_frame(frame);   // Replay owns frame attribution across every cut of this job.
+#endif
     mtl_queue_activate(((const queue_t *)q)->serial);
     mtl_set_queue_origin_lower_left(((const queue_t *)q)->origin_ll);
     nvn_cap_submit(n, (const uint64_t *)h);   // DM_NVN_CAPTURE (nvn_capture.inc)
@@ -1623,7 +1646,8 @@ static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h) {
     mtl_exec_rest(NULL, 0);
     mtl_sub_commit();
     pthread_mutex_unlock(&g_sub_mu);
-    uint64_t dw = now_ns() - t0;
+    uint64_t end = now_ns(), dw = end - t0;
+    dm_perf_replay_work(frame, t0, end);
     atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
     uint64_t i1, y1; thr_counts(&i1, &y1); uint64_t dc = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, di = i1 - i0;
     atomic_fetch_add(&g_cum_sub_cyc, y1 - y0); atomic_fetch_add(&g_cum_sub_sys_ns, thr_sys_ns() - s0); atomic_fetch_add(&g_cum_sub_wall_ns, dw);
@@ -1723,7 +1747,8 @@ static int present_itv(const win_t *o);
 static int link_wait(const win_t *o, uint64_t timeout_ns);
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
-__attribute__((weak)) void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { (void)pace_ns; (void)pq_ns; }   // Android (perf_android.c): a frame's work starts, for the CPU performance hint
+__attribute__((weak)) void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { (void)pace_ns; (void)pq_ns; }
+__attribute__((weak)) void dm_perf_frame_start_id(uint64_t frame, uint64_t pace_ns, uint64_t pq_ns) { (void)frame; dm_perf_frame_start(pace_ns, pq_ns); }   // Android (perf_android.c): a frame's work starts, for the CPU performance hint
 __attribute__((weak)) uint64_t dm_present_period_adapt(uint64_t period) { return period; }   // Android (perf_android.c): a longer period the frames can hold steadily
 int mtl_probe_ramp_on(void);   // nvn_mtl.m: DM_FSTEP_PROBE_RAMP (default on; ab with DM_AB)
 __attribute__((weak)) void dm_yield_top(char *out, size_t n) { if (n) snprintf(out, n, "-"); }   // hle_thread.c: the threads that yielded most since the last call; none in graphics unit tests
@@ -1731,7 +1756,7 @@ __attribute__((weak)) void dm_thread_cpu(char *out, size_t n, double secs) { (vo
 void mtl_res_stats(char *out, size_t n);
 void mtl_barrier_stats(uint64_t *skip, uint64_t *full);
 extern uint32_t mtl_present_qos(void);
-static uint64_t g_frame;
+static _Atomic uint64_t g_frame;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 static uint64_t g_fs_start, g_fs_wait;   // frame step (fstep_tick): when the first acquire after a present returned (the frame's start, 0 = none yet), and its pacing wait
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
@@ -1783,7 +1808,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     { static int w = -1; if (w < 0) { const char *ar = getenv("DM_NVN_ACQ_REPLAYED"); w = !(ar && !atoi(ar)); } if (w && nvn_async()) job_wait(g_job_enq, ~0ull); }
     if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = acq_now || *idx >= 4 ? nvn_fence_now() : o->done[*idx]; }   // (fenced 2: an acquire sync, waited through mtl_wait_acq for the wait ledger)
     SEQ("acquire %d sync %p", *idx, (void *)s);   // The swapchain texture becomes available once the commits before this point have completed
-    if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; dm_perf_frame_start(pace_ns, pq_ns); }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
+    if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; dm_perf_frame_start_id(g_frame, pace_ns, pq_ns); }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
 // The older API (NVN 53, Super Mario 3D World + Bowser's Fury): the queue waits for the texture on the GPU and no sync object is handed out. The host replays in submission order, so later commands already come after earlier presents; the same as WindowAcquireTexture without a sync object
@@ -2454,7 +2479,11 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     dump_frame();
     { void dm_vi_frame_queued(uint64_t); dm_vi_frame_queued(g_frame); }   // the layer's frame history (hle_vi.c), numbered as GetLatestFrameNumber
     if (g_frame % TWIN == 0) tsummary(g_frame);
-    mtl_set_frame(g_frame);
+#ifdef __ANDROID__
+    if (!nvn_async()) mtl_set_frame(g_frame);   // Queued Android work carries its own frame ID.
+#else
+    mtl_set_frame(g_frame);   // Metal also advances capture and A/B state here.
+#endif
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
     g_hold_ring[o->presents % 16] = (uint8_t)present_itv(o);

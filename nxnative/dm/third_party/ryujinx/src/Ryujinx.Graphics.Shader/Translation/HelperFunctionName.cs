@@ -17,5 +17,6 @@ namespace Ryujinx.Graphics.Shader.Translation
         ShuffleXor,
         TexelFetchScale,
         TextureSizeUnscale,
+        Hmma16816F16Shuffle,
     }
 }

@@ -4,6 +4,9 @@
 // The translator numbers every stage's bindings from 0 in set 0; at module creation each stage's bindings move to a set of its own (vertex 0, fragment 1,
 // geometry 2, tessellation 3 / 4; compute 0) by rewriting the DescriptorSet decorations, so a program's stages never collide.
 #include "gfx_vk.h"
+#include "gfx_vk_ubo_extent.h"
+#include "gfx_vk_gs_claim.h"
+#include "dmsh_abi.h"
 #include "nvn_hmap.h"
 #include "zstd.h"
 #include <CommonCrypto/CommonDigest.h>
@@ -305,6 +308,16 @@ static int spv_tbl_shrink(uint32_t *w, uint32_t nw, const uint32_t *tv, int ntv,
     free(ptr_of); free(pointee); free(arr_len); free(cval); free(ctype);
     return ok;
 }
+// A pipeline currently combines vertex, fragment and geometry sets. Reserve at most one third of the total dynamic-storage limit per stage.
+// Only directly bound single storage buffers participate; arrays, UBO-derived pointers, compute and unsupported alignment keep their static descriptor.
+static uint32_t storage_dynamic_limit(int stage, int enabled, const VkPhysicalDeviceLimits *limits) {
+    VkDeviceSize a = limits->minStorageBufferOffsetAlignment;
+    if (!enabled || stage < 0 || stage >= 3 || !a || a > 256 || 256 % a) return 0;
+    return limits->maxDescriptorSetStorageBuffersDynamic / 3;
+}
+static int storage_dynamic_binding(const dmsv_bind *b, uint32_t used, uint32_t limit) {
+    return used < limit && b->desc == RD_SSBO && b->count == 1 && (b->kind == RK_GS_CLAIM || (b->kind == RK_SBUF && b->reg >= 0 && b->reg < 16));
+}
 static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet);
 vkshader_t *vk_shader(uint64_t key, int stage) { return vk_shader_q(key, stage, 0); }
 // A geometry shader's input primitive is fixed when it is translated, and Maxwell's shader header doesn't give it: shader_vk.py translates each geometry shader for
@@ -418,22 +431,59 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
           else if (op == 12 && n >= 5 && glsl && w[i + 3] == glsl) { uint32_t *x = &w[i + 4];   // OpExtInst: FMin 37 → NMin 79, FMax 40 → NMax 80, FClamp 43 → NClamp 81
               if (*x == 37) *x = 79; else if (*x == 40) *x = 80; else if (*x == 43) *x = 81; }
           i += n; } }
+    // Qualcomm/Turnip repeat geometry execution for each output vertex. Claim each primitive in
+    // fresh host-owned storage, only when analysis proves suppressed atomic results cannot affect raster output.
+    // The descriptor is synthetic, never part of the guest ABI or on-disk reflection. Startup A/B: DM_VK_GS_CLAIM=0.
+    if (stage == 2 && (V.props.vendorID == 0x5143 || strstr(V.props.deviceName, "Adreno"))) {
+        static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_GS_CLAIM"); on = !(e && !atoi(e)); }
+        if (on && s->nbind < 95) { uint32_t n2 = 0, iv = 0; char why[128];
+            uint32_t *w2 = spv_gs_claim(w, nw, (uint32_t)s->set, 95, &n2, &iv, why, sizeof why);
+            if (w2) {
+                dmsv_bind *b = malloc((size_t)(s->nbind + 1) * sizeof *b);
+                if (b) { memcpy(b, s->b, (size_t)s->nbind * sizeof *b);
+                    b[s->nbind++] = (dmsv_bind){.kind = RK_GS_CLAIM, .desc = RD_SSBO, .binding = 95, .count = 1, .reg = -1};
+                    s->b = b; s->gs_claim_invocations = iv; free(w); w = w2; nw = n2;
+                    VKLOG("shader %016llx: geometry side effects claimed once per primitive (%s)", (unsigned long long)key, why);
+                } else free(w2);
+            } else if (strcmp(why, "no memory side effects")) VKLOG("[RED] shader %016llx: geometry primitive claim declined: %s", (unsigned long long)key, why);
+        }
+    }
+    // Bound graphics uniform shadow copies from the final base module, not the declared 64 KiB array size. Unknown uses stay full.
+    // This is host analysis only: no shader code/bundle changes. External alternative modules bypass these bounds in cbuf_desc.
+    if (stage >= 0 && stage < 3) {
+        int any = 0; for (int i = 0; i < s->nbind; i++) any |= s->b[i].kind == RK_CBUF;
+        if (any) { uint32_t ext[96]; uint8_t seen[16] = {0};
+            vk_spv_ubo_extents(w, nw, (uint32_t)s->set, ext, 96);
+            for (int i = 0; i < s->nbind; i++) { const dmsv_bind *b = &s->b[i];
+                if (b->kind != RK_CBUF || b->reg < 0 || b->reg >= 16) continue;
+                uint32_t n = b->desc == RD_UBO && b->count == 1 && b->binding < 96 ? ext[b->binding] : 0;
+                if (!seen[b->reg]) { s->ubo_extent[b->reg] = n; seen[b->reg] = 1; }
+                else if (!n || !s->ubo_extent[b->reg]) s->ubo_extent[b->reg] = 0;   // every alias of the guest slot must be bounded
+                else if (n > s->ubo_extent[b->reg]) s->ubo_extent[b->reg] = n;
+            }
+        }
+    }
     spv_io_locs(w, nw, &s->in_locs, &s->out_locs);
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
     VkResult vr = vkCreateShaderModule(V.dev, &ci, NULL, &s->mod); s->spv = w; s->nspv = nw;
-    if (vr) { VKLOG("[RED] shader %016llx: vkCreateShaderModule %d", (unsigned long long)key, vr); free(w); free(s); nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); return NULL; }
+    if (vr) { VKLOG("[RED] shader %016llx: vkCreateShaderModule %d", (unsigned long long)key, vr); free(w); if (s->gs_claim_invocations) free((void *)s->b); free(s); nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); return NULL; }
     // descriptor set layout: one entry per binding
     // The game's constant buffers and the driver segment are dynamic uniform buffers: their offset is given when the set is bound, so a set matches any draw's
     // with the same buffers (Unity updates a constant buffer before nearly every draw, and each update is a shadow at a new offset: NEO made a new set for
     // 94% of its draws, 5 ms a frame). Up to half the device's limit per stage, as the vertex and fragment sets share a pipeline layout. DM_VK_DYN_UBO=0: none.
     static int dyn_on = -1; if (dyn_on < 0) { const char *e = getenv("DM_VK_DYN_UBO"); dyn_on = !(e && !atoi(e)); }
     uint32_t dynmax = dyn_on ? V.props.limits.maxDescriptorSetUniformBuffersDynamic / 2 : 0;
+    uint32_t sdmax = storage_dynamic_limit(stage, V.dyn_ssbo, &V.props.limits), nubo = 0, nsbuf = 0;
+    if (V.dyn_ssbo) { static int noted; if (!noted++) VKLOG("dynamic storage descriptors enabled (DM_VK_DYN_SSBO, startup): max %u per graphics stage, alignment %llu; buffers and ranges unchanged",
+        storage_dynamic_limit(0, 1, &V.props.limits), (unsigned long long)V.props.limits.minStorageBufferOffsetAlignment); }
     VkDescriptorSetLayoutBinding lb[96]; uint32_t nl = 0;
     for (int i = 0; i < s->nbind && nl < 96; i++) {
         const dmsv_bind *b = &s->b[i]; if (s->tbl[i]) continue;   // (in the table set)
-        int dyn = b->desc == RD_UBO && (b->kind == RK_CBUF || b->kind == RK_DRV) && b->count == 1 && (uint32_t)s->ndyn < dynmax;
-        s->dyn[i] = (uint8_t)dyn; s->ndyn += dyn;
-        lb[nl++] = (VkDescriptorSetLayoutBinding){b->binding, dyn ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : desc_type(b->desc), b->count ? b->count : 32, stage_flag(stage), NULL};
+        int du = b->desc == RD_UBO && (b->kind == RK_CBUF || b->kind == RK_DRV) && b->count == 1 && nubo < dynmax;
+        int ds = storage_dynamic_binding(b, nsbuf, sdmax);
+        s->dyn[i] = ds ? 2 : (uint8_t)du; s->ndyn += du || ds; nubo += du; nsbuf += ds;
+        VkDescriptorType dt = ds ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : du ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : desc_type(b->desc);
+        lb[nl++] = (VkDescriptorSetLayoutBinding){b->binding, dt, b->count ? b->count : 32, stage_flag(stage), NULL};
     }
     s->dsl = shader_layout(lb, nl);
     nvn_hm_put(&g_shaders, &hk, s);
@@ -618,17 +668,18 @@ static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im,
     pthread_mutex_unlock(&g_sh_mu);
     return m;
 }
-// static buffers: Ryujinx's support buffer (render scales 1.0, nothing else set: as nvn_mtl.m support_buf) and 64 KB of zeros (unbound uniform slots, driver segments nobody reads)
+// Process-lifetime buffers: Ryujinx support values, 64 KB of zeros, and the immutable all-set raw-global write bitmap (Android does not consume the write log).
 static VkBuffer static_buf(int which) {
-    static VkBuffer b[2]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static VkBuffer b[3]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     { VkBuffer r = __atomic_load_n(&b[which], __ATOMIC_ACQUIRE); if (r) return r; }   // made already: no lock (every draw binds them)
     pthread_mutex_lock(&mu);
     if (!b[which]) {
-        VkBuffer nb; VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 65536, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        VkDeviceSize size = which == 2 ? DMSH_GMEM_MAP_ENTRIES / 8 : 65536;
+        VkBuffer nb; VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
         VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &nb)); VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, nb, &req);
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
         VkDeviceMemory m; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, nb, m, 0));
-        void *p; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p)); memset(p, 0, 65536);
+        void *p; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p)); memset(p, which == 2 ? 0xff : 0, size);
         if (which == 0) for (int i = 0; i < 73; i++) *(float *)((uint8_t *)p + 192 + 16 * i) = 1.0f;   // render_scale[i].x (SupportBuffer.cs layout)
         __atomic_store_n(&b[which], nb, __ATOMIC_RELEASE);   // published once filled
     }
@@ -637,6 +688,7 @@ static VkBuffer static_buf(int which) {
 }
 VkBuffer vk_support_buffer(void) { return static_buf(0); }
 VkBuffer vk_zero_buffer(void) { return static_buf(1); }
+VkBuffer vk_gmem_log_disabled(void) { return static_buf(2); }
 // a shader's c1 constants: copied once into a buffer of their own (the bundle bytes do not change; the reflection is never compressed)
 void vk_shader_c1(vkshader_t *s, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *len) {
     if (!s->c1_len) { *buf = vk_zero_buffer(); *off = 0; *len = 65536; return; }

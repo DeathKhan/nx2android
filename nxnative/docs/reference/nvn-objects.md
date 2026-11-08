@@ -305,6 +305,13 @@ Games read this count as a position in their own command memory and size their h
 - **Found on:** [Fire Emblem Fortune's Weave](../../dm/games/04007EF01F8AE000/README.md), left on the title screen until the opening demo: 5 of 5 runs crashed before, 0 of 7 after, each logging one drop from the active queue.
 - **Check:** `t_queue_origin` finalizes a program bound in the active queue and in a saved one, poisons its memory and switches back: both lose it; finalizing the fragment program of a composite leaves the vertex stage alone as the effective program.
 
+### Program destruction waits for queued CPU replay
+
+- **Symptom:** with `DM_NVN_ASYNC=1`, a submitted program bind can read a finalized or replaced `prog_t`, even though finalization took the submission mutex. Depending on address reuse, the result can be an invalid key, a wrong shader, or a stale-memory read.
+- **Cause:** asynchronous submission copies the command records, while `OP_BIND_PROGRAM` still points to the guest's program object. The mutex excludes a job currently replaying, but does not wait for jobs still queued. The permanent per-serial key record preserves shader keys and copied control bytes; it does not own the `prog_t` containing that serial. Both host backends share this recording path.
+- **Fix:** `ProgramFinalize` drains jobs queued before the lifecycle call, then holds the submission mutex through forgetting, releasing and invalidating the program. Replacing an already-set program with `ProgramSetShaders` uses the same ordering; first-time setup remains immediate. The drain snapshots its target under the job mutex and waits with neither mutex held. Compiled host pipelines already own the shader after replay, so this adds no GPU-idle wait or per-draw work. Code memory pools retain their existing finalization drain.
+- **Check:** `python3 tests/test_nvn_program_lifetime.py` runs the actual queue-copy, wait, lifecycle and key-lookup functions under ASan/UBSan. A queued bind reads its original program, copied control bytes and code before another thread can finalize/free or replace them. It also checks invalid setup, first-time setup with unrelated queued work, synchronous finalization, and lock ordering. This is a reproduced lifetime race and regression test; it is not evidence that this race caused Bananza's terrain artifacts. Submitting a stale command record only after its program was finalized is outside the protection of this queued-replay drain.
+
 ### Fence syncs recorded in command buffers
 
 - **Symptom:** `nvnCommandBufferFenceSync` unimplemented, every `SyncWait` timed out at once.
