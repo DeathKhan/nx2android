@@ -241,7 +241,10 @@ def spirv_bindings(spv):
 
 # Handle decoding: as dmsh_build.py decode_tex / decode_ubo_tex / reflect (names: <stage>_t<type>_cb<slot>_<handle>, <stage>_c<n>, <stage>_s<n>, <stage>_i…)
 TEX_BASE, IMG_BASE, IMG_SLOTS, SEPTEX_BASE, SEPTEX_SLOT0, SAMP_BASE = 0x20, 0x120, 8, 0x168, 128, 0x568
-SSBO = {'vs': 0x110, 'cs': 0x310, 'ps': 0x510, 'ts': 0x670, 'ms': 0x770}   # each stage's storage buffer table in c0 (dmsh_abi.h DMSH_C0_SSBO_*; ts / ms: NVN2's task and mesh stages)
+# each stage's storage buffer table in c0 (dmsh_abi.h DMSH_C0_SSBO_*; ts / ms: NVN2's task and mesh stages). The geometry stage's was missing here (the Mac chain's dmsh_build.py had it):
+# a geometry shader's storage buffers got no slot and the backend bound zeros to them. Donkey Kong Bananza's culling geometry shader 5d537f7630ec3671 adds each terrain chunk's surviving
+# triangles to its indirect draw record through storage buffer 0 (c0 0x410): with zeros bound the counts stayed 0 and the chunks' colour passes drew nothing (black floors, rooms in)
+SSBO = {'vs': abi.C0_SSBO_VS, 'cs': abi.C0_SSBO_CS, 'gs': abi.C0_SSBO_GS, 'ps': abi.C0_SSBO_PS, 'ts': abi.C0_SSBO_TS, 'ms': abi.C0_SSBO_MS}
 GMEM_MAP_CB_SLOT, GMEM_LOG_CB_OFFSET = abi.GMEM_MAP_CB_SLOT, abi.GMEM_LOG_CB_OFFSET   # dmsh_abi.h: the sentinel constant buffer slot of the raw global memory table, and the write log's offset under it (GlobalToStorage.GmemMapCbSlot / GmemLogCbOffset)
 def classify(stage, b, res):
     nm = b['name']; e = dict(b)

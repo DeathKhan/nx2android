@@ -1071,7 +1071,7 @@ int dm_sdk_ounce(void);   // loader.c: the game's sdk is built for the Switch 2 
 static void drv_segment(int st, int bank, uint8_t *d, int dyn) {
     memset(d, 0, 0x1000);
     if (bank == 0) {
-        int base = st == 0 ? 0x110 : st == 5 ? 0x310 : st == 1 ? 0x510 : -1;
+        int base = st == 0 ? DMSH_C0_SSBO_VS : st == 5 ? DMSH_C0_SSBO_CS : st == 1 ? DMSH_C0_SSBO_PS : st == 2 ? DMSH_C0_SSBO_GS : -1;   // (the geometry stage's table was left out before: a geometry shader reading its storage buffer addresses from c0 read 0)
         if (base >= 0) for (int r = 0; r < 16; r++) { uint64_t a = S.ssbo[st][r].addr; uint32_t n = (uint32_t)S.ssbo[st][r].size; memcpy(d + base + 16 * r, &a, 8); memcpy(d + base + 16 * r + 8, &n, 4); }
         if (st != 5) { const float mp = 2047.0f; memcpy(d + 0x610, &mp, 4); memcpy(d + 0x644, &g_draw_binst, 4); }
         else { memcpy(d + 0x200, g_dispatch, 12); if (dm_sdk_ounce()) memcpy(d + 4, g_dispatch, 12);   // NVN2 compute reads the workgroup counts at +4 (DMSH_C0_DISPATCH_NVN2), below its per-shader layout
