@@ -1,6 +1,15 @@
 # The rewriter's patches of Nintendo SDK module builds (sdk), which several games can ship: dm/tools/patch_nso.py applies those of a module's NSO build ID, whatever the game.
 # A patch of a game's own module (main) goes in its profile's patches.py (dm/games/<id>/patches.py). CUTS as described in patch_nso.py ("Registered patches")
 CUTS = {
+  # The Legend of Zelda: Ocarina of Time v131072 sdk (SDK 22.2.8, build 1643a838…): nn::os's context start signs the entry it jumps to with the IA key on the thread that makes the
+  # context (pacia x16 / x17 with the stack top as modifier, +0x16d0e8 / +0x16d0f8) and the started context checks it with autiasp (+0x16d40c) before branching there. On the Odin 3
+  # (Snapdragon 8 Elite, FPAC) that check traps (SIGILL) on nn.npln.GrpcDispatcher's start though the GA-key hash over the same values passes one instruction earlier; on the Mac it
+  # passes. The three become NOPs: the entry goes unsigned from the pacia to the autiasp, and the code's own compare against the entry's address (+0x16d41c) still guards it
+  '1643a838814f9c10c696f930ed681e7f': [
+    (0x16d0e8, '3001c1da', '1f2003d5', 'context start: pacia x16,x9 (the entry signed with the IA key) → nop'),
+    (0x16d0f8, '3101c1da', '1f2003d5', 'context start: pacia x17,x9 (the same, for the compare) → nop'),
+    (0x16d40c, 'bf2303d5', '1f2003d5', 'context start: autiasp (the entry authenticated against the stack top; traps with FPAC on Android) → nop'),
+  ],
   # Kingdom Battle 1.9.589692, SDK 4.4.0: the older VammManager reserves a
   # full 1 GB node area (constructor +0x93dd8, occupied range +0x93e98).
   # Snowdrop's compact 3 GB region follows its small metadata reservation;
