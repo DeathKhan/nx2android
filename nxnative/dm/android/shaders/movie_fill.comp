@@ -1,0 +1,23 @@
+#version 450
+// Movie fill (movie_fill_vk.c): the decoder's latest NV12 picture, read as it lies in the game's image pool (the pool's VkBuffer as a storage buffer of uint words: Y rows of
+// stride w from byte word0 x 4 of the bound range, the interleaved UV plane of stride w at w x h after them), written as RGBA8 into an intermediate storage image of the
+// picture's size, which movie_fill_vk.c then blits over the output image of a movie post-processing stage the device cannot run. One invocation per picture texel; chroma is
+// the 2x2 block's sample (no filtering). flags: 1 the BT.709 matrix (else BT.601), 2 full range (else limited: Y 16..235, C 16..240), as hle_codec_video.c DM_CODEC_CS_*
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer NV12 { uint words[]; } src;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dst;
+layout(push_constant) uniform PC { uint w, h, word0, flags; } pc;
+float byte_at(uint i) { i += pc.word0 * 4u; return float((src.words[i >> 2] >> ((i & 3u) * 8u)) & 0xffu); }
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.w || p.y >= pc.h) return;
+    uint uv = pc.w * pc.h + (p.y >> 1) * pc.w + (p.x & ~1u);
+    float y = byte_at(p.y * pc.w + p.x), cb = byte_at(uv), cr = byte_at(uv + 1u);
+    bool full = (pc.flags & 2u) != 0u;
+    y = full ? y / 255.0 : (y - 16.0) / 219.0;
+    cb = full ? (cb - 128.0) / 255.0 : (cb - 128.0) / 224.0;
+    cr = full ? (cr - 128.0) / 255.0 : (cr - 128.0) / 224.0;
+    vec3 rgb = (pc.flags & 1u) != 0u ? vec3(y + 1.5748 * cr, y - 0.187324 * cb - 0.468124 * cr, y + 1.8556 * cb)
+                                     : vec3(y + 1.402 * cr, y - 0.344136 * cb - 0.714136 * cr, y + 1.772 * cb);
+    imageStore(dst, ivec2(p), vec4(clamp(rgb, 0.0, 1.0), 1.0));
+}

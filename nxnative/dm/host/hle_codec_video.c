@@ -21,6 +21,7 @@
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
 #include "hle_movie_yuv.h"
+#include "hle_codec_video.h"   // dm_codec_last_nv12: the latest NV12 picture written into a pool, for dm/android/movie_fill_vk.c
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
 #include "hle_movie_av1.h"   // AV1 on VideoToolbox
 #ifdef __ANDROID__
@@ -119,9 +120,33 @@ static uint64_t native_size(uint32_t w, uint32_t h) { return ((uint64_t)native_s
 // with its own GPU copies rather than ReadDecoderOutputImageNv12 (Ocarina of Time's movie player: CopyBufferToTexture from picture 0 into its 1920x1080 R8 and 960x540 RG8 textures;
 // the pictures the host kept for the Read calls never reached the pool, and its movies were black). The memory pool is the GPU's too (zero-copy), so the copy reads what is written here
 #define CV_FMT_NV12 3
+// The latest NV12 picture written into a pool (dm_codec_last_nv12): where a GPU-side replacement of a game's movie post-processing finds the picture (dm/android/movie_fill_vk.c).
+// Its own leaf lock (taken under a decoder's lock by the writer, by the graphics thread alone otherwise); cleared when its pool is finalized
+static struct { uint64_t addr, gen; uint32_t w, h; int cs; } g_last_nv12;
+static pthread_mutex_t g_last_nv12_mu = PTHREAD_MUTEX_INITIALIZER;
+static void last_nv12_set(const cv_pool *p, const uint8_t *mem, const vpx_image_t *im) {
+    // the matrix and range as md_rgba picks them: what the picture declares, undeclared BT.709 from 720 lines up (DM_CODEC_CS_BT709 / DM_CODEC_CS_FULL)
+    int cs = (im->cs == VPX_CS_BT_709 || (im->cs == VPX_CS_UNKNOWN && p->h >= 720) ? DM_CODEC_CS_BT709 : 0) | (im->range == VPX_CR_FULL_RANGE ? DM_CODEC_CS_FULL : 0);
+    pthread_mutex_lock(&g_last_nv12_mu);
+    g_last_nv12.addr = (uint64_t)(uintptr_t)mem; g_last_nv12.w = p->w; g_last_nv12.h = p->h; g_last_nv12.cs = cs; g_last_nv12.gen++;
+    pthread_mutex_unlock(&g_last_nv12_mu);
+}
+static void last_nv12_forget(const cv_pool *p) {   // the pool goes: no address into it stays published
+    pthread_mutex_lock(&g_last_nv12_mu);
+    if (p->mem && g_last_nv12.addr >= (uint64_t)(uintptr_t)p->mem && g_last_nv12.addr < (uint64_t)(uintptr_t)p->mem + p->size) g_last_nv12.addr = 0;
+    pthread_mutex_unlock(&g_last_nv12_mu);
+}
+int dm_codec_last_nv12(uint64_t *addr, uint32_t *w, uint32_t *h, uint64_t *gen, int *cs) {
+    pthread_mutex_lock(&g_last_nv12_mu);
+    int ok = g_last_nv12.addr != 0;
+    if (ok) { *addr = g_last_nv12.addr; *w = g_last_nv12.w; *h = g_last_nv12.h; *gen = g_last_nv12.gen; if (cs) *cs = g_last_nv12.cs; }
+    pthread_mutex_unlock(&g_last_nv12_mu);
+    return ok;
+}
 static void pool_native_write(cv_pool *p, uint32_t i, const vpx_image_t *im) {
     if (p->fmt == CV_FMT_NV12 && p->mem && (i + 1) * native_size(p->w, p->h) <= p->size && (uint64_t)p->w * p->h * 3 / 2 <= native_size(p->w, p->h)) {
         md_nv12(im, p->mem + i * native_size(p->w, p->h), p->w, p->h);
+        last_nv12_set(p, p->mem + i * native_size(p->w, p->h), im);
         static int once; if (!once++) LOG("[codec] NV12 pool %p: pictures are written into the pool's memory (Y rows then UV at w x h, %ux%u), as the console's decoder does", (void *)p->mem, p->w, p->h);
         if (!p->native) return;
     }
@@ -197,6 +222,7 @@ HLE_FORCE("_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTy
     for (int k = 0; k < 16; k++) if (g_cv[k]) { pthread_mutex_lock(&g_cv[k]->mu); for (int i = 0; i < CV_BUFS; i++) if (g_cv[k]->buf[i].pool == p) g_cv[k]->buf[i].pool = NULL; pthread_mutex_unlock(&g_cv[k]->mu); }
     if (p->slot) g_cv_pools[p->slot - 1] = NULL;
     pthread_mutex_unlock(&g_cv_mu);
+    last_nv12_forget(p);
 #ifdef __ANDROID__
     if (p->mem) zc_slot_clear(p->mem, p->size);   // the frames shown in its picture slots go back to the codec
 #endif

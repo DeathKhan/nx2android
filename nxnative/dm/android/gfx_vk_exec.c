@@ -4,6 +4,7 @@
 // buffers) and the draw. Render passes open lazily at the first draw or clear after SetRenderTargets and close before anything that is not drawing.
 // Version 1 orders everything with whole-pipeline barriers around passes, copies and dispatches.
 #include "gfx_vk.h"
+#include "movie_fill_vk.h"   // the decoded movie picture in place of a skipped post-processing stage (passthru_replace)
 #include "gfx_vk_slot.h"
 #include "dmsh_abi.h"   // DMSH_GMEM_MAP_ENTRIES: the raw global memory write log's bits (stage_set RK_GMEM_LOG)
 #include "nvn_hmap.h"
@@ -2833,6 +2834,10 @@ static int passthru_replace(vkshader_t *cs, const p_dispatch *d) {
     why = "indirect dispatch"; if (d->ind) goto keep;
     upscaler_image in = {0}, out = {0}; why = "input/output image or view";
     if (!upscaler_image_at(S.img[5][ireg], 0, &out)) goto keep;
+    // DM_VK_MOVIE_FILL_CS names it: the decoded movie picture itself goes into its output image (movie_fill_vk.c), in place of the copy of a skipped layer's black output
+    if (vk_movie_fill_kernel(cs->key) && vk_movie_fill(out.im)) {
+        if (vk_movie_fill_note(cs->key)) VKLOG("movie fill %016llx: the decoded picture → image slot %d id %d fmt %d %ux%u", (unsigned long long)cs->key, ireg, out.tid, out.im->fmt, out.w, out.h);
+        return 1; }
     // two textures (a stage blending the network's output with the original picture): the one the size of the output, else the lower slot
     for (int k = 0; k < nt; k++) { upscaler_image c = {0};
         if (upscaler_image_at(vk_tex_slot_handle(S.tex[5], S.img[5], tregs[k]), 1, &c) && c.im != out.im && (treg < 0 || (c.w == out.w && c.h == out.h && !(in.w == out.w && in.h == out.h)))) { in = c; treg = tregs[k]; } }

@@ -27,3 +27,7 @@ env	DM_ADAPTIVE_FPS=0
 # The game only dispatches the network once per movie here (the frames themselves are drawn from the decoded planes), so the title and the opening look right without it
 env	DM_VK_SKIP_CS=c2fc2ddd604c25e7,4f41ccf24f163e0d,ba079f68ae288dba,a8b4fb48fee0ccf8,e2eebd7ba18fe35f,e6be82d835fbe4d3,9442573ee4ace011,0a56002cdc7e1fce,d15370a382630d4e,7f7ff0f36b54d90f,5a7d69b067a7f011,329e4b0f0b3f2bc6,7653fe5f6ef0b2f2,b6e34b46dea44278,3f18f89630c05813,539ad3b353758de0,d72077c4b6cc264f,ab9a92b55950ec02,c41f451b88a050f6,55ee6dc89a2b64e2,49dff010b9832251,8e98d86c0e4a7b53
 env	DM_VK_PASSTHRU_CS=5a7d69b067a7f011,55ee6dc89a2b64e2,4f41ccf24f163e0d
+# The passthrough copies a skipped layer's output, which is black. Movie fill: the output images of these stages take the decoded NV12 picture itself (the one the CPU path wrote into
+# the game's image pool), converted on the GPU and scaled over the image (dm/android/movie_fill_vk.c; the keys must also be in DM_VK_PASSTHRU_CS). Named for every output stage,
+# since it is not known which one the final draw samples; the first dispatch of each logs "movie fill <key>: the decoded picture → image slot ..."
+env	DM_VK_MOVIE_FILL_CS=5a7d69b067a7f011,55ee6dc89a2b64e2,4f41ccf24f163e0d
