@@ -25,6 +25,9 @@ namespace Ryujinx.Graphics.Shader.Translation
         public int Cb1DataSize => _program.Cb1DataSize;
 
         internal AttributeUsage AttributeUsage => _program.AttributeUsage;
+        // nxnative: the flat input locations a fragment shader's per-vertex reads took without barycentrics (AttributeUsage.GetPerVertexFlatLocation): source location →
+        // the locations of the value at vertex 0, 1 and 2, which the generated pass-through geometry shader writes (dm/android/tools/shader_vk.py pv_geometry)
+        public IReadOnlyDictionary<int, int[]> PerVertexFlatLocations => _program.AttributeUsage.PerVertexFlatLocations;
 
         internal ShaderDefinitions Definitions { get; }
 
@@ -385,6 +388,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                 GpuAccessor.QueryHostReducedPrecision(),
                 GpuAccessor.QueryHostSupportsFragmentShaderInterlock(),
                 GpuAccessor.QueryHostSupportsFragmentShaderOrderingIntel(),
+                GpuAccessor.QueryHostSupportsFragmentShaderBarycentric(),
                 GpuAccessor.QueryHostSupportsGeometryShaderPassthrough(),
                 GpuAccessor.QueryHostSupportsShaderBallot(),
                 GpuAccessor.QueryHostSupportsShaderBarrierDivergence(),

@@ -20,6 +20,13 @@
 #   buffer slot 0xff (DMSH_GMEM_MAP_CB_SLOT) at offset 0, and its write log at offset DMSH_GMEM_LOG_CB_OFFSET (1). They are binding kinds gmem_map (17) and gmem_log (18) here, as
 #   dmsh_build.py classifies them for Metal; the Vulkan backend builds the table from its pools (gfx_vk_core.c vk_gmem_map) and hands each set a cleared log (gfx_vk_exec.c stage_set).
 #   Before that they were read as sbuf_ubo of uniform slot 0xff - 3 and bound to zeros: Donkey Kong Bananza's terrain (gsys vertex shader c9a56f796ea4a4cd) wrote its draw records nowhere.
+# Per-vertex fragment inputs (Ampere LDTRAM: Nintendo Switch 2 Welcome Tour's 27 wireframe pixel shaders read an input at each of the triangle's vertices): job per_vertex (PER_VERTEX
+#   below) picks their form. "khr": one PerVertexKHR array, VK_KHR_fragment_shader_barycentric from the device. "gs" (the default: the Odin 3's stock Adreno 830 driver has no
+#   barycentrics): three flat inputs per attribute (the attribute's own location for vertex 0, free locations above the shader's inputs for 1 and 2; the translator's reflection
+#   per_vertex_gs) and a pass-through geometry shader this script generates for each such fragment shader (shader_pvgs.py), in the bundle under shader_pvgs.pv_gs_key(fragment key),
+#   stage 2, for triangles, and under gs_variant_key of that for the other input primitives as a game's own geometry shaders are. The backend puts it between the vertex and
+#   fragment stages of a draw whose program has no geometry shader of its own (gfx_vk_exec.c bind_program); a program with one keeps its own, and those pixel shaders' per-vertex
+#   inputs then go unwritten (noted once there).
 import argparse, collections, concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys, tempfile
 from pathlib import Path
 
@@ -29,6 +36,7 @@ sys.path[:0] = [str(TOOLS), str(HERE)]
 import dmsh_facts, dmsh_chain, dmsv   # noqa: E402  (DM_GAME picks the profile)
 import dmsh_abi as abi              # noqa: E402  the shader library ABI (dm/gfx/nvn/dmsh_abi.h): the raw global memory slot
 import dmsh_ampere, dmsh_meshstage    # noqa: E402  NVN2 (Switch 2) control sections and task / mesh stage memory, the Mac chain's own modules (backend-neutral)
+import shader_pvgs                    # noqa: E402  the pass-through geometry shader of a fragment shader with per-vertex inputs (per_vertex = gs)
 from shader_split import glslc_stage   # the package reader also recognizes headerless compute code
 
 ap = argparse.ArgumentParser()
@@ -59,6 +67,10 @@ SUBGROUP = int(GAME.get("android_subgroup_size", "128"))
 # Tears of the Kingdom on the Adreno 830 drew dark boxes of whole 16x16 tiles in its tiled lighting (607 shaders gather, 38 of them compute): in 2 of 12 camera
 # steps at the Great Sky Island pond and every frame at the Temple of Time's stone circle; with the bias, 0 in 24
 GATHER_BIAS = 8
+# How a fragment input read per vertex (Ampere LDTRAM) is declared (see the header): DM_PER_VERTEX, else the profile's android_per_vertex, else gs. "khr" needs
+# VK_KHR_fragment_shader_barycentric from the device (Turnip has it; Qualcomm's 512.800 driver does not)
+PER_VERTEX = os.environ.get('DM_PER_VERTEX') or GAME.get('android_per_vertex', 'gs')
+if PER_VERTEX not in ('gs', 'khr'): sys.exit(f'per_vertex {PER_VERTEX!r}: gs or khr')
 
 def records(d):
     r = [m.start() for m in re.finditer(b'BTCDBTCD', d)]
@@ -137,6 +149,7 @@ def nvn2_job(key, stage, rec, ci, w):
     c1 = dmsh_ampere.c1_segment(ctl, area)
     code = area[:dmsh_ampere.inst_len(ctl)]
     extra, facts = {'arch': 'sm86'}, True
+    if stage == 'ps': extra['per_vertex'] = PER_VERTEX   # only LDTRAM, an Ampere pixel shader's instruction, reads it: every other shader's translation is unchanged by it
     if stage == 'cs':
         extra['nvn2_cs'] = [ctl[0xb1], ctl[0xb2], ctl[0xb3], struct.unpack_from('<H', ctl, 0xba)[0], ctl[0xa9] * 4, ctl[0xb4], ctl[0xb5]]
         x, y, z = struct.unpack_from('<3I', ctl, NVN2_LOCAL); shared = struct.unpack_from('<I', ctl, NVN2_SHARED)[0]
@@ -469,6 +482,7 @@ def main():
         for ln in r.stderr.splitlines():
             if ln.strip(): errs[ln.strip()[:120]] += 1
     entries, fails = [], collections.Counter()
+    pv_fs = {}   # fragment shaders whose per-vertex reads became flat inputs (per_vertex = gs): their SPIR-V and the flat locations, for the geometry shaders below
     for k in keys:
         spv_p, res_p = os.path.join(w, k + '.spv'), os.path.join(w, k + '.res.json')
         if not os.path.exists(spv_p): fails['no output'] += 1; continue
@@ -486,9 +500,21 @@ def main():
         # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
         hdr3 = (local or jobs[k].get('local') or [1, 1, 1]) if st in ('cs', 'ts', 'ms') else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
         entries.append((gs_var[k] if k in gs_var else int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3)))
+        if st == 'ps' and res.get('per_vertex_gs'): pv_fs[k] = (spv, res['per_vertex_gs'])
+    # the pass-through geometry shaders of the fragment shaders with per-vertex inputs (see the header): triangles under pv_gs_key, the other input primitives under
+    # gs_variant_key of it, chosen by the draw's topology as a game's own (gfx_vk_shader.c vk_shader_gs_topo). No bindings, no c1: the reflection is empty
+    pv_gs, pv_bad = 0, 0
+    for k, (spv, pvmap) in sorted(pv_fs.items()):
+        gk = shader_pvgs.pv_gs_key(int(k, 16))
+        try: made = {t: shader_pvgs.pv_geometry(spv, pvmap, t) for t in (0, 1, 2, 3, 4)}
+        except ValueError as e: pv_bad += 1; print(f'[RED] {k} (ps): reads inputs per vertex, but no pass-through geometry shader could be made: {e}; its per-vertex inputs go unwritten', flush=True); continue
+        for t, g in made.items(): entries.append((gk if t == 3 else gs_variant_key(gk, t), STAGES['gs'], g, refl_bin([], b'', [0, 0, 0])))
+        pv_gs += 1
+    if pv_fs: print(f'{len(pv_fs)} fragment shaders read inputs per vertex (per_vertex gs): pass-through geometry shaders generated for {pv_gs}, {pv_bad} failed '
+                    f'(flat locations {sorted({t for _, m in pv_fs.values() for v in m.values() for t in v})})', flush=True)
     if a.zstd: print(f'compressing {len(entries)} shaders (zstd level {a.zstd}, {a.jobs} threads) ...', flush=True)
     ver, raw, stored = dmsv.write(a.out, entries, level=a.zstd, jobs=a.jobs)
-    print(f'{len(entries)} of {len(keys)} shaders → {a.out} ({os.path.getsize(a.out) / 2**20:.1f} MB, version {ver}: SPIR-V {raw / 2**20:.1f} MB'
+    print(f'{len(entries)} of {len(keys) + 5 * pv_gs} shaders → {a.out} ({os.path.getsize(a.out) / 2**20:.1f} MB, version {ver}: SPIR-V {raw / 2**20:.1f} MB'
           f'{f", {stored / 2**20:.1f} MB compressed" if ver > 1 else ""}); failed: {dict(fails)}; binding kinds: {dict(kinds_all)}')
     for e, n in errs.most_common(8): print(f'  translator: {n:5d}  {e}')
     arch = collections.Counter('sm86' if jobs[k].get('arch') == 'sm86' else 'maxwell' for k in keys)

@@ -6,6 +6,7 @@ namespace Ryujinx.Graphics.Shader.Translation
         public readonly bool ReducedPrecision;
         public readonly bool SupportsFragmentShaderInterlock;
         public readonly bool SupportsFragmentShaderOrderingIntel;
+        public readonly bool SupportsFragmentShaderBarycentric;   // nxnative: per-vertex fragment inputs (PerVertexKHR), see IGpuAccessor
         public readonly bool SupportsGeometryShaderPassthrough;
         public readonly bool SupportsShaderBallot;
         public readonly bool SupportsShaderBarrierDivergence;
@@ -18,6 +19,7 @@ namespace Ryujinx.Graphics.Shader.Translation
             bool reducedPrecision,
             bool supportsFragmentShaderInterlock,
             bool supportsFragmentShaderOrderingIntel,
+            bool supportsFragmentShaderBarycentric,
             bool supportsGeometryShaderPassthrough,
             bool supportsShaderBallot,
             bool supportsShaderBarrierDivergence,
@@ -31,6 +33,7 @@ namespace Ryujinx.Graphics.Shader.Translation
             ReducedPrecision = reducedPrecision;
             SupportsFragmentShaderInterlock = supportsFragmentShaderInterlock;
             SupportsFragmentShaderOrderingIntel = supportsFragmentShaderOrderingIntel;
+            SupportsFragmentShaderBarycentric = supportsFragmentShaderBarycentric;
             SupportsGeometryShaderPassthrough = supportsGeometryShaderPassthrough;
             SupportsShaderBallot = supportsShaderBallot;
             SupportsShaderBarrierDivergence = supportsShaderBarrierDivergence;

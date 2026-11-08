@@ -817,6 +817,10 @@ static void bind_program(const p_bind_program *bp) {
         if (st < 0 || st > 5 || !(mask >> st & 1)) continue;
         S.sh[st] = vk_shader(kk, st);
     }
+    // a fragment shader whose per-vertex inputs a generated geometry shader feeds (shader_vk.py per_vertex gs, shader_pvgs.py): it takes the geometry stage of a program that has none
+    if (S.sh[2] && S.sh[2]->pv_gs && (mask & 2)) S.sh[2] = NULL;   // the fragment stage was rebound: the generated one belonged to the old fragment shader
+    if (!S.sh[2] && S.sh[1]) S.sh[2] = vk_shader_pv_gs(S.sh[1]);   // NULL when the bundle has none (no per-vertex reads, or translated for barycentrics)
+    else if (S.sh[2] && !S.sh[2]->pv_gs && S.sh[1] && vk_shader_pv_gs(S.sh[1])) VKRED_ONCE(115, "program with a geometry shader of its own and a fragment shader that reads inputs per vertex: those inputs go unwritten");
     S.prog_ok = S.sh[0] || S.sh[5];   // a vertex-only program draws depth only (prepare_draw)
 }
 typedef struct {

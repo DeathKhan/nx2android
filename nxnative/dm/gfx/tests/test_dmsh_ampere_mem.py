@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ampere instructions through the offline translator (dmsh_xlate, arch sm86): SUATOM (0x593), the image atomic Donkey Kong Bananza's agl technique compute shaders (agl_technique_pfx) take an
 append counter with; shared memory's scaled address, IMAD.HI and ATOMS.CAS; and the instructions tested on the atomic's result below. Needs DMSH_TEST_XLATE (the translator) like the other translator tests."""
-import json, os, re, struct, subprocess, sys, tempfile, unittest
+import json, os, re, shutil, struct, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
@@ -217,11 +217,12 @@ class AmpereProgram(unittest.TestCase):
     """A graphics-stage program (SPH, instructions, EXIT) through the translator: the SPIR-V, or None, and the log"""
     SPH = PixelCovered.SPH
 
-    def spv(self, *ops, stage='ps'):
+    def spv(self, *ops, stage='ps', **job):   # job: more job keys (per_vertex); the reflection (<key>.res.json) is left in self.res
         with tempfile.TemporaryDirectory(prefix='ampere_prog_') as d:
             work = Path(d); (work / 'k.bin').write_bytes(self.SPH + b''.join(inst(*op) for op in ops) + inst(*EXIT))
-            (work / 'jobs.json').write_text(json.dumps([dict(key='k', stage=stage, arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, debug=True)]))
+            (work / 'jobs.json').write_text(json.dumps([dict(key='k', stage=stage, arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, debug=True, **job)]))
             r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
+            self.res = json.loads((work / 'k.res.json').read_text()) if (work / 'k.res.json').exists() else None
             return ((work / 'k.spv').read_bytes() if (work / 'k.spv').exists() else None), r.stdout + r.stderr
 
 
@@ -255,6 +256,87 @@ class Ldtram(AmpereProgram):
         spv, log = self.spv((0x000fe20000000179, 0x000000003f0f73ad), self.OUT)   # bit 91 clear
         self.assertIsNone(spv)
         self.assertIn('form not known', log)
+
+
+def spirv_inputs(ops):   # a module's Input (1) and Output (3) variables with a Location: {storage class: {location: (id, decorations of the id)}}
+    deco = {}
+    for op, o in ops:
+        if op == 71: deco.setdefault(o[0], {})[o[1]] = o[2] if len(o) > 2 else 1
+    out = {1: {}, 3: {}}
+    for op, o in ops:
+        if op == 59 and o[2] in out and 30 in deco.get(o[1], {}): out[o[2]][deco[o[1]][30]] = (o[1], deco[o[1]])
+    return out
+
+
+class LdtramFlat(AmpereProgram):
+    """The same reads on a device without VK_KHR_fragment_shader_barycentric (job per_vertex = gs; the Odin 3's stock Adreno 830 driver): three flat inputs per attribute, the
+    attribute's own location (22) for vertex 0 and the next free locations (23, 24) for vertices 1 and 2, and shader_vk.py's pass-through geometry shader (shader_pvgs.py) writing them"""
+    C, AB, SUB1, SUB2, OUT, IPA = Ldtram.C, Ldtram.AB, Ldtram.SUB1, Ldtram.SUB2, Ldtram.OUT, Ldtram.IPA
+
+    def flat(self):
+        spv, log = self.spv(self.C, self.AB, self.SUB1, self.SUB2, self.OUT, per_vertex='gs')
+        self.assertIsNotNone(spv, log)
+        return spv, log
+
+    def test_without_barycentrics_the_reads_are_three_flat_inputs(self):
+        spv, log = self.flat(); ops = spirv_ops(spv)
+        self.assertNotIn((17, (5284,)), ops)   # no FragmentBarycentricKHR capability
+        self.assertFalse(any(op == 10 and b'SPV_KHR_fragment_shader_barycentric' in struct.pack(f'<{len(o)}I', *o) for op, o in ops))
+        self.assertFalse(any(op == 71 and o[1:] == (5285,) for op, o in ops))   # no PerVertexKHR
+        ins = spirv_inputs(ops)[1]
+        self.assertEqual(sorted(ins), [22, 23, 24])
+        for loc in (22, 23, 24): self.assertIn(14, ins[loc][1], f'location {loc} is not flat')   # Flat
+        self.assertEqual(self.res['per_vertex_gs'], {'22': [22, 23, 24]})
+        consts = {o[1]: o[2] for op, o in ops if op == 43 and len(o) == 3}
+        by_id = {v[0]: loc for loc, v in ins.items()}
+        reads = sorted((by_id[o[2]], consts[o[3]]) for op, o in ops if op == 65 and o[2] in by_id)   # OpAccessChain: (location, component)
+        self.assertEqual(reads, [(22, 1), (23, 1), (24, 1)])   # a[0x1e4].y at vertices 0, 1, 2
+
+    def test_the_barycentric_form_stays_when_asked(self):
+        spv, log = self.spv(self.C, self.AB, self.SUB1, self.SUB2, self.OUT, per_vertex='khr')
+        self.assertIsNotNone(spv, log); ops = spirv_ops(spv)
+        self.assertIn((17, (5284,)), ops); self.assertIsNone(self.res.get('per_vertex_gs'))
+
+    def test_an_interpolated_read_of_the_same_attribute_is_refused_too(self):
+        spv, log = self.spv(self.C, self.IPA, self.OUT, per_vertex='gs')
+        self.assertIsNone(spv); self.assertIn('LDTRAM reads per vertex', log)
+
+    def geometry(self, topo):
+        sys.path.insert(0, str(TOOLS.parents[1] / 'android/tools')); import shader_pvgs
+        spv, _ = self.flat()
+        gs = shader_pvgs.pv_geometry(spv, self.res['per_vertex_gs'], topo)
+        val = shutil.which('spirv-val')
+        if val:
+            with tempfile.TemporaryDirectory(prefix='ampere_gs_') as d:
+                Path(d, 'gs.spv').write_bytes(gs); r = subprocess.run([val, '--target-env', 'vulkan1.3', str(Path(d, 'gs.spv'))], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return spirv_ops(gs)
+
+    def test_the_pass_through_geometry_shader_for_triangles(self):
+        ops = self.geometry(3); modes = {o[1:] for op, o in ops if op == 16}
+        self.assertEqual(modes, {(22,), (0, 1), (29,), (26, 3)})   # Triangles, Invocations 1, OutputTriangleStrip, OutputVertices 3
+        io = spirv_inputs(ops)
+        self.assertEqual(sorted(io[1]), [22]); self.assertEqual(sorted(io[3]), [22, 23, 24])   # reads the attribute from the vertices, writes the three flat ones
+        consts = {o[1]: o[2] for op, o in ops if op == 43 and len(o) == 3}
+        src = io[1][22][0]; stores = {}
+        chains = {o[1]: consts[o[3]] for op, o in ops if op == 65 and o[2] == src}   # access chain id → vertex read
+        loads = {o[1]: chains[o[2]] for op, o in ops if op == 61 and o[2] in chains}
+        for op, o in ops:
+            if op == 62 and o[1] in loads: stores.setdefault(o[0], set()).add(loads[o[1]])
+        by_id = {v[0]: loc for loc, v in io[3].items()}
+        self.assertEqual({by_id[v]: s for v, s in stores.items()}, {22: {0}, 23: {1}, 24: {2}})   # each flat output takes its vertex's value, on every emitted vertex
+        self.assertEqual(sum(1 for op, _ in ops if op == 218), 3); self.assertEqual(sum(1 for op, _ in ops if op == 219), 1)   # EmitVertex x3, EndPrimitive
+
+    def test_the_pass_through_geometry_shader_for_lines(self):
+        ops = self.geometry(1); modes = {o[1:] for op, o in ops if op == 16}
+        self.assertEqual(modes, {(20,), (0, 1), (28,), (26, 2)})   # InputLines, OutputLineStrip, 2 vertices
+        self.assertEqual(sum(1 for op, _ in ops if op == 218), 2)
+
+    def test_a_fragment_shader_without_the_map_is_refused(self):
+        sys.path.insert(0, str(TOOLS.parents[1] / 'android/tools')); import shader_pvgs
+        spv, _ = self.flat()
+        with self.assertRaises(ValueError): shader_pvgs.pv_geometry(spv, {'22': [22, 23, 25]}, 3)   # 25 is not an input of the fragment shader
+        with self.assertRaises(ValueError): shader_pvgs.pv_geometry(spv, {}, 3)
 
 
 class PatchLevelIndexed(AmpereProgram):

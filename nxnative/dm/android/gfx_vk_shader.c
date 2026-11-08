@@ -572,3 +572,6 @@ VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[5], int nsets) {
     pthread_mutex_unlock(&mu);
     return pl;
 }
+// The pass-through geometry shader shader_vk.py generates for a fragment shader that reads inputs per vertex (Ampere LDTRAM) on a device without VK_KHR_fragment_shader_barycentric:
+// keyed by the fragment shader's key and shader_pvgs.PV_GS_SALT, with the usual topology variants beside it (vk_shader_gs_topo)
+vkshader_t *vk_shader_pv_gs(vkshader_t *fs) { if (!fs) return NULL; vkshader_t *g = vk_shader_q(fs->key ^ 0x61C8864680B583EBull, 2, 1); if (g) g->pv_gs = 1; return g; }

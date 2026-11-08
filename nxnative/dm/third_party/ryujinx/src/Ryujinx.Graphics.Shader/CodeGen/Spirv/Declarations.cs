@@ -365,6 +365,13 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     if (ioVariable == IoVariable.UserDefined)
                     {
                         iq = context.Definitions.ImapTypes[ioDefinition.Location].GetFirstUsedType();
+
+                        // nxnative: a per-vertex read without barycentrics is of a flat input the generated geometry shader writes (AttributeUsage.GetPerVertexFlatLocation);
+                        // the header's interpolation of the attribute it stands for does not apply
+                        if (!ioDefinition.StorageKind.IsOutput() && context.AttributeUsage.IsPerVertexFlatLocation(ioDefinition.Location))
+                        {
+                            iq = PixelImap.Constant;
+                        }
                     }
                     else
                     {
@@ -562,7 +569,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             // nxnative: a fragment input Ampere's LDTRAM reads per vertex (InstEmitAmpereMem.ALdtram) is an array of the primitive's three vertices, PerVertexKHR
             // (SPV_KHR_fragment_shader_barycentric: the Spv.Generator names are the NV ones, the same values); it takes no interpolation qualifier
             bool perVertexFragment = !isOutput && !isPerPatch && ioVariable == IoVariable.UserDefined &&
-                context.Definitions.Stage == ShaderStage.Fragment && context.AttributeUsage.IsPerVertexInput(ioDefinition.Location);
+                context.Definitions.Stage == ShaderStage.Fragment && context.AttributeUsage.IsPerVertexInput(ioDefinition.Location) &&
+                context.HostCapabilities.SupportsFragmentShaderBarycentric;   // (without it the per-vertex reads are of flat inputs: AttributeUsage.GetPerVertexFlatLocation)
 
             if (perVertexFragment)
             {

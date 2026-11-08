@@ -192,6 +192,11 @@ static class SwshXlate
         public bool QueryHostSupportsDepthClipControl() => false;   // Metal has no -1..1 clip control; the depth convention is not left to the translator, the rewrite is added per entry point in the MSL (see the file header)
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
+        // Job "per_vertex" (the Android chain, shader_vk.py PER_VERTEX): how a fragment input Ampere's LDTRAM reads per vertex (Nintendo Switch 2 Welcome Tour's wireframes) is
+        // declared. "khr" (the default, and every Apple job): one array of the three vertices, PerVertexKHR, which needs VK_KHR_fragment_shader_barycentric. "gs" (a device
+        // without it: the Odin 3's Adreno 830 driver): three flat inputs per attribute, written by a pass-through geometry shader shader_vk.py generates from the
+        // reflection's "per_vertex_gs" (source location → the three flat locations; see Main)
+        public bool QueryHostSupportsFragmentShaderBarycentric() => !(_job["per_vertex"] is JsonNode pv && (string)pv == "gs");
         // Job softfloat64 = true: the host has no FP64, so Ryujinx's DoubleToFloat pass lowers double operations to float (Metal has no double type). Set only on the retry of a
         // shader whose first translation declared a 64-bit float (see Main): answering "no" for every shader would also drop the Float64 capability from all the others
         public bool QueryHostSupportsShaderFloat64() => !(_job["softfloat64"] is JsonNode n && (bool)n);
@@ -266,6 +271,11 @@ static class SwshXlate
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
                     foreach (var t in list) res[name].AsArray().Add(new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
                 if (acc.Fetch1D.Count > 0) { var f1 = new JsonArray(); foreach (int h in acc.Fetch1D) f1.Add(h); res["fetch1d"] = f1; }
+                if (ctx.PerVertexFlatLocations.Count > 0)   // per-vertex reads as flat inputs (job per_vertex = gs): what the generated geometry shader must write
+                {
+                    var pv = new JsonObject(); foreach (var kv in ctx.PerVertexFlatLocations.OrderBy(kv => kv.Key)) pv[kv.Key.ToString()] = new JsonArray(kv.Value.Select(l => (JsonNode)l).ToArray());
+                    res["per_vertex_gs"] = pv;
+                }
                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
                 ok++;
             }

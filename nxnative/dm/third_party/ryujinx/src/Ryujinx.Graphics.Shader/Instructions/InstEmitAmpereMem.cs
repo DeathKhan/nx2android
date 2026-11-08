@@ -222,7 +222,10 @@ namespace Ryujinx.Graphics.Shader.Instructions
         // a[0x1e0], a[0x1e4] and a[0x1e8] that way, each with .ab into a pair and .c into one register, and take the three pairwise differences of the values per component
         // (R9 - R15, R8 - R15, R8 - R9), squared and summed: the triangle's edge lengths, as a wireframe needs. The input is declared as an array of the three vertices with
         // PerVertexKHR (Declarations.cs), which needs VK_KHR_fragment_shader_barycentric from the host; an attribute IPA also interpolates is refused there (AIpa), as one
-        // declaration cannot be both, and so is a shader that indexes its inputs (one array of them all).
+        // declaration cannot be both, and so is a shader that indexes its inputs (one array of them all). A host without the extension (Adreno's stock driver;
+        // IGpuAccessor.QueryHostSupportsFragmentShaderBarycentric false) reads flat inputs instead, one per vertex (AttributeUsage.GetPerVertexFlatLocation: the
+        // attribute's own location for vertex 0, free locations above the shader's inputs for 1 and 2), which a generated pass-through geometry shader between the
+        // vertex and fragment stages writes from the primitive's vertices (dm/android/tools/shader_vk.py pv_geometry).
         public static void ALdtram(EmitterContext context)
         {
             AmpereOp x = new(context.CurrOp);
@@ -249,7 +252,28 @@ namespace Ryujinx.Graphics.Shader.Instructions
                     break;
                 }
 
-                Operand value = context.Load(StorageKind.Input, IoVariable.UserDefined, Const(location), Const(c ? 2 : i), Const(component));
+                int vertex = c ? 2 : i;
+                Operand value;
+
+                if (context.TranslatorContext.GpuAccessor.QueryHostSupportsFragmentShaderBarycentric())
+                {
+                    value = context.Load(StorageKind.Input, IoVariable.UserDefined, Const(location), Const(vertex), Const(component));
+                }
+                else
+                {
+                    int flatLocation;
+
+                    try
+                    {
+                        flatLocation = context.TranslatorContext.AttributeUsage.GetPerVertexFlatLocation(location, vertex);
+                    }
+                    catch (System.InvalidOperationException e)
+                    {
+                        throw AFail(context, "LDTRAM without barycentrics: " + e.Message);
+                    }
+
+                    value = context.Load(StorageKind.Input, IoVariable.UserDefined, null, Const(flatLocation), Const(component));
+                }
 
                 context.Copy(Register(x.Rd + i, RegisterType.Gpr), value);
             }

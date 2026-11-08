@@ -47,6 +47,57 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         public bool IsPerVertexInput(int index) => (PerVertexInputAttributes & (1 << index)) != 0;
 
+        // nxnative: without VK_KHR_fragment_shader_barycentric (IGpuAccessor.QueryHostSupportsFragmentShaderBarycentric) a per-vertex read of input L at vertex v is a read of a
+        // flat input: L itself for vertex 0 (the interpolated input is no longer declared there), and for vertices 1 and 2 locations above every input the shader reads,
+        // taken in order of first use; a generated geometry shader writes the three from the primitive's vertices (shader_vk.py pv_geometry). The shader's inputs are
+        // all known before any instruction is emitted (the decoder runs first), so the first allocation sees the whole mask. Past location 31 (32 user attributes)
+        // there is no room, and the shader is refused
+        private readonly Dictionary<int, int[]> _perVertexFlatLocations = new();
+        private int _perVertexFlatNext = -1;
+
+        public IReadOnlyDictionary<int, int[]> PerVertexFlatLocations => _perVertexFlatLocations;
+
+        public bool IsPerVertexFlatLocation(int location)
+        {
+            foreach (int[] locations in _perVertexFlatLocations.Values)
+            {
+                if (Array.IndexOf(locations, location) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        public int GetPerVertexFlatLocation(int location, int vertex)
+        {
+            if (!_perVertexFlatLocations.TryGetValue(location, out int[] locations))
+            {
+                if (_perVertexFlatNext < 0)
+                {
+                    _perVertexFlatNext = UsedInputAttributes == 0 ? 0 : 32 - BitOperations.LeadingZeroCount((uint)UsedInputAttributes);
+                }
+
+                locations = new int[3];
+                locations[0] = location;
+
+                for (int v = 1; v < 3; v++)
+                {
+                    if (_perVertexFlatNext > 31)
+                    {
+                        throw new InvalidOperationException($"no input location left for the per-vertex read of attribute {location} at vertex {v} (32 in use)");
+                    }
+
+                    locations[v] = _perVertexFlatNext++;
+                }
+
+                _perVertexFlatLocations.Add(location, locations);
+            }
+
+            return locations[vertex];
+        }
+
         public void SetInputUserAttributePerPatch(int index)
         {
             UsedInputAttributesPerPatch.Add(index);

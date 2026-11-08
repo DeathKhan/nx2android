@@ -286,6 +286,16 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: whether the host has VK_KHR_fragment_shader_barycentric, so a fragment input Ampere's LDTRAM reads per vertex can be declared PerVertexKHR
+        /// (InstEmitAmpereMem.ALdtram). Without it the reads become flat inputs a generated pass-through geometry shader feeds (AttributeUsage.GetPerVertexFlatLocation)
+        /// </summary>
+        /// <returns>True if the GPU and driver support per-vertex fragment inputs, false otherwise</returns>
+        bool QueryHostSupportsFragmentShaderBarycentric()
+        {
+            return true;
+        }
+
+        /// <summary>
         /// Queries host GPU geometry shader passthrough support.
         /// </summary>
         /// <returns>True if the GPU and driver supports geometry shader passthrough, false otherwise</returns>
