@@ -20,6 +20,8 @@ setting	fps=1
 env	DM_GPU_MIN_FREQ=967000000
 # Cave tuning (2026-11-07, handheld). ADPF 90 is an 11.11 ms CPU work hint, independent of game pacing/display rate. Completed-frame accounting remains off after its latency/throughput A/B.
 # DM_VK_PASS_SPLIT=128 measured best in handheld (frame work p50 16.66 ms against 17.4 ms unsplit; 256 was between)
+# Outdoors (2026-11-08, handheld, Ingotis gate, 12,200 draws a frame): the backend now paces its 32 command-buffer parts over the frame (DM_VK_PART_PACE, on by default),
+# 46.2 -> 34.2 ms frames standing still and 30 -> ~56 fps on the smash route. With it PASS_SPLIT 128 and 512 measure the same, PASS_SPLIT_DEPTH=0 is worse (40.3 ms), CB_DRAWS 2048 no better
 env	DM_NVN_ASYNC=1
 env	DM_VK_DYN_SSBO=1
 env	DM_ADPF_TARGET_FPS=90
