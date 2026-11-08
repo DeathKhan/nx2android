@@ -95,6 +95,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) 1.4.2 with `DM_FPS_TARGET=60`, from reading the code after [PR #794](https://github.com/seedds/nxnative/pull/794); not reproduced in a game run.
 - **Check:** `t_fpslock` (`dm_fps_lock_engine` in every case, asked before the first present in half of them: limiter rows, Unreal, Frostbite, NieR's build gate, another build's main, a main without Unreal variables); `t_nvn` (no limiter: the 60 and 30 caps are not applied and the game's interval stays; a state page needs no limiter).
 
+### A player's frame cap goes through the game's own frame-rate controller
+
+- **Symptom:** a frame cap the host applies by presenting less often (a longer present period) slows a game that steps its time by the present interval it chose itself: Donkey Kong Bananza ran at two thirds of its speed when the Android adaptive rate held it at 40 fps while it presented at interval 1.
+- **Cause:** the game's controller measures the frame's work (frame start to the later of submission and the GPU's end), not the host's pacing wait, so it keeps the shorter interval and keeps stepping by it.
+- **Fix:** the pause menu's frame cap (`hle_framecap.c`, Android `front_android.c` "Frame cap": Off / 60 / 30) acts where the profile shows how. An `OBS_FRAME_CAP` gate at the controller's read of its frame time lengthens the reading to the capped period: the controller asks for the capped interval itself, with its own hysteresis, and steps the game by it; a longer frame still reads as itself. A game whose time follows the clock can be paced by the host instead (profile env `DM_FRAME_CAP_MODE=pace`: the present period is held at the cap's). Any other game is not offered the cap ("Not for this game"): the menu changes nothing. `[framecap] game time` logs the game's time (Σ interval / 60) against the wall clock every 600 frames.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#pause-menu-frame-cap-and-resolution-android-2026-11-08): 0.999-1.004 of real time at the 30 fps cap. Nintendo Switch 2 Welcome Tour is not offered it: its `bex::MainModule::GetDeltaTime` is the constant 1/60 (`main+0x22d390` loads `0.016667` from rodata) once per update, so a frame presented every other vsync would run it at half speed.
+
 ### Engine-native frame caps also govern presentation
 
 - **Symptom:** selecting 30 FPS changes the engine's interval field, but the screen and frame loop still run near 60 FPS.

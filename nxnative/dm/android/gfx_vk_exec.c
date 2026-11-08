@@ -2684,6 +2684,15 @@ static int upscaler_replace(vkshader_t *cs, const p_dispatch *d) {
         VKLOG("upscaler network %016llx: cubic declined (%s); retaining bilinear", (unsigned long long)cs->key, cubic_reason);
     vk_end_pass_land(); VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, in.im); vk_tex_prepare(cb, out.im); vk_img_barrier_all(cb);
     vkCmdBlitImage(cb, in.im->img, VK_IMAGE_LAYOUT_GENERAL, out.im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, filter);
+    {   // the game's render size (its dynamic resolution) going into the upscaler, over 600 upscales: the pause menu's Resolution level is judged by it
+        static unsigned n, wmin, wmax, hmin, hmax; static double ws, hs; unsigned w = rects[2] + 1, h = rects[3] + 1;
+        if (!n || w < wmin) { wmin = w; }
+        if (!n || h < hmin) { hmin = h; }
+        if (w > wmax) { wmax = w; }
+        if (h > hmax) { hmax = h; }
+        ws += w; hs += h;
+        if (++n == 600) { VKLOG("upscaler input (the game's render size) over 600 frames: %ux%u to %ux%u, mean %.0fx%.0f; output %ux%u", wmin, hmin, wmax, hmax, ws / n, hs / n, rects[6] + 1, rects[7] + 1); n = 0; wmax = hmax = 0; ws = hs = 0; }
+    }
     out.im->gpu_w = 1; vk_img_barrier_all(cb);
     if (upscaler_note(cs->key, filter == VK_FILTER_CUBIC_EXT ? 4 : 1)) {
         VKLOG("upscaler network %016llx: %s; input slot 0 id %d fmt %d view mip %u layer %u (%ux%u), rect %u,%u + %ux%u; output slot 1 id %d fmt %d view mip %u layer %u (%ux%u), rect %u,%u + %ux%u",
