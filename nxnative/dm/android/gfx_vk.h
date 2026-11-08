@@ -203,6 +203,7 @@ typedef struct {
                                                                                     // that declare the vec4 outputs xo (bit = location) the next stage reads, and (fd) that write gl_FragDepth = gl_FragCoord.z
     int depth_repl;                     // a fragment shader that writes gl_FragDepth (DepthReplacing / DepthGreater / DepthLess)
     uint32_t in_locs, out_locs;         // the vec4 (or per-vertex vec4) inputs and outputs it declares, by location
+    uint32_t omap; int omap_known;      // a fragment shader's output map (SPH word 18, shader_vk.py ps_omap): 4 bits per colour output; the components it writes (gfx_vk_exec.c wmask)
     uint32_t gs_claim_invocations;     // transformed geometry shader: claim slots per input primitive, zero when unchanged
     int storage_images;                 // replay preflight: 0 unknown, 1 has reflected storage images, 2 none
     int setmemo;                        // gfx_vk_exec.c stage_set: 1 its set may be memoized per stage, 2 not (it reads handles or addresses from uniform buffer memory), 0 not known yet

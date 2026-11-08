@@ -1951,6 +1951,10 @@ static int prepare_draw(int prim, int indexed) {
     for (int i = 0; i < S.ncol; i++) {
         k.cfmt[i] = S.cfmt[i];
         k.wmask[i] = S.cfmt[i] && S.sh[1] ? (S.chmask.mask >> (4 * i)) & 0xf : 0;   // no fragment shader: no colour written
+        // Components outside the fragment shader's output map (SPH word 18; port of upstream 51ecd693b): the GPU leaves them as they were, the translator does not store them,
+        // and Vulkan would write them undefined. DM_VK_OMAP=0 (start-up): no such mask
+        { static int om = -1; if (om < 0) { const char *e = getenv("DM_VK_OMAP"); om = !(e && *e == '0'); }
+          if (om && k.wmask[i] && S.sh[1]->omap_known) k.wmask[i] &= S.sh[1]->omap >> (4 * i) & 0xf; }
         const vkfmt_t *f = S.rt_has_col[i] ? vk_fmt(S.rt_col[i].d.format) : NULL;
         if (((S.color.blend_en >> i) & 1) && f && !f->is_int) {
             k.blend_en |= 1u << i;

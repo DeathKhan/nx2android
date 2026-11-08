@@ -338,6 +338,20 @@ KIND = {'support': 0, 'cbuf': 1, 'c1': 2, 'drvcb': 3, 'sbuf': 4, 'ubo_ptr': 5, '
 DESC = {'ubo': 0, 'ssbo': 1, 'sampled': 2, 'storage': 3, 'tbuf': 4, 'storage_tbuf': 5, 'image': 6, 'sampler': 7, '?': 255}
 SAMP_NONE, SAMP_TEX, SAMP_SLOT, SAMP_ID, SAMP_UBO = 0, 1, 2, 3, 4
 kinds_all = collections.Counter()
+# A pixel shader's output map (SPH word 18, as dmsh_build.py ps_omap for the Mac chain, upstream 51ecd693b): 4 bits per colour output, R G B A from the low bit. The GPU writes only
+# those components of a bound target and leaves the others; the translator stores only them, and Vulkan writes the whole attachment under its colorWriteMask, the others undefined
+# (Lichii traced a NaN band above Ocarina of Time's horizon to this: its agl_common depth pass maps output 0 RGBA and output 2 R only). It travels in the pixel shader's header words,
+# whose output-location masks use the low 8 bits: word 2 bit 31 = known, the map's low half in word 3 bits 16-31, its high half in word 4 bits 16-31 (gfx_vk_shader.c vk_shader).
+# Bundles made before carry no flag: the backend then masks nothing, as before
+def ps_omap(code):
+    return struct.unpack_from('<I', code, 18 * 4)[0] if code is not None and len(code) >= 0x50 else None
+def ps_omap_words(hdr, code_path):
+    try: om = ps_omap(open(code_path, 'rb').read()) if code_path else None
+    except OSError: om = None
+    if om is None: return hdr
+    h = list(hdr) + [0] * (3 - len(hdr))
+    return [h[0] & 0xffff | 1 << 31, h[1] & 0xffff | (om & 0xffff) << 16, h[2] & 0xffff | (om >> 16) << 16]
+
 def refl_bin(binds, c1, local):
     out = [struct.pack('<5I', len(binds), len(c1), *(list(local) + [1, 1, 1])[:3])]
     for e in binds:
@@ -515,6 +529,7 @@ def main():
         for e in cl: kinds_all[e['kind']] += 1
         # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
         hdr3 = shader_meshwrap.facts(mesh_jobs[k][0]) if k in mesh_jobs else (local or jobs[k].get('local') or [1, 1, 1]) if st == 'cs' else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
+        if st == 'ps' and k not in mesh_jobs: hdr3 = ps_omap_words(hdr3, jobs[k].get('code'))
         entries.append((gs_var[k] if k in gs_var else int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3)))
         if mesh_vs:
             vb, _, vio = spirv_bindings(mesh_vs); entries.append((shader_meshwrap.mesh_vs_key(int(k, 16)), STAGES['vs'], mesh_vs, refl_bin([classify('vs', b, {}) for b in vb], b'', vio[1])))

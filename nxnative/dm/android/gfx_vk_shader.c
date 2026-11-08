@@ -362,6 +362,8 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     if (stage == 6 || stage == 7) {   // a task / mesh kernel: the header words are shader_meshwrap.facts, not a local size (its LocalSize is in the SPIR-V)
         uint32_t w0 = s->local[0]; s->mesh_kind = (int)(w0 >> 24 & 3); s->mesh_threads = w0 & 0x3ff; s->mesh_pay = w0 >> 10 & 0x3ff; s->mesh_task = w0 >> 20 & 1; s->mesh_verts = w0 >> 21 & 7;
         s->mesh_max_v = s->local[1] & 0xffff; s->mesh_max_p = s->local[1] >> 16; s->mesh_ncomp = s->local[2]; s->local[0] = s->mesh_threads ? s->mesh_threads : 1; s->local[1] = s->local[2] = 1; }
+    if (stage == 1 && s->local[0] >> 31) {   // a fragment shader's output map in its header words (shader_vk.py ps_omap_words); the output-location masks keep their low bits
+        s->omap = (s->local[1] >> 16) | (s->local[2] >> 16) << 16; s->omap_known = 1; s->local[0] &= 0xffff; s->local[1] &= 0xffff; s->local[2] &= 0xffff; }
     s->b = (const dmsv_bind *)(r + 20); s->c1 = r + 20 + 20 * s->nbind;
     // texture tables (gfx_vk.h): the arrays of TBL_MIN+ combined image samplers read through one uniform buffer's handles, by slot; one source buffer per shader
     uint32_t tbind[TBL_SLOTS] = {0}, tvar[TBL_SLOTS] = {0}; int thave[TBL_SLOTS] = {0}, tbig = 0; s->tbl_reg = -1;
