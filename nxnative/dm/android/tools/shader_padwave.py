@@ -25,8 +25,13 @@ the same code with LocalSize 64 1 1 compiles, the pack's 16x8 kernels without sh
   Bails (ValueError) on: a LocalSize whose x is not 32, a LocalInvocationId read through a non-constant index, a LocalInvocationId or LocalInvocationIndex passed by pointer, a
   loop header holding a side effect whose terminator is conditional (the body block would need a merge of its own).
 
-    pad(spv, pad_to=64) → the padded module's bytes, and a dict of what was done: {'stores': {kind: n}, 'atomics': n, 'image_writes': n, 'functions': n predicated, 'lid_loads': n,
+    pad(spv, pad_to=64, mode='branch') → the padded module's bytes, and a dict of what was done: {'stores': {kind: n}, 'atomics': n, 'image_writes': n, 'functions': n predicated, 'lid_loads': n,
                            'barriers': n, 'shuffles': n, 'local': [64, N, 1]}
+    mode 'select' (branchless padding): no selection construct for a Workgroup store or an image write. Each Workgroup array grows by one spare element and a padding
+      lane's store index is OpSelect'ed to it (the lane's own slot otherwise: the access chain's one index; Qualcomm's compiler ran out of heap on the ~280 small
+      blocks mode 'branch' adds to a 1.4 MB kernel, where the plain LocalSize-64 probe compiled); an image write's coordinate is OpSelect'ed to -1 (out of bounds:
+      Vulkan drops the store). Only a BDA / storage-buffer store and an atomic keep a branch (one or two blocks a module here). A Workgroup store through anything
+      but a one-index access chain on a Workgroup variable falls back to the branch.
     shuffle_xor(spv) → (module, n) with every OpGroupNonUniformShuffle whose index is provably `lane ^ constant` (lane = SubgroupLocalInvocationId & 31 or the masked
                        LocalInvocationId.x, the warp base ORed in or not) rewritten to OpGroupNonUniformShuffleXor, and how many were; the rest keep their OpGroupNonUniformShuffle
     info(spv) → {'local': [x, y, z], 'shuffles': n, 'barriers': n, 'ballot_votes': [op names]}: what a module holds, for shader_vk.py to pick the kernels the pass is for
@@ -41,6 +46,7 @@ OP_NAME, OP_STRING, OP_EXT_IMPORT, OP_ENTRY, OP_EXEC_MODE, OP_TYPE_BOOL, OP_TYPE
 OP_CONST, OP_CONST_COMPOSITE, OP_FUNCTION, OP_FN_PARAM, OP_FUNCTION_END, OP_CALL, OP_VARIABLE, OP_LOAD, OP_STORE, OP_COPY_MEMORY, OP_COPY_MEMORY_SIZED = 43, 44, 54, 55, 56, 57, 59, 61, 62, 63, 64
 OP_ACCESS, OP_IN_ACCESS, OP_PTR_ACCESS, OP_DECORATE, OP_DECORATION_GROUP, OP_EXTRACT, OP_INSERT, OP_IMAGE_WRITE, OP_UNDEF = 65, 66, 67, 71, 73, 81, 82, 99, 1
 OP_BITCAST, OP_IADD, OP_IMUL, OP_ULESS, OP_AND, OP_OR, OP_XOR, OP_SHL, OP_PHI, OP_LOOP_MERGE, OP_SEL_MERGE, OP_LABEL, OP_BRANCH, OP_BRANCH_COND, OP_SWITCH = 124, 128, 132, 176, 199, 197, 198, 196, 245, 246, 247, 248, 249, 250, 251
+OP_SELECT = 169
 OP_KILL, OP_RETURN, OP_RETURN_VALUE, OP_UNREACHABLE, OP_BARRIER = 252, 253, 254, 255, 224
 OP_ATOMIC_LOAD, OP_ATOMIC_STORE, OP_ATOMIC_FLAG_TEST, OP_ATOMIC_FLAG_CLEAR = 227, 228, 318, 319
 OP_SHUFFLE, OP_SHUFFLE_XOR = 345, 346
@@ -133,6 +139,10 @@ class _Mod:
         return self._const[k]
 
     def undef(self, ty): return self.const_like(OP_UNDEF, ty)
+    def const_composite(self, ty, parts):
+        k = (OP_CONST_COMPOSITE, ty, tuple(parts))
+        if k not in self._const: c = self.id(); self.new_globals.append(Ins(OP_CONST_COMPOSITE, [ty, c] + list(parts))); self._const[k] = c
+        return self._const[k]
     def const_like(self, op, ty):
         k = (op, ty)
         if k not in self._const: u = self.id(); self.new_globals.append(Ins(op, [ty, u])); self._const[k] = u
@@ -169,7 +179,8 @@ def wants_pad(spv, x=32):
     return bool(i['local']) and i['local'][0] == x and i['local'][2] == 1 and i['subgroup_ops'] > 0
 
 
-def pad(spv, pad_to=64):
+def pad(spv, pad_to=64, mode='branch'):
+    if mode not in ('branch', 'select'): raise ValueError(f'mode {mode!r}: branch or select')
     m = _Mod(spv)
     if m.exec_mode is None: raise ValueError('no LocalSize execution mode (not a compute kernel)')
     x, y, z = m.exec_mode.a[2:5]
@@ -199,10 +210,28 @@ def pad(spv, pad_to=64):
         c.a[2] = m.const(m.type_of(c.a[2]), pad_to)
     m.exec_mode.a[2] = pad_to
     stats = {'stores': collections.Counter(), 'atomics': 0, 'image_writes': 0, 'functions': 0, 'lid_loads': 0, 'barriers': sum(1 for x_ in m.ins if x_.op == OP_BARRIER),
-             'shuffles': sum(1 for x_ in m.ins if x_.op in (345, 346, 347, 348)), 'local': [pad_to, y, z], 'split_loop_headers': 0, 'selections': 0}
+             'shuffles': sum(1 for x_ in m.ins if x_.op in (345, 346, 347, 348)), 'local': [pad_to, y, z], 'split_loop_headers': 0, 'selections': 0, 'selects': 0, 'mode': mode}
+    # mode select: the Workgroup arrays grow by one spare slot (variable → its index); the access chains whose one index a padding lane's store redirects there
+    spare, redirect = {}, {}
+    if mode == 'select':
+        for x_ in m.ins[:m.first_fn]:
+            if x_.op == OP_VARIABLE and x_.a[2] == SC_WORKGROUP:
+                arr = m.by_id.get(m.by_id[x_.a[0]].a[2])
+                if arr is None or arr.op != 28 or m.const_value(arr.a[2]) is None: continue   # not a sized array: its stores keep the branch
+                n_ = m.const_value(arr.a[2]); spare[x_.a[1]] = (n_, arr)
+        for v, (n_, arr) in spare.items():   # (the type may be shared by another variable: it grows too, harmlessly); the new length constant goes right before the array type
+            ct = m.type_of(arr.a[2]); c = m.id(); at = m.ins.index(arr); m.ins.insert(at, Ins(OP_CONST, [ct, c, n_ + 1])); m.first_fn += 1; m.by_id[c] = m.ins[at]; arr.a[2] = c
+        for x_ in m.ins[m.first_fn:]:
+            if x_.op == OP_STORE and m.storage_class(x_.a[0]) == SC_WORKGROUP:
+                ch = m.by_id.get(x_.a[0])
+                if ch is not None and ch.op in (OP_ACCESS, OP_IN_ACCESS) and len(ch.a) == 4 and ch.a[2] in spare: redirect[ch.a[1]] = spare[ch.a[2]][0]
     c32 = m.const(uint, pad_to // 2)
 
-    def side_effect(x_):   # the kind of side effect an instruction is, or None
+    def selectable(x_):   # mode select: a side effect made harmless by an OpSelect instead of a branch
+        return mode == 'select' and ((x_.op == OP_STORE and x_.a[0] in redirect) or x_.op == OP_IMAGE_WRITE)
+
+    def side_effect(x_):   # the kind of side effect an instruction is (one that needs the branch), or None
+        if selectable(x_): return None
         if x_.op == OP_STORE or x_.op == OP_COPY_MEMORY or x_.op == OP_COPY_MEMORY_SIZED: return SE_KIND.get(m.storage_class(x_.a[0]))
         if x_.op == OP_IMAGE_WRITE: return 'image'
         if x_.op in ATOMICS:
@@ -228,7 +257,7 @@ def pad(spv, pad_to=64):
     out = m.ins[:m.first_fn]
     for s, e in m.functions():
         fn = m.ins[s:e + 1]
-        has_se = any(side_effect(x_) for x_ in fn)
+        has_se = any(side_effect(x_) or selectable(x_) for x_ in fn)
         reads_lid = any(x_.op == OP_LOAD and (x_.a[2] == lid or x_.a[2] in x_chains or x_.a[2] == lidx) for x_ in fn)
         if not has_se and not reads_lid: out += fn; continue
         first_label = next(i for i, x_ in enumerate(fn) if x_.op == OP_LABEL)
@@ -265,6 +294,16 @@ def pad(spv, pad_to=64):
             i = 0
             while i < len(body2):
                 x_ = body2[i]
+                if mode == 'select' and x_.op in (OP_ACCESS, OP_IN_ACCESS) and x_.a[1] in redirect:   # the lane's slot, or the spare one for a padding lane
+                    it = m.type_of(x_.a[3]); sel = m.id(); cur.append(Ins(OP_SELECT, [it, sel, real, x_.a[3], m.const(it, redirect[x_.a[1]])])); x_.a[3] = sel; stats['selects'] += 1
+                    stats['stores']['workgroup'] += sum(1 for y_ in fn if y_.op == OP_STORE and y_.a[0] == x_.a[1]); cur.append(x_); i += 1; continue
+                if selectable(x_) and x_.op == OP_IMAGE_WRITE:   # the coordinate, or -1 (out of bounds, dropped) for a padding lane
+                    ct = m.type_of(x_.a[1]); tv = m.by_id[ct]; n_ = tv.a[2] if tv.op == OP_TYPE_VECTOR else 1; et = tv.a[1] if tv.op == OP_TYPE_VECTOR else ct
+                    neg = m.const(et, 0xffffffff)
+                    if n_ > 1:
+                        neg = m.const_composite(ct, [neg] * n_); vb = m.find_type(OP_TYPE_VECTOR, bool_, n_); cv = m.id(); cur.append(Ins(80, [vb, cv] + [real] * n_))   # OpCompositeConstruct
+                    else: cv = real
+                    sel = m.id(); cur.append(Ins(OP_SELECT, [ct, sel, cv, x_.a[1], neg])); x_.a[1] = sel; stats['selects'] += 1; stats['image_writes'] += 1; cur.append(x_); i += 1; continue
                 if not side_effect(x_): cur.append(x_); i += 1; continue
                 run = []
                 while i < len(body2) and side_effect(body2[i]): run.append(body2[i]); i += 1
@@ -347,9 +386,9 @@ def shuffle_xor(spv):
 
 if __name__ == '__main__':
     import argparse
-    ap = argparse.ArgumentParser(); ap.add_argument('inp'); ap.add_argument('out'); ap.add_argument('--to', type=int, default=64); ap.add_argument('--xor', action='store_true'); ap.add_argument('--info', action='store_true')
+    ap = argparse.ArgumentParser(); ap.add_argument('inp'); ap.add_argument('out'); ap.add_argument('--to', type=int, default=64); ap.add_argument('--xor', action='store_true'); ap.add_argument('--mode', default='branch', choices=('branch', 'select')); ap.add_argument('--info', action='store_true')
     a = ap.parse_args(); b = open(a.inp, 'rb').read()
     if a.info: print(info(b)); sys.exit()
     if a.xor: b, n, t = shuffle_xor(b); print(f'{n} of {t} shuffles → ShuffleXor')
-    else: b, st = pad(b, a.to); print(st)
+    else: b, st = pad(b, a.to, a.mode); print(st)
     open(a.out, 'wb').write(b)

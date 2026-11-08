@@ -1,7 +1,8 @@
 # shader_padwave.py: a 32-lane compute kernel padded to 64 lanes for a 64-lane-wave GPU (the Odin 3's Adreno 830 driver fails Ocarina of Time's NDVE movie kernels at
 # LocalSize 32). A tiny hand-written kernel (assembled with spirv-as when it is on the PATH), and Ocarina of Time's e6be82d835fbe4d3 when its SPIR-V is at hand
 # (DM_PADWAVE_SAMPLE=<dir with <key>.spv>): the output validates, its LocalSize is 64xNx1, every store to Workgroup / storage / BDA / image memory and every atomic
-# sits in a block entered only under the lane < 32 predicate, the barrier and shuffle counts are unchanged, and a padded module pads no further.
+# sits in a block entered only under the lane < 32 predicate (mode branch) or behind an OpSelect of its slot / coordinate (mode select), the barrier and shuffle counts are
+# unchanged, and a padded module pads no further.
 import os, shutil, struct, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
@@ -173,6 +174,20 @@ class PadWave(unittest.TestCase):
         self.assertEqual(pw.info(xo)['shuffles'], 1); self.assertIn(pw.OP_SHUFFLE_XOR, {x.op for x in pw.parse(xo)[1]})
 
     @unittest.skipUnless(SPIRV_AS and SPIRV_VAL, 'needs spirv-as and spirv-val')
+    def test_tiny_select(self):   # branchless padding: the Workgroup stores and the image write take an OpSelect, only the storage stores and the atomic a branch
+        spv = assemble(TINY); out, st = pw.pad(spv, mode='select')
+        ok, err = validate(out); self.assertTrue(ok, err); self.assertEqual(local_size(out), [64, 2, 1])
+        self.assertEqual(st['stores'], {'workgroup': 2, 'storage': 2}); self.assertEqual(st['atomics'], 1); self.assertEqual(st['image_writes'], 1); self.assertEqual(st['selects'], 3)
+        def blocks(b): return sum(1 for x in pw.parse(b)[1] if x.op == pw.OP_LABEL)
+        self.assertEqual(blocks(out) - blocks(spv), 2 * st['selections']); self.assertEqual(st['selections'], 3)   # the ssbo store, the atomic, the second ssbo store (an OpIAdd between the last two)
+        ins = pw.parse(out)[1]
+        arr = [x for x in ins if x.op == 28]; self.assertEqual(len(arr), 1); self.assertEqual(pw._Mod(out).const_value(arr[0].a[2]), 33, 'the shared array grew by one spare slot')
+        for x in ins:   # every Workgroup store's access chain indexes through a select on the predicate
+            if x.op == pw.OP_STORE and pw._Mod(out).storage_class(x.a[0]) == pw.SC_WORKGROUP:
+                ch = next(y for y in ins if y.result == x.a[0]); sel = next(y for y in ins if y.result == ch.a[3]); self.assertEqual(sel.op, pw.OP_SELECT)
+        self.assertEqual(pw.info(out)['barriers'], 1); self.assertEqual(pw.info(out)['shuffles'], 1)
+
+    @unittest.skipUnless(SPIRV_AS and SPIRV_VAL, 'needs spirv-as and spirv-val')
     def test_bails(self):
         other = TINY.replace('LocalSize 32 2 1', 'LocalSize 16 2 1'); spv = assemble(other)
         self.assertFalse(pw.wants_pad(spv))
@@ -196,6 +211,8 @@ class PadWave(unittest.TestCase):
         def binds(b): return sorted(tuple(x.a) for x in pw.parse(b)[1] if x.op == pw.OP_DECORATE and len(x.a) == 3 and x.a[1] in (33, 34))
         self.assertEqual(binds(spv), binds(out))
         xo, n, total = pw.shuffle_xor(spv); self.assertEqual(total, 864); self.assertEqual(n, 0, 'its shuffle indices are 2 * v | base, no lane ^ constant')
+        out2, st2 = pw.pad(spv, mode='select'); ok, err = validate(out2); self.assertTrue(ok, err)
+        self.assertEqual(st2['selects'], 276); self.assertEqual(st2['selections'], 2); self.assertEqual(pw.info(out2)['barriers'], 362); self.assertEqual(pw.info(out2)['shuffles'], 864)
 
 
 if __name__ == '__main__':
