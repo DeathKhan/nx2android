@@ -224,7 +224,7 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
 // With a theme in the APK (overlay_theme.c), the gamepad is its sprites instead: an atlas per layout in a texture of its own (g_tt), uploaded once, every
 // control drawn from it on each present; the procedural layer is then only the menu's panel, the dimming and the counter.
 enum { SP_DISC = OV_N, SP_BLACK, SP_WHITE, SP_ACCENT, SP_N };   // (black, white, accent: solid blocks, the dimming and the layout editor's frames)
-#define OV_FPS_CHARS "0123456789 FPS-"
+#define OV_FPS_CHARS "0123456789 FPS-CBATO"   // (the temperature rows: "SOC 52C", "BAT 38C")
 static struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkSampler samp; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set;
                 VkPipeline pipe; VkFormat pfmt; uint32_t w, h, sh, pw, ph, gh, gs, tw; unsigned acc; VkBuffer up; VkDeviceMemory upm; uint8_t *px; int uploaded, panel, lay, cver; float sp[SP_N][4];
                 VkRenderPass rp; VkFramebuffer fb[8]; VkImageView fbview[8]; VkExtent2D fbext[8]; } g_ov;
@@ -411,7 +411,7 @@ static void ov_accent_update(void) {
 static const uint8_t C_PANEL0[4] = {34, 35, 43, 246}, C_PANEL1[4] = {19, 20, 25, 250}, C_RIM[4] = {255, 255, 255, 30}, C_TEXT[4] = {244, 244, 248, 255},
                      C_SUB[4] = {146, 149, 162, 255}, C_DIM[4] = {186, 188, 199, 255}, C_FILL[4] = {255, 255, 255, 20}, C_FILL2[4] = {255, 255, 255, 34},
                      C_SEP[4] = {255, 255, 255, 16}, C_OFF[4] = {255, 255, 255, 52}, C_KNOB_OFF[4] = {222, 223, 230, 255}, C_SHADOW[4] = {0, 0, 0, 255},
-                     C_BADGE[4] = {226, 227, 233, 255}, C_BADGE_TX[4] = {24, 24, 30, 255}, C_RED[4] = {255, 105, 97, 255};
+                     C_BADGE[4] = {226, 227, 233, 255}, C_BADGE_TX[4] = {24, 24, 30, 255}, C_RED[4] = {255, 105, 97, 255}, C_HOT[4] = {255, 64, 48, 255};
 static void ov_menu_icon(const ov_canvas *cv, const ov_ctl *c, const float b[4]) {   // the menu button: a dark pill with a ring and three bars
     static const uint8_t fill[4] = {20, 20, 26, 170}, ring[4] = {255, 255, 255, 210};
     float r = b[3], t = fmaxf(2, r * 0.07f);
@@ -812,29 +812,43 @@ static void ov_fps_glyphs(void) {   // the characters into the rows under the pa
     ov_canvas cv = {g_ov.px, g_ov.tw, 0, g_ov.h + g_ov.sh + g_ov.ph, g_ov.tw, g_ov.gh};
     for (uint32_t y = 0; y < g_ov.gh; y++) memset(g_ov.px + 4 * ((size_t)(cv.y0 + y) * g_ov.tw), 0, (size_t)g_ov.tw * 4);
     float px = ovf_ready() ? 7.0f * g_ov.gs / ovf_cap(1) : 0, cell = ov_fps_cell();
-    for (int i = 0; OV_FPS_CHARS[i]; i++) {
-        char one[2] = {OV_FPS_CHARS[i], 0}; const uint8_t *c = one[0] >= 'A' && one[0] <= 'Z' ? C_ACCENT : C_WHITE;
+    int nc = (int)strlen(OV_FPS_CHARS);   // the characters, then the same ones again in red after them (a temperature too hot: ov_fps)
+    for (int i = 0; i < 2 * nc; i++) {
+        char one[2] = {OV_FPS_CHARS[i % nc], 0}; const uint8_t *c = i >= nc ? C_HOT : one[0] >= 'A' && one[0] <= 'Z' ? C_ACCENT : C_WHITE;
         if (px > 0) tx_c(&cv, i * cell + cell / 2, g_ov.gh / 2.0f, one, px, 1, c); else cv_text(&cv, i * cell + 1 + g_ov.gs * 0.5f, g_ov.gh / 2.0f, one, (int)g_ov.gs, c);
     }
 }
+__attribute__((weak)) void dm_android_temps(int *soc, int *bat) { *soc = *bat = -1000; }   // (front_android.c temp_watch; absent in other builds)
+// One row of the counter at y0: its box and its characters, in the corner the player chose (dm_overlay_fps_pos); on the right a box is placed as wide as "999 FPS", so it stays
+// put as the number changes (the bottom corners are clear of the gesture bar in the middle, the right ones of the system handle half way down the right edge). hot: the red copies
+static void ov_fps_row(VkCommandBuffer cb, const char *s, int hot, float y0) {
+    float cw = ov_fps_cell() * (ovf_ready() ? 0.80f : 1), ch = (float)g_ov.gh, m = (float)g_sext.height * 0.02f, r = ch / 2, x = m + r * 0.9f, gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
+    float bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1], x1 = x + (strlen(s) - (strchr(s, ' ') ? 0.55f : 0)) * cw + r * 0.1f;
+    int pos = dm_overlay_fps_pos() & 3; float bw = (7 - 0.55f) * cw + 1.9f * r, dx = pos & 1 ? (float)g_sext.width - 2 * m - bw : 0;
+    x += dx; x1 += dx;
+    ov_rect(cb, m + dx, y0, x1 + r * 0.9f, y0 + ch, bx - 2, by - 2, bx + 2, by + 2, 0.50f);   // the box: square-cornered, as much room each side
+    size_t nc = strlen(OV_FPS_CHARS);
+    for (int i = 0; s[i]; x += s[i] == ' ' ? cw * 0.45f : cw, i++) {   // (a narrower space)
+        const char *c = strchr(OV_FPS_CHARS, s[i]); if (!c || s[i] == ' ') continue;
+        float u = (float)((size_t)(c - OV_FPS_CHARS) + (hot ? nc : 0)) * ov_fps_cell(), o = (ov_fps_cell() - cw) / 2;
+        ov_rect(cb, x - o, y0, x - o + ov_fps_cell(), y0 + ch, u, gy, u + ov_fps_cell(), gy + ch, 1);
+    }
+}
+// The counter: the frame rate, then the chip's and the battery's temperature where the device gives them (front_android.c dm_android_temps, upstream nx2android #150), one box
+// a row; in a bottom corner the rows grow upwards and the frame rate stays on top. Red from where it is dangerously hot: the chip at 80 C (phones throttle hard in the high 80s),
+// the battery at 45 C (Android's warnings and charging limits)
 static void ov_fps(VkCommandBuffer cb, int64_t now) {
     static uint64_t n0; static int64_t t0; static int fps = -1;
     uint64_t n = atomic_load(&g_fps_frames);
     if (!t0 || now - t0 > 2000000000ll) { t0 = now; n0 = n; fps = -1; }   // the first frame, or after a pause in the presents (the menu, the background): measure anew
     else if (now - t0 >= 500000000ll) { fps = (int)((double)(n - n0) * 1e9 / (double)(now - t0) + 0.5); t0 = now; n0 = n; }
-    char s[16]; if (fps < 0) snprintf(s, sizeof s, "-- FPS"); else snprintf(s, sizeof s, "%d FPS", fps > 999 ? 999 : fps);
-    float cw = ov_fps_cell() * (ovf_ready() ? 0.80f : 1), ch = (float)g_ov.gh, m = (float)g_sext.height * 0.02f, r = ch / 2, x = m + r * 0.9f, gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
-    float bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1], x1 = x + (strlen(s) - (strchr(s, ' ') ? 0.55f : 0)) * cw + r * 0.1f;
-    // the corner (dm_overlay_fps_pos): the same margin m from each edge; on the right the box is placed as wide as "999 FPS", so it stays put as the number
-    // changes (the bottom corners are clear of the gesture bar in the middle, the right ones of the system handle half way down the right edge)
-    int pos = dm_overlay_fps_pos() & 3; float bw = (7 - 0.55f) * cw + 1.9f * r, dx = pos & 1 ? (float)g_sext.width - 2 * m - bw : 0, y0 = pos & 2 ? (float)g_sext.height - m - ch : m;
-    x += dx; x1 += dx;
-    ov_rect(cb, m + dx, y0, x1 + r * 0.9f, y0 + ch, bx - 2, by - 2, bx + 2, by + 2, 0.50f);   // the box: square-cornered, as much room each side
-    for (int i = 0; s[i]; x += s[i] == ' ' ? cw * 0.45f : cw, i++) {   // (a narrower space)
-        const char *c = strchr(OV_FPS_CHARS, s[i]); if (!c || s[i] == ' ') continue;
-        float u = (float)(c - OV_FPS_CHARS) * ov_fps_cell(), o = (ov_fps_cell() - cw) / 2;
-        ov_rect(cb, x - o, y0, x - o + ov_fps_cell(), y0 + ch, u, gy, u + ov_fps_cell(), gy + ch, 1);
-    }
+    char rows[3][16]; int nr = 0, hot[3] = {0};
+    if (fps < 0) snprintf(rows[nr++], 16, "-- FPS"); else snprintf(rows[nr++], 16, "%d FPS", fps > 999 ? 999 : fps);
+    int soc = -1000, bat = -1000; dm_android_temps(&soc, &bat);   // whole degrees C, -1000 when not known
+    if (soc > -100 && soc < 1000) { hot[nr] = soc >= 80; snprintf(rows[nr++], 16, "SOC %dC", soc); }
+    if (bat > -100 && bat < 1000) { hot[nr] = bat >= 45; snprintf(rows[nr++], 16, "BAT %dC", bat); }
+    float ch = (float)g_ov.gh, m = (float)g_sext.height * 0.02f, gap = ch * 0.15f; int bottom = (dm_overlay_fps_pos() & 2) != 0;
+    for (int i = 0; i < nr; i++) ov_fps_row(cb, rows[i], hot[i], bottom ? (float)g_sext.height - m - ch - (float)(nr - 1 - i) * (ch + gap) : m + (float)i * (ch + gap));
 }
 static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) {   // (alpha: the player's opacity; each control at its own size factor)
     float W = (float)g_sext.width, H = (float)g_sext.height, k = H / t->dh * dm_overlay_scale(), b[4]; const ov_ctl *L = OV_LAYOUTS[t->layout];
@@ -1007,7 +1021,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
           if (g_ov.ph < (uint32_t)ceilf(a[3] + b[3]) + 4) g_ov.ph = (uint32_t)ceilf(a[3] + b[3]) + 4; }
         g_ov.tw = g_ov.pw > w ? g_ov.pw : w;
         g_ov.gs = (uint32_t)fmaxf(2, roundf(g_sext.height * 0.024f / 7)); g_ov.gh = 7 * g_ov.gs + 8;   // the counter's capitals: 2.4% of the window's height
-        if (g_ov.tw < (uint32_t)((strlen(OV_FPS_CHARS) + 2) * ov_fps_cell() + g_ov.gh)) g_ov.tw = (uint32_t)((strlen(OV_FPS_CHARS) + 2) * ov_fps_cell() + g_ov.gh);
+        if (g_ov.tw < (uint32_t)((2 * strlen(OV_FPS_CHARS) + 2) * ov_fps_cell() + g_ov.gh)) g_ov.tw = (uint32_t)((2 * strlen(OV_FPS_CHARS) + 2) * ov_fps_cell() + g_ov.gh);   // (twice: the red copies)
         ov_accent_update(); g_ov.acc = g_acc_rgb;
         uint32_t th = h + sh + g_ov.ph + g_ov.gh;
         VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {g_ov.tw, th, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
