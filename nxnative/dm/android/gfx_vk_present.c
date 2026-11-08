@@ -70,7 +70,8 @@ __attribute__((weak)) float dm_overlay_scale(void) { return 1; }
 __attribute__((weak)) void dm_overlay_knob(int stick, float *dx, float *dy) { (void)stick; *dx = *dy = 0; }
 __attribute__((weak)) int64_t dm_overlay_pressed(int ctl, uint64_t bit) { (void)ctl; (void)bit; return 0; }
 __attribute__((weak)) int dm_menu_state(void) { return -1; }
-__attribute__((weak)) int dm_overlay_fps(void) { return 0; }   // front_android.c: the pause menu's Show FPS
+__attribute__((weak)) int dm_overlay_fps(void) { return 0; }
+__attribute__((weak)) int dm_overlay_fps_pos(void) { return 0; }   // front_android.c: the counter's corner (bit 0 right, bit 1 bottom)   // front_android.c: the pause menu's Show FPS
 __attribute__((weak)) int dm_save_note(char *out, int cap) { if (cap > 0) out[0] = 0; return OVX_IDLE; }   // front_android.c: the save manager's rows
 __attribute__((weak)) int dm_save_rows(ov_srow rows[OVM_ROWS]) { (void)rows; return 0; }
 __attribute__((weak)) int dm_overlay_custom(int layout, int ctl, float *x, float *y, float *s) { (void)layout; (void)ctl; (void)x; (void)y; *s = 1; return 0; }
@@ -78,7 +79,7 @@ __attribute__((weak)) int dm_overlay_custom_ver(void) { return 0; }
 __attribute__((weak)) float dm_overlay_opacity(void) { return 0.6f; }
 __attribute__((weak)) int dm_overlay_layout(void) { return 0; }
 __attribute__((weak)) int dm_menu_value(int item) { (void)item; return 0; }   // front_android.c: the pause menu's rows' values, colour and header
-__attribute__((weak)) unsigned dm_menu_accent(void) { return 0xFF3C8E; }
+__attribute__((weak)) unsigned dm_menu_accent(void) { return OVM_ACCENT_DEFAULT; }
 __attribute__((weak)) const char *dm_menu_choice_name(int item, int v) {
     if (item < 0 || item >= OVM_N) return "";
     return v == OVM_NA ? (OVM_ROW[item].na ? OVM_ROW[item].na : "") : v >= 0 && v < OVM_ROW[item].n ? OVM_ROW[item].choices[v] : "Custom";
@@ -398,8 +399,8 @@ static void tx_clip(char *s, float px, int bold, float room) {   // s cut short 
 // The colours. The accent is the player's (front_android.c dm_menu_accent, settings.txt accent=): the selection, the switches, the slider, the open tab,
 // Resume, the layout editor's chosen control and the frame rate counter's letters. On a light accent (yellow, white) the words on it are dark
 static const uint8_t C_WHITE[4] = {255, 255, 255, 255};
-static uint8_t C_ACCENT[4] = {255, 60, 142, 255}, C_ON_ACCENT[4] = {255, 255, 255, 255}, C_ACC_SEL[4], C_ACC_PRESS[4];
-static unsigned g_acc_rgb = 0xFF3C8E;
+static uint8_t C_ACCENT[4] = {OVM_ACCENT_DEFAULT >> 16 & 255, OVM_ACCENT_DEFAULT >> 8 & 255, OVM_ACCENT_DEFAULT & 255, 255}, C_ON_ACCENT[4] = {255, 255, 255, 255}, C_ACC_SEL[4], C_ACC_PRESS[4];
+static unsigned g_acc_rgb = OVM_ACCENT_DEFAULT;
 static void ov_accent_update(void) {
     unsigned c = dm_menu_accent() & 0xffffff; g_acc_rgb = c;
     C_ACCENT[0] = c >> 16 & 255; C_ACCENT[1] = c >> 8 & 255; C_ACCENT[2] = c & 255; C_ACCENT[3] = 255;
@@ -824,11 +825,15 @@ static void ov_fps(VkCommandBuffer cb, int64_t now) {
     char s[16]; if (fps < 0) snprintf(s, sizeof s, "-- FPS"); else snprintf(s, sizeof s, "%d FPS", fps > 999 ? 999 : fps);
     float cw = ov_fps_cell() * (ovf_ready() ? 0.80f : 1), ch = (float)g_ov.gh, m = (float)g_sext.height * 0.02f, r = ch / 2, x = m + r * 0.9f, gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
     float bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1], x1 = x + (strlen(s) - (strchr(s, ' ') ? 0.55f : 0)) * cw + r * 0.1f;
-    ov_rect(cb, m, m, x1 + r * 0.9f, m + ch, bx - 2, by - 2, bx + 2, by + 2, 0.50f);   // the box: square-cornered, as much room each side
+    // the corner (dm_overlay_fps_pos): the same margin m from each edge; on the right the box is placed as wide as "999 FPS", so it stays put as the number
+    // changes (the bottom corners are clear of the gesture bar in the middle, the right ones of the system handle half way down the right edge)
+    int pos = dm_overlay_fps_pos() & 3; float bw = (7 - 0.55f) * cw + 1.9f * r, dx = pos & 1 ? (float)g_sext.width - 2 * m - bw : 0, y0 = pos & 2 ? (float)g_sext.height - m - ch : m;
+    x += dx; x1 += dx;
+    ov_rect(cb, m + dx, y0, x1 + r * 0.9f, y0 + ch, bx - 2, by - 2, bx + 2, by + 2, 0.50f);   // the box: square-cornered, as much room each side
     for (int i = 0; s[i]; x += s[i] == ' ' ? cw * 0.45f : cw, i++) {   // (a narrower space)
         const char *c = strchr(OV_FPS_CHARS, s[i]); if (!c || s[i] == ' ') continue;
         float u = (float)(c - OV_FPS_CHARS) * ov_fps_cell(), o = (ov_fps_cell() - cw) / 2;
-        ov_rect(cb, x - o, m, x - o + ov_fps_cell(), m + ch, u, gy, u + ov_fps_cell(), gy + ch, 1);
+        ov_rect(cb, x - o, y0, x - o + ov_fps_cell(), y0 + ch, u, gy, u + ov_fps_cell(), gy + ch, 1);
     }
 }
 static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) {   // (alpha: the player's opacity; each control at its own size factor)

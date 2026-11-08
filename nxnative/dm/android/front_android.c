@@ -73,10 +73,13 @@ static char g_title[128];   // the app's name (on_create: app_label), the menu's
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
-static _Atomic unsigned g_set_accent = 0xFF3C8E;   // the menu's highlight colour, 0xRRGGBB (overlay_layout.h OVM_ACCENTS; settings.txt accent=RRGGBB)
+static _Atomic unsigned g_set_accent = OVM_ACCENT_DEFAULT;   // the menu's highlight colour, 0xRRGGBB (overlay_layout.h OVM_ACCENTS; settings.txt accent=RRGGBB; none: orange)
 static _Atomic int g_set_res = DM_RES_BALANCED;   // the Resolution level (DM_RES_*: docked at DM_RES_MAX, else handheld; settings.txt res=, docked= kept beside it)
 static const char *const RES_KEYS[DM_RES_N] = {"performance", "balanced", "quality", "max"};
 static _Atomic int g_set_cap;    // the frame cap's index in OVM_CAPS (0 off; settings.txt fpscap= in fps; hle_framecap.c holds the game to it)
+static _Atomic int g_set_fpspos;   // the frame rate counter's corner (OVM_FPSPOS_KEYS: 0 top left for every game until the player picks another; settings.txt fpspos=)
+static int fpspos_index(const char *s) { for (int i = 0; i < 4; i++) if (!strncmp(s, OVM_FPSPOS_KEYS[i], 2)) return i; return -1; }
+int dm_overlay_fps_pos(void) { return atomic_load(&g_set_fpspos); }
 static int cap_index(int fps) { for (int i = 0; i < OVM_NCAPS; i++) if (OVM_CAPS[i] == fps) return i; return 0; }
 // settings.txt lines this build does not know (a newer build's, or one a tool wrote): kept as they are and written again after the known ones
 static char g_set_extra[2048];
@@ -95,6 +98,7 @@ static void settings_load(void) {
         else if (sscanf(line, "docked=%d", &v) == 1) { setenv("DM_OPMODE", v ? "1" : "0", 1); atomic_store(&g_set_res, v ? DM_RES_MAX : DM_RES_BALANCED); }   // over env.txt's: the host reads it once, at its first query
         else if (!strncmp(line, "res=", 4)) { for (int k = 0; k < DM_RES_N; k++) if (!strncmp(line + 4, RES_KEYS[k], strlen(RES_KEYS[k]))) { atomic_store(&g_set_res, k); setenv("DM_OPMODE", k == DM_RES_MAX ? "1" : "0", 1); } }   // (after docked=)
         else if (sscanf(line, "fpscap=%d", &v) == 1) atomic_store(&g_set_cap, cap_index(v));
+        else if (!strncmp(line, "fpspos=", 7) && fpspos_index(line + 7) >= 0) atomic_store(&g_set_fpspos, fpspos_index(line + 7));
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
         else if (!strncmp(line, "accent=", 7)) { unsigned c; if (sscanf(line + 7, "%6x", &c) == 1 && strspn(line + 7, "0123456789abcdefABCDEF") == 6) atomic_store(&g_set_accent, c); }
@@ -119,6 +123,7 @@ static void settings_save(void) {
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\nfpscap=%d\nres=%s\naccent=%06X\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0,
             atomic_load(&g_set_fps), atomic_load(&g_set_opacity), atomic_load(&g_set_grid), OVM_CAPS[atomic_load(&g_set_cap)], RES_KEYS[atomic_load(&g_set_res)],
             atomic_load(&g_set_accent) & 0xffffff);
+    fprintf(f, "fpspos=%s\n", OVM_FPSPOS_KEYS[atomic_load(&g_set_fpspos) & 3]);
     fputs(g_set_extra, f);   // the lines settings_load did not know
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
@@ -430,6 +435,7 @@ int dm_menu_value(int item) {
     case OVM_OPACITY: return atomic_load(&g_set_opacity);
     case OVM_MODE: return atomic_load(&g_set_res);
     case OVM_ACCENT: return accent_index(atomic_load(&g_set_accent));
+    case OVM_FPSPOS: return dm_overlay_fps_pos();
     case OVM_FRAMECAP: return dm_frame_cap_how() == DM_FRAME_CAP_NONE ? OVM_NA : atomic_load(&g_set_cap);
     default: return 0;
     }
@@ -452,7 +458,8 @@ static void menu_set(int item, int v) {   // a row's new value (a switch, a choi
     else if (item == OVM_MODE && v >= 0 && v < DM_RES_N) {   // Resolution: the mode reaches the game as the notification it takes when the menu closes, the GPU target at its next frame
         atomic_store(&g_set_res, v); dm_set_opmode(v == DM_RES_MAX); dm_res_set(v);
         LOG("[menu] resolution %s (%s; the game takes the mode as it goes on)", RES_KEYS[v], v == DM_RES_MAX ? "docked" : "handheld");
-    } else if (item == OVM_FRAMECAP && v >= 0 && v < OVM_NCAPS) {   // applied at once (hle_framecap.c)
+    } else if (item == OVM_FPSPOS && v >= 0 && v < 4) { atomic_store(&g_set_fpspos, v); LOG("[menu] FPS position %s", OVM_FPSPOS_KEYS[v]); }
+    else if (item == OVM_FRAMECAP && v >= 0 && v < OVM_NCAPS) {   // applied at once (hle_framecap.c)
         if (dm_frame_cap_how() == DM_FRAME_CAP_NONE) return;
         atomic_store(&g_set_cap, v); dm_frame_cap_set(OVM_CAPS[v]);
         if (OVM_CAPS[v]) LOG("[menu] frame cap %d", OVM_CAPS[v]); else LOG("[menu] frame cap off");
