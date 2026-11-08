@@ -1577,6 +1577,7 @@ static int set_memo_ok(vkshader_t *s) {
     if (!s->setmemo) { int ok = 1, ncb = 0, claim = 0;
         for (int i = 0; i < s->nbind; i++) { const dmsv_bind *b = &s->b[i]; ncb += memo_buffer(b); claim |= b->kind == RK_GS_CLAIM;
             ok &= b->kind != RK_TEXD && b->kind != RK_SAMPD && b->kind != RK_SBUF_UBO && b->kind != RK_UBO_PTR && (b->kind != RK_TEX_UBO || s->tbl[i]) && b->kind != RK_IMG_UBO && b->kind != RK_TBUF_UBO && b->samp != RS_UBO && i < 256;   // (a texture table binding is in the table set, tbl_set, not this one)
+            ok &= (b->kind != RK_TEXP && b->kind != RK_SAMPP) || s->tbl[i];   // (a pool array is in the table set too: vk_shader draws no shader whose pool arrays are not)
             ok &= !(b->kind >= RK_MESH_CTL && b->kind <= RK_MESH_IDX); }   // (the mesh emulation's buffers change every draw: mesh_draw)
         s->setmemo = ok && ncb <= MEMO_CB ? (claim ? 3 : 1) : 2; }
     return (s->setmemo & 1) && (s->setmemo != 3 || g_buffer_memo);
@@ -1777,24 +1778,50 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
 // the slot's kind (2D, 2D array, cube; what does not fit the kind, or has integer texels, gets the dummy), up to the buffer's bound size and the table's length; the rest dummies.
 // Sets are kept per submission by the handles' hash (and the texture, sampler and pool generations), as stage_set's are; a draw's set is bound only when it differs from the last
 // bound (draw). DM_VK_TBL_N=0 leaves the arrays in the stages' sets as before
+// The texture and sampler pool tables (gfx_vk.h RK_TEXP / RK_SAMPP) share the set: element k of each kind's sampled-image array is the texture registered under ID k (the bound
+// pool's base added, mem_handle) through a view of the kind, the dummy where none fits or the texels are integers; element k of the sampler array is sampler ID k. Written when a
+// stage of the draw reads a pool (pool), from the registries as they are, and kept by the same cache: a set lives as long as no texture or sampler registration changes
 static struct { uint64_t h, epoch, tex, samp; uint32_t n, pool; VkDescriptorSet set; } g_tblc[64];
-static uint64_t g_tbl_builds, g_tbl_hits, g_tbl_binds, g_ns_tbl; static uint32_t g_tbl_max_n, g_tbl_max_bytes;
-static VkDescriptorSet tbl_set(int st, vkshader_t *s) {
-    uint64_t t0 = tick(); const int N = vk_tbl_n();
-    static uint32_t words[2 * 65536 / 8]; static VkDescriptorImageInfo *ii;   // the handles read (8 bytes each), and TBL_SLOTS x N descriptors
-    const p_bind_buf *u = s->tbl_reg >= 0 && s->tbl_reg < 16 ? &S.ubo[st][s->tbl_reg] : NULL; uint32_t n = 0;
+static uint64_t g_tbl_builds, g_tbl_hits, g_tbl_binds, g_ns_tbl, g_pool_builds; static uint32_t g_tbl_max_n, g_tbl_max_bytes;
+static VkDescriptorSet tbl_set(int st, vkshader_t *s, int pool) {   // s: the shader of stage st whose handle table is read (NULL: none); pool: the pool tables too
+    uint64_t t0 = tick(); const int N = vk_tbl_n(), NP = vk_pool_n(), NS = vk_pool_samp_n(); const int ntbl = s && s->ntbl;
+    static uint32_t words[2 * 65536 / 8]; static VkDescriptorImageInfo *ii;   // the handles read (8 bytes each), and TBL_SLOTS x N + POOL_TEX_SLOTS x NP + NS descriptors
+    const p_bind_buf *u = ntbl && s->tbl_reg >= 0 && s->tbl_reg < 16 ? &S.ubo[st][s->tbl_reg] : NULL; uint32_t n = 0;
     if (u && u->addr && s->tbl_off >= 0) { uint64_t a = u->addr + (uint64_t)s->tbl_off, size = u->size ? u->size : 65536; if (size > 65536) size = 65536;
         vkpool_t *p = vk_pool_peek(a, 8);
         if (p && size > (uint64_t)s->tbl_off) { uint64_t bytes = size - (uint64_t)s->tbl_off; if (a + bytes > p->end) bytes = p->end > a ? p->end - a : 0;
             n = (uint32_t)(bytes / 8); if (n > (uint32_t)N) n = (uint32_t)N; if (n) vk_ubd_read(a, (uint64_t)n * 8, (uint8_t *)words);
             if (bytes > g_tbl_max_bytes || n > g_tbl_max_n) { g_tbl_max_bytes = bytes > g_tbl_max_bytes ? (uint32_t)bytes : g_tbl_max_bytes; g_tbl_max_n = n > g_tbl_max_n ? n : g_tbl_max_n;
                 static int nl; if (nl++ < 12) VKLOG("texture table: stage %d uniform buffer %d +%d bound with %llu bytes: %u handles read (table length %d)", st, s->tbl_reg, s->tbl_off, (unsigned long long)size, n, N); } } }
-    uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)n; for (uint32_t k = 0; k < n; k++) h = (h ^ words[2 * k]) * 0x100000001b3ull;   // the handle words (the high word of each 8 bytes is not read)
+    uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)n ^ (uint64_t)(pool != 0) << 40 ^ (uint64_t)(ntbl != 0) << 41; for (uint32_t k = 0; k < n; k++) h = (h ^ words[2 * k]) * 0x100000001b3ull;   // the handle words (the high word of each 8 bytes is not read)
     uint64_t gtex = g_tex_gen, gsamp = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE); uint32_t gpool = vk_pool_gen(); unsigned c = (unsigned)(h % (sizeof g_tblc / sizeof *g_tblc));
     if (g_tblc[c].epoch == g_set_epoch && g_tblc[c].h == h && g_tblc[c].n == n && g_tblc[c].tex == gtex && g_tblc[c].samp == gsamp && g_tblc[c].pool == gpool && !g_tracing && !g_x_nosetc) { g_tbl_hits++; g_ns_tbl += tick() - t0; return g_tblc[c].set; }
-    if (!ii) ii = calloc((size_t)TBL_SLOTS * (size_t)N, sizeof *ii);
-    VkDescriptorSet set = vk_alloc_set(vk_tbl_dsl()); VkWriteDescriptorSet w[TBL_SLOTS];
-    for (int slot = 0; slot < TBL_SLOTS; slot++) {
+    if (!ii) ii = calloc((size_t)TBL_SLOTS * (size_t)(N ? N : 1) + (size_t)POOL_TEX_SLOTS * (size_t)(NP ? NP : 1) + (size_t)(NS ? NS : 1), sizeof *ii);
+    VkDescriptorSet set = vk_alloc_set(vk_tbl_dsl()); VkWriteDescriptorSet w[SET0_BINDINGS]; uint32_t nwr = 0;
+    if (pool && NP && NS) {   // the pool tables (written before the handle tables: those bindings follow in w[])
+        VkDescriptorImageInfo *d = ii + (size_t)TBL_SLOTS * (size_t)(N ? N : 1); uint32_t filled[POOL_TEX_SLOTS + 1] = {0};
+        for (int ps = 0; ps < POOL_TEX_SLOTS; ps++, d += NP) {
+            dmsv_bind vb = {.kind = RK_TEXP, .desc = RD_IMAGE, .dim = (uint8_t)(ps == 2 ? 3 : ps == 3 ? 2 : 1), .flags = (uint8_t)(ps == 1 ? 1 : 0), .samp = RS_NONE, .reg = -1, .off = -1};
+            VkDescriptorImageInfo dummy = {VK_NULL_HANDLE, vk_dummy_view(vb.dim, vb.flags & 1, 0, 0, 0), VK_IMAGE_LAYOUT_GENERAL}; d[0] = dummy;
+            for (int k = 1; k < NP; k++) {
+                uint64_t hh = mem_handle((uint64_t)k); const view_t *v = NULL; const tex_t *t = NULL; int fits = 0;
+                if (vk_tex_by_id((int)(hh & 0xfffff), &v, &t) && t) { int target = v && v->set_target ? v->target : t->d.target;
+                    fits = ps == 2 ? (t->d.width == t->d.height && (target == 8 || target == 9 || (target == 4 && t->d.depth >= 6))) : ps == 3 ? target == 2 : (target == 1 || target == 4 || target == 8 || target == 9);
+                    if (fits && view_num(t, v)) fits = 0; }   // (the arrays declare floating-point texels)
+                if (fits) { tex_desc_for(st, &vb, hh, &d[k], 0); d[k].sampler = VK_NULL_HANDLE; if (!d[k].imageView) d[k] = dummy; else filled[ps]++; } else d[k] = dummy;
+            }
+            w[nwr++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)(POOL_B0 + ps), 0, (uint32_t)NP, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, d, NULL, NULL};
+        }
+        d[0] = (VkDescriptorImageInfo){vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+        for (int k = 1; k < NS; k++) { VkSampler sm = vk_samp_by_id((int)(mem_handle((uint64_t)k << 20) >> 20 & 0xfff)); if (sm) filled[POOL_TEX_SLOTS]++; d[k] = (VkDescriptorImageInfo){sm ? sm : vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; }
+        w[nwr++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, POOL_SAMP_B, 0, (uint32_t)NS, VK_DESCRIPTOR_TYPE_SAMPLER, d, NULL, NULL};
+        g_pool_builds++;
+        if (g_pool_builds <= 4 || !(g_pool_builds & (g_pool_builds - 1))) VKLOG("texture pool tables: build %llu (stage %d shader %016llx): %u 2D, %u 2D-array, %u cube, %u 3D textures of %d entries, %u samplers of %d; the highest IDs registered %d / %d (pool bases %d / %d)",
+            (unsigned long long)g_pool_builds, st, (unsigned long long)(s ? s->key : 0), filled[0], filled[1], filled[2], filled[3], NP, filled[4], NS, vk_tex_id_max(), vk_samp_id_max(), g_pool_tex_base, g_pool_samp_base);
+        if (vk_tex_id_max() - g_pool_tex_base >= NP) VKRED_ONCE(101, "texture pool table: a texture ID (%d) is registered past the table's %d entries: reads of it take the last entry (DM_VK_POOL_N raises the length)", vk_tex_id_max() - g_pool_tex_base, NP);
+        if (vk_samp_id_max() - g_pool_samp_base >= NS) VKRED_ONCE(102, "sampler pool table: a sampler ID (%d) is registered past the table's %d entries", vk_samp_id_max() - g_pool_samp_base, NS);
+    }
+    for (int slot = 0; slot < TBL_SLOTS && ntbl; slot++) {
         const dmsv_bind *b = NULL; for (int i = 0; i < s->nbind && i < 96; i++) if (s->tbl[i] == 1 + slot) b = &s->b[i];
         dmsv_bind vb = b ? *b : (dmsv_bind){.kind = RK_TEX_UBO, .desc = RD_SAMPLED, .dim = (uint8_t)(slot == 2 ? 3 : 1), .flags = (uint8_t)(slot == 1 ? 1 : 0), .samp = RS_TEX, .reg = (int16_t)s->tbl_reg, .off = s->tbl_off};
         VkDescriptorImageInfo dummy = {vk_dummy_sampler(), vk_dummy_view(vb.dim, vb.flags & 1, 0, 0, 0), VK_IMAGE_LAYOUT_GENERAL}, *d = ii + (size_t)slot * (size_t)N;
@@ -1806,12 +1833,12 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s) {
             if (fits) { tex_desc_for(st, &vb, hh, &d[k], 0); if (!d[k].imageView) d[k] = dummy; } else d[k] = dummy;
         }
         for (uint32_t k = b ? n : 0; k < (uint32_t)N; k++) d[k] = dummy;
-        w[slot] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)slot, 0, (uint32_t)N, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d, NULL, NULL};
+        w[nwr++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)slot, 0, (uint32_t)N, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d, NULL, NULL};
     }
-    vkUpdateDescriptorSets(V.dev, TBL_SLOTS, w, 0, NULL);
+    if (nwr) vkUpdateDescriptorSets(V.dev, nwr, w, 0, NULL);
     g_tblc[c] = (typeof(g_tblc[0])){h, g_set_epoch, gtex, gsamp, n, gpool, set};
     g_tbl_builds++; g_ns_tbl += tick() - t0;
-    if (g_tbl_builds <= 4 || !(g_tbl_builds & (g_tbl_builds - 1))) VKLOG("texture tables: %llu sets built (%llu reused, %llu bound; %.1f ms in all), the longest %u handles of %u bytes bound; stage %d shader %016llx uniform buffer %d +%d: %u handles", (unsigned long long)g_tbl_builds, (unsigned long long)g_tbl_hits, (unsigned long long)g_tbl_binds, g_ns_tbl / 1e6, g_tbl_max_n, g_tbl_max_bytes, st, (unsigned long long)s->key, s->tbl_reg, s->tbl_off, n);
+    if (g_tbl_builds <= 4 || !(g_tbl_builds & (g_tbl_builds - 1))) VKLOG("texture tables: %llu sets built (%llu reused, %llu bound, %llu with the pool tables; %.1f ms in all), the longest %u handles of %u bytes bound; stage %d shader %016llx uniform buffer %d +%d: %u handles", (unsigned long long)g_tbl_builds, (unsigned long long)g_tbl_hits, (unsigned long long)g_tbl_binds, (unsigned long long)g_pool_builds, g_ns_tbl / 1e6, g_tbl_max_n, g_tbl_max_bytes, st, (unsigned long long)(s ? s->key : 0), s ? s->tbl_reg : -1, s ? s->tbl_off : -1, n);
     return set;
 }
 
@@ -2007,8 +2034,10 @@ static int prepare_draw(int prim, int indexed) {
     VkDescriptorSet sets[VK_NSETS] = {0}, tbl = VK_NULL_HANDLE;
     uint32_t dofs[VK_NSETS][96], ndofs = 0, dall[3 * 96];
     uint64_t t1d = tick();
+    vkshader_t *ts = NULL; int tst = 0, pool = 0;
     for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && k.raster_discard)) { sets[S.sh[st]->set] = stage_set(st, S.sh[st], dofs[S.sh[st]->set]); k.um[st] = g_num_um; k.im[st] = g_num_im;
-        if (S.sh[st]->ntbl && !tbl) tbl = tbl_set(st, S.sh[st]); }   // (two stages with tables of different sources: the first stage's; not seen)
+        if (S.sh[st]->ntbl && !ts) { ts = S.sh[st]; tst = st; } if (S.sh[st]->npool) pool = 1; }   // (two stages with tables of different sources: the first stage's; not seen)
+    if (ts || pool) tbl = tbl_set(ts ? tst : 0, ts, pool);   // set 0: the handle table of the stage that reads one, the pool tables when a stage reads them
     uint64_t tdesc = tick() - t1d; g_vkst.ns_desc += tdesc; if (g_prof_on) g_prof_ns[5] += tdesc;
     if (g_tracing) {
         VKLOG("  pipeline: topology %u restart %u discard %u cull %u front %u mode %u clamp %u bias %u; depth test %u write %u func %u stencil %u; attributes %u bindings %u; colour %u (format %u) samples %u a2c %u; blend enable %#x logic %u/%u; fragment depth variant %u (depth written by a shader at present %llu, now %llu)",

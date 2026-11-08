@@ -181,6 +181,7 @@ void vk_img_budget_stats(uint64_t *budget, uint64_t *evicted, uint64_t *evicted_
 enum { RK_SUPPORT, RK_CBUF, RK_C1, RK_DRV, RK_SBUF, RK_UBO_PTR, RK_SBUF_UBO, RK_TEX, RK_TBUF, RK_IMG, RK_IMG_TBUF, RK_TEX_C2A, RK_TEX_UBO, RK_TBUF_UBO, RK_IMG_UBO, RK_TEXD, RK_SAMPD,
        RK_GMEM_MAP, RK_GMEM_LOG,   // raw global memory (dmsh_abi.h DMSH_KIND_GMEM_MAP / _LOG): the pool table (vk_gmem_map) and the write log of the stores through it (stage_set); ids in step with shader_vk.py KIND
        RK_MESH_CTL, RK_MESH_TASKOUT, RK_MESH_LAUNCH, RK_MESH_VTX, RK_MESH_IDX,   // the mesh emulation's buffers (shader_meshwrap.py dm_mesh_*; gfx_vk_exec.c mesh_draw sets them before stage_set)
+       RK_TEXP, RK_SAMPP,   // the texture and sampler pools indexed by handle ID (shader_vk.py classify pools): separate sampled image arrays and a sampler array in set 0's pool bindings (vk_tbl_dsl; gfx_vk_exec.c tbl_set)
        RK_GS_CLAIM = 240,        // synthetic runtime-only per-draw geometry side-effect claim storage; not an on-disk KIND
        RK_UNKNOWN = 255 };
 enum { RD_UBO, RD_SSBO, RD_SAMPLED, RD_STORAGE, RD_TBUF, RD_STORAGE_TBUF, RD_IMAGE, RD_SAMPLER };
@@ -193,6 +194,7 @@ typedef struct {
     VkDescriptorSetLayout dsl; int set;   // the set this stage's bindings were moved to (vertex 1, fragment 2, geometry 3; compute 0: set 0 of a graphics layout is the texture table, vk_tbl_dsl)
     int nbind; const dmsv_bind *b;
     uint8_t tbl[96]; int ntbl, tbl_reg, tbl_off;   // bindings moved to the texture table set (1 + slot: 2D, 2D array, cube; gfx_vk_exec.c tbl_set), their count, and the uniform buffer (register, byte offset) the handles come from
+    int npool;                        // of those, the pool arrays (RK_TEXP / RK_SAMPP; tbl[i] = 1 + TBL_SLOTS + pool slot: 2D, 2D array, cube, 3D, samplers), bound by texture / sampler ID (tbl_set)
     const uint8_t *c1; uint32_t c1_len; VkBuffer c1_buf; VkDeviceSize c1_off;
     uint32_t local[3];
     uint32_t ubo_extent[16];           // proven base-module read extents by guest uniform slot; zero means unknown (graphics shadow copies only)
@@ -219,8 +221,16 @@ vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no
 // again only when the handles change; the arrays' lengths in the SPIR-V are cut to vk_tbl_n() (the UMin clamps on their indices with them). Adreno copies every bound set into
 // command memory at each vkCmdBindDescriptorSets: with the tables in the per-draw fragment sets a Welcome Tour scene submission mapped 2.4-3.3 GB. DM_VK_TBL_N: the length (0: off)
 enum { VK_NSETS = 6, TBL_SLOTS = 3, TBL_MIN = 256 };
+// Texture and sampler pools (RK_TEXP / RK_SAMPP): the translator's arrays over the whole ID ranges (2^20 textures, 4096 samplers) for a handle it could trace to no constant-buffer
+// word (Ocarina of Time's gsys materials read theirs from records in storage buffers). Set 0 holds, after the texture tables, POOL_TEX_SLOTS sampled-image arrays of vk_pool_n()
+// (element k = the registered texture of ID k through a 2D, 2D-array, cube or 3D view; the arrays declare floating-point texels) and a sampler array of vk_pool_samp_n() (element
+// k = sampler ID k), rebuilt when a registration changes (gfx_vk_exec.c tbl_set) and bound with the table set; the SPIR-V arrays and their index clamps are cut to those lengths
+// (gfx_vk_shader.c). DM_VK_POOL_N: the texture length (4096 unless set; 0: such shaders are not drawn), bounded by the device's per-stage descriptor limits
+enum { POOL_TEX_SLOTS = 4, POOL_B0 = TBL_SLOTS, POOL_SAMP_B = TBL_SLOTS + POOL_TEX_SLOTS, SET0_BINDINGS = TBL_SLOTS + POOL_TEX_SLOTS + 1 };
 VkDescriptorSetLayout vk_tbl_dsl(void);
 int vk_tbl_n(void);
+int vk_pool_n(void); int vk_pool_samp_n(void);
+int vk_tex_id_max(void); int vk_samp_id_max(void);   // the highest texture / sampler ID registered so far (gfx_vk_tex.c)
 vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo);   // the geometry shader translated for the draw's input primitive (shader_vk.py gs_variant_key); gs when there is none
 enum { VK_ATEST_SPEC_FUNC = 0x7a00, VK_ATEST_SPEC_REF = 0x7a01 };   // the alpha test variant's specialization constants (gfx_vk_shader.c spv_alpha_test)
 VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd);   // the module, or its variant (integer views; extra outputs; fragment depth written)

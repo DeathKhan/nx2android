@@ -248,12 +248,34 @@ int vk_tbl_n(void) {   // the texture tables' length (gfx_vk.h): DM_VK_TBL_N, 20
     static int n = -1; if (n < 0) { const char *e = getenv("DM_VK_TBL_N"); n = e ? atoi(e) : 2048; if (n < 0) n = 0; if (n > 65536) n = 65536; }
     return n;
 }
-VkDescriptorSetLayout vk_tbl_dsl(void) {   // set 0 of every graphics pipeline layout: TBL_SLOTS arrays of vk_tbl_n() combined image samplers (2D, 2D array, cube)
+// The pool tables' lengths (gfx_vk.h): DM_VK_POOL_N textures (4096 unless set; 0 off), 4096 samplers (the whole sampler ID range), each bounded by what the device lets one stage bind
+// beside the texture tables and a stage's own descriptors (the combined image samplers of the tables count as sampled images and as samplers both). Fixed for the process: set 0's layout
+// is shared by every graphics pipeline layout. Logged once; an index past the length reads the last entry (the clamp), and tbl_set notes a registered ID past the length
+static int pool_lengths(int *tex, int *samp) {
+    static int nt = -1, ns; if (nt < 0) {
+        const char *e = getenv("DM_VK_POOL_N"); int n = e ? atoi(e) : 4096; if (n < 0) n = 0; if (n > 65536) n = 65536;
+        int s = n ? 4096 : 0, tbl = vk_tbl_n() * TBL_SLOTS;
+        long limi = (long)V.props.limits.maxPerStageDescriptorSampledImages - tbl - 256, lims = (long)V.props.limits.maxPerStageDescriptorSamplers - tbl - 256;
+        if (limi > (long)V.props.limits.maxDescriptorSetSampledImages - tbl - 256) limi = (long)V.props.limits.maxDescriptorSetSampledImages - tbl - 256;
+        if (lims > (long)V.props.limits.maxDescriptorSetSamplers - tbl - 256) lims = (long)V.props.limits.maxDescriptorSetSamplers - tbl - 256;
+        if (n && (long)n * POOL_TEX_SLOTS > limi) n = limi > 0 ? (int)(limi / POOL_TEX_SLOTS) & ~255 : 0;
+        if (s && (long)s > lims) s = lims > 0 ? (int)lims & ~255 : 0;
+        if (!n || !s) n = s = 0;
+        VKLOG("texture pool tables: %d textures x %d kinds, %d samplers (DM_VK_POOL_N %s; the device binds %u sampled images and %u samplers a stage, %u and %u a set)", n, POOL_TEX_SLOTS, s, e ? e : "unset",
+              V.props.limits.maxPerStageDescriptorSampledImages, V.props.limits.maxPerStageDescriptorSamplers, V.props.limits.maxDescriptorSetSampledImages, V.props.limits.maxDescriptorSetSamplers);
+        ns = s; __atomic_store_n(&nt, n, __ATOMIC_RELEASE); }
+    if (tex) *tex = nt; if (samp) *samp = ns; return nt;
+}
+int vk_pool_n(void) { int t; pool_lengths(&t, NULL); return t; }
+int vk_pool_samp_n(void) { int s; pool_lengths(NULL, &s); return s; }
+VkDescriptorSetLayout vk_tbl_dsl(void) {   // set 0 of every graphics pipeline layout: TBL_SLOTS arrays of vk_tbl_n() combined image samplers (2D, 2D array, cube), then the pool tables (gfx_vk.h)
     static VkDescriptorSetLayout l; VkDescriptorSetLayout r = __atomic_load_n(&l, __ATOMIC_ACQUIRE); if (r) return r;
     pthread_mutex_lock(&g_sh_mu);
-    if (!l) { VkDescriptorSetLayoutBinding lb[TBL_SLOTS]; uint32_t n = (uint32_t)(vk_tbl_n() ? vk_tbl_n() : 1);
+    if (!l) { VkDescriptorSetLayoutBinding lb[SET0_BINDINGS]; uint32_t n = (uint32_t)(vk_tbl_n() ? vk_tbl_n() : 1), np = (uint32_t)(vk_pool_n() ? vk_pool_n() : 1), ns = (uint32_t)(vk_pool_samp_n() ? vk_pool_samp_n() : 1);
         for (uint32_t i = 0; i < TBL_SLOTS; i++) lb[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
-        VkDescriptorSetLayout m = shader_layout(lb, TBL_SLOTS); __atomic_store_n(&l, m, __ATOMIC_RELEASE); }
+        for (uint32_t i = 0; i < POOL_TEX_SLOTS; i++) lb[POOL_B0 + i] = (VkDescriptorSetLayoutBinding){POOL_B0 + i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, np, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
+        lb[POOL_SAMP_B] = (VkDescriptorSetLayoutBinding){POOL_SAMP_B, VK_DESCRIPTOR_TYPE_SAMPLER, ns, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
+        VkDescriptorSetLayout m = shader_layout(lb, SET0_BINDINGS); __atomic_store_n(&l, m, __ATOMIC_RELEASE); }
     pthread_mutex_unlock(&g_sh_mu);
     return l;
 }
@@ -295,7 +317,8 @@ static int spv_tbl_shrink(uint32_t *w, uint32_t nw, const uint32_t *tv, int ntv,
     uint32_t lens[TBL_SLOTS] = {0}, clamps[TBL_SLOTS] = {0}; int nl = 0, nc = 0;
     for (int t = 0; t < ntv && ok; t++) {
         uint32_t v = tv[t], p = v < bound ? ptr_of[v] : 0, a = p && p < bound ? pointee[p] : 0, l = a && a < bound ? arr_len[a] : 0;
-        if (!l || l >= bound || !ctype[l] || cval[l] <= newn) { ok = 0; break; }   // (an array already short enough never gets here: the caller checks the reflection's count)
+        if (!l || l >= bound || !ctype[l]) { ok = 0; break; }
+        if (cval[l] <= newn) continue;   // already short enough (a pool array of the sampler range under a longer table, or a table array beside a longer one): as it is
         int had = 0; for (int j = 0; j < nl; j++) had |= lens[j] == l; if (!had) lens[nl++] = l;
         uint32_t c = 0; for (uint32_t id = 1; id < bound && !c; id++) if (ctype[id] == ctype[l] && cval[id] == cval[l] - 1 && id != l) c = id;   // the clamp constant: the same type, one less
         if (!c) { ok = 0; break; }
@@ -381,10 +404,34 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
         if (!s->ntbl) { memset(s->tbl, 0, sizeof s->tbl); memset(thave, 0, sizeof thave); s->tbl_reg = -1; static int nl; if (nl++ < 8) VKLOG("[RED] shader %016llx: its texture arrays could not be moved to the table (their SPIR-V could not be cut to %d); left in its stage's set", (unsigned long long)key, vk_tbl_n()); }
         else { static int nl; if (nl++ < 4) VKLOG("shader %016llx: %d texture arrays moved to the table set (uniform buffer %d +%d, %d entries each)", (unsigned long long)key, s->ntbl, s->tbl_reg, s->tbl_off, vk_tbl_n()); }
     }
-    // SPIR-V with the stage's set (the table's variables: set 0, binding = slot)
+    // texture and sampler pools (gfx_vk.h RK_TEXP / RK_SAMPP; shader_vk.py classify pools): arrays indexed by the handle's texture or sampler ID, declared as long as the whole ID
+    // ranges, into set 0's pool bindings by image kind (2D, 2D array, cube, 3D; the samplers under POOL_SAMP_B), cut to the tables' lengths with their index clamps. One a shader
+    // cannot be given (the tables off, a compute kernel, a kind the tables have none of, an uncuttable module) leaves the shader undrawable: its own set would need 2^20 descriptors
+    // Several arrays may share a kind (a 2D and a 2D shadow image type over the same texture IDs): they share the binding, as Vulkan lets variables of one descriptor type do
+    struct { uint32_t var; int slot; } pv[96]; int npv = 0; const char *pfail = NULL;
+    for (int i = 0; i < s->nbind && i < 96; i++) { const dmsv_bind *b = &s->b[i]; if (b->kind != RK_TEXP && b->kind != RK_SAMPP) continue;
+        int slot = b->kind == RK_SAMPP ? POOL_TEX_SLOTS : (b->flags & 2) ? -1 : b->dim == 1 ? ((b->flags & 1) ? 1 : 0) : b->dim == 3 ? 2 : b->dim == 2 ? 3 : -1;
+        if (!vk_pool_n()) pfail = "the pool tables are off (DM_VK_POOL_N=0)"; else if (stage > 4) pfail = "a compute kernel has no pool table set"; else if (slot < 0) pfail = "an image kind the pool tables have none of";
+        if (pfail) { static int nl; if (nl++ < 8) VKLOG("[RED] shader %016llx (stage %d): texture pool array binding %u (dim %u, flags %#x, kind %d): %s", (unsigned long long)key, stage, b->binding, b->dim, b->flags, b->kind, pfail); continue; }
+        s->tbl[i] = (uint8_t)(1 + TBL_SLOTS + slot); s->npool++; }
+    if (s->npool && !pfail) {   // their variables (OpDecorate Binding, by the reflection's binding numbers), then the arrays cut: the textures' to vk_pool_n(), the samplers' to vk_pool_samp_n()
+        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break;
+            if (op == 71 && n >= 4 && w[i + 2] == 33) for (int k = 0; k < s->nbind && k < 96; k++) if (s->tbl[k] > TBL_SLOTS && s->b[k].binding == w[i + 3] && npv < 96) pv[npv++] = (typeof(pv[0])){w[i + 1], s->tbl[k] - 1 - TBL_SLOTS};
+            i += n; }
+        uint32_t tv[96], sv[96]; int ntv = 0, nsv = 0;
+        for (int k = 0; k < npv; k++) { if (pv[k].slot == POOL_TEX_SLOTS) sv[nsv++] = pv[k].var; else tv[ntv++] = pv[k].var; }
+        if (npv < s->npool) pfail = "an array variable was not found";
+        if (!pfail && ntv && !spv_tbl_shrink(w, nw, tv, ntv, (uint32_t)vk_pool_n())) pfail = "its texture arrays could not be cut to the table's length";
+        if (!pfail && nsv && !spv_tbl_shrink(w, nw, sv, nsv, (uint32_t)vk_pool_samp_n())) pfail = "its sampler array could not be cut to the table's length";
+    }
+    if (pfail) { static int nl; if (nl++ < 16) VKLOG("[RED] shader %016llx (stage %d): %s; not drawn (its texture pool arrays can be bound only from the pool tables)", (unsigned long long)key, stage, pfail);
+        nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); free(w); free(s); return NULL; }
+    if (s->npool) { static int nl; if (nl++ < 4) VKLOG("shader %016llx (stage %d): %d pool arrays moved to the pool tables (%d textures a kind, %d samplers)", (unsigned long long)key, stage, s->npool, vk_pool_n(), vk_pool_samp_n()); }
+    // SPIR-V with the stage's set (the table's variables: set 0, binding = slot; the pools': set 0, POOL_B0 + kind / POOL_SAMP_B)
     int f64_used = 0; uint32_t xb = 4;
     for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break;
         if (op == 71 && n >= 4 && (w[i + 2] == 34 || w[i + 2] == 33)) { int slot = -1; for (int t = 0; t < TBL_SLOTS; t++) if (thave[t] && tvar[t] == w[i + 1]) slot = t;   // OpDecorate DescriptorSet / Binding
+            for (int k = 0; k < npv; k++) if (pv[k].var == w[i + 1]) slot = POOL_B0 + pv[k].slot;
             if (w[i + 2] == 34) w[i + 3] = slot >= 0 ? 0 : (uint32_t)s->set; else if (slot >= 0) w[i + 3] = (uint32_t)slot; }
         if (op == 22 && n == 3 && w[i + 2] == 64) f64_used = 1;   // OpTypeFloat 64
         if (op == 16 && n >= 3 && w[i + 2] == 11) s->xfb = 1;     // OpExecutionMode Xfb: a vertex shader that captures transform feedback (shader_vk.py xfb_layout)

@@ -268,11 +268,36 @@ TEX_BASE, IMG_BASE, IMG_SLOTS, SEPTEX_BASE, SEPTEX_SLOT0, SAMP_BASE = 0x20, 0x12
 # triangles to its indirect draw record through storage buffer 0 (c0 0x410): with zeros bound the counts stayed 0 and the chunks' colour passes drew nothing (black floors, rooms in)
 SSBO = {'vs': abi.C0_SSBO_VS, 'cs': abi.C0_SSBO_CS, 'gs': abi.C0_SSBO_GS, 'ps': abi.C0_SSBO_PS, 'ts': abi.C0_SSBO_TS, 'ms': abi.C0_SSBO_MS}
 GMEM_MAP_CB_SLOT, GMEM_LOG_CB_OFFSET = abi.GMEM_MAP_CB_SLOT, abi.GMEM_LOG_CB_OFFSET   # dmsh_abi.h: the sentinel constant buffer slot of the raw global memory table, and the write log's offset under it (GlobalToStorage.GmemMapCbSlot / GmemLogCbOffset)
+POOL_MIN = 33   # arrays at least this long named for the pools are pools (dmsh_build.py POOL_MIN): the vendored translator keeps 32-entry slot arrays (NvnSlotArrayLength)
+def pool_array(b):
+    """A texture pool array (a separate sampled image array indexed by texture ID) or a sampler pool array (see classify): the translator's pool fallback"""
+    return b['count'] >= POOL_MIN and b['type'] in ('image', 'sampler') and re.fullmatch(r'[a-z]+_([ts])\w*_cb0_40000000', b['name']) is not None and (b['type'] == 'sampler') == (b['name'].split('_')[1] == 's')
+def compact_bindings(spv, binds):
+    """Renumber the module's Binding decorations densely, in the order of the old numbers, in the SPIR-V and the reflection together (the backend builds each stage's set layout from
+    the reflection's numbers, so any numbering the two share works). Ryujinx numbers bindings as it declares them, an array taking count numbers: after a 2^20-entry texture pool
+    array every later binding (the sampler pool, the constant buffers declared after) is past refl_bin's 16-bit field"""
+    new = {o: i for i, o in enumerate(sorted({b['binding'] for b in binds}))}
+    w = list(struct.unpack(f'<{len(spv) // 4}I', spv)); i = 5
+    while i < len(w):
+        n, op = w[i] >> 16, w[i] & 0xffff
+        if not n: raise ValueError('invalid SPIR-V instruction')
+        if op == OP_DECORATE and n == 4 and w[i + 2] == DEC_BINDING and w[i + 3] in new: w[i + 3] = new[w[i + 3]]
+        i += n
+    for b in binds: b['binding'] = new[b['binding']]
+    return struct.pack(f'<{len(w)}I', *w)
 def classify(stage, b, res):
     nm = b['name']; e = dict(b)
     # Dynamic pool arrays use driver c2 slot indices (as the Metal backend).
     if GAME.get('android_dynamic_slots', 'off') == 'on' and b['type'] in ('image', 'sampler') and b['count'] == 32 and re.fullmatch(r'[a-z]+_[ts]\w*_cb0_40000000', nm):
         e.update(kind='texd' if b['type'] == 'image' else 'sampd'); return e
+    # Texture and sampler pools: a handle the translator could trace to no constant-buffer word indexes the game's whole pools by the handle's IDs (the vendored BindlessElimination's
+    # GenerateBindlessAccess: texture ID = bits 0-19 into <stage>_t<type>_cb0_40000000, a separate sampled image array of 2^20; sampler ID = bits 20-31 into <stage>_s_cb0_40000000, a
+    # sampler array of 4096; Program.cs QueryTextureArrayLengthFromPool / QuerySamplerArrayLengthFromPool), as dmsh_build.py pool_arrays reads them for Metal. The Ocarina of Time's
+    # gsys materials and lights read their 32-bit texture handles from records in storage buffers (c0's stage tables), at offsets computed per draw, vertex or light: 4,823 shaders.
+    # The Vulkan backend binds the arrays from its texture and sampler ID tables in the shared set 0 (gfx_vk.h RK_TEXP / RK_SAMPP, gfx_vk_exec.c tbl_set), cut to DM_VK_POOL_N
+    # entries. The 32-entry slot arrays (NvnSlotArrayLength: buffer textures and images) are the dynamic slots above or stay '?'
+    if pool_array(b):
+        e.update(kind='texp' if b['type'] == 'image' else 'sampp'); return e
     m = re.fullmatch(r'[a-z]+_c(\d+)', nm)
     if m:
         n = int(m.group(1))
@@ -334,7 +359,7 @@ def classify(stage, b, res):
 #          i16 reg, u8 samp (sampler source), u8 fmt (SPIR-V image format), i32 off, i32 samp_arg
 KIND = {'support': 0, 'cbuf': 1, 'c1': 2, 'drvcb': 3, 'sbuf': 4, 'ubo_ptr': 5, 'sbuf_ubo': 6, 'tex': 7, 'tbuf': 8, 'img': 9, 'img_tbuf': 10, 'tex_c2a': 11,
         'tex_ubo': 12, 'tbuf_ubo': 13, 'img_ubo': 14, 'texd': 15, 'sampd': 16, 'gmem_map': 17, 'gmem_log': 18,
-        'mesh_ctl': 19, 'mesh_taskout': 20, 'mesh_launch': 21, 'mesh_vtx': 22, 'mesh_idx': 23, '?': 255}   # in step with gfx_vk.h RK_*
+        'mesh_ctl': 19, 'mesh_taskout': 20, 'mesh_launch': 21, 'mesh_vtx': 22, 'mesh_idx': 23, 'texp': 24, 'sampp': 25, '?': 255}   # in step with gfx_vk.h RK_*
 DESC = {'ubo': 0, 'ssbo': 1, 'sampled': 2, 'storage': 3, 'tbuf': 4, 'storage_tbuf': 5, 'image': 6, 'sampler': 7, '?': 255}
 SAMP_NONE, SAMP_TEX, SAMP_SLOT, SAMP_ID, SAMP_UBO = 0, 1, 2, 3, 4
 kinds_all = collections.Counter()
@@ -506,7 +531,7 @@ def main():
     for r in rs:
         for ln in r.stderr.splitlines():
             if ln.strip(): errs[ln.strip()[:120]] += 1
-    entries, fails = [], collections.Counter()
+    entries, fails, pooled = [], collections.Counter(), collections.Counter()   # pooled: shaders per stage whose texture and sampler pool arrays go to the backend's pool tables
     pv_fs = {}   # fragment shaders whose per-vertex reads became flat inputs (per_vertex = gs): their SPIR-V and the flat locations, for the geometry shaders below
     for k in keys:
         spv_p, res_p = os.path.join(w, k + '.spv'), os.path.join(w, k + '.res.json')
@@ -522,9 +547,18 @@ def main():
             spv = remap_handles(spv, *handle_remaps[k])
         st = stages[k]
         if any(b['binding'] > 0xffff or b['count'] > 0xffff for b in binds):
-            # The translator could not resolve a handle to a slot and declared bindless arrays (2^20 textures, 4096 samplers; Welcome Tour's two Ampere compute shaders that index
-            # their textures at run time): the bindings past them do not fit refl_bin's 16-bit fields, and no device binds such arrays. Left out of the bundle, counted apart
-            fails['bindless arrays (reflection past 16 bits)'] += 1; print(f'[RED] {k} ({st}): bindless texture arrays, left out of the bundle', flush=True); continue
+            # The translator could not trace a handle to a constant-buffer word and indexed the texture and sampler pools (classify's pools: 2^20 textures, 4096 samplers): the arrays
+            # and the bindings past them do not fit refl_bin's 16-bit fields. In a graphics stage the bindings are renumbered densely (compact_bindings) and the pool arrays' counts
+            # saturate (the backend reads their lengths from the SPIR-V and cuts them to its tables', gfx_vk_shader.c); the pools are bound from set 0, the texture table set. A compute,
+            # task or mesh kernel's set 0 is its own (gfx_vk_shader.c set_of; Welcome Tour's two Ampere compute shaders that index their textures at run time): left out, counted apart
+            why = None
+            if st not in ('vs', 'ps', 'gs', 'hs', 'ds'): why = 'bindless arrays (a compute, task or mesh kernel: no pool table set for compute)'
+            elif not any(pool_array(b) for b in binds) or any(b['count'] > 0xffff and not pool_array(b) for b in binds): why = 'bindless arrays (reflection past 16 bits)'
+            if why: fails[why] += 1; print(f'[RED] {k} ({st}): bindless texture arrays, left out of the bundle ({why})', flush=True); continue
+            spv = compact_bindings(spv, binds)
+            for b in binds:
+                if pool_array(b): b['count'] = min(b['count'], 0xffff)
+            pooled[st] += 1
         cl = [classify(st, b, res) for b in binds]
         for e in cl: kinds_all[e['kind']] += 1
         # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
@@ -551,6 +585,7 @@ def main():
     print(f'{len(entries)} of {len(keys) + 5 * pv_gs + nvn2_notes["mesh shaders with a pass-through vertex shader"]} shaders → {a.out} ({os.path.getsize(a.out) / 2**20:.1f} MB, version {ver}: SPIR-V {raw / 2**20:.1f} MB'
           f'{f", {stored / 2**20:.1f} MB compressed" if ver > 1 else ""}); failed: {dict(fails)}; binding kinds: {dict(kinds_all)}')
     for e, n in errs.most_common(8): print(f'  translator: {n:5d}  {e}')
+    if pooled: print(f'{sum(pooled.values())} shaders index the texture and sampler pools by handle ID (bound from the pool tables, gfx_vk_exec.c tbl_set; DM_VK_POOL_N): {dict(pooled)}', flush=True)
     arch = collections.Counter('sm86' if jobs[k].get('arch') == 'sm86' else 'maxwell' for k in keys)
     if arch['sm86']: print(f'NVN2 (Switch 2) shaders: {arch["sm86"]} of {len(keys)} translated as Ampere' + ''.join(f'; {n} {e}' for e, n in nvn2_notes.most_common()), flush=True)
 

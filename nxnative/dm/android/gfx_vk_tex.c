@@ -712,7 +712,9 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
 enum { TREG_OLD = 3 };
 typedef struct { tex_t t; view_t v; uint8_t ok, has_v; uint64_t seq; } treg_ver;
 typedef struct { treg_ver cur; treg_ver *old; } treg_t;   // old: TREG_OLD earlier versions, newest first (allocated at the first rewrite)
-static treg_t *g_treg; static int g_ntreg;
+static treg_t *g_treg; static int g_ntreg, g_tid_max, g_sid_max;   // the registry, and the highest IDs registered (the pool tables' logs, gfx_vk_exec.c tbl_set)
+int vk_tex_id_max(void) { return __atomic_load_n(&g_tid_max, __ATOMIC_RELAXED); }
+int vk_samp_id_max(void) { return __atomic_load_n(&g_sid_max, __ATOMIC_RELAXED); }
 uint64_t g_tex_gen = 1;   // changes whenever a texture ID is registered again or views go (gfx_vk_exec.c's per-submission view cache)
 uint64_t g_samp_gen = 1;  // changes whenever a sampler ID is registered with other parameters (gfx_vk_exec.c samp_cached and the descriptor set memo)
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static VkSampler *g_samp; static int g_nsreg;
@@ -734,7 +736,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     uint64_t seq = nvn_jobs_queued();
     pthread_mutex_lock(&g_rmu);
     if (tid >= g_ntreg) { int n = tid + 1024; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
-    g_tex_gen++; treg_t *r = &g_treg[tid];
+    g_tex_gen++; treg_t *r = &g_treg[tid]; if (tid > g_tid_max) g_tid_max = tid;
     if (r->cur.ok && seq) {   // keep the one replaced for the jobs queued before this registration
         if (!r->old) r->old = calloc(TREG_OLD, sizeof *r->old);
         if (r->old) { memmove(r->old + 1, r->old, sizeof *r->old * (TREG_OLD - 1)); r->old[0] = r->cur; }
@@ -796,6 +798,7 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
         g_sseq = realloc(g_sseq, n * sizeof *g_sseq); g_sold = realloc(g_sold, (size_t)n * SREG_OLD * sizeof *g_sold);
         memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg); memset(g_samp + g_nsreg, 0, (n - g_nsreg) * sizeof *g_samp); memset(g_sseq + g_nsreg, 0, (n - g_nsreg) * sizeof *g_sseq);
         memset(g_sold + (size_t)g_nsreg * SREG_OLD, 0, (size_t)(n - g_nsreg) * SREG_OLD * sizeof *g_sold); g_nsreg = n; }
+    if (sid > g_sid_max) g_sid_max = sid;
     if (!g_sreg_ok[sid] || memcmp(&g_sreg[sid], sp, sizeof *sp)) {
         sreg_ver *o = g_sold + (size_t)sid * SREG_OLD;
         if (g_sreg_ok[sid]) { memmove(o + 1, o, sizeof *o * (SREG_OLD - 1)); o[0] = (sreg_ver){g_sreg[sid], g_sseq[sid]}; }
