@@ -20,3 +20,10 @@ env	DM_ADAPTIVE_FPS=0
 #   env DM_DYNAMIC_RESOLUTION=1   the game's dynamic resolution through upstream's climbing stub (0, the default, holds 1536x864)
 #   env DM_VK_RC_QUEUE=1          render-enable state kept per NVN queue across submissions, as upstream's logical queues do (the queue-ordering fix for its flashes is Apple-only)
 #   env DM_GPU_MIN_FREQ=967000000 the GPU clock floor the other Switch 2 profiles use (through su)
+# Movies (2026-11-08, Odin 3): the AV1 movies decode on MediaCodec (c2.qti.av1.decoder; the game reads the pictures on the CPU, so they go through NV12 copies into its linear
+# textures). The NDVE enhancement network the game runs over each decoded picture (Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs, 22 compute shaders of 0.15-1.8 MB of SPIR-V with up to
+# 1,000 subgroup shuffles) does not build on Adreno 830's driver: vkCreateComputePipelines fails on e6be82d835fbe4d3 and throws std::bad_alloc on d15370a382630d4e, which ends the app.
+# Its stages are left out, and the two output stages (ssbo activations + the picture → the enhanced picture) copy the picture through instead: the movies show unenhanced.
+# The game only dispatches the network once per movie here (the frames themselves are drawn from the decoded planes), so the title and the opening look right without it
+env	DM_VK_SKIP_CS=c2fc2ddd604c25e7,4f41ccf24f163e0d,ba079f68ae288dba,a8b4fb48fee0ccf8,e2eebd7ba18fe35f,e6be82d835fbe4d3,9442573ee4ace011,0a56002cdc7e1fce,d15370a382630d4e,7f7ff0f36b54d90f,5a7d69b067a7f011,329e4b0f0b3f2bc6,7653fe5f6ef0b2f2,b6e34b46dea44278,3f18f89630c05813,539ad3b353758de0,d72077c4b6cc264f,ab9a92b55950ec02,c41f451b88a050f6,55ee6dc89a2b64e2,49dff010b9832251,8e98d86c0e4a7b53
+env	DM_VK_PASSTHRU_CS=5a7d69b067a7f011,55ee6dc89a2b64e2,4f41ccf24f163e0d
