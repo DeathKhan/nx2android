@@ -5,6 +5,7 @@
 //   dirty-page tracker saw a write to its pages; any other texture is the GPU's (render targets, images), filled only by GPU work.
 //   Version 1 keeps every image in VK_IMAGE_LAYOUT_GENERAL after its first use, ordered by whole-pipeline barriers.
 #include "gfx_vk.h"
+#include "movie_zc.h"   // zero-copy movie pictures: textures over a decoder pool's picture slot (zc_tex_wants, zc_tex_refresh)
 #include "nvn_tex.h"
 #include "../gfx/tex/nvn_deswizzle.h"
 #include "nvn_hmap.h"
@@ -180,6 +181,8 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if ((d->flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
+    // a texture over a movie decoder's picture slot (movie_zc.h): the zero-copy conversion writes it as a storage image (zc_tex_refresh; without the usage it goes through a staging copy)
+    if (t->mem && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && zc_tex_wants(t->mem, t->L.size)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     // a block-compressed texture can be drawn into through a view in the uncompressed format of its block size (Mario Kart 8 Deluxe writes BC3 blocks into its
     // reflection cubemaps through RGBA32UI views): with EXTENDED_USAGE the image may carry a usage its own format lacks, and an attachment view needs it on the image
     if (f->compressed && !f->dec && (f->bpb == 16 || f->bpb == 8)) { VkFormatProperties up; vkGetPhysicalDeviceFormatProperties(V.pd, f->bpb == 16 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32_UINT, &up);
@@ -345,7 +348,9 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     // a texture's first use: written by the CPU since it was registered (profile tex_dirty_upload), it is CPU-written from now on, as at nvn_mtl.m's first resolution;
     // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
     int nvn_ft_written(const tex_t *);
-    if (t->mem && lin_copy(im, t, f)) {}
+    // a texture over a movie decoder's picture slot: the GPU converts the decoded picture into it (movie_zc_vk.c); nothing is taken from its storage (the host no longer writes it)
+    if (t->mem && zc_tex_refresh(im, t->mem, t->L.size)) { if (first && im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(vk_upload_cmd(), im); }
+    else if (t->mem && lin_copy(im, t, f)) {}
     else if (t->mem && (packaged_tex(t) || (first && (nvn_ft_written(t) || cpu_content_tex(t, f))))) {
         im->pkg_used = g_tex_frame;
         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
