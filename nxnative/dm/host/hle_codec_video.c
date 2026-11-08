@@ -430,7 +430,12 @@ static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t s
     int got = 0;
     if (CV_MC(d->codec) && d->avc) {   // VideoToolbox reorders: pictures leave in presentation order, all of them at the end of the stream
 #ifdef __ANDROID__
-        if (d->zc && d->zc_off) { cv_held_zc_drop(d); for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]); d->nheld = 0; cv_open(d); }   // the game reads on the CPU: the codec opens again in the CPU mode
+        if (d->zc && d->zc_off) {   // the game reads on the CPU: the codec opens again in the CPU mode
+            cv_held_zc_drop(d); for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]); d->nheld = 0;
+            // the picture slots the zero-copy frames were shown in go back to being plain storage: a texture over a slot still in the table is refreshed from the slot
+            // (zc_tex_refresh), never copied from the storage the CPU path writes (gfx_vk_tex.c lin_copy), and Ocarina of Time's movies stayed black after the switch
+            for (int i = 0; i < CV_BUFS; i++) if (d->buf[i].pool && d->buf[i].pool->mem) zc_slot_clear(d->buf[i].pool->mem, d->buf[i].pool->size);
+            cv_open(d); }
         if (size && mavc_decode(d->avc, data, (int)size, ts / 1000) < 0) { static int n; if (n++ < 4) LOG("[RED] nn::codec %s: MediaCodec could not decode a packet", k_cv_name[d->codec]); }
         if (d->zc) { zc_frame *zf; int64_t pts = 0;
             while (d->nheld < CV_HOLD && mavc_take_frame(d->avc, eos, &zf, &pts) == 1) { d->held[d->nheld] = NULL; d->held_zc[d->nheld] = zf; d->held_ts[d->nheld] = pts * 1000; d->held_eos[d->nheld] = 0; d->nheld++; got++; }

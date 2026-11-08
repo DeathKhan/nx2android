@@ -2756,6 +2756,51 @@ static int upscaler_native_dispatch(uint64_t key, int *trace) {
     VKLOG("upscaler network %016llx: original compute dispatch (%d diagnostic dispatches remaining)", (unsigned long long)key, left - 1);
     return 1;
 }
+// ---- a compute stage replaced by a copy of its sampled texture into its storage image (DM_VK_PASSTHRU_CS=<key>,…): the output stages of a movie enhancement
+// network whose layers the driver cannot build (Ocarina of Time's NDVE: ssbo activations + the decoded picture in a texture → the enhanced picture in an image).
+// The picture goes through unenhanced: the blit scales the whole texture over the whole image. Any binding set is accepted as long as the shader has exactly one
+// sampled 2D texture and one storage 2D image; a dispatch the blit cannot serve falls through (to the skip list, or the shader)
+static uint64_t g_pt_keys[64]; static uint8_t g_pt_noted[64]; static int g_pt_n = -1;
+static int passthru_kernel(uint64_t key) {
+    if (g_pt_n < 0) { g_pt_n = 0; const char *e = getenv("DM_VK_PASSTHRU_CS");
+        for (const char *q = e; q && *q && g_pt_n < 64; ) { char *end; uint64_t k = strtoull(q, &end, 16); if (end == q) break; g_pt_keys[g_pt_n++] = k; q = *end == ',' ? end + 1 : end; }
+        if (g_pt_n) VKLOG("[RED] %d compute shaders replaced by a texture → image copy (DM_VK_PASSTHRU_CS): their pictures go through unprocessed", g_pt_n); }
+    for (int i = 0; i < g_pt_n; i++) if (g_pt_keys[i] == key) return 1;
+    return 0;
+}
+static int passthru_note(uint64_t key, uint8_t bit) { for (int i = 0; i < g_pt_n; i++) if (g_pt_keys[i] == key) { int first = !(g_pt_noted[i] & bit); g_pt_noted[i] |= bit; return first; } return 0; }
+static int passthru_replace(vkshader_t *cs, const p_dispatch *d) {
+    const char *why = "binding contract"; int tregs[2] = {-1, -1}, nt = 0, ireg = -1, treg = -1;
+    for (int i = 0; i < cs->nbind; i++) { const dmsv_bind *b = &cs->b[i];
+        if (b->kind == RK_TEX && b->desc == RD_SAMPLED) { if (nt >= 2 || b->dim != 1 || b->count != 1 || b->reg > 31) goto keep; tregs[nt++] = b->reg; }
+        else if (b->kind == RK_IMG && b->desc == RD_STORAGE) { if (ireg >= 0 || b->dim != 1 || b->count != 1) goto keep; ireg = b->reg; } }
+    if (!nt || ireg < 0 || ireg > 15) goto keep;
+    why = "indirect dispatch"; if (d->ind) goto keep;
+    upscaler_image in = {0}, out = {0}; why = "input/output image or view";
+    if (!upscaler_image_at(S.img[5][ireg], 0, &out)) goto keep;
+    // two textures (a stage blending the network's output with the original picture): the one the size of the output, else the lower slot
+    for (int k = 0; k < nt; k++) { upscaler_image c = {0};
+        if (upscaler_image_at(vk_tex_slot_handle(S.tex[5], S.img[5], tregs[k]), 1, &c) && c.im != out.im && (treg < 0 || (c.w == out.w && c.h == out.h && !(in.w == out.w && in.h == out.h)))) { in = c; treg = tregs[k]; } }
+    if (treg < 0) goto keep;
+    static VkFormat last_in, last_out; static int formats_ok;
+    if (last_in != in.im->fmt || last_out != out.im->fmt) { VkFormatProperties a, b;
+        last_in = in.im->fmt; last_out = out.im->fmt; vkGetPhysicalDeviceFormatProperties(V.pd, last_in, &a); vkGetPhysicalDeviceFormatProperties(V.pd, last_out, &b);
+        VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        formats_ok = (a.optimalTilingFeatures & need) == need && (b.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT); }
+    why = "unsupported image blit";
+    if (!formats_ok || !(in.im->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || !(out.im->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) goto keep;
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, in.level, in.layer, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)in.w, (int32_t)in.h, 1}},
+                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, out.level, out.layer, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)out.w, (int32_t)out.h, 1}}};
+    vk_end_pass_land(); VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, in.im); vk_tex_prepare(cb, out.im); vk_img_barrier_all(cb);
+    vkCmdBlitImage(cb, in.im->img, VK_IMAGE_LAYOUT_GENERAL, out.im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+    out.im->gpu_w = 1; vk_img_barrier_all(cb);
+    if (passthru_note(cs->key, 1)) VKLOG("passthrough %016llx: texture slot %d id %d fmt %d %ux%u → image slot %d id %d fmt %d %ux%u (%dx%dx%d groups)",
+        (unsigned long long)cs->key, treg, in.tid, in.im->fmt, in.w, in.h, ireg, out.tid, out.im->fmt, out.w, out.h, d->x, d->y, d->z);
+    return 1;
+keep:
+    if (passthru_note(cs->key, 2)) VKLOG("passthrough %016llx: not served (%s): the dispatch goes on to the skip list or the shader", (unsigned long long)cs->key, why);
+    return 0;
+}
 // ---- dispatches left out (DM_VK_SKIP_CS=<key>,<key>…, a bring-up switch): a compute shader the device's driver cannot build (Ocarina of Time's NDVE movie
 // networks, 1.3-1.8 MB of SPIR-V with 500-1,000 subgroup shuffles: Adreno 830's compiler refuses the first and throws std::bad_alloc on the second, which ends
 // the app) is neither built nor run; the first dispatch of each named shader logs its binding contract (textures, images, storage buffers, group counts), the
@@ -2782,6 +2827,7 @@ static void dispatch(const p_dispatch *d) {
     if (g_ups_n && upscaler_kernel(cs->key)) {
         if (!upscaler_native_dispatch(cs->key, &native_trace) && upscaler_replace(cs, d)) return;
     }
+    if (g_pt_n && passthru_kernel(cs->key) && passthru_replace(cs, d)) return;
     if (skip_kernel(cs->key, d)) return;
     g_vkst.dispatches++;
     vk_end_pass_land();
