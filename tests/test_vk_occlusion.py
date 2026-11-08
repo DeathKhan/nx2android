@@ -30,7 +30,7 @@ class OcclusionCounter(unittest.TestCase):
         start = runtime.index('        for (int i = 0; i < c->n; i++) {')
         completion = runtime[start:runtime.index('        pthread_mutex_lock(&g_cmu);', start)]
         wait = function(runtime, 'static void slot_recycle(')
-        wait = wait[wait.index('{') + 1:wait.index('    for (int i = 0; i < s->ndf; i++)')]
+        wait = wait[wait.index('{') + 1:wait.index('    pthread_mutex_lock(&g_df_mu);')]
         code = r'''
 #include <stdint.h>
 #include <stddef.h>
