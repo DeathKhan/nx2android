@@ -69,9 +69,11 @@ JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalSurface(JNIEnv *en
 void dm_focus_set(int st); void dm_audio_suspend(int on); void guest_clock_freeze_for(int reason, int on); void dm_gfx_suspend(int on);
 // ---- settings (the pause menu's), kept in the files folder as KEY=VALUE lines ----
 static char g_root[512];
+static char g_title[128];   // the app's name (on_create: app_label), the menu's header
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
+static _Atomic unsigned g_set_accent = 0xFF3C8E;   // the menu's highlight colour, 0xRRGGBB (overlay_layout.h OVM_ACCENTS; settings.txt accent=RRGGBB)
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1)
 static _Atomic int g_cust[2][2][DM_AOV_N][3], g_cust_ver, g_edit;
@@ -86,6 +88,7 @@ static void settings_load(void) {
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
+        else if (!strncmp(line, "accent=", 7)) { unsigned c; if (sscanf(line + 7, "%6x", &c) == 1 && strspn(line + 7, "0123456789abcdefABCDEF") == 6) atomic_store(&g_set_accent, c); }
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
             char lay[16], name[32]; int x, y, z, l, i;
             if (sscanf(line + 3, "%15[^,],%31[^,],%d,%d,%d", lay, name, &x, &y, &z) != 5 || (i = ctl_named(name)) < 0) continue;
@@ -101,8 +104,8 @@ static void settings_load(void) {
 static void settings_save(void) {
     char p[600], tmp[610]; snprintf(p, sizeof p, "%s/settings.txt", g_root); snprintf(tmp, sizeof tmp, "%s.new", p);
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
-    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
-            atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
+    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\naccent=%06X\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0,
+            atomic_load(&g_set_fps), atomic_load(&g_set_opacity), atomic_load(&g_set_grid), atomic_load(&g_set_accent) & 0xffffff);
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
         if ((x && y) || z) fprintf(f, "ui=%s,%s,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000);
@@ -136,6 +139,18 @@ static void on_window_focus(ANativeActivity *a, int focused) { (void)a; if (atom
 // A save manager's request, or a RomFS the app cannot read (romfs_readable), asked the app to end (ANativeActivity_onCreate): Activity.finish() when it is resumed, through JNI on the main thread.
 // ANativeActivity_finish, from onCreate or from here, left the activity on the screen (Y700, Android 16), and porter's am start -W waited out its timeout
 static int g_quit;
+static void app_label(ANativeActivity *a) {   // the app's name (the launcher's label: the game's), for the menu's header (dm_game_title)
+    JNIEnv *E = a->env; jobject act = a->clazz, o = NULL;
+#define AL_CALL(obj, name, sig, ...) do { jclass c_ = (*E)->GetObjectClass(E, obj); jmethodID m_ = c_ ? (*E)->GetMethodID(E, c_, name, sig) : NULL; \
+        o = m_ && !(*E)->ExceptionCheck(E) ? (*E)->CallObjectMethod(E, obj, m_, ##__VA_ARGS__) : NULL; if ((*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); o = NULL; } } while (0)
+    AL_CALL(act, "getPackageManager", "()Landroid/content/pm/PackageManager;"); jobject pm = o; if (!pm) return;
+    AL_CALL(act, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;"); jobject ai = o; if (!ai) return;
+    AL_CALL(pm, "getApplicationLabel", "(Landroid/content/pm/ApplicationInfo;)Ljava/lang/CharSequence;", ai); if (!o) return;
+    AL_CALL(o, "toString", "()Ljava/lang/String;"); if (!o) return;
+#undef AL_CALL
+    const char *u = (*E)->GetStringUTFChars(E, (jstring)o, NULL);
+    if (u) { snprintf(g_title, sizeof g_title, "%s", u); (*E)->ReleaseStringUTFChars(E, (jstring)o, u); }
+}
 static void act_finish(ANativeActivity *a) {
     JNIEnv *E = a->env; jclass c = (*E)->GetObjectClass(E, a->clazz); jmethodID m = c ? (*E)->GetMethodID(E, c, "finish", "()V") : NULL;
     if (m) (*E)->CallVoidMethod(E, a->clazz, m);
@@ -204,6 +219,7 @@ static uint64_t g_btn; static float g_ax[8]; static int g_pad_used;   // lx ly r
 // right one A (as the iOS front end maps). A device whose buttons carry Nintendo's labels in Nintendo's places and reports them by label (the AYN Odin 3: its right button, labelled A,
 // sends BUTTON_A) wants them as labelled: env.txt DM_PAD_LABELS=1, which porter install writes for such devices
 static int pad_labels(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PAD_LABELS"); v = e && atoi(e) > 0; } return v; }
+int dm_pad_labels(void) { return pad_labels(); }   // (gfx_vk_present.c: the menu's key hints name the buttons as labelled)
 static uint64_t key_bit(int32_t k) {
     switch (k) {
     case AKEYCODE_BUTTON_A: return pad_labels() ? DM_BTN_A : DM_BTN_B; case AKEYCODE_BUTTON_B: return pad_labels() ? DM_BTN_B : DM_BTN_A;
@@ -372,9 +388,12 @@ static void *pad_watch(void *a) {
     return NULL;
 }
 
-// ---- the pause menu: the game is held while it is open; touches and a controller's keys go to it. Two tabs (overlay_layout.h OVM_TAB_ITEMS): the gamepad's
-// settings (shown, opacity, the layout editor, rumble) and the game's (the frame rate counter, the mode, exporting and importing the save); Resume under them ----
-static _Atomic int g_menu_hi = -1, g_menu_tab;   // the highlighted row (a controller's selection, or the row a finger is on), -1 none; the open tab
+// ---- the pause menu: the game is held while it is open; touches and a controller's keys go to it. Three tabs (overlay_layout.h OVM_TAB_ITEMS): the game's
+// (the mode, the frame rate counter), the touch controls' (shown, opacity, the layout editor, rumble) and the app's (the highlight colour, exporting and
+// importing the save); Resume under them. Each row's value is dm_menu_value's, changed by menu_set; what a press does follows the row's kind ----
+static int g_menu_last = 1;   // the row last highlighted (a controller's, or the last row tapped): the highlight comes back there (while the app runs)
+static _Atomic int g_menu_hi = -1, g_menu_tab, g_menu_down;   // the highlighted row (a controller's selection, or the row a finger is on), -1 none; the open tab;
+                                                              // a finger is down on the highlighted row (the row is drawn pressed)
 static int g_menu_ptr = -1, g_menu_row = -2;   // the pointer pressing in the menu, and the row it went down on (-3 the menu button)
 static _Atomic int g_tx_ver;   // the text entry's edit count: the panel is drawn again when it changes
 static _Atomic int g_ed_st;    // the layout editor's state for dm_menu_state (overlay_layout.h OVE_ST)
@@ -386,12 +405,37 @@ int dm_menu_state(void) {
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
     return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
-           atomic_load(&g_menu_tab) << 8 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24;
+           atomic_load(&g_menu_tab) << 8 | (atomic_load(&g_menu_down) ? OVM_PRESSED : 0) | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24;
+}
+static int accent_index(unsigned c) { for (int i = 0; i < OVM_ACCENTS_N; i++) if (OVM_ACCENTS[i] == c) return i; return -1; }
+int dm_menu_value(int item) {
+    switch (item) {
+    case OVM_OVERLAY: return atomic_load(&g_set_overlay);
+    case OVM_RUMBLE: return atomic_load(&g_set_rumble);
+    case OVM_FPS: return atomic_load(&g_set_fps);
+    case OVM_OPACITY: return atomic_load(&g_set_opacity);
+    case OVM_MODE: return dm_opmode() != 0;
+    case OVM_ACCENT: return accent_index(atomic_load(&g_set_accent));
+    default: return 0;
+    }
+}
+unsigned dm_menu_accent(void) { return atomic_load(&g_set_accent) & 0xffffff; }
+int dm_game_title(char *out, int cap) { if (cap > 0) snprintf(out, (size_t)cap, "%s", g_title); return g_title[0] != 0; }
+static void menu_set(int item, int v) {   // a row's new value (a switch, a choice's index, the slider's percent), saved
+    if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, v != 0); atomic_store(&g_overlay, 1); }
+    else if (item == OVM_RUMBLE) { atomic_store(&g_set_rumble, v != 0); dm_haptics_android_set(v != 0); }
+    else if (item == OVM_FPS) atomic_store(&g_set_fps, v != 0);
+    else if (item == OVM_MODE) dm_set_opmode(v != 0);   // the game takes it when it goes on
+    else if (item == OVM_ACCENT && v >= 0 && v < OVM_ACCENTS_N) atomic_store(&g_set_accent, OVM_ACCENTS[v]);
+    else if (item == OVM_OPACITY) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
+    else return;
+    settings_save();
 }
 int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_menu); }   // gfx_vk_present.c draws the counter (not while the menu holds the game)
 static void menu_open(int hi) {
     if (!atomic_load(&g_running) || atomic_exchange(&g_menu, 1)) return;
-    atomic_store(&g_menu_hi, hi); g_menu_ptr = -1;
+    if (hi >= 0) hi = g_menu_last >= 0 && g_menu_last < OVM_ROWS && ov_menu_item(atomic_load(&g_menu_tab), g_menu_last) >= 0 ? g_menu_last : 1;   // a controller opened it: the last row used
+    atomic_store(&g_menu_hi, hi); atomic_store(&g_menu_down, 0); g_menu_ptr = -1;
     if (atomic_load(&g_sv_st) != OVX_BUSY) atomic_store(&g_sv_st, OVX_IDLE);   // the last export's note goes (one still copying stays)
     dm_input_set(0, 0, 0, 0, 0); dm_touch_set(NULL, 0); g_touch_btn = 0;   // nothing stays pressed in the game
     for (int i = 0; i < 16; i++) atomic_store(&g_press_t[i], 0);
@@ -407,7 +451,7 @@ static void menu_close(void) {
     if (atomic_load(&g_edit)) { ed_cancel(); return; }   // the editor first: its changes are kept or thrown away before the game goes on
     if (atomic_load(&g_sp_on)) { sp_back(); return; }    // the save picker: back a step
     if (!atomic_exchange(&g_menu, 0)) return;
-    g_menu_ptr = -1; atomic_store(&g_menu_t, 0);
+    g_menu_ptr = -1; atomic_store(&g_menu_t, 0); atomic_store(&g_menu_down, 0);
     hold_sync(); dm_haptics_suspend(4, 0); dm_overlay_redraw();
     LOG("[menu] closed: the game goes on (gamepad %s, opacity %d%%, rumble %s, frame rate %s, %s)", atomic_load(&g_set_overlay) ? "on" : "off", atomic_load(&g_set_opacity),
         atomic_load(&g_set_rumble) ? "on" : "off", atomic_load(&g_set_fps) ? "shown" : "hidden", dm_opmode() ? "docked" : "handheld");
@@ -417,12 +461,20 @@ static void menu_opacity(int v) {   // the slider: a new value is drawn at once 
     if (atomic_exchange(&g_set_opacity, v) != v) { dm_haptics_android_tap(); dm_overlay_redraw(); }
 }
 static void menu_tab(int t) { t = (t % OVM_TABS + OVM_TABS) % OVM_TABS; if (atomic_exchange(&g_menu_tab, t) != t) dm_haptics_android_tap(); dm_overlay_redraw(); }
+static void menu_step(int item, int d) {   // left or right on a row: a choice's next or previous value (round), the slider by 5, the tabs
+    int k = ov_menu_kind(item);
+    if (k == OVR_SLIDER) { menu_opacity(atomic_load(&g_set_opacity) + 5 * d); settings_save(); }
+    else if (k == OVR_TABS) menu_tab(atomic_load(&g_menu_tab) + d);
+    else if (k == OVR_CHOICE) {
+        int n = OVM_ROW[item].n, v = dm_menu_value(item); v = v < 0 ? (d > 0 ? 0 : n - 1) : ((v + d) % n + n) % n;
+        menu_set(item, v); dm_haptics_android_tap(); dm_overlay_redraw();
+    }
+}
 static void ed_open(void); static void sp_open(void); static void save_export(void);
-static void menu_do(int item) {
-    if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, !atomic_load(&g_set_overlay)); atomic_store(&g_overlay, 1); settings_save(); }
-    else if (item == OVM_RUMBLE) { int on = !atomic_load(&g_set_rumble); atomic_store(&g_set_rumble, on); dm_haptics_android_set(on); settings_save(); }
-    else if (item == OVM_FPS) { atomic_store(&g_set_fps, !atomic_load(&g_set_fps)); settings_save(); }
-    else if (item == OVM_MODE) { dm_set_opmode(dm_opmode() ? 0 : 1); settings_save(); }   // the game takes it when it goes on
+static void menu_do(int item) {   // A on a row, or a tap on it: a switch flips, a choice steps on, a button does its thing
+    int k = ov_menu_kind(item);
+    if (k == OVR_TOGGLE) menu_set(item, !dm_menu_value(item));
+    else if (k == OVR_CHOICE) { menu_step(item, 1); return; }
     else if (item == OVM_TAB) { menu_tab(atomic_load(&g_menu_tab) + 1); return; }
     else if (item == OVM_EDIT) { dm_haptics_android_tap(); ed_open(); return; }
     else if (item == OVM_OPACITY) return;   // (the slider is dragged, or stepped with left and right)
@@ -442,38 +494,58 @@ static void menu_touch(AInputEvent *e, float W, float H) {   // a press on a row
         g_menu_ptr = id; g_menu_row = row;
         if (item == OVM_TAB) menu_tab(ov_menu_tab_at(x, p));   // a tab opens as the finger touches it
         else if (item == OVM_OPACITY) menu_opacity(ov_menu_track_value(x, p, row));
-        if (row >= 0) { atomic_store(&g_menu_hi, item >= 0 ? row : -1); dm_overlay_redraw(); }
+        if (row >= 0) { atomic_store(&g_menu_hi, item >= 0 ? row : -1); atomic_store(&g_menu_down, item >= 0 && item != OVM_TAB); dm_overlay_redraw(); }
     } else if (act == AMOTION_EVENT_ACTION_MOVE && g_menu_ptr >= 0 && g_menu_row >= 0) {   // the slider follows the finger; another row's highlight follows it off the row and back
         for (size_t k = 0; k < AMotionEvent_getPointerCount(e); k++) if ((AMotionEvent_getPointerId(e, k) & 31) == g_menu_ptr) {
             float kx = AMotionEvent_getX(e, k), ky = AMotionEvent_getY(e, k);
             if (ov_menu_item(tab, g_menu_row) == OVM_OPACITY) { menu_opacity(ov_menu_track_value(kx, p, g_menu_row)); continue; }
             int r = ov_menu_row_at(kx, ky, W, H), hi = r == g_menu_row && ov_menu_item(tab, r) >= 0 ? r : -1;
-            if (atomic_exchange(&g_menu_hi, hi) != hi) dm_overlay_redraw();
+            if (atomic_exchange(&g_menu_hi, hi) != hi) { atomic_store(&g_menu_down, hi >= 0 && ov_menu_item(tab, hi) != OVM_TAB); dm_overlay_redraw(); }
         }
     } else if ((act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_POINTER_UP) && id == g_menu_ptr) {
-        int down = g_menu_row; g_menu_ptr = -1; atomic_store(&g_menu_hi, -1);
+        int down = g_menu_row; g_menu_ptr = -1; atomic_store(&g_menu_hi, -1); atomic_store(&g_menu_down, 0);
+        if (row == down && row > 0) g_menu_last = row;
         if (down >= 0 && ov_menu_item(tab, down) == OVM_OPACITY) { settings_save(); dm_overlay_redraw(); }
+        else if (row == down && ov_menu_kind(item) == OVR_CHOICE && OVM_ROW[item].swatches && ov_menu_swatch_at(x, p, row, OVM_ROW[item].n) >= 0) {   // a colour tapped
+            menu_set(item, ov_menu_swatch_at(x, p, row, OVM_ROW[item].n)); dm_haptics_android_tap(); dm_overlay_redraw(); }
+        else if (row == down && ov_menu_kind(item) == OVR_CHOICE) menu_step(item, ov_menu_choice_dir(x, p, row));   // the value's left arrow goes back
         else if (row == down && item >= 0 && item != OVM_TAB) menu_do(item);
         else if (row == down && (row == -2 || row == -3)) { dm_haptics_android_tap(); menu_close(); }
         else dm_overlay_redraw();
-    } else if (act == AMOTION_EVENT_ACTION_CANCEL) { g_menu_ptr = -1; atomic_store(&g_menu_hi, -1); dm_overlay_redraw(); }
+    } else if (act == AMOTION_EVENT_ACTION_CANCEL) { g_menu_ptr = -1; atomic_store(&g_menu_hi, -1); atomic_store(&g_menu_down, 0); dm_overlay_redraw(); }
 }
 static void ed_key(uint64_t bit); static void sp_key(uint64_t bit);
-static void menu_key(uint64_t bit) {   // a controller key pressed while the menu is open: up and down go through the rows, left and right change the tab or the
-    if (atomic_load(&g_edit)) { ed_key(bit); return; }   // opacity on their rows, L and R change the tab anywhere, A does the row, B and + close
-    if (atomic_load(&g_sp_on)) { sp_key(bit); return; }
-    int hi = atomic_load(&g_menu_hi), tab = atomic_load(&g_menu_tab), item = hi >= 0 ? ov_menu_item(tab, hi) : -1;
-    if (bit == DM_BTN_UP || bit == DM_BTN_DOWN) {
-        for (int k = 0; k < OVM_ROWS; k++) { hi = hi < 0 ? (bit == DM_BTN_UP ? OVM_ROWS - 1 : 1) : (hi + (bit == DM_BTN_UP ? OVM_ROWS - 1 : 1)) % OVM_ROWS; if (ov_menu_item(tab, hi) >= 0) break; }
-        atomic_store(&g_menu_hi, hi); dm_overlay_redraw();
-    } else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_OPACITY) { menu_opacity(atomic_load(&g_set_opacity) + (bit == DM_BTN_LEFT ? -5 : 5)); settings_save(); }
-    else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_TAB) menu_tab(tab + (bit == DM_BTN_LEFT ? -1 : 1));
-    else if (bit == DM_BTN_L || bit == DM_BTN_ZL || bit == DM_BTN_R || bit == DM_BTN_ZR) {
+static int menu_first_row(int tab) { for (int r = 1; r < OVM_ROWS; r++) if (ov_menu_item(tab, r) >= 0) return r; return OVM_ROWS - 1; }
+static void sp_close_all(void);
+static void menu_key(uint64_t bit) {   // a controller key pressed while the menu is open (also each repeat of a held direction: menu_nav). Up and down go through
+    // the rows (the tabs' row too; round), left and right change the value on a row that has one (a slider, a choice, a switch: left off, right on) and the
+    // tab on the tabs' row, L and R (ZL, ZR) the tab anywhere, keeping the row; A does the row, B and + close. Without a highlight (after a touch) the first key
+    // shows it again on the last row used
+    if (atomic_load(&g_edit)) { ed_key(bit); return; }
+    if (atomic_load(&g_sp_on)) { if (bit == DM_BTN_PLUS) sp_close_all(); else sp_key(bit); return; }
+    int hi = atomic_load(&g_menu_hi), tab = atomic_load(&g_menu_tab);
+    if (bit == DM_BTN_B || bit == DM_BTN_PLUS) { menu_close(); return; }
+    if (bit == DM_BTN_L || bit == DM_BTN_ZL || bit == DM_BTN_R || bit == DM_BTN_ZR) {
         menu_tab(tab + (bit == DM_BTN_L || bit == DM_BTN_ZL ? -1 : 1));
-        if (hi > 0 && ov_menu_item(atomic_load(&g_menu_tab), hi) < 0) atomic_store(&g_menu_hi, OVM_ROWS - 1);   // (the other tab has fewer rows)
+        int t = atomic_load(&g_menu_tab), r = hi >= 0 ? hi : g_menu_last;
+        if (r > 0 && r < OVM_ROWS - 1 && ov_menu_item(t, r) < 0) { while (r > 1 && ov_menu_item(t, r) < 0) r--; if (ov_menu_item(t, r) < 0) r = menu_first_row(t); }   // (the other tab has fewer rows): its last one
+        if (hi >= 0) { atomic_store(&g_menu_hi, r); g_menu_last = r; dm_overlay_redraw(); }
+        return;
     }
-    else if (bit == DM_BTN_A) menu_do(hi < 0 ? OVM_RESUME : item);
-    else if (bit == DM_BTN_B || bit == DM_BTN_PLUS) menu_close();
+    if (hi < 0 || ov_menu_item(tab, hi) < 0) {   // no highlight: shown again where it was, the key does nothing else
+        hi = g_menu_last >= 0 && g_menu_last < OVM_ROWS && ov_menu_item(tab, g_menu_last) >= 0 ? g_menu_last : menu_first_row(tab);
+        atomic_store(&g_menu_hi, hi); g_menu_last = hi; dm_haptics_android_tap(); dm_overlay_redraw(); return;
+    }
+    int item = ov_menu_item(tab, hi), k = ov_menu_kind(item);
+    if (bit == DM_BTN_UP || bit == DM_BTN_DOWN) {
+        for (int n = 0; n < OVM_ROWS; n++) { hi = (hi + (bit == DM_BTN_UP ? OVM_ROWS - 1 : 1)) % OVM_ROWS; if (ov_menu_item(tab, hi) >= 0) break; }
+        atomic_store(&g_menu_hi, hi); g_menu_last = hi; dm_haptics_android_tap(); dm_overlay_redraw();
+    } else if (bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) {
+        int d = bit == DM_BTN_LEFT ? -1 : 1;
+        if (k == OVR_SLIDER || k == OVR_CHOICE || k == OVR_TABS) menu_step(item, d);
+        else if (k == OVR_TOGGLE && dm_menu_value(item) != (d > 0)) { menu_set(item, d > 0); dm_haptics_android_tap(); dm_overlay_redraw(); }
+    }
+    else if (bit == DM_BTN_A) menu_do(item);
 }
 
 // ---- the save manager (saves_android.c): Export save copies the game's committed save to the files folder's saves/ on a thread of its own (the row shows it
@@ -516,6 +588,11 @@ static void sp_back(void) {   // the confirmation → the list → the menu (not
     dm_haptics_android_tap();
     if (confirm) { atomic_store(&g_sp_hi, 1); sp_changed(); return; }
     atomic_store(&g_sp_on, 0); atomic_store(&g_menu_hi, -1); dm_overlay_redraw();
+}
+static void sp_close_all(void) {   // + or the menu key in the picker: the picker and the menu close (not once the import is under way)
+    pthread_mutex_lock(&g_sp_mu); int closing = g_sp.closing; if (!closing) g_sp.confirm = 0; g_sp.ptr = -1; pthread_mutex_unlock(&g_sp_mu);
+    if (closing) return;
+    atomic_store(&g_sp_on, 0); menu_close();
 }
 static void *sp_end(void *a) {   // the panel's note shows for a moment, then the app ends; the next start imports the save (saves_android.c dm_saves_start)
     (void)a; sleep(3); LOG("[saves] the app ends for the import"); _exit(0);
@@ -844,13 +921,62 @@ static void touch_event(AInputEvent *e) {
     dm_touch_set(t, n);
     if (open) menu_open(-1);
 }
+// ---- a controller's directions in the menu and the text entry: the d-pad (keys or a hat) and the left stick (past NAV_DEAD) move once when pressed, then
+// again after NAV_DELAY and every NAV_EVERY while held; a held left or right on a slider speeds up after NAV_FAST_AFTER. Our own repeat (Android's key
+// repeats are ignored), timed by the input thread's poll (nav_timeout_ms, nav_tick). Input thread only ----
+#define NAV_DEAD 0.55f
+#define NAV_DELAY_NS 350000000ll
+#define NAV_EVERY_NS 120000000ll
+#define NAV_FAST_NS 50000000ll
+#define NAV_FAST_AFTER_NS 1000000000ll
+#define NAV_DIRS (DM_BTN_UP | DM_BTN_DOWN | DM_BTN_LEFT | DM_BTN_RIGHT)
+static struct { uint64_t keys, hat, stick, bit; int64_t start, next; } g_nav;
+static void nav_fire(uint64_t bit) {
+    if (atomic_load(&g_tx_on)) {
+        int dx = bit == DM_BTN_LEFT ? -1 : bit == DM_BTN_RIGHT ? 1 : 0, dy = bit == DM_BTN_UP ? -1 : bit == DM_BTN_DOWN ? 1 : 0;
+        pthread_mutex_lock(&g_tx_mu); g_tx.sel = ov_kb_move(g_tx.sel, dx, dy); pthread_mutex_unlock(&g_tx_mu); tx_changed();
+    } else if (atomic_load(&g_menu)) menu_key(bit);
+}
+static uint64_t nav_dir(uint64_t held) {   // the one direction held: the newest source's, up/down before left/right
+    for (int i = 0; i < 4; i++) { static const uint64_t o[4] = {DM_BTN_UP, DM_BTN_DOWN, DM_BTN_LEFT, DM_BTN_RIGHT}; if (held & o[i]) return o[i]; }
+    return 0;
+}
+static void nav_update(void) {   // after a source changed: a new direction moves now
+    uint64_t want = nav_dir(g_nav.keys | g_nav.hat | g_nav.stick);
+    if (want == g_nav.bit) return;
+    g_nav.bit = want; if (!want) return;
+    g_nav.start = mono_ns(); g_nav.next = g_nav.start + NAV_DELAY_NS; nav_fire(want);
+}
+static void nav_tick(void) {
+    if (!atomic_load(&g_menu) && !atomic_load(&g_tx_on)) { if (g_nav.bit | g_nav.keys | g_nav.hat | g_nav.stick) memset(&g_nav, 0, sizeof g_nav); return; }
+    if (!g_nav.bit) return;
+    int64_t now = mono_ns(); if (now < g_nav.next) return;
+    int lr = g_nav.bit == DM_BTN_LEFT || g_nav.bit == DM_BTN_RIGHT, slider = lr && !atomic_load(&g_tx_on) && !atomic_load(&g_sp_on) && !atomic_load(&g_edit) &&
+        ov_menu_kind(ov_menu_item(atomic_load(&g_menu_tab), atomic_load(&g_menu_hi))) == OVR_SLIDER;
+    g_nav.next = now + (slider && now - g_nav.start > NAV_FAST_AFTER_NS ? NAV_FAST_NS : NAV_EVERY_NS);
+    nav_fire(g_nav.bit);
+}
+static int nav_timeout_ms(void) { if (!g_nav.bit) return -1; int64_t d = g_nav.next - mono_ns(); return d <= 0 ? 0 : (int)(d / 1000000) + 1; }
+static void nav_axes(AInputEvent *e) {   // a motion event's hat and left stick
+    float hx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0), hy = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_Y, 0);
+    float sx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_X, 0), sy = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_Y, 0);
+    g_nav.hat = (hy < -0.5f ? DM_BTN_UP : hy > 0.5f ? DM_BTN_DOWN : 0) | (hx < -0.5f ? DM_BTN_LEFT : hx > 0.5f ? DM_BTN_RIGHT : 0);
+    uint64_t st = 0;   // the stick: its stronger axis only (a diagonal does not move two ways)
+    if (fabsf(sy) >= fabsf(sx)) st = sy < -NAV_DEAD ? DM_BTN_UP : sy > NAV_DEAD ? DM_BTN_DOWN : 0;
+    else st = sx < -NAV_DEAD ? DM_BTN_LEFT : sx > NAV_DEAD ? DM_BTN_RIGHT : 0;
+    g_nav.stick = st; nav_update();
+}
 static int handle_event(AInputEvent *e) {
     int32_t src = AInputEvent_getSource(e), type = AInputEvent_getType(e);
     if (type == AINPUT_EVENT_TYPE_KEY) {
+        { uint64_t d = key_bit(AKeyEvent_getKeyCode(e)) & NAV_DIRS; int32_t a = AKeyEvent_getAction(e);   // a direction in the menu or the text entry: the repeater's
+          if (d && (atomic_load(&g_tx_on) || atomic_load(&g_menu)) && !atomic_load(&g_edit)) {
+              if (a == AKEY_EVENT_ACTION_DOWN && AKeyEvent_getRepeatCount(e) == 0) g_nav.keys |= d; else if (a == AKEY_EVENT_ACTION_UP) g_nav.keys &= ~d;
+              nav_update(); return 1; } }
         if (atomic_load(&g_tx_on)) return tx_key(e);   // the text entry takes every key while it is open
         int32_t k = AKeyEvent_getKeyCode(e), down = AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN;
         if (k == AKEYCODE_BACK || k == AKEYCODE_BUTTON_MODE || k == AKEYCODE_MENU) {   // the menu, both ways (Back would otherwise finish the activity, and the game with it)
-            if (down && AKeyEvent_getRepeatCount(e) == 0) { if (atomic_load(&g_menu)) menu_close(); else menu_open(k == AKEYCODE_BACK ? -1 : 0); }
+            if (down && AKeyEvent_getRepeatCount(e) == 0) { if (atomic_load(&g_sp_on)) sp_close_all(); else if (atomic_load(&g_menu)) menu_close(); else menu_open(k == AKEYCODE_BACK ? -1 : 0); }
             return 1;
         }
         uint64_t bit = key_bit(k);
@@ -866,25 +992,19 @@ static int handle_event(AInputEvent *e) {
         dm_pad_players(1); pad_publish(); return 1;
     }
     if (atomic_load(&g_tx_on) && ((src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK || (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD)) {
-        // the d-pad (reported as a hat on Retroid and many Android handhelds) or the left stick moves the text-entry highlight on edge transitions, as the pause menu uses the hat; touch taps the keys (tx_touch)
-        static float thx, thy;
-        float hx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0), hy = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_Y, 0);
-        float sx = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_X, 0), sy = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_Y, 0);
-        float x = fabsf(sx) > fabsf(hx) ? sx : hx, y = fabsf(sy) > fabsf(hy) ? sy : hy;
-        int dx = 0, dy = 0;
-        if (y < -0.5f && thy >= -0.5f) dy = -1; else if (y > 0.5f && thy <= 0.5f) dy = 1;
-        if (x < -0.5f && thx >= -0.5f) dx = -1; else if (x > 0.5f && thx <= 0.5f) dx = 1;
-        thx = x; thy = y;
-        if (dx || dy) { pthread_mutex_lock(&g_tx_mu); g_tx.sel = ov_kb_move(g_tx.sel, dx, dy); pthread_mutex_unlock(&g_tx_mu); tx_changed(); }
-        return 1;
+        // the d-pad (reported as a hat on Retroid and many Android handhelds) or the left stick moves the text-entry highlight, held ones repeating (nav_*); touch taps the keys (tx_touch)
+        nav_axes(e); return 1;
     }
     if ((src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK || (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD) {
         g_pad_used = 1; atomic_store(&g_pad_in, AInputEvent_getDeviceId(e)); dm_haptics_android_device(AInputEvent_getDeviceId(e));
-        if (atomic_load(&g_menu)) {   // the hat moves the selection
-            static float hx, hy; float x = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0), y = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_Y, 0);
-            if (y < -0.5f && hy >= -0.5f) menu_key(DM_BTN_UP); else if (y > 0.5f && hy <= 0.5f) menu_key(DM_BTN_DOWN);
-            if (x < -0.5f && hx >= -0.5f) menu_key(DM_BTN_LEFT); else if (x > 0.5f && hx <= 0.5f) menu_key(DM_BTN_RIGHT);
-            hx = x; hy = y; return 1;
+        if (atomic_load(&g_menu)) {   // the hat and the left stick move the selection (held: repeating); nothing reaches the game
+            if (atomic_load(&g_edit)) {   // the layout editor: the hat's edges, as before
+                static float hx, hy; float x = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_X, 0), y = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_HAT_Y, 0);
+                if (y < -0.5f && hy >= -0.5f) menu_key(DM_BTN_UP); else if (y > 0.5f && hy <= 0.5f) menu_key(DM_BTN_DOWN);
+                if (x < -0.5f && hx >= -0.5f) menu_key(DM_BTN_LEFT); else if (x > 0.5f && hx <= 0.5f) menu_key(DM_BTN_RIGHT);
+                hx = x; hy = y; return 1;
+            }
+            nav_axes(e); return 1;
         }
         g_ax[0] = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_X, 0); g_ax[1] = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_Y, 0);
         g_ax[2] = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_Z, 0); g_ax[3] = AMotionEvent_getAxisValue(e, AMOTION_EVENT_AXIS_RZ, 0);
@@ -1005,8 +1125,8 @@ static void *input_thread(void *a) {
     shake_start();
     uint64_t prev = 0, latched = 0, sample = 0; int64_t since = 0;
     for (;;) {
-        ALooper_pollOnce(latched ? 10 : -1, NULL, NULL, NULL);
-        ext_touch_drain();
+        int nt = nav_timeout_ms(); ALooper_pollOnce(latched ? (nt >= 0 && nt < 10 ? nt : 10) : nt, NULL, NULL, NULL);
+        nav_tick(); ext_touch_drain();
         if (!dm_external_active()) { prev = latched = 0; atomic_store(&g_ext_presses, 0); atomic_store(&g_ext_touch_enabled, 0); continue; }
         if (atomic_load(&g_ext_touch_enabled)) continue;
         int toggle = atomic_exchange(&g_ext_menu, 0);
@@ -1143,7 +1263,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     // the save manager's requests (saves_android.c), before the host mounts the save: an import chosen in the menu or pushed by porter, an export porter asks for
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
-    settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
+    settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act); app_label(act);
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);
