@@ -6,7 +6,11 @@
 // and at the end of the stream sends an end-of-stream input and collects every picture still in the codec. Pictures leave the codec as compact NV12 copies (the output buffer's stride,
 // slice height and crop come from its format: Qualcomm's decoder pads rows to 128 bytes and planes to 32 rows), so a buffer goes back to the codec at once.
 // The same machinery decodes AV1 (mavc_new_av1, movie_av1.c / movie_av1.h): mime video/av01, configured from the stream's sequence header instead of SPS / PPS, fed temporal units of
-// low-overhead OBUs, with a software decoder to fall back on
+// low-overhead OBUs, with a software decoder to fall back on.
+// A codec opened again mid-stream (hle_codec_video.c turns zero copy off at the game's first CPU read of a picture, after the first picture is out: the codec is closed and opened in the
+// CPU mode at the next packet) decodes nothing until a key frame comes: Qualcomm's c2.qti.av1.decoder gave no picture for Ocarina of Time's inter frames after such a reopen and the
+// software decoder took over at the next sequence header, seconds later. So the units since the last key frame are kept (gop, up to GOP_CAP) and go into the new codec first, the
+// pictures the game already took (by time) left out; with no key frame to start from, units are skipped until one comes rather than fed to a decoder that cannot use them
 #include "dm.h"
 #include "hle_movie_avc.h"
 #include <stdlib.h>
@@ -39,9 +43,14 @@ struct mavc {
     // which zq then holds in presentation order. The reader lives as long as the mode (the codec may be opened again for a new stream)
     int zc, zc_w, zc_h; zc_reader *rd; zc_tsmap tsmap; struct { zc_frame *f; int64_t pts; } zq[QMAX]; int nzq;
     // AV1 (mavc_new_av1): seq is the stream's sequence header OBU (csd-0 is made from it; a changed one opens the codec again), si what it says. sw: the software decoder; sw_next:
-    // it takes over at the next sequence header (the hardware one stalled or failed); framing: how the packets came (movie_av1.h); pictures: out of the decoder since it was opened
+    // it takes over at the next sequence header or key frame (the hardware one stalled or failed); framing: how the packets came (movie_av1.h); pictures: out of the decoder since it was opened
     int av1, sw, sw_next, framing; uint8_t seq[512]; size_t nseq; mav1_seq si; long pictures;
+    // The units since the last key frame (each: a gop_hdr, then its bytes), for a codec opened again mid-stream; gop_key: they start with a key frame. key: the unit being decoded is
+    // one (1), is not (0), or has no frame to tell by (-1). last_out: the time of the last picture handed out; a replay leaves out the pictures up to skip_le (INT64_MIN: none)
+    uint8_t *gop; size_t ngop, gopcap; int gop_key, key, need_key; int64_t last_out, skip_le;
 };
+#define GOP_CAP (24u << 20)   // bytes of units kept; over it, nothing is kept until the next key frame
+typedef struct { uint32_t len; int64_t pts; } gop_hdr;
 #define KIND(a) ((a)->av1 ? "AV1" : "AVC")
 static int64_t game_pts(mavc *a, int64_t cpts) {   // the codec's timestamp back to the game's (pmap)
     for (int m = 0; m < a->npmap; m++) if (a->pmap[m].c == cpts) { int64_t g = a->pmap[m].g; a->pmap[m] = a->pmap[--a->npmap]; return g; }
@@ -61,15 +70,16 @@ static int zc_pull(mavc *a, int discard) {
     return n;
 }
 
-mavc *mavc_new(void) { mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed"); a->last_in = INT64_MIN; return a; }
+mavc *mavc_new(void) { mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed"); a->last_in = a->last_out = a->skip_le = INT64_MIN; a->key = -1; return a; }
 static void close_codec(mavc *a) { if (a->mc) { AMediaCodec_stop(a->mc); AMediaCodec_delete(a->mc); a->mc = NULL; } a->nin = a->nout = 0; a->eos_sent = 0; a->last_in = INT64_MIN; a->npmap = 0; }
 void mavc_drop(mavc *a) {
     for (int i = 0; i < a->nq; i++) free(a->q[i].nv12);
     a->nq = 0;
     if (a->zc) { zq_drop(a); zc_pull(a, 1); }
     if (a->mc) { AMediaCodec_flush(a->mc); a->nin = a->nout = 0; a->eos_sent = 0; a->last_in = INT64_MIN; a->npmap = 0; }   // a seek: pictures in the codec belong to the old position
+    a->skip_le = INT64_MIN;   // (the kept units stay: a stream going on mid-way after a Stop, or the CPU-mode reopen, starts from them; a stream from another position starts at a key frame, which replaces them)
 }
-void mavc_free(mavc *a) { if (!a) return; mavc_drop(a); close_codec(a); if (a->rd) zc_reader_free(a->rd); free(a->au); free(a); }
+void mavc_free(mavc *a) { if (!a) return; mavc_drop(a); close_codec(a); if (a->rd) zc_reader_free(a->rd); free(a->au); free(a->gop); free(a); }
 int mavc_queued(const mavc *a) { return a->nq + a->nzq; }
 int mavc_held(const mavc *a) { return a->nq + a->nzq + a->tsmap.n + (a->mc && !a->eos_sent && a->nin > a->nout ? (int)(a->nin - a->nout) : 0); }
 // Zero copy on: the codec is opened again (at the next packet) with the reader's surface as its output. DM_MOVIE_ZC_IMAGES (start-up): the reader's image count (16: hle_codec_video.c holds
@@ -170,7 +180,7 @@ static int open_codec(mavc *a) {
                     a->sw ? " (software)" : "", a->zc ? ", pictures into the zero-copy reader's buffers" : ", NV12 copies");
     else LOG("[movie] AVC: MediaCodec decoder %s, profile %d%s", name ? name : "?", a->nsps > 1 ? a->sps[1] : 0, a->zc ? ", pictures into the zero-copy reader's buffers" : "");
     if (name) AMediaCodec_releaseName(a->mc, name);
-    a->fw = a->fh = 0; a->dirty = 0; a->pictures = 0; return 1;
+    a->fw = a->fh = 0; a->dirty = 0; a->pictures = 0; a->need_key = 0; return 1;
 }
 static void read_format(mavc *a) {
     AMediaFormat *f = AMediaCodec_getOutputFormat(a->mc); int32_t v;
@@ -202,8 +212,7 @@ static void keep_picture(mavc *a, const uint8_t *src, size_t n, int64_t pts) {
         }
     } else for (int r = 0; r < h / 2; r++) memcpy(ouv + (size_t)r * w, src + uvoff + (size_t)(a->ct / 2 + r) * s + (a->cl & ~1), (size_t)w);
     if (a->nq == QMAX) { if (!a->red++) LOG("[RED] movie: %s picture queue full, dropping the oldest picture", KIND(a)); free(a->q[0].nv12); memmove(a->q, a->q + 1, --a->nq * sizeof a->q[0]); }
-    pts = game_pts(a, pts);   // the game's own timestamp
-    int k = a->nq; while (!a->synth && k > 0 && a->q[k - 1].pts > pts) { a->q[k] = a->q[k - 1]; k--; }
+    int k = a->nq; while (!a->synth && k > 0 && a->q[k - 1].pts > pts) { a->q[k] = a->q[k - 1]; k--; }   // (pts: the game's own timestamp)
     a->q[k].nv12 = o; a->q[k].w = w; a->q[k].h = h; a->q[k].pts = pts; a->nq++;
 }
 // collect the pictures the codec has ready, waiting up to wait_us for the first; 1 = the end-of-stream output came
@@ -222,16 +231,20 @@ static int drain(mavc *a, int64_t wait_us) {
             return 0;
         }
         if (!a->fw) read_format(a);
+        int pic = bi.size > 0;
+        if (pic) { a->nout++; if (a->av1 && !a->pictures++) LOG("[movie] AV1: first picture out of the decoder"); }
+        // a picture of a unit decoded again (a reopened codec, mavc_decode) that the game already took: not given twice
+        int64_t g = pic ? game_pts(a, bi.presentationTimeUs) : 0;
+        if (pic && a->skip_le != INT64_MIN && g <= a->skip_le) pic = 0;
         if (a->zc) {   // rendered into the reader's buffers: the picture comes back through the reader (zc_pull), found by its codec timestamp
-            int render = bi.size > 0;
-            if (render) { zc_tsmap_push(&a->tsmap, bi.presentationTimeUs, game_pts(a, bi.presentationTimeUs)); a->nout++; if (a->av1 && !a->pictures++) LOG("[movie] AV1: first picture out of the decoder"); }
-            AMediaCodec_releaseOutputBuffer(a->mc, (size_t)i, render);
+            if (pic) zc_tsmap_push(&a->tsmap, bi.presentationTimeUs, g);
+            AMediaCodec_releaseOutputBuffer(a->mc, (size_t)i, pic);
             zc_pull(a, 0);
             if (bi.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) return 1;
             wait_us = 0; continue;
         }
-        size_t n = 0; uint8_t *b = AMediaCodec_getOutputBuffer(a->mc, (size_t)i, &n);
-        if (b && bi.size > 0) { keep_picture(a, b + bi.offset, (size_t)bi.size, bi.presentationTimeUs); a->nout++; if (a->av1 && !a->pictures++) LOG("[movie] AV1: first picture out of the decoder"); }
+        size_t n = 0; uint8_t *b = pic ? AMediaCodec_getOutputBuffer(a->mc, (size_t)i, &n) : NULL;
+        if (b) keep_picture(a, b + bi.offset, (size_t)bi.size, g);
         AMediaCodec_releaseOutputBuffer(a->mc, (size_t)i, false);
         if (bi.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) return 1;
         wait_us = 0;
@@ -242,6 +255,7 @@ static void au_add(void *ctx, const uint8_t *nal, size_t n) {
     au_ctx *c = ctx; mavc *a = c->a; int t = nal[0] & 31;
     if (t == 7 || t == 8) { keep_ps(a, nal, n); return; }
     if (t == 9) return;   // access unit delimiter
+    if (t == 5) a->key = 1; else if (t == 1 && a->key < 0) a->key = 0;   // an IDR slice: the access unit starts a stream; a non-IDR one: it does not
     if (c->len + 4 + n > a->aucap) { a->aucap = (c->len + 4 + n) * 2; a->au = realloc(a->au, a->aucap); if (!a->au) die("movie: AVC buffer allocation failed"); }
     uint8_t *o = a->au + c->len; o[0] = o[1] = o[2] = 0; o[3] = 1; memcpy(o + 4, nal, n); c->len += 4 + n;
 }
@@ -268,22 +282,27 @@ static ssize_t av1_unit(mavc *a, const uint8_t *p, size_t n) {
             if (a->nseq) LOG("[movie] AV1: a new sequence header (%dx%d), the decoder opens again", si.w, si.h);
             memcpy(a->seq, s, sl); a->nseq = sl; a->si = si; a->dirty = 1;
         }
-        if (a->sw_next) { a->sw_next = 0; a->sw = 1; a->dirty = 1; }   // the software decoder from this key frame on
     }
+    a->key = a->nseq ? mav1_tu_key(a->au, (size_t)len, a->si.reduced) : -1;
+    if (a->sw_next && (s || a->key == 1)) { a->sw_next = 0; a->sw = 1; a->dirty = 1; }   // the software decoder from this key frame on
     return a->nseq ? len : 0;
 }
-int mavc_decode(mavc *a, const uint8_t *p, int n, int64_t pts_us) {
-    size_t len;
-    if (a->av1) { ssize_t l = av1_unit(a, p, (size_t)n); if (l < 0) return -1; len = (size_t)l; }
-    else { au_ctx c = {a, 0}; each_nal(p, (size_t)n, au_add, &c); len = c.len; }
-    if (!len) return 0;
-
-    if ((a->dirty || !a->mc || a->eos_sent) && !open_codec(a)) return -1;
+// The unit in a->au into the kept ones (gop): a key frame starts them over; past GOP_CAP they are dropped until the next key frame
+static void gop_add(mavc *a, size_t len, int64_t pts) {
+    if (a->key == 1) { a->ngop = 0; a->gop_key = 1; }
+    if (!a->gop_key) return;
+    size_t need = a->ngop + sizeof(gop_hdr) + len;
+    if (need > GOP_CAP) { a->ngop = 0; a->gop_key = 0; return; }
+    if (need > a->gopcap) { size_t c = need * 2 > GOP_CAP ? GOP_CAP : need * 2; uint8_t *g = realloc(a->gop, c); if (!g) { a->ngop = 0; a->gop_key = 0; return; } a->gop = g; a->gopcap = c; }
+    gop_hdr h = {(uint32_t)len, pts}; memcpy(a->gop + a->ngop, &h, sizeof h); memcpy(a->gop + a->ngop + sizeof h, a->au, len); a->ngop = need;
+}
+// one unit into the codec (its timestamp as mavc's comment on last_in says): 0, or -1 when the codec took none
+static int feed(mavc *a, const uint8_t *u, size_t len, int64_t pts_us) {
     ssize_t i = input_slot(a);
     if (i < 0) { static long nd; long k = ++nd; if (!(k & (k - 1))) LOG("[RED] movie: MediaCodec %s decoder has no free input buffer, a packet is dropped (%ld so far)", KIND(a), k); return -1; }
     size_t cap = 0; uint8_t *b = AMediaCodec_getInputBuffer(a->mc, (size_t)i, &cap);
     if (!b || cap < len) { if (!a->red++) LOG("[RED] movie: %s access unit of %zu bytes does not fit MediaCodec's %zu-byte input buffer", KIND(a), len, cap); AMediaCodec_queueInputBuffer(a->mc, (size_t)i, 0, 0, (uint64_t)pts_us, 0); return -1; }
-    memcpy(b, a->au, len);
+    memcpy(b, u, len);
     int64_t cpts = pts_us > a->last_in ? pts_us : a->last_in + 1; if (cpts != pts_us) a->synth = 1; a->last_in = cpts;
     if (a->npmap == 64) a->pmap[0] = a->pmap[--a->npmap];   // (outputs the codec never gave)
     a->pmap[a->npmap].c = cpts; a->pmap[a->npmap].g = pts_us; a->npmap++;
@@ -291,6 +310,38 @@ int mavc_decode(mavc *a, const uint8_t *p, int n, int64_t pts_us) {
     a->nin++;
     drain(a, 0);
     return 0;
+}
+// A codec opened mid-stream: the kept units, from their key frame, go in first; of their pictures only those after the last one the game took come out (none left out when the stream's
+// timestamps are made up: synth)
+static void replay(mavc *a) {
+    a->skip_le = a->synth ? INT64_MIN : a->last_out;
+    int n = 0, fed = 0; int64_t first = 0;
+    for (size_t i = 0; i + sizeof(gop_hdr) <= a->ngop; n++) {
+        gop_hdr h; memcpy(&h, a->gop + i, sizeof h); i += sizeof h;
+        if (h.len > a->ngop - i) break;
+        if (!n) first = h.pts;
+        if (feed(a, a->gop + i, h.len, h.pts) == 0) fed++;
+        i += h.len;
+    }
+    LOG("[movie] %s: the decoder opened again mid-stream: %d of the %d packet(s) since the key frame at %lld µs decoded again%s, the pictures the game has (up to %lld µs) left out",
+        KIND(a), fed, n, (long long)first, a->zc ? "" : " (CPU copies)", a->skip_le == INT64_MIN ? -1LL : (long long)a->skip_le);
+}
+int mavc_decode(mavc *a, const uint8_t *p, int n, int64_t pts_us) {
+    size_t len;
+    if (a->av1) { ssize_t l = av1_unit(a, p, (size_t)n); if (l < 0) return -1; len = (size_t)l; }
+    else { au_ctx c = {a, 0}; a->key = -1; each_nal(p, (size_t)n, au_add, &c); len = c.len; }
+    if (!len) return 0;
+
+    int opened = 0;
+    if (a->dirty || !a->mc || a->eos_sent) { if (!open_codec(a)) return -1; opened = 1; }
+    if (opened && a->key == 0) {   // the codec starts mid-stream (hle_codec_video.c reopened it for the CPU mode, a Stop with the stream going on): the units since the key frame first
+        if (a->gop_key) replay(a);
+        else { a->need_key = 1; static int k; if (k++ < 4) LOG("[movie] %s: the decoder opened mid-stream with no key frame to start from: packets are skipped until one comes", KIND(a)); }
+    }
+    if (a->need_key) { if (a->key == 0) return 0; a->need_key = 0; }
+    int r = feed(a, a->au, len, pts_us);
+    gop_add(a, len, pts_us);
+    return r;
 }
 // the end of the stream: an end-of-stream input, then every picture still in the codec; the codec is opened afresh for the next stream (a loop restarts with Flush and new packets)
 static void finish(mavc *a) {
@@ -322,7 +373,7 @@ int mavc_take_frame(mavc *a, int flush, zc_frame **out, int64_t *pts_us) {
     else if (!a->nzq && a->mc && a->nin > a->nout) { drain(a, 4000); zc_pull(a, 0); }   // a picture is in the codec's pipeline: give it a few milliseconds
     for (int k = 0; !a->nzq && a->tsmap.n && k < 32; k++) { usleep(250); zc_pull(a, 0); }
     if (!a->nzq) return 0;
-    *out = a->zq[0].f; if (pts_us) *pts_us = a->zq[0].pts;
+    *out = a->zq[0].f; if (pts_us) *pts_us = a->zq[0].pts; a->last_out = a->zq[0].pts;
     memmove(a->zq, a->zq + 1, --a->nzq * sizeof a->zq[0]);
     return 1;
 }
@@ -331,7 +382,7 @@ int mavc_take(mavc *a, int flush, uint8_t *dst, int w, int h, int64_t *pts_us) {
     if (flush) finish(a);
     else if (!a->nq && a->mc && a->nin > a->nout) drain(a, 4000);   // a picture is in the codec's pipeline: give it a few milliseconds
     if (!a->nq) return 0;
-    uint8_t *pic = a->q[0].nv12; int pw = a->q[0].w, ph = a->q[0].h; if (pts_us) *pts_us = a->q[0].pts;
+    uint8_t *pic = a->q[0].nv12; int pw = a->q[0].w, ph = a->q[0].h; if (pts_us) *pts_us = a->q[0].pts; a->last_out = a->q[0].pts;
     memmove(a->q, a->q + 1, --a->nq * sizeof a->q[0]);
     const uint8_t *uv = pic + (size_t)pw * ph;
     if (a->rgba) nv12_rgba(pic, uv, pw, ph, dst, w, h);

@@ -89,8 +89,23 @@ static void t_ivf(void) {
     assert(mav1_tu(iv, sizeof iv, out, sizeof out, &f) == (ssize_t)n - 2 && f == MAV1_IVF && !memcmp(out, av1 + 2, n - 2));   // the first, after the file header
     puts("IVF ok");
 }
+static void t_key(void) {   // mav1_tu_key: the unit's first frame header's show_existing_frame and frame_type bits
+    int f = 0; ssize_t n = mav1_tu(av1, sizeof av1, out, sizeof out, &f);
+    assert(n > 0 && mav1_tu_key(out, (size_t)n, 0) == 1);                                      // the SVT-AV1 key frame (frame OBU, 0x10: KEY_FRAME, shown)
+    mav1_seq si; assert(mav1_seq_parse(av1 + SEQ_AT, SEQ_N, NULL, &si) && !si.reduced);
+    uint8_t fh[] = {0x1a, 0x03, 0x30, 0x00, 0x00};                                               // a frame header OBU: 0x30 = frame_type INTER (01), shown
+    assert(mav1_tu_key(fh, sizeof fh, 0) == 0 && mav1_tu_key(fh, sizeof fh, 1) == 1);          // (with reduced_still_picture_header every frame is a key frame)
+    fh[2] = 0x50; assert(mav1_tu_key(fh, sizeof fh, 0) == 0);                                   // INTRA_ONLY (10): not a start either
+    fh[2] = 0x80; assert(mav1_tu_key(fh, sizeof fh, 0) == 0);                                   // show_existing_frame
+    fh[2] = 0x10; assert(mav1_tu_key(fh, sizeof fh, 0) == 1);                                   // KEY_FRAME
+    uint8_t both[SEQ_N + sizeof fh]; memcpy(both, av1 + SEQ_AT, SEQ_N); memcpy(both + SEQ_N, fh, sizeof fh); fh[2] = 0x30; memcpy(both + SEQ_N, fh, sizeof fh);
+    assert(mav1_tu_key(both, sizeof both, 0) == 0);                                              // a sequence header before an inter frame does not make it one
+    assert(mav1_tu_key(av1 + SEQ_AT, SEQ_N, 0) == -1);                                          // a sequence header alone: nothing to tell by
+    static const uint8_t junk[] = {0xff, 0x01}; assert(mav1_tu_key(junk, sizeof junk, 0) == -1);
+    puts("key frame ok");
+}
 int main(void) {
-    t_seq(); t_low_overhead(); t_annexb(); t_ivf();
+    t_seq(); t_low_overhead(); t_annexb(); t_ivf(); t_key();
     puts("t_movie_av1: all ok");
     return 0;
 }

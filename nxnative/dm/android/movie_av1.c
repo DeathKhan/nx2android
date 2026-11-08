@@ -88,7 +88,7 @@ int mav1_seq_parse(const uint8_t *obu, size_t n, uint8_t c[4], mav1_seq *s) {
     }
     if (s) {   // matrix coefficients (AV1 6.4.2): 1 BT.709, 5 / 6 BT.601, 9 / 10 BT.2020; unspecified (2) or anything else as the height says
         int m = mc == 1 ? 2 : mc == 5 || mc == 6 ? 1 : mc == 9 || mc == 10 ? 5 : h < 720 ? 1 : 2;
-        *s = (mav1_seq){w, h, (int)profile, (int)level, (int)tier, twelve ? 12 : hbd ? 10 : 8, (int)mono, m, (int)range};
+        *s = (mav1_seq){w, h, (int)profile, (int)level, (int)tier, twelve ? 12 : hbd ? 10 : 8, (int)mono, m, (int)range, (int)reduced};
     }
     return 1;
 }
@@ -118,6 +118,22 @@ const uint8_t *mav1_find_seq(const uint8_t *p, size_t n, size_t *len) {
         i += hdr + l + (size_t)size;
     }
     return NULL;
+}
+// The first frame header (3), redundant frame header (4) or frame (6) OBU's uncompressed_header (AV1 5.9.2): show_existing_frame f(1), frame_type f(2) (KEY_FRAME = 0); with
+// reduced_still_picture_header neither is coded and the frame is a key frame
+int mav1_tu_key(const uint8_t *p, size_t n, int reduced) {
+    if (!low_overhead(p, n)) return -1;
+    for (size_t i = 0; i < n;) {
+        unsigned t = p[i] >> 3 & 15; size_t hdr = p[i] & 4 ? 2 : 1; uint64_t size; size_t l = leb128(p + i + hdr, n - i - hdr, &size);
+        if (t == 3 || t == 4 || t == 6) {
+            if (reduced) return 1;
+            if (!size) return -1;
+            uint8_t b = p[i + hdr + l];
+            return !(b & 0x80) && !(b & 0x60);
+        }
+        i += hdr + l + (size_t)size;
+    }
+    return -1;
 }
 // One OBU (header, optional extension, payload of psize bytes) appended to out with its size field; temporal delimiters (2) and padding (15) are left out. The new end, or -1 when out is full
 static ssize_t emit(uint8_t *out, size_t at, size_t cap, uint8_t h0, const uint8_t *ext, const uint8_t *payload, size_t psize) {
