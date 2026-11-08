@@ -80,6 +80,7 @@ typedef struct thr {
     uint64_t nspin, nspin_seen, spin_site; const char *spin_mod;   // Spin wait passes (dm_spin_wait; those that yield count in nyield too) and where the last one was
     uint64_t srun_svc, srun_t0, spin_ret;     // Current spin wait: nsvc at its passes, when it began, when the last pass returned
     uint64_t cpu_seen_us;                     // CPU time (µs) at the last power report (dm_thread_cpu)
+    uint64_t ywin_t0, ywin_n; int ywin_hot;   // Yield watchdog (yield_watch): start of the current 10 s window, nyield then, and windows in a row at the watch rate or above
     uint64_t yrun_svc, yrun_t0, yrun_sig, yrun_sig2, poll_ret;   // Current run of yields: nsvc of the last yield, when the run began, and the caller's x19–x28 at the last two yields (a run lasts while no other SVC comes between two yields and those registers match one of the last two, thr_yield); when the last yield or short timed-out wait returned (poll_wait_begin)
     uint64_t yrun_clk;                        // dm_clock_reads at the last yield: a pass that read the clock since makes the yield a clock wait (thr_yield)
     uint64_t cw_sig, cw_run, cw_last, cw_end, cw_per, cw_per2, cw_wake, ncwpred, ncwpred_seen;   // The clock wait followed (clock_wait): its x19–x28, the run it was last seen in, when its last yield returned,
@@ -829,6 +830,29 @@ static uint64_t yield_backoff_ns(uint64_t run_ns, int clock) {
     return s < (uint64_t)cap ? s : (uint64_t)cap;
 }
 static void sleep_precise(uint64_t dl);
+// Yield watchdog, on in release builds too (they take no DM_CTL, so no "threads" line): a thread that yields at DM_YIELD_WATCH times a second or more (start-up; default 12000,
+// 0 = off) through three 10 s windows in a row logs a [RED] line with its backtrace and every guest thread's wait and backtrace (svc_thread_dump), and once more after 5 minutes
+// of it; at most 4 dumps of each kind a run, one at a time. The default is above the busiest normal yielder seen: ACNH's SupportWorker Sub1/Sub2 yield about 780 times a second
+// at the title and made up to 7,700 SVCs a second in play. Animal Crossing: New Horizons' release app once stayed on the first night's loading screen for 25 minutes while two threads that load
+// creates (most likely ActorCalcSub0/1) spun in yields at about 60% of a core each; the debug app did the same load in 8-10 s twice, so the next such hang dumps itself.
+// fp = the caller's frame pointer (0: none, a spin wait); site = the yield's return address, or a spin wait's gate
+static void yield_watch(thr_t *me, uint64_t now, uint64_t fp, uint64_t site) {
+    static int64_t rate = -1; static _Atomic int ndump[2]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    if (rate < 0) { const char *e = getenv("DM_YIELD_WATCH"); rate = e && *e ? atoll(e) : 12000; if (e && *e) LOG("DM_YIELD_WATCH=%lld: %s", (long long)rate, rate ? "yield watchdog rate (yields a second)" : "no yield watchdog"); }
+    if (!rate) return;
+    if (!me->ywin_t0) { me->ywin_t0 = now; me->ywin_n = me->nyield; return; }
+    uint64_t dt = now - me->ywin_t0; if (dt < 10000000000ull) return;
+    uint64_t n = me->nyield - me->ywin_n; me->ywin_t0 = now; me->ywin_n = me->nyield;
+    me->ywin_hot = n * 1000000000ull / dt >= (uint64_t)rate ? me->ywin_hot + 1 : 0;
+    if (me->ywin_hot != 3 && me->ywin_hot != 30) return;
+    char nb[32]; module_t *m = module_of((void *)site);
+    pthread_mutex_lock(&mu);   // two threads of one hang trip it in the same window: one report after the other
+    LOG("[RED] yield watchdog: thread %#x '%s' (priority %d core %d) has yielded %.0f times a second for %d s, at %s+%#llx", me->handle, thr_name(me, nb, sizeof nb), me->prio, me->core,
+        n * 1e9 / dt, me->ywin_hot * 10, m ? m->name : "?", (unsigned long long)(m ? site - (uint64_t)m->base : site));
+    if (fp) { void dm_backtrace(uint64_t fp); dm_backtrace(fp); }
+    if (atomic_fetch_add(&ndump[me->ywin_hot == 30], 1) < 4) { LOG("yield watchdog: guest threads"); svc_thread_dump(); }
+    pthread_mutex_unlock(&mu);
+}
 // sched_yield, or a short sleep once the wait has lasted run_ns past the back-off's start
 static void yield_for(thr_t *me, uint64_t run_ns, int clock) {
     uint64_t bo = yield_backoff_ns(run_ns, clock);
@@ -861,6 +885,7 @@ static void thr_yield(thr_t *me, const uint64_t *regs) {
     me->nyield++; if (!same || moved) me->yrun_t0 = y0; me->yrun_svc = me->nsvc; me->yrun_sig2 = me->yrun_sig; me->yrun_sig = sig; me->yrun_clk = dm_clock_reads;
     if (clock) { me->nclkyield++; clock_wait(me, sig, y0, clock_on == 2 && !dm_detclock_enabled()); }
     else if (!moved) yield_for(me, y0 - me->yrun_t0, 0);
+    yield_watch(me, y0, regs[29], regs[30]);   // (upstream nx2android ac2f105e0)
     me->poll_ret = now_ns();
     if (clock && sig == me->cw_sig) me->cw_last = me->poll_ret;
     if (me->handle == 0x1001) { g_main_yield_ns += me->poll_ret - y0; g_main_yield_n++; }
@@ -933,7 +958,7 @@ void dm_spin_wait(uint64_t gate, uint64_t site) {
     if (me->srun_svc != me->nsvc || now - me->spin_ret > SPIN_GAP_NS) me->srun_t0 = now;   // a new wait
     me->srun_svc = me->nsvc; me->nspin++;
     if (site != me->spin_site || !me->spin_mod) { const module_t *m = module_of((void *)gate); me->spin_mod = m ? m->name : "?"; me->spin_site = site; }
-    if (on && now - me->srun_t0 >= poll_ns) { me->nyield++; yield_for(me, now - me->srun_t0, 0); }
+    if (on && now - me->srun_t0 >= poll_ns) { me->nyield++; yield_for(me, now - me->srun_t0, 0); yield_watch(me, now, 0, gate); }
     me->spin_ret = now_ns();
 }
 // Short timed waits as polls. A wait with a timeout under 20 µs (a condition variable, WaitSynchronization or WaitForAddress) that times out is a poll, as a SleepThread that short is
