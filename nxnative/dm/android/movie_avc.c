@@ -11,6 +11,10 @@
 #include <string.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
+#include <unistd.h>
+#include <android/native_window.h>
+#include "movie_zc.h"   // the surface mode: pictures stay in the codec's AHardwareBuffers (mavc_set_zero_copy, mavc_take_frame)
+#define COLOR_FORMAT_SURFACE 0x7F000789   // MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface: the codec picks its buffers' layout for the surface
 
 #define QMAX 16
 #define COLOR_YUV420_PLANAR 19   // MediaCodecInfo.CodecCapabilities: I420 (the software decoder's); every other format is read as semi-planar (21, Qualcomm's 0x7fa30c04 venus NV12)
@@ -26,18 +30,54 @@ struct mavc {
     // packet of its 1024x576 movies with time 0, and c2.qti.avc.decoder gave no picture for 81 packets and then took no more input. With made-up timestamps the codec's
     // own output order stands (synth: the queue is not sorted)
     int64_t last_in; int synth; struct { int64_t c, g; } pmap[64]; int npmap;
+    // Surface mode (zero copy, movie_zc.h): the codec renders each picture into the reader's buffers; rendered pictures wait in tsmap (codec time → game time) for their AImage,
+    // which zq then holds in presentation order. The reader lives as long as the mode (the codec may be opened again for a new stream)
+    int zc, zc_w, zc_h; zc_reader *rd; zc_tsmap tsmap; struct { zc_frame *f; int64_t pts; } zq[QMAX]; int nzq;
 };
+static int64_t game_pts(mavc *a, int64_t cpts) {   // the codec's timestamp back to the game's (pmap)
+    for (int m = 0; m < a->npmap; m++) if (a->pmap[m].c == cpts) { int64_t g = a->pmap[m].g; a->pmap[m] = a->pmap[--a->npmap]; return g; }
+    return cpts;
+}
+static void zq_drop(mavc *a) { for (int i = 0; i < a->nzq; i++) zc_frame_unref(a->zq[i].f); a->nzq = 0; a->tsmap.n = 0; }
+// the pictures the codec rendered into the reader's buffers, into zq in presentation order (discard: images from before a flush)
+static int zc_pull(mavc *a, int discard) {
+    int n = 0; zc_frame *f;
+    while (a->rd && (f = zc_reader_acquire(a->rd))) {
+        int64_t g; int known = zc_tsmap_take(&a->tsmap, zc_frame_ts(f) / 1000, &g);
+        if (discard || !known) { zc_frame_unref(f); continue; }
+        if (a->nzq == QMAX) { if (!a->red++) LOG("[RED] movie: AVC picture queue full, dropping the oldest picture"); zc_frame_unref(a->zq[0].f); memmove(a->zq, a->zq + 1, --a->nzq * sizeof a->zq[0]); }
+        int k = a->nzq; while (!a->synth && k > 0 && a->zq[k - 1].pts > g) { a->zq[k] = a->zq[k - 1]; k--; }
+        a->zq[k].f = f; a->zq[k].pts = g; a->nzq++; n++;
+    }
+    return n;
+}
 
 mavc *mavc_new(void) { mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed"); a->last_in = INT64_MIN; return a; }
 static void close_codec(mavc *a) { if (a->mc) { AMediaCodec_stop(a->mc); AMediaCodec_delete(a->mc); a->mc = NULL; } a->nin = a->nout = 0; a->eos_sent = 0; a->last_in = INT64_MIN; a->npmap = 0; }
 void mavc_drop(mavc *a) {
     for (int i = 0; i < a->nq; i++) free(a->q[i].nv12);
     a->nq = 0;
+    if (a->zc) { zq_drop(a); zc_pull(a, 1); }
     if (a->mc) { AMediaCodec_flush(a->mc); a->nin = a->nout = 0; a->eos_sent = 0; a->last_in = INT64_MIN; a->npmap = 0; }   // a seek: pictures in the codec belong to the old position
 }
-void mavc_free(mavc *a) { if (!a) return; mavc_drop(a); close_codec(a); free(a->au); free(a); }
-int mavc_queued(const mavc *a) { return a->nq; }
-int mavc_held(const mavc *a) { return a->nq + (a->mc && !a->eos_sent && a->nin > a->nout ? (int)(a->nin - a->nout) : 0); }
+void mavc_free(mavc *a) { if (!a) return; mavc_drop(a); close_codec(a); if (a->rd) zc_reader_free(a->rd); free(a->au); free(a); }
+int mavc_queued(const mavc *a) { return a->nq + a->nzq; }
+int mavc_held(const mavc *a) { return a->nq + a->nzq + a->tsmap.n + (a->mc && !a->eos_sent && a->nin > a->nout ? (int)(a->nin - a->nout) : 0); }
+// Zero copy on: the codec is opened again (at the next packet) with the reader's surface as its output. DM_MOVIE_ZC_IMAGES (start-up): the reader's image count (16: hle_codec_video.c holds
+// up to 12 pictures for the game, one is shown, a few wait for the GPU); the codec stalls, not the host, when every image is out
+int mavc_set_zero_copy(mavc *a, int on, int w, int h) {
+    if (on && !a->zc) {
+        if (!zc_gpu_ok()) return 0;
+        const char *e = getenv("DM_MOVIE_ZC_IMAGES"); int n = e ? atoi(e) : 16; if (n < 4) n = 4; if (n > 32) n = 32;
+        if (!a->rd || a->zc_w != w || a->zc_h != h) { if (a->rd) zc_reader_free(a->rd); a->rd = zc_reader_new(w, h, n); a->zc_w = w; a->zc_h = h; }
+        if (!a->rd) return 0;
+        a->zc = 1; close_codec(a);
+    } else if (!on && a->zc) {
+        close_codec(a); zq_drop(a); zc_pull(a, 1); a->zc = 0;
+        if (a->rd) { zc_reader_free(a->rd); a->rd = NULL; }
+    }
+    return a->zc;
+}
 void mavc_set_rgba(mavc *a) { a->rgba = 1; }
 
 static void keep_ps(mavc *a, const uint8_t *nal, size_t n) {   // a parameter set NAL unit (without start code)
@@ -86,13 +126,14 @@ static int open_codec(mavc *a) {
     AMediaFormat_setString(f, AMEDIAFORMAT_KEY_MIME, "video/avc");
     AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_WIDTH, 1920); AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_HEIGHT, 1080);   // the decoder takes the real size from the SPS (an output format change)
     AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, 4 << 20);
+    if (a->zc) { AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_COLOR_FORMAT, COLOR_FORMAT_SURFACE); if (a->zc_w && a->zc_h) { AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_WIDTH, a->zc_w); AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_HEIGHT, a->zc_h); } }
     set_csd(f, AMEDIAFORMAT_KEY_CSD_0, a->sps, a->nsps); set_csd(f, AMEDIAFORMAT_KEY_CSD_1, a->pps, a->npps);
-    media_status_t st = AMediaCodec_configure(a->mc, f, NULL, NULL, 0);
+    media_status_t st = AMediaCodec_configure(a->mc, f, a->zc ? (ANativeWindow *)zc_reader_window(a->rd) : NULL, NULL, 0);
     if (st == AMEDIA_OK) st = AMediaCodec_start(a->mc);
     AMediaFormat_delete(f);
     if (st != AMEDIA_OK) { if (!a->red++) LOG("[RED] movie: MediaCodec AVC decoder refused its configuration (%d), outputting black frames", (int)st); AMediaCodec_delete(a->mc); a->mc = NULL; return 0; }
     char *name = NULL; AMediaCodec_getName(a->mc, &name);
-    LOG("[movie] AVC: MediaCodec decoder %s, profile %d", name ? name : "?", a->nsps > 1 ? a->sps[1] : 0);
+    LOG("[movie] AVC: MediaCodec decoder %s, profile %d%s", name ? name : "?", a->nsps > 1 ? a->sps[1] : 0, a->zc ? ", pictures into the zero-copy reader's buffers" : "");
     if (name) AMediaCodec_releaseName(a->mc, name);
     a->fw = a->fh = 0; a->dirty = 0; return 1;
 }
@@ -126,7 +167,7 @@ static void keep_picture(mavc *a, const uint8_t *src, size_t n, int64_t pts) {
         }
     } else for (int r = 0; r < h / 2; r++) memcpy(ouv + (size_t)r * w, src + uvoff + (size_t)(a->ct / 2 + r) * s + (a->cl & ~1), (size_t)w);
     if (a->nq == QMAX) { if (!a->red++) LOG("[RED] movie: AVC picture queue full, dropping the oldest picture"); free(a->q[0].nv12); memmove(a->q, a->q + 1, --a->nq * sizeof a->q[0]); }
-    for (int m = 0; m < a->npmap; m++) if (a->pmap[m].c == pts) { pts = a->pmap[m].g; a->pmap[m] = a->pmap[--a->npmap]; break; }   // the game's own timestamp
+    pts = game_pts(a, pts);   // the game's own timestamp
     int k = a->nq; while (!a->synth && k > 0 && a->q[k - 1].pts > pts) { a->q[k] = a->q[k - 1]; k--; }
     a->q[k].nv12 = o; a->q[k].w = w; a->q[k].h = h; a->q[k].pts = pts; a->nq++;
 }
@@ -138,6 +179,14 @@ static int drain(mavc *a, int64_t wait_us) {
         if (i == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
         if (i < 0) return 0;   // AMEDIACODEC_INFO_TRY_AGAIN_LATER
         if (!a->fw) read_format(a);
+        if (a->zc) {   // rendered into the reader's buffers: the picture comes back through the reader (zc_pull), found by its codec timestamp
+            int render = bi.size > 0;
+            if (render) { zc_tsmap_push(&a->tsmap, bi.presentationTimeUs, game_pts(a, bi.presentationTimeUs)); a->nout++; }
+            AMediaCodec_releaseOutputBuffer(a->mc, (size_t)i, render);
+            zc_pull(a, 0);
+            if (bi.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) return 1;
+            wait_us = 0; continue;
+        }
         size_t n = 0; uint8_t *b = AMediaCodec_getOutputBuffer(a->mc, (size_t)i, &n);
         if (b && bi.size > 0) { keep_picture(a, b + bi.offset, (size_t)bi.size, bi.presentationTimeUs); a->nout++; }
         AMediaCodec_releaseOutputBuffer(a->mc, (size_t)i, false);
@@ -201,7 +250,19 @@ static void nv12_rgba(const uint8_t *y, const uint8_t *uv, int pw, int ph, uint8
         }
     }
 }
+// the surface mode's mavc_take: a rendered picture's image follows its release by a little (the codec's and the reader's threads), waited for up to 8 ms
+int mavc_take_frame(mavc *a, int flush, zc_frame **out, int64_t *pts_us) {
+    if (!a->zc) return 0;
+    if (flush) { finish(a); zc_pull(a, 0); }
+    else if (!a->nzq && a->mc && a->nin > a->nout) { drain(a, 4000); zc_pull(a, 0); }   // a picture is in the codec's pipeline: give it a few milliseconds
+    for (int k = 0; !a->nzq && a->tsmap.n && k < 32; k++) { usleep(250); zc_pull(a, 0); }
+    if (!a->nzq) return 0;
+    *out = a->zq[0].f; if (pts_us) *pts_us = a->zq[0].pts;
+    memmove(a->zq, a->zq + 1, --a->nzq * sizeof a->zq[0]);
+    return 1;
+}
 int mavc_take(mavc *a, int flush, uint8_t *dst, int w, int h, int64_t *pts_us) {
+    if (a->zc) return 0;   // (surface mode: mavc_take_frame)
     if (flush) finish(a);
     else if (!a->nq && a->mc && a->nin > a->nout) drain(a, 4000);   // a picture is in the codec's pipeline: give it a few milliseconds
     if (!a->nq) return 0;

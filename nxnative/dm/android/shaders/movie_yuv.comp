@@ -1,0 +1,15 @@
+#version 450
+// Zero-copy movie pictures (movie_zc_vk.c): the decoder's Y'CbCr picture, read through a sampler Y'CbCr conversion (an immutable sampler: texture() gives RGB), written as RGBA
+// into the game's texture over the decoder pool's picture slot. One invocation per texel of the destination; the source's crop rectangle is mapped over the whole destination
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dst;
+layout(push_constant) uniform PC { uvec2 size; vec2 off, scale; int swap_rb; } pc;
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+    vec2 uv = pc.off + (vec2(p) + 0.5) * pc.scale;
+    vec4 c = vec4(texture(src, uv).rgb, 1.0);
+    if (pc.swap_rb != 0) c = c.bgra;
+    imageStore(dst, ivec2(p), c);
+}

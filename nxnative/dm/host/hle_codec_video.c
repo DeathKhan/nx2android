@@ -23,6 +23,9 @@
 #include "hle_movie_yuv.h"
 #include "hle_movie_avc.h"   // H.264 on VideoToolbox
 #include "hle_movie_av1.h"   // AV1 on VideoToolbox
+#ifdef __ANDROID__
+#include "movie_zc.h"        // Android: H.264 pictures stay in the codec's buffers and the GPU converts them into the game's native-image texture (zero copy; dm/android/movie_zc*.c)
+#endif
 
 #define CV_MAGIC 0x56436d44u        // 'DmCV'
 #define CV_SYNC 0x53436d44u         // 'DmCS': a sync handle the host made (dec id, index, generation)
@@ -49,7 +52,25 @@ typedef struct {
     uint32_t pend[CV_BUFS], phead, pcount;    // released, waiting for a picture
     vpx_image_t *held[CV_HOLD]; int64_t held_ts[CV_HOLD]; uint8_t held_eos[CV_HOLD]; int nheld;
     int eos_pending;
+#ifdef __ANDROID__
+    zc_frame *held_zc[CV_HOLD];   // zero copy: the held picture is a frame (held[i] NULL)
+    int zc, zc_off;               // the H.264 decoder's pictures are frames; a CPU read of a pool asked for the CPU path (the next packet switches)
+#endif
 } cv_dec;
+#ifdef __ANDROID__
+static int zc_wanted(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_MOVIE_ZEROCOPY"); v = !e || atoi(e) != 0; } return v; }
+static void cv_held_zc_drop(cv_dec *d) { for (int i = 0; i < d->nheld; i++) if (d->held_zc[i]) { zc_frame_unref(d->held_zc[i]); d->held_zc[i] = NULL; } }
+// the picture slot of pool picture i: what the game's native-image texture is made over (dm_native_image)
+static uint64_t native_size(uint32_t w, uint32_t h);
+static void cv_fill_zc(cv_dec *d, uint32_t i, zc_frame *zf, int64_t ts, uint8_t eos) {
+    typeof(d->buf[0]) *b = &d->buf[i];
+    b->w = (uint16_t)d->w; b->h = (uint16_t)d->h; b->ts = ts; b->eos = eos;
+    if (b->pool && b->pidx < b->pool->count && b->pool->mem && (b->pidx + 1) * native_size(b->pool->w, b->pool->h) <= b->pool->size)
+        zc_slot_set(b->pool->mem + b->pidx * native_size(b->pool->w, b->pool->h), native_size(b->pool->w, b->pool->h), zf);
+    zc_frame_unref(zf);
+    if (!d->pictures++) LOG("[codec] %s decoder %u: first picture %ux%u into buffer %u (zero copy: shown by the GPU from the codec's buffer)", k_cv_name[d->codec], d->id, b->w, b->h, i);
+}
+#endif
 
 static cv_dec *g_cv[16];
 static pthread_mutex_t g_cv_mu = PTHREAD_MUTEX_INITIALIZER;   // lock order: g_cv_mu, then a decoder's mu, then g_spt_mu
@@ -111,9 +132,15 @@ static void drain(cv_dec *d, int took) {
             vpx_image_t *im = d->held[0]; int64_t ts = d->held_ts[0]; uint8_t eos = d->held_eos[0];
             memmove(d->held, d->held + 1, sizeof d->held[0] * (CV_HOLD - 1)); memmove(d->held_ts, d->held_ts + 1, sizeof d->held_ts[0] * (CV_HOLD - 1));
             memmove(d->held_eos, d->held_eos + 1, CV_HOLD - 1); d->nheld--;
+#ifdef __ANDROID__
+            zc_frame *zf = d->held_zc[0]; memmove(d->held_zc, d->held_zc + 1, sizeof d->held_zc[0] * (CV_HOLD - 1)); d->held_zc[CV_HOLD - 1] = NULL;
+            if (zf) cv_fill_zc(d, i, zf, ts, eos); else
+#endif
+            {
             b->w = (uint16_t)im->d_w; b->h = (uint16_t)im->d_h; b->ts = ts; b->eos = eos;
             if (b->pool && b->pidx < b->pool->count) { pool_native_write(b->pool, b->pidx, im); if (b->pool->img[b->pidx]) vpx_img_free(b->pool->img[b->pidx]); b->pool->img[b->pidx] = im; } else vpx_img_free(im);
             if (!d->pictures++) LOG("[codec] %s decoder %u: first picture %ux%u into buffer %u", k_cv_name[d->codec], d->id, b->w, b->h, i);
+            }
         } else { b->w = b->h = 0; b->ts = 0; b->eos = 1; d->eos_pending = 0; }
         if (b->eos) LOG("[codec] %s decoder %u: end of stream after %llu pictures", k_cv_name[d->codec], d->id, (unsigned long long)d->pictures);
         b->filled = 1; b->filled_gen = b->gen;
@@ -155,6 +182,9 @@ HLE_FORCE("_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTy
     for (int k = 0; k < 16; k++) if (g_cv[k]) { pthread_mutex_lock(&g_cv[k]->mu); for (int i = 0; i < CV_BUFS; i++) if (g_cv[k]->buf[i].pool == p) g_cv[k]->buf[i].pool = NULL; pthread_mutex_unlock(&g_cv[k]->mu); }
     if (p->slot) g_cv_pools[p->slot - 1] = NULL;
     pthread_mutex_unlock(&g_cv_mu);
+#ifdef __ANDROID__
+    if (p->mem) zc_slot_clear(p->mem, p->size);   // the frames shown in its picture slots go back to the codec
+#endif
     for (uint32_t i = 0; i < p->count; i++) if (p->img[i]) vpx_img_free(p->img[i]);
     free(p->img); p->magic = 0; free(p); *(cv_pool **)t = NULL;
 }
@@ -215,9 +245,22 @@ HLE_FORCE("_ZN2nn5codec29ReadDecoderOutputImageRgbaHdrEPKNS0_25VideoDecoderImage
     memset(dst, 0, size); return 0;
 }
 // The picture of pool image i (the region x, y, w, h; Bananza reads it whole) as RGBA or as NV12
+#ifdef __ANDROID__
+// A CPU read of a pool whose decoder keeps its pictures in the codec's buffers: there are no bytes to give (black this once); the decoder switches to the CPU path at its next packet
+static void cv_zc_cpu_read(cv_pool *p) {
+    pthread_mutex_lock(&g_cv_mu);
+    for (int k = 0; k < 16; k++) { cv_dec *d = g_cv[k]; if (!d) continue; pthread_mutex_lock(&d->mu);
+        if (d->zc && !d->zc_off) for (int i = 0; i < CV_BUFS; i++) if (d->buf[i].pool == p) { d->zc_off = 1; LOG("[codec] %s decoder %u: the game reads pictures on the CPU: zero copy off, the CPU path from the next packet", k_cv_name[d->codec], d->id); break; }
+        pthread_mutex_unlock(&d->mu); }
+    pthread_mutex_unlock(&g_cv_mu);
+}
+#endif
 HLE_FORCE("_ZN2nn5codec26ReadDecoderOutputImageRgbaEPKNS0_25VideoDecoderImagePoolTypeEjttttPvmm", "converts the host's picture (md_rgba)",
           Result, h_cv_rgba, const void *t, uint32_t i, uint16_t x, uint16_t y, uint16_t w, uint16_t h, void *dst, uint64_t stride, uint64_t size) {
     cv_pool *p = pool_of(t); const vpx_image_t *im = p && i < p->count ? p->img[i] : NULL;
+#ifdef __ANDROID__
+    if (p && !im) cv_zc_cpu_read(p);
+#endif
     if (!im) { memset(dst, 0, size); return 0; }
     if (x || y || stride != (uint64_t)w * 4 || size < (uint64_t)w * h * 4) { static int once; if (!once++) LOG("[RED] nn::codec::ReadDecoderOutputImageRgba: region %u,%u stride %llu: only whole tight pictures are served", x, y, (unsigned long long)stride); return 0; }
     md_rgba(im, dst, w, h);
@@ -226,6 +269,9 @@ HLE_FORCE("_ZN2nn5codec26ReadDecoderOutputImageRgbaEPKNS0_25VideoDecoderImagePoo
 HLE_FORCE("_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoolTypeEjttttPvmmS4_mm", "converts the host's picture (md_nv12)",
           Result, h_cv_nv12, const void *t, uint32_t i, uint16_t x, uint16_t y, uint16_t w, uint16_t h, void *ydst, uint64_t ystride, uint64_t ysize, void *uvdst, uint64_t uvstride, uint64_t uvsize) {
     cv_pool *p = pool_of(t); const vpx_image_t *im = p && i < p->count ? p->img[i] : NULL;
+#ifdef __ANDROID__
+    if (p && !im) cv_zc_cpu_read(p);
+#endif
     if (x || y || ystride != w || uvstride != w || ysize < (uint64_t)w * h || uvsize < (uint64_t)w * h / 2) { static int once; if (!once++) LOG("[RED] nn::codec::ReadDecoderOutputImageNv12: region %u,%u strides %llu / %llu: only whole tight pictures are served", x, y, (unsigned long long)ystride, (unsigned long long)uvstride); return 0; }
     if (!im) { memset(ydst, 16, ysize); memset(uvdst, 128, uvsize); return 0; }
     if ((uint8_t *)uvdst == (uint8_t *)ydst + (size_t)w * h) { md_nv12(im, ydst, w, h); return 0; }
@@ -242,7 +288,14 @@ static void cv_open(cv_dec *d) {   // (re)creates the codec state: a new stream 
         d->vpx_ok = 1;
         return;
     }
-    if (d->codec == CV_H264) { if (!d->avc) d->avc = mavc_new(); else mavc_drop(d->avc); if (d->csd_n) mavc_param_sets(d->avc, d->csd, d->csd_n); d->vpx_ok = 1; return; }
+    if (d->codec == CV_H264) { if (!d->avc) d->avc = mavc_new(); else mavc_drop(d->avc); if (d->csd_n) mavc_param_sets(d->avc, d->csd, d->csd_n); d->vpx_ok = 1;
+#ifdef __ANDROID__
+        // Android: pictures stay in MediaCodec's buffers, imported into Vulkan and converted into the game's native-image texture (the Switch 2's 4K movies; Welcome Tour's intro at 3840x2160).
+        // Not when the game asked for the CPU path (zc_off), or DM_MOVIE_ZEROCOPY=0
+        if (d->zc_off && d->zc) d->zc = mavc_set_zero_copy(d->avc, 0, d->w, d->h);
+        else if (zc_wanted() && !d->zc_off) { int was = d->zc; d->zc = mavc_set_zero_copy(d->avc, 1, d->w, d->h); if (d->zc && !was) LOG("[codec] H.264 decoder %u: zero-copy pictures (MediaCodec → AImageReader → Vulkan Y'CbCr sampling → the game's texture)", d->id); }
+#endif
+        return; }
     if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
     vpx_codec_dec_cfg_t cfg = {.threads = 2, .w = d->w, .h = d->h};
     d->vpx_ok = vpx_codec_dec_init(&d->vpx, d->codec == CV_VP8 ? vpx_codec_vp8_dx() : vpx_codec_vp9_dx(), &cfg, 0) == VPX_CODEC_OK;
@@ -269,6 +322,9 @@ static Result cv_dec_fin(void *t) {
     if (d->codec != CV_H264 && d->codec != CV_AV1 && d->vpx_ok) vpx_codec_destroy(&d->vpx);
     if (d->avc) mavc_free(d->avc);
     if (d->av1) mav1_free(d->av1);
+#ifdef __ANDROID__
+    cv_held_zc_drop(d);
+#endif
     for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]);
     free(d->csd); d->magic = 0;
     // The submission-ready event goes with the decoder, as in the SDK. Kept, it stayed in the host's bound-event table, so the next decoder initialised in the same memory found its
@@ -303,6 +359,9 @@ static Result cv_dec_unreg(void *t, uint32_t i) {   // the buffer leaves the dec
 static Result cv_dec_reset(void *t) {   // Stop / Flush: pictures not yet given to a buffer and a pending end of stream are dropped, the decoder starts over at the next key frame
     cv_dec *d = cv_of(t); if (!d) return 0;
     pthread_mutex_lock(&d->mu);
+#ifdef __ANDROID__
+    cv_held_zc_drop(d);
+#endif
     for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]);
     d->nheld = 0; d->eos_pending = 0;
     cv_open(d);
@@ -353,10 +412,22 @@ static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t s
     if (d->nheld >= CV_HOLD) { static int n; if (n++ < 4) LOG("nn::codec %s: busy (result 3603), a packet refused with %d pictures waiting for a released buffer",k_cv_name[d->codec], d->nheld); if (d->event) hle_clear_system_event(d->event); pthread_mutex_unlock(&d->mu); return CV_BUSY; }
     int got = 0;
     if (d->codec == CV_H264 && d->avc) {   // VideoToolbox reorders: pictures leave in presentation order, all of them at the end of the stream
+#ifdef __ANDROID__
+        if (d->zc && d->zc_off) { cv_held_zc_drop(d); for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]); d->nheld = 0; cv_open(d); }   // the game reads on the CPU: the codec opens again in the CPU mode
+        if (size && mavc_decode(d->avc, data, (int)size, ts / 1000) < 0) { static int n; if (n++ < 4) LOG("[RED] nn::codec H.264: MediaCodec could not decode a packet"); }
+        if (d->zc) { zc_frame *zf; int64_t pts = 0;
+            while (d->nheld < CV_HOLD && mavc_take_frame(d->avc, eos, &zf, &pts) == 1) { d->held[d->nheld] = NULL; d->held_zc[d->nheld] = zf; d->held_ts[d->nheld] = pts * 1000; d->held_eos[d->nheld] = 0; d->nheld++; got++; }
+        } else {
+        uint8_t *nv12 = malloc((size_t)d->w * d->h * 3 / 2); int64_t pts = 0;
+        while (nv12 && d->nheld < CV_HOLD && mavc_take(d->avc, eos, nv12, d->w, d->h, &pts) == 1) { vpx_image_t *c = nv12_to_i420(nv12, d->w, d->h); if (c) got += cv_hold(d, c, pts * 1000); }
+        free(nv12);
+        }
+#else
         if (size && mavc_decode(d->avc, data, (int)size, ts / 1000) < 0) { static int n; if (n++ < 4) LOG("[RED] nn::codec H.264: VideoToolbox could not decode a packet"); }
         uint8_t *nv12 = malloc((size_t)d->w * d->h * 3 / 2); int64_t pts = 0;
         while (nv12 && d->nheld < CV_HOLD && mavc_take(d->avc, eos, nv12, d->w, d->h, &pts) == 1) { vpx_image_t *c = nv12_to_i420(nv12, d->w, d->h); if (c) got += cv_hold(d, c, pts * 1000); }
         free(nv12);
+#endif
     } else if (d->codec == CV_AV1) {
         if (size) {
             mav1_picture pic;
