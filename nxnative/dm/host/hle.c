@@ -89,6 +89,24 @@ void stubs_report(void) { LOG("stubs=%u", g_nstub); }
 enum { G_SVC, G_CNTPCT, G_CNTVCT, G_OBS, G_SPIN };
 // Observation gates (inserted offline from the rewriter's OBS table): number → read-only callback; with no callback attached the gate returns after one pass in and out
 static void (*g_obs_fn[OBS_MAX])(uint64_t *regs, int param); static int g_obs_have[OBS_MAX];
+// OBS_REGS: a bring-up gate with no game-specific host code. It logs the registers at its site for the first N hits (N from the gate number's upper bits, 16 without) and for every
+// hit whose x0 is 0 (a null result right after a bl: an allocation that failed), so a profile can watch any instruction by adding one OBS row and rebuilding
+static void obs_regs(uint64_t *r, int param) {
+    static struct { uint64_t site; int n; } sites[16]; static int nsites;   // one counter per gate (x30 is the gate block's return point, unique to the site)
+    int cap = param > 0 ? param : 16, i;
+    for (i = 0; i < nsites && sites[i].site != r[30]; i++) ;
+    if (i == nsites) { if (nsites == 16) i = 15; else sites[nsites++].site = r[30]; }
+    if (sites[i].n >= cap && r[0]) return;
+    if (sites[i].n < cap) sites[i].n++;
+    LOG("[obs] regs at %#llx: x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x6=%#llx x7=%#llx x8=%#llx", r[30],
+        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]);
+    LOG("[obs]   x19=%#llx x20=%#llx x21=%#llx x22=%#llx x23=%#llx x24=%#llx x25=%#llx x26=%#llx x27=%#llx x28=%#llx x29=%#llx",
+        r[19], r[20], r[21], r[22], r[23], r[24], r[25], r[26], r[27], r[28], r[29]);
+    if (!r[0]) {   // a null result: how much the process really holds, so that an allocator's refusal can be told from exhausted memory
+        FILE *f = fopen("/proc/self/status", "r"); char line[256];
+        if (f) { while (fgets(line, sizeof line, f)) if (!strncmp(line, "VmRSS:", 6) || !strncmp(line, "VmSize:", 7) || !strncmp(line, "VmSwap:", 7)) { line[strcspn(line, "\n")] = 0; LOG("[obs]   %s", line); } fclose(f); }
+    }
+}
 void gate_obs_set(int id, void (*fn)(uint64_t *regs, int param)) { if (id <= 0 || id >= OBS_MAX) die("observation gate number out of range %d", id); g_obs_fn[id] = fn; }
 int gate_obs_present(int id) { return id > 0 && id < OBS_MAX && g_obs_have[id]; }
 typedef struct { uint64_t ret; int kind, arg; uint64_t orig; } gate_t;
@@ -101,6 +119,7 @@ void gate_register(uint64_t ret_abs, const char *kind, int arg, uint64_t orig) {
     int k = !strcmp(kind, "svc") ? G_SVC : !strcmp(kind, "cntpct") ? G_CNTPCT : !strcmp(kind, "cntvct") ? G_CNTVCT : !strcmp(kind, "obs") ? G_OBS : !strcmp(kind, "spin") ? G_SPIN : -1;
     if (k < 0) die("unknown gate kind %s", kind);
     if (k == G_OBS) { if ((arg & 0xff) <= 0 || (arg & 0xff) >= OBS_MAX) die("observation gate number out of range %d", arg & 0xff); g_obs_have[arg & 0xff] = 1; }
+    if (k == G_OBS && (arg & 0xff) == OBS_REGS && !g_obs_fn[OBS_REGS]) g_obs_fn[OBS_REGS] = obs_regs;
     if (++g_ngate > (1 << GATE_BITS) / 4) die("gate overflow");
     unsigned i = gate_h(ret_abs);
     while (g_gate[i].ret) { if (g_gate[i].ret == ret_abs) die("gate registered twice %#llx", ret_abs); i = (i + 1) & ((1u << GATE_BITS) - 1); }

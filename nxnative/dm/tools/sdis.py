@@ -81,7 +81,7 @@ if sys.argv[2] == '--xref':     # sdis.py <image> --xref 0xaddr...  find the ins
     textend = max((v + s for v, s in defs.values() if v < 0x10000000 and s), default=0)
     if not plt: plt_scan()
     if plt: textend = max(textend, max(plt) + 16)   # the PLT ends the text segment (a main exports too few symbols to bound it)
-    for o in range(0, min(len(img), textend), 4):
+    for o in range(0, min(len(img) - 3, textend), 4):
         w = struct.unpack_from('<I', img, o)[0]
         if w & 0x9F000000 != 0x90000000: continue
         rd = w & 31; imm = (((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3)
@@ -108,7 +108,7 @@ if sys.argv[2] == '--callers':
     tgt = resolve(sys.argv[3]); textend = max((v + s for v, s in defs.values() if v < 0x10000000 and s), default=0)  # Coarse upper bound
     if not plt: plt_scan()
     if plt: textend = max(textend, max(plt) + 16)   # the PLT ends the text segment (a main exports too few symbols to bound it)
-    for o in range(0, min(len(img), textend), 4):
+    for o in range(0, min(len(img) - 3, textend), 4):
         w = struct.unpack_from('<I', img, o)[0]
         if w >> 26 in (0x25, 0x05) and o + ((((w & 0x3ffffff) ^ 0x2000000) - 0x2000000) * 4) == tgt:
             print(f'{o:#x} {name(o)}')

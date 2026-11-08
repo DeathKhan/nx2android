@@ -618,7 +618,10 @@ static uint64_t alias_room(void) {
 }
 static void stdalloc_init(uint64_t *r, int param) {
     (void)param;
-    if (r[1]) return;   // a heap over memory the game passes in: no address region
+    if (r[1]) {   // a heap over memory the game passes in: no address region; a big one is logged, as the game's own memory layout (Bezel's heap path: the heap less malloc's 32 MB)
+        if (r[2] >= 256ull << 20) { char who[40]; uint64_t via; guest_caller(r, who, sizeof who, &via); LOG("[mem] StandardAllocator::Initialize(%#llx, %.2f GB) returning to %s", r[1], r[2] / 1073741824.0, who); }
+        return;
+    }
     uint64_t cap = DM_GAME_STDALLOC_CAP ? DM_GAME_STDALLOC_CAP : alias_room();
     if (!cap || r[2] <= cap) return;
     char who[40]; uint64_t via; guest_caller(r, who, sizeof who, &via);

@@ -1,0 +1,8 @@
+# Nintendo Switch 2 Welcome Tour on Android (keys in docs/ARCHITECTURE.md "Game profiles on Android"). A Switch 2 game (NVN2, Ampere, SDK 20.5.29 Ounce, Bezel Engine) packed from its NUP.
+# 2026-11-07, AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver 512.800.72): boots from the NUP to its title screen (3D intro 27-40 fps, title 40 fps) after the fixes in
+# hle_vi.c / hle_hid.c / hle_oe.c / hle_nvn.c (nvnDeviceCalculateAccelerationStructureMemoryRequirements). Open: a low-memory kill about 44 s in (6 GB outside the process RSS: GPU
+# backing of the mapped guest pages), the 4K H.264 intro through three CPU copies (30 fps), 8 task / mesh shaders and 27 per-vertex-input shaders the stock driver cannot run yet.
+status	wip
+tested	v262144 AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, Android 15)
+package	org.nx2a.t040057c02159a000
+orientation	landscape
