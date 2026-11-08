@@ -54,6 +54,7 @@ bad = []
 for f in files:
     m = re.match(r'nxnative/dm/games/(0100[0-9A-F]{12})/(.+)', f)
     if not m: continue
+    if m.group(2) == 'duo_anchor.c': continue   # upstream's iPhone Duo layout hooks for two games (Mac/iOS build only; the Android build does not compile profile folders)
     if f.endswith(('.c', '.h', '.m', '.cs', '.sh')) or (f.endswith('.py') and m.group(2) != 'patches.py'): bad.append(f)
 check('profiles hold data only (code only as patches.py)', not bad, ', '.join(bad))
 atsv = [f for f in files if f.endswith('/android.tsv') and f.startswith('nxnative/dm/games/')]
@@ -122,7 +123,7 @@ check('doctor checks NDK, .NET, adb, keys', all(w in tc for w in ('ndk', 'dotnet
 # 9. Keys and game files never in the repository
 leak = [f for f in files if re.search(r'\.(nsp|nsz|xci|nca|keys)$|prod\.keys|title\.keys|signing-key', f, re.I)]
 check('no keys, game files or signing keys committed', not leak, ', '.join(leak))
-gen = [f for f in files if Path(f).name in ('game_profile.h', 'android_profile.h')]
+gen = [f for f in files if Path(f).name in ('game_profile.h', 'android_profile.h') and '/tests/' not in f]   # upstream's test fixtures under */tests/ are committed on purpose
 check('generated profile headers not committed', not gen, ', '.join(gen))
 
 # 10. Repository layout
