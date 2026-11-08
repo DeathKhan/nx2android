@@ -23,7 +23,7 @@ class PushMemo(unittest.TestCase):
         declarations.append(next(x.split("   //")[0] for x in obj.splitlines() if "} p_push_const;" in x))
         declarations.append(next(x for x in abi.splitlines() if x.startswith("#define DMSH_PUSH_BANK ")))
         helpers = []
-        for name in ("static void push_constants(", "static int set_memo_get("):
+        for name in ("static void push_constants(", "static uint32_t storage_dynamic_offset(", "static int set_memo_get("):
             start = source.index(name)
             helpers.append(source[start:source.index("\n}\n", start) + 3])
         memo = next(x for x in source.splitlines() if x.startswith("typedef struct ") and x.endswith(" set_memo_t;"))
@@ -35,17 +35,22 @@ class PushMemo(unittest.TestCase):
 #include <stdint.h>
 #include <string.h>
 DECLARATIONS
-typedef struct { int nbind, ndyn; const dmsv_bind *b; } vkshader_t;
+typedef struct { int nbind, ndyn, setmemo; const dmsv_bind *b; uint8_t dyn[96]; } vkshader_t;
 enum { MEMO_CB = 16, OP_PUSH_CONST = 17 };
 MEMO_TYPE
 static struct { uint8_t push[2][256]; vkshader_t *sh[3]; } S;
 static set_memo_t g_smemo[3];
-static uint64_t g_set_epoch=9, g_bind_gen[6], g_ubo_gen[6], g_tex_gen, g_samp_gen, g_ubd_gen, g_num_um, g_num_im;
-static uint32_t g_draw_binst;
+static uint64_t g_set_epoch=9, g_bind_gen[6], g_ssbo_gen[6], g_ubo_gen[6], g_tex_gen, g_samp_gen, g_ubd_gen, g_num_um, g_num_im;
+static uint32_t g_draw_binst; static int g_buffer_memo=1;
+static struct { struct { VkPhysicalDeviceLimits limits; } props; } V;
+static VkDescriptorBufferInfo g_draw_claim;
+static VkBuffer vk_zero_buffer(void) { return (VkBuffer)(uintptr_t)1; }
 static uint32_t vk_pool_gen(void) { return 0; }
 static void cbuf_desc(int st, vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *d) {
     (void)st; (void)s; (void)b; (void)d; assert(0 && "fixture has no cbuf");
 }
+static void sbuf_desc(int st, const dmsv_bind *b, VkDescriptorBufferInfo *d) { (void)st; (void)b; (void)d; assert(0 && "fixture has no sbuf"); }
+static void drv_shared(int st, int bank, VkBuffer *buf, VkDeviceSize *off, int dyn) { (void)st; (void)bank; (void)buf; (void)off; (void)dyn; assert(0 && "fixture has no driver bank"); }
 HELPERS
 static void replay_push(const void *a) { switch(OP_PUSH_CONST) {
 DISPATCH

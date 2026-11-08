@@ -39,10 +39,14 @@ typedef struct { struct { uint64_t lo,hi; } gw[64]; int ngw,readback_ranges; } v
 static vksub_t g_slot[2]; static int g_cur=-1;
 typedef struct { int kind,desc,flags; } binding;
 typedef struct { int nbind; binding b[2]; } vkshader_t;
+typedef struct { int used; } set_profile_t;
+static set_profile_t *set_profile_row(int st, const vkshader_t *s) { (void)st; (void)s; return NULL; }
 CONTROLS
 RANGES
 static void observe(vkshader_t *s) {
+    int st = 0;
 GATE
+    (void)sp;
 }
 int main(void) {
     assert(!vk_readback_ranges()); vk_readback_unknown();
@@ -84,7 +88,8 @@ int main(void) {
     vk_readback_unknown(); assert(!vk_readback_ranges());
 }
 '''.replace('ENUMS', enums).replace('CONTROLS', controls).replace('RANGES', ranges).replace('GATE', gate)
-        with tempfile.TemporaryDirectory(prefix='nx2a-readback-ranges-') as tmp:
+        target = dm.parents[2] / 'target/tests'; target.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='nx2a-readback-ranges-', dir=target) as tmp:
             c, exe = Path(tmp)/'check.c', Path(tmp)/'check'
             c.write_text(harness)
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', str(c), '-o', str(exe)], check=True)

@@ -28,6 +28,8 @@ class DynamicStorage(unittest.TestCase):
         layout = shader[start:shader.index('    s->dsl = shader_layout(', start)]
         start = execute.index('        wr->pBufferInfo = &bi[nw]; wr->descriptorType = b->desc == RD_SSBO')
         bind = execute[start:execute.index('        nw++;', start) + len('        nw++;')]
+        start = execute.index('static int memo_buffer(')
+        memo_buffer = execute[start:execute.index('\n}\n', start) + 3]
         start = execute.index('static int set_memo_get(')
         memo_get = execute[start:execute.index('\n}\n', start) + 3]
         memo_type = next(x for x in execute.splitlines() if x.startswith('typedef struct ') and x.endswith(' set_memo_t;'))
@@ -38,7 +40,7 @@ class DynamicStorage(unittest.TestCase):
 #include <assert.h>
 #include <string.h>
 DECLARATIONS
-typedef struct { int nbind,ndyn;const dmsv_bind *b;uint8_t dyn[96]; } vkshader_t;
+typedef struct { int nbind,ndyn,setmemo;const dmsv_bind *b;uint8_t dyn[96],tbl[96]; } vkshader_t;
 static struct { int dyn_ssbo;struct {VkPhysicalDeviceLimits limits;} props; } V;
 static VkDescriptorType desc_type(int d) {assert(d==RD_UBO || d==RD_SSBO);return d==RD_SSBO?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;}
 static VkShaderStageFlags stage_flag(int stage) {(void)stage;return VK_SHADER_STAGE_VERTEX_BIT;}
@@ -48,9 +50,14 @@ HELPERS
 OFFSET
 enum { MEMO_CB = 16 };
 MEMO_TYPE
+MEMO_BUFFER
 static set_memo_t g_smemo[3];
-static uint64_t g_set_epoch,g_bind_gen[6],g_ubo_gen[6],g_tex_gen,g_samp_gen,g_ubd_gen,g_num_um,g_num_im;
-static uint32_t g_draw_binst;
+static uint64_t g_set_epoch,g_bind_gen[6],g_ssbo_gen[6],g_ubo_gen[6],g_tex_gen,g_samp_gen,g_ubd_gen,g_num_um,g_num_im;
+static uint32_t g_draw_binst;static int g_buffer_memo=1;
+static VkDescriptorBufferInfo g_draw_claim;
+static VkBuffer vk_zero_buffer(void){return (VkBuffer)(uintptr_t)1;}
+static void sbuf_desc(int st,const dmsv_bind *b,VkDescriptorBufferInfo *d){(void)st;(void)b;(void)d;assert(0&&"fixture has no storage refresh");}
+static void drv_shared(int st,int bank,VkBuffer *buf,VkDeviceSize *off,int dyn){(void)st;(void)bank;(void)buf;(void)off;(void)dyn;assert(0&&"fixture has no driver bank");}
 static VkDescriptorBufferInfo cbuf_values[16];
 static uint32_t vk_pool_gen(void){return 0;}
 static void cbuf_desc(int st,vkshader_t *s,const dmsv_bind *b,VkDescriptorBufferInfo *d){(void)st;(void)s;*d=cbuf_values[b->reg];}
@@ -60,15 +67,15 @@ LAYOUT
  memcpy(result,lb,nl*sizeof *lb);return nl;
 }
 static int bind_offsets(vkshader_t *s,VkDescriptorBufferInfo *bi,VkWriteDescriptorSet *w,uint32_t *dofs,uint32_t *bindings,uint8_t *positions) {
- struct {uint32_t b,o;int i;} dp[96];int nd=0;uint32_t nw=0;
+ struct {uint32_t b,o;int i;} dp[96];int nd=0;uint32_t nw=0;int ncb=0;uint8_t mci[MEMO_CB];VkDescriptorBufferInfo mcd[MEMO_CB];
  for(int i=0;i<s->nbind;i++) {const dmsv_bind *b=&s->b[i];VkWriteDescriptorSet *wr=&w[nw];
 BIND
  }
  for(int j=0;j<nd;j++){dofs[j]=dp[j].o;bindings[j]=dp[j].b;}
- set_memo_t mm={0},*m=&mm;int ncb=0;uint8_t mci[16];
- for(int i=0;i<s->nbind;i++)if(s->b[i].kind==RK_CBUF)mci[ncb++]=(uint8_t)i;
+ set_memo_t mm={0},*m=&mm;(void)mcd;
 MEMO_POS
- memcpy(positions,m->cpos,(size_t)ncb);
+ assert(ncb==5); // every storage and uniform buffer is a memo dependency
+ int np=0;for(int c=0;c<ncb;c++)if(s->b[mci[c]].kind==RK_CBUF)positions[np++]=m->cpos[c];
  return nd;
 }
 int main(void) {
@@ -130,7 +137,7 @@ int main(void) {
  return 0;
 }
 '''
-        for name, value in [('DECLARATIONS', '\n'.join(declarations)), ('HELPERS', helpers), ('OFFSET', offset), ('LAYOUT', layout), ('BIND', bind), ('MEMO_TYPE', memo_type), ('MEMO_GET', memo_get), ('MEMO_POS', memo_pos)]:
+        for name, value in [('DECLARATIONS', '\n'.join(declarations)), ('HELPERS', helpers), ('OFFSET', offset), ('LAYOUT', layout), ('BIND', bind), ('MEMO_TYPE', memo_type), ('MEMO_BUFFER', memo_buffer), ('MEMO_GET', memo_get), ('MEMO_POS', memo_pos)]:
             code = code.replace(name, value)
         target = ROOT / 'target/tests'; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='dynamic-storage-', dir=target) as folder:

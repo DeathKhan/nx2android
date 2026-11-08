@@ -13,7 +13,10 @@ class UniformShadowBounds(unittest.TestCase):
     def test_shadow_descriptor_and_full_range_fallbacks(self):
         source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text()
         start = source.index('static void cbuf_desc(')
-        body = source[start:source.index('// The set a stage', start)]
+        pos = source.index('{', start) + 1; depth = 1
+        while depth:
+            depth += (source[pos] == '{') - (source[pos] == '}'); pos += 1
+        body = source[start:pos] + '\n'
         code = r"""
 #include <stdint.h>
 #include <stddef.h>
@@ -90,7 +93,8 @@ int main(void) {
  return 0;
 }
 """
-        with tempfile.TemporaryDirectory(prefix='nx2a-ubo-bounds-') as folder:
+        target = ROOT / 'target/tests'; target.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='nx2a-ubo-bounds-', dir=target) as folder:
             src = Path(folder) / 'test.c'
             exe = Path(folder) / 'test'
             src.write_text(code)

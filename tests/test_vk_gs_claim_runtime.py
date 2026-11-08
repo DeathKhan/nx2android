@@ -25,7 +25,7 @@ class Claims(unittest.TestCase):
         start=source.index('static struct { uint32_t count, instances; int prim, indirect; } g_claim_draw;')
         end=source.index('\n}',source.index('static void gs_claim_prepare(',start))+2
         helper=source[start:end]
-        memo=function(source,'static int set_memo_ok(')
+        memo=function(source,'static int memo_buffer(')+'\n'+function(source,'static int set_memo_ok(')
         dynamic=function(source,'static uint32_t storage_dynamic_offset(')
         hash_function=function(source,'static inline uint64_t fnv(')
         code=r'''
@@ -38,12 +38,12 @@ class Claims(unittest.TestCase):
 #include <string.h>
 #include "gfx_vk_gs_claim_runtime.h"
 ENUMS
-typedef struct { int kind,samp; } dmsv_bind;
-typedef struct { uint64_t key; uint32_t gs_claim_invocations; int setmemo,nbind; const dmsv_bind *b; uint8_t dyn[96]; } vkshader_t;
+typedef struct { int kind,samp,reg; } dmsv_bind;
+typedef struct { uint64_t key; uint32_t gs_claim_invocations; int setmemo,nbind; const dmsv_bind *b; uint8_t dyn[96],tbl[96]; } vkshader_t;
 typedef uint64_t VkDeviceSize;
 #define VK_WHOLE_SIZE UINT64_MAX
 typedef struct { uintptr_t buffer; uint64_t offset,range; } VkDescriptorBufferInfo;
-static uint64_t g_set_epoch=1;
+static uint64_t g_set_epoch=1;static int g_buffer_memo=1;
 static struct { struct { struct { uint64_t minStorageBufferOffsetAlignment,maxStorageBufferRange; } limits; } props; } V;
 static unsigned char arena[GS_CLAIM_BUDGET+4096];static uint64_t cursor;static int allocations;
 static uintptr_t vk_zero_buffer(void){return 1;}
@@ -130,7 +130,8 @@ int main(void){
  const dmsv_bind plain[]={{.kind=RK_CBUF,.samp=RS_NONE}};
  vkshader_t ordinary={.nbind=1,.b=plain};assert(set_memo_ok(&ordinary));
  const dmsv_bind claim[]={{.kind=RK_CBUF},{.kind=RK_GS_CLAIM}};
- vkshader_t claimed={.nbind=2,.b=claim};assert(!set_memo_ok(&claimed)&&claimed.setmemo==2);
+ vkshader_t claimed={.nbind=2,.b=claim};assert(set_memo_ok(&claimed)&&claimed.setmemo==3); // the claim is a refreshed memo dependency
+ g_buffer_memo=0;assert(!set_memo_ok(&claimed)&&claimed.setmemo==3);g_buffer_memo=1; // DM_VK_BUFFER_MEMO=0 keeps claim shaders out of the memo
  return 0;
 }
 '''

@@ -40,7 +40,7 @@ class BufferMemo(unittest.TestCase):
 DECL
 enum { MEMO_CB = 48, OP_BIND_SSBO = 123, SB_ALIGN = 256 };
 typedef struct { int stage,index;uint64_t addr,size; } p_bind_buf;
-typedef struct { int nbind,ndyn,setmemo;const dmsv_bind *b;uint8_t dyn[96]; } vkshader_t;
+typedef struct { int nbind,ndyn,setmemo;const dmsv_bind *b;uint8_t dyn[96],tbl[96]; } vkshader_t;
 typedef struct { uint64_t lo,hi,end;VkBuffer buf; } vkpool_t;
 static struct { p_bind_buf ssbo[6][16],ubo[6][16]; } S;
 static struct { struct { VkPhysicalDeviceLimits limits; } props; } V;
@@ -55,6 +55,7 @@ static uint32_t vk_pool_gen(void){return pool_gen;}
 static VkBuffer vk_zero_buffer(void){return (VkBuffer)(uintptr_t)99;}
 static vkpool_t *vk_pool_of(uint64_t a,int late){(void)late;return a>=pool.lo&&a<pool.hi?&pool:NULL;}
 static void vk_cross(int k,uint64_t a,uint64_t n,const vkpool_t *p){(void)k;(void)a;(void)n;(void)p;}
+static uint32_t ubo_word(int st,int reg,int off){(void)st;(void)reg;(void)off;assert(0&&"fixture has no uniform-held storage address");return 0;}
 void vk_gpu_wrote(uint64_t a,uint64_t n){(void)a;(void)n;}
 #define VKRED_ONCE(...) ((void)0)
 static void cbuf_desc(int st,const vkshader_t *s,const dmsv_bind *b,VkDescriptorBufferInfo *d){(void)st;(void)s;(void)b;cb_reads++;*d=cb_value;}
