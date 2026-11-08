@@ -10,6 +10,8 @@
 #include "gfx_vk.h"
 #include "nvn_hmap.h"
 #include "nvn_dirty.h"
+#include <fcntl.h>
+#include <unistd.h>
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -113,6 +115,236 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vk_validation_msg(VkDebugUtilsMessageSever
 }
 
 // Whether a driver offers a Vulkan 1.3 GPU (DM_VK_DRIVER: a Turnip built for another Adreno generation loads and then has none)
+// ---------------- device memory accounting ----------------
+// Every allocation through the function table (all of gfx_vk_*.c and movie_zc_vk.c) is counted by a tag: the thread's vk_mem_tag where a site sets one
+// (pools, scratch, staging, images, gmem table), else by what the memory is bound to (image / buffer, seen at vkBind*Memory) and the caller's offset in the
+// library. A line at each 512 MB more of a tag, at each single allocation of 64 MB or more, and the whole table at each 512 MB more in all. Nintendo Switch 2
+// Welcome Tour: 5 GB of device memory that was neither imported pools nor images appeared at its first scene load. DM_VK_MEM_ACCT=0 turns it off
+__thread const char *vk_mem_tag;
+static PFN_vkAllocateMemory real_vkAllocateMemory; static PFN_vkFreeMemory real_vkFreeMemory; static PFN_vkBindImageMemory real_vkBindImageMemory; static PFN_vkBindBufferMemory real_vkBindBufferMemory;
+typedef struct { VkDeviceSize size; int tag; } macct_t;
+enum { MACCT_TAGS = 32 };
+static struct { const char *name; uint64_t live, peak, n, logged; } g_macct[MACCT_TAGS]; static int g_macct_n; static uint64_t g_macct_total, g_macct_total_logged;
+static nvn_hmap g_macct_map = {.klen = 8}; static pthread_mutex_t g_macct_mu = PTHREAD_MUTEX_INITIALIZER; static void *g_lib_base;
+static int macct_tag(const char *name) { for (int i = 0; i < g_macct_n; i++) if (!strcmp(g_macct[i].name, name)) return i; if (g_macct_n == MACCT_TAGS) return 0; g_macct[g_macct_n].name = strdup(name); return g_macct_n++; }
+static void macct_table(const char *why) {
+    char line[2048]; int n = snprintf(line, sizeof line, "device memory %s: %.0f MB live;", why, g_macct_total / 1048576.0);
+    for (int i = 0; i < g_macct_n && n < (int)sizeof line - 80; i++) if (g_macct[i].live || g_macct[i].peak > (64u << 20)) n += snprintf(line + n, sizeof line - n, " %s %.0f MB (peak %.0f, %llu allocs);", g_macct[i].name, g_macct[i].live / 1048576.0, g_macct[i].peak / 1048576.0, (unsigned long long)g_macct[i].n);
+    VKLOG("%s", line);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL acct_alloc(VkDevice dev, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *cb, VkDeviceMemory *out) {
+    VkResult r = real_vkAllocateMemory(dev, ai, cb, out); if (r) return r;
+    char nm[96]; const char *tag = vk_mem_tag;
+    if (!tag) { for (const VkBaseInStructure *x = (const VkBaseInStructure *)ai->pNext; x; x = x->pNext) if (x->sType == VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID) tag = "imported-ahb";
+        if (!tag) { snprintf(nm, sizeof nm, "untagged@+%llx", (unsigned long long)((uintptr_t)__builtin_return_address(0) - (uintptr_t)g_lib_base)); tag = nm; } }
+    pthread_mutex_lock(&g_macct_mu);
+    macct_t *e = malloc(sizeof *e); e->size = ai->allocationSize; e->tag = macct_tag(tag); uint64_t key = (uint64_t)(uintptr_t)*out; nvn_hm_put(&g_macct_map, &key, e);
+    g_macct[e->tag].live += e->size; g_macct[e->tag].n++; if (g_macct[e->tag].live > g_macct[e->tag].peak) g_macct[e->tag].peak = g_macct[e->tag].live; g_macct_total += e->size;
+    int big = e->size >= (64u << 20), cross = g_macct[e->tag].live >= g_macct[e->tag].logged + (512u << 20), all = g_macct_total >= g_macct_total_logged + (512u << 20);
+    if (cross) g_macct[e->tag].logged = g_macct[e->tag].live; if (all) g_macct_total_logged = g_macct_total;
+    const char *name = g_macct[e->tag].name; uint64_t live = g_macct[e->tag].live, cnt = g_macct[e->tag].n;
+    pthread_mutex_unlock(&g_macct_mu);
+    if (big) { static int nb; if (nb++ < 40) VKLOG("device memory: %.1f MB allocated as %s (type %u; %s now %.0f MB in %llu allocations)", e->size / 1048576.0, name, ai->memoryTypeIndex, name, live / 1048576.0, (unsigned long long)cnt); }
+    if (cross) VKLOG("device memory: %s at %.0f MB (%llu allocations live)", name, live / 1048576.0, (unsigned long long)cnt);
+    if (all) macct_table("by tag");
+    return r;
+}
+static void macct_rebind(VkDeviceMemory m, const char *kind) {   // an untagged allocation named by what it is bound to
+    pthread_mutex_lock(&g_macct_mu); uint64_t key = (uint64_t)(uintptr_t)m; macct_t *e = nvn_hm_get(&g_macct_map, &key);
+    if (e && !strncmp(g_macct[e->tag].name, "untagged@", 9)) { char nm[128]; snprintf(nm, sizeof nm, "%s-%s", kind, g_macct[e->tag].name + 9); int t = macct_tag(nm);
+        g_macct[e->tag].live -= e->size; g_macct[e->tag].n--; e->tag = t; g_macct[t].live += e->size; g_macct[t].n++; if (g_macct[t].live > g_macct[t].peak) g_macct[t].peak = g_macct[t].live;
+        if (g_macct[t].live >= g_macct[t].logged + (512u << 20)) { g_macct[t].logged = g_macct[t].live; VKLOG("device memory: %s at %.0f MB (%llu allocations live)", nm, g_macct[t].live / 1048576.0, (unsigned long long)g_macct[t].n); } }
+    pthread_mutex_unlock(&g_macct_mu);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL acct_bind_image(VkDevice dev, VkImage i, VkDeviceMemory m, VkDeviceSize off) { macct_rebind(m, "image"); return real_vkBindImageMemory(dev, i, m, off); }
+static VKAPI_ATTR VkResult VKAPI_CALL acct_bind_buffer(VkDevice dev, VkBuffer b, VkDeviceMemory m, VkDeviceSize off) { macct_rebind(m, "buffer"); return real_vkBindBufferMemory(dev, b, m, off); }
+// Pipelines: the driver allocates their shader and private (spill / local) memory itself; measured as the process's mapped GPU memory around the call
+static PFN_vkCreateGraphicsPipelines real_vkCreateGraphicsPipelines; static PFN_vkCreateComputePipelines real_vkCreateComputePipelines;
+static uint64_t g_pipe_kgsl, g_pipe_n, g_pipe_big;
+static uint64_t kgsl_mapped(void);
+static void pipe_note(const char *kind, uint32_t n, uint64_t before, const VkPipelineShaderStageCreateInfo *st, uint32_t nst) {
+    uint64_t after = kgsl_mapped(), d = after > before ? after - before : 0; g_pipe_kgsl += d; g_pipe_n += n;
+    if (d >= (16u << 20)) { g_pipe_big++; static int nl; if (nl++ < 24) { char mods[160]; int k = 0; for (uint32_t i = 0; i < nst && k < 120; i++) k += snprintf(mods + k, sizeof mods - k, " %s%llx", i ? "" : "", (unsigned long long)(uintptr_t)st[i].module);
+        VKLOG("%s pipeline: %.1f MB of GPU memory mapped for it (stages %u: modules%s); pipelines %llu so far, %.0f MB in all, %llu of 16 MB or more", kind, d / 1048576.0, nst, mods, (unsigned long long)g_pipe_n, g_pipe_kgsl / 1048576.0, (unsigned long long)g_pipe_big); } }
+    if (g_pipe_n && !(g_pipe_n & 63)) VKLOG("pipelines: %llu made, %.0f MB of GPU memory mapped around their creation (%llu of 16 MB or more)", (unsigned long long)g_pipe_n, g_pipe_kgsl / 1048576.0, (unsigned long long)g_pipe_big);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL acct_gpipe(VkDevice dev, VkPipelineCache pc, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *cb, VkPipeline *out) {
+    uint64_t b = kgsl_mapped(); VkResult r = real_vkCreateGraphicsPipelines(dev, pc, n, ci, cb, out); pipe_note("graphics", n, b, ci->pStages, ci->stageCount); return r; }
+static VKAPI_ATTR VkResult VKAPI_CALL acct_cpipe(VkDevice dev, VkPipelineCache pc, uint32_t n, const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *cb, VkPipeline *out) {
+    uint64_t b = kgsl_mapped(); VkResult r = real_vkCreateComputePipelines(dev, pc, n, ci, cb, out); pipe_note("compute", n, b, &ci->stage, 1); return r; }
+// ---------------- descriptor set layouts with large arrays: update-after-bind ----------------
+// Adreno's vkCmdBindDescriptorSets copies a bound set's descriptors into the command stream: Nintendo Switch 2 Welcome Tour binds its texture / sampler tables
+// (bindless arrays of tens of thousands of descriptors, RK_TEXD / RK_SAMPD) at most draws of its first scene, 12 MB of GPU memory a bind, 3.3 GB in one submission,
+// and the low-memory killer ended it (measured with DM_VK_KGSL_TRACE=1). A binding flagged update-after-bind lives in the pool's memory and is bound by reference.
+// Every layout with a binding of UAB_MIN descriptors or more gets the flag on those bindings (not on dynamic buffers, which the rule forbids), and every pool the
+// update-after-bind bit, when the device has the Vulkan 1.2 features (g_uab: 1 sampled images and samplers, 2 also storage images, texel buffers and storage buffers).
+// DM_VK_NO_UAB=1: off
+static int g_uab; enum { UAB_MIN = 1024 };
+static PFN_vkCreateDescriptorSetLayout real_vkCreateDescriptorSetLayout; static uint64_t g_uab_layouts;
+static int uab_type_ok(VkDescriptorType t) {
+    switch (t) { case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_SAMPLER: case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: return g_uab >= 1;
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: return g_uab >= 2; default: return 0; }
+}
+static VKAPI_ATTR VkResult VKAPI_CALL uab_dsl(VkDevice dev, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *cb, VkDescriptorSetLayout *out) {
+    int big = 0; for (uint32_t i = 0; i < ci->bindingCount; i++) if (ci->pBindings[i].descriptorCount >= UAB_MIN && uab_type_ok(ci->pBindings[i].descriptorType)) big = 1;
+    if (!big || ci->pNext) return real_vkCreateDescriptorSetLayout(dev, ci, cb, out);   // (a chained info of the caller's: left as it is)
+    VkDescriptorBindingFlags fl[128]; uint32_t n = ci->bindingCount < 128 ? ci->bindingCount : 128, maxc = 0;
+    for (uint32_t i = 0; i < n; i++) { const VkDescriptorSetLayoutBinding *b = &ci->pBindings[i]; fl[i] = b->descriptorCount >= UAB_MIN && uab_type_ok(b->descriptorType) ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT : 0; if (b->descriptorCount > maxc) maxc = b->descriptorCount; }
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bf = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, NULL, n, fl};
+    VkDescriptorSetLayoutCreateInfo c2 = *ci; c2.pNext = &bf; c2.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    VkResult r = real_vkCreateDescriptorSetLayout(dev, &c2, cb, out);
+    if (r) { VKRED_ONCE(160, "descriptor set layout with update-after-bind arrays refused (%d): made as before", r); return real_vkCreateDescriptorSetLayout(dev, ci, cb, out); }
+    g_uab_layouts++; static int nl; if (nl++ < 4) VKLOG("descriptor set layout %llu with update-after-bind arrays (%u bindings, the largest %u descriptors)", (unsigned long long)g_uab_layouts, n, maxc);
+    return r;
+}
+static void uab_install(void) {
+    const char *e = getenv("DM_VK_UAB"); if (!(e && atoi(e)) || !g_uab) { g_uab = 0; return; }   // opt-in: on the Adreno 830 (512.800) the driver copied the set into the command stream all the same (12 MB a bind, measured with DM_VK_KGSL_TRACE=1)
+    real_vkCreateDescriptorSetLayout = vkCreateDescriptorSetLayout; vkCreateDescriptorSetLayout = uab_dsl;
+    VKLOG("descriptor set layouts with arrays of %d or more get update-after-bind (level %d; DM_VK_UAB=1)", UAB_MIN, g_uab);
+}
+// ---------------- GPU memory trace (DM_VK_KGSL_TRACE=1) ----------------
+// The driver allocates GPU memory of its own as commands are recorded (command memory, visibility streams, per-pass and per-draw state): each wrapped entry point
+// measures the process's mapped GPU memory around the call and charges the difference to the call's name. A call that maps 1 MB or more is logged (the first 80), and
+// the totals by name go into the submission's line (sub_stats). Nintendo Switch 2 Welcome Tour: 3.3 GB mapped while recording 430 draws of its first scene
+enum { KT_N = 36 };
+static const char *g_kt_name[KT_N] = {"vkCmdDraw", "vkCmdDrawIndexed", "vkCmdDrawIndirect", "vkCmdDrawIndexedIndirect", "vkCmdDispatch", "vkCmdBeginRenderPass", "vkCmdBeginRendering", "vkCmdEndRenderPass", "vkCmdEndRendering", "vkCmdPipelineBarrier", "vkCmdCopyImage", "vkCmdCopyBufferToImage", "vkCmdCopyImageToBuffer", "vkCmdBlitImage", "vkCmdClearColorImage", "vkCmdClearDepthStencilImage", "vkCmdClearAttachments", "vkCmdResolveImage", "vkCmdFillBuffer", "vkCmdUpdateBuffer", "vkCmdCopyBuffer", "vkCmdBindDescriptorSets", "vkCmdBindPipeline", "vkCmdBindVertexBuffers", "vkCmdBindIndexBuffer", "vkCmdPushConstants", "vkCmdSetViewport", "vkCmdSetScissor", "vkCreateImageView", "vkCreateFramebuffer", "vkAllocateDescriptorSets", "vkUpdateDescriptorSets", "vkEndCommandBuffer", "vkBeginCommandBuffer", "vkQueueSubmit", "vkCreateImage"};
+static uint64_t g_kt_bytes[KT_N], g_kt_calls[KT_N], g_kt_big[KT_N]; static int g_kt_on;
+static void kt_note(int k, uint64_t before, const char *info) {
+    uint64_t after = kgsl_mapped(); g_kt_calls[k]++; if (after <= before) return; uint64_t d = after - before; g_kt_bytes[k] += d;
+    if (d >= (1u << 20)) { g_kt_big[k]++; static int nl; if (nl++ < 80) VKLOG("gpu memory +%.1f MB at %s (%s); %.0f MB mapped", d / 1048576.0, g_kt_name[k], info, after / 1048576.0); }
+}
+static void kt_table(void) {
+    if (!g_kt_on) return; char line[2048]; int n = snprintf(line, sizeof line, "gpu memory by call since the start:");
+    for (int k = 0; k < KT_N && n < (int)sizeof line - 96; k++) if (g_kt_bytes[k] >= (1u << 20)) n += snprintf(line + n, sizeof line - n, " %s %.0f MB (%llu calls, %llu of 1 MB+);", g_kt_name[k], g_kt_bytes[k] / 1048576.0, (unsigned long long)g_kt_calls[k], (unsigned long long)g_kt_big[k]);
+    VKLOG("%s", line);
+}
+static PFN_vkCmdDraw real_vkCmdDraw;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdDraw(cb, vc, ic, fv, fi); char info[160]; snprintf(info, sizeof info, "%u vertices x %u", vc, ic); kt_note(0, kt_b0, info); }
+static PFN_vkCmdDrawIndexed real_vkCmdDrawIndexed;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdDrawIndexed(VkCommandBuffer cb, uint32_t ic, uint32_t inst, uint32_t fi, int32_t vo, uint32_t fin) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdDrawIndexed(cb, ic, inst, fi, vo, fin); char info[160]; snprintf(info, sizeof info, "%u indices x %u", ic, inst); kt_note(1, kt_b0, info); }
+static PFN_vkCmdDrawIndirect real_vkCmdDrawIndirect;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdDrawIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t st) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdDrawIndirect(cb, b, o, n, st); char info[160]; snprintf(info, sizeof info, "%u records", n); kt_note(2, kt_b0, info); }
+static PFN_vkCmdDrawIndexedIndirect real_vkCmdDrawIndexedIndirect;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, uint32_t n, uint32_t st) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdDrawIndexedIndirect(cb, b, o, n, st); char info[160]; snprintf(info, sizeof info, "%u records", n); kt_note(3, kt_b0, info); }
+static PFN_vkCmdDispatch real_vkCmdDispatch;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdDispatch(cb, x, y, z); char info[160]; snprintf(info, sizeof info, "%ux%ux%u", x, y, z); kt_note(4, kt_b0, info); }
+static PFN_vkCmdBeginRenderPass real_vkCmdBeginRenderPass;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo *bi, VkSubpassContents c) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdBeginRenderPass(cb, bi, c); char info[160]; snprintf(info, sizeof info, "%ux%u", bi->renderArea.extent.width, bi->renderArea.extent.height); kt_note(5, kt_b0, info); }
+static PFN_vkCmdBeginRendering real_vkCmdBeginRendering;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *ri) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdBeginRendering(cb, ri); char info[160]; snprintf(info, sizeof info, "%ux%u, %u colour attachments, depth %d, layers %u", ri->renderArea.extent.width, ri->renderArea.extent.height, ri->colorAttachmentCount, ri->pDepthAttachment != NULL, ri->layerCount); kt_note(6, kt_b0, info); }
+static PFN_vkCmdEndRenderPass real_vkCmdEndRenderPass;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdEndRenderPass(VkCommandBuffer cb) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdEndRenderPass(cb); char info[160]; snprintf(info, sizeof info, "%s", ""); kt_note(7, kt_b0, info); }
+static PFN_vkCmdEndRendering real_vkCmdEndRendering;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdEndRendering(VkCommandBuffer cb) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdEndRendering(cb); char info[160]; snprintf(info, sizeof info, "%s", ""); kt_note(8, kt_b0, info); }
+static PFN_vkCmdPipelineBarrier real_vkCmdPipelineBarrier;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags a, VkPipelineStageFlags b, VkDependencyFlags d, uint32_t nm, const VkMemoryBarrier *m, uint32_t nb, const VkBufferMemoryBarrier *bm, uint32_t ni, const VkImageMemoryBarrier *im) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdPipelineBarrier(cb, a, b, d, nm, m, nb, bm, ni, im); char info[160]; snprintf(info, sizeof info, "%u image barriers", ni); kt_note(9, kt_b0, info); }
+static PFN_vkCmdCopyImage real_vkCmdCopyImage;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdCopyImage(VkCommandBuffer cb, VkImage si, VkImageLayout sl, VkImage di, VkImageLayout dl, uint32_t n, const VkImageCopy *r) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdCopyImage(cb, si, sl, di, dl, n, r); char info[160]; snprintf(info, sizeof info, "%ux%ux%u", r->extent.width, r->extent.height, r->extent.depth); kt_note(10, kt_b0, info); }
+static PFN_vkCmdCopyBufferToImage real_vkCmdCopyBufferToImage;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer sb, VkImage di, VkImageLayout dl, uint32_t n, const VkBufferImageCopy *r) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdCopyBufferToImage(cb, sb, di, dl, n, r); char info[160]; snprintf(info, sizeof info, "%ux%ux%u", r->imageExtent.width, r->imageExtent.height, r->imageExtent.depth); kt_note(11, kt_b0, info); }
+static PFN_vkCmdCopyImageToBuffer real_vkCmdCopyImageToBuffer;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage si, VkImageLayout sl, VkBuffer db, uint32_t n, const VkBufferImageCopy *r) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdCopyImageToBuffer(cb, si, sl, db, n, r); char info[160]; snprintf(info, sizeof info, "%ux%ux%u", r->imageExtent.width, r->imageExtent.height, r->imageExtent.depth); kt_note(12, kt_b0, info); }
+static PFN_vkCmdBlitImage real_vkCmdBlitImage;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdBlitImage(VkCommandBuffer cb, VkImage si, VkImageLayout sl, VkImage di, VkImageLayout dl, uint32_t n, const VkImageBlit *r, VkFilter f) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdBlitImage(cb, si, sl, di, dl, n, r, f); char info[160]; snprintf(info, sizeof info, "%dx%d", r->dstOffsets[1].x, r->dstOffsets[1].y); kt_note(13, kt_b0, info); }
+static PFN_vkCmdClearColorImage real_vkCmdClearColorImage;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdClearColorImage(VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearColorValue *v, uint32_t n, const VkImageSubresourceRange *r) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdClearColorImage(cb, i, l, v, n, r); char info[160]; snprintf(info, sizeof info, "%u ranges", n); kt_note(14, kt_b0, info); }
+static PFN_vkCmdClearDepthStencilImage real_vkCmdClearDepthStencilImage;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdClearDepthStencilImage(VkCommandBuffer cb, VkImage i, VkImageLayout l, const VkClearDepthStencilValue *v, uint32_t n, const VkImageSubresourceRange *r) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdClearDepthStencilImage(cb, i, l, v, n, r); char info[160]; snprintf(info, sizeof info, "%u ranges", n); kt_note(15, kt_b0, info); }
+static PFN_vkCmdClearAttachments real_vkCmdClearAttachments;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdClearAttachments(VkCommandBuffer cb, uint32_t na, const VkClearAttachment *a, uint32_t nr, const VkClearRect *r) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdClearAttachments(cb, na, a, nr, r); char info[160]; snprintf(info, sizeof info, "%u attachments", na); kt_note(16, kt_b0, info); }
+static PFN_vkCmdResolveImage real_vkCmdResolveImage;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdResolveImage(VkCommandBuffer cb, VkImage si, VkImageLayout sl, VkImage di, VkImageLayout dl, uint32_t n, const VkImageResolve *r) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdResolveImage(cb, si, sl, di, dl, n, r); char info[160]; snprintf(info, sizeof info, "%ux%u", r->extent.width, r->extent.height); kt_note(17, kt_b0, info); }
+static PFN_vkCmdFillBuffer real_vkCmdFillBuffer;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdFillBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkDeviceSize n, uint32_t v) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdFillBuffer(cb, b, o, n, v); char info[160]; snprintf(info, sizeof info, "%llu bytes", (unsigned long long)n); kt_note(18, kt_b0, info); }
+static PFN_vkCmdUpdateBuffer real_vkCmdUpdateBuffer;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdUpdateBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkDeviceSize n, const void *d) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdUpdateBuffer(cb, b, o, n, d); char info[160]; snprintf(info, sizeof info, "%llu bytes", (unsigned long long)n); kt_note(19, kt_b0, info); }
+static PFN_vkCmdCopyBuffer real_vkCmdCopyBuffer;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdCopyBuffer(VkCommandBuffer cb, VkBuffer sb, VkBuffer db, uint32_t n, const VkBufferCopy *r) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdCopyBuffer(cb, sb, db, n, r); char info[160]; snprintf(info, sizeof info, "%llu bytes", (unsigned long long)r->size); kt_note(20, kt_b0, info); }
+static PFN_vkCmdBindDescriptorSets real_vkCmdBindDescriptorSets;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t first, uint32_t n, const VkDescriptorSet *sets, uint32_t nd, const uint32_t *d) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdBindDescriptorSets(cb, bp, l, first, n, sets, nd, d); char info[160]; snprintf(info, sizeof info, "%u sets", n); kt_note(21, kt_b0, info); }
+static PFN_vkCmdBindPipeline real_vkCmdBindPipeline;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdBindPipeline(cb, bp, p); char info[160]; snprintf(info, sizeof info, "%llx", (unsigned long long)(uintptr_t)p); kt_note(22, kt_b0, info); }
+static PFN_vkCmdBindVertexBuffers real_vkCmdBindVertexBuffers;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdBindVertexBuffers(cb, first, n, b, o); char info[160]; snprintf(info, sizeof info, "%u buffers", n); kt_note(23, kt_b0, info); }
+static PFN_vkCmdBindIndexBuffer real_vkCmdBindIndexBuffer;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdBindIndexBuffer(cb, b, o, t); char info[160]; snprintf(info, sizeof info, "%s", ""); kt_note(24, kt_b0, info); }
+static PFN_vkCmdPushConstants real_vkCmdPushConstants;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout l, VkShaderStageFlags st, uint32_t o, uint32_t n, const void *v) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdPushConstants(cb, l, st, o, n, v); char info[160]; snprintf(info, sizeof info, "%u bytes", n); kt_note(25, kt_b0, info); }
+static PFN_vkCmdSetViewport real_vkCmdSetViewport;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdSetViewport(VkCommandBuffer cb, uint32_t f, uint32_t n, const VkViewport *v) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdSetViewport(cb, f, n, v); char info[160]; snprintf(info, sizeof info, "%u", n); kt_note(26, kt_b0, info); }
+static PFN_vkCmdSetScissor real_vkCmdSetScissor;
+static VKAPI_ATTR void VKAPI_CALL kt_vkCmdSetScissor(VkCommandBuffer cb, uint32_t f, uint32_t n, const VkRect2D *v) { uint64_t kt_b0 = kgsl_mapped(); real_vkCmdSetScissor(cb, f, n, v); char info[160]; snprintf(info, sizeof info, "%u", n); kt_note(27, kt_b0, info); }
+static PFN_vkCreateImageView real_vkCreateImageView;
+static VKAPI_ATTR VkResult VKAPI_CALL kt_vkCreateImageView(VkDevice dev, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *cb, VkImageView *v) { uint64_t kt_b0 = kgsl_mapped(); VkResult r = real_vkCreateImageView(dev, ci, cb, v); char info[160]; snprintf(info, sizeof info, "format %d", ci->format); kt_note(28, kt_b0, info); return r; }
+static PFN_vkCreateFramebuffer real_vkCreateFramebuffer;
+static VKAPI_ATTR VkResult VKAPI_CALL kt_vkCreateFramebuffer(VkDevice dev, const VkFramebufferCreateInfo *ci, const VkAllocationCallbacks *cb, VkFramebuffer *v) { uint64_t kt_b0 = kgsl_mapped(); VkResult r = real_vkCreateFramebuffer(dev, ci, cb, v); char info[160]; snprintf(info, sizeof info, "%ux%u x%u, %u attachments", ci->width, ci->height, ci->layers, ci->attachmentCount); kt_note(29, kt_b0, info); return r; }
+static PFN_vkAllocateDescriptorSets real_vkAllocateDescriptorSets;
+static VKAPI_ATTR VkResult VKAPI_CALL kt_vkAllocateDescriptorSets(VkDevice dev, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out) { uint64_t kt_b0 = kgsl_mapped(); VkResult r = real_vkAllocateDescriptorSets(dev, ai, out); char info[160]; snprintf(info, sizeof info, "%u", ai->descriptorSetCount); kt_note(30, kt_b0, info); return r; }
+static PFN_vkUpdateDescriptorSets real_vkUpdateDescriptorSets;
+static VKAPI_ATTR void VKAPI_CALL kt_vkUpdateDescriptorSets(VkDevice dev, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) { uint64_t kt_b0 = kgsl_mapped(); real_vkUpdateDescriptorSets(dev, nw, w, nc, c); char info[160]; snprintf(info, sizeof info, "%u writes", nw); kt_note(31, kt_b0, info); }
+static PFN_vkEndCommandBuffer real_vkEndCommandBuffer;
+static VKAPI_ATTR VkResult VKAPI_CALL kt_vkEndCommandBuffer(VkCommandBuffer cb) { uint64_t kt_b0 = kgsl_mapped(); VkResult r = real_vkEndCommandBuffer(cb); char info[160]; snprintf(info, sizeof info, "%s", ""); kt_note(32, kt_b0, info); return r; }
+static PFN_vkBeginCommandBuffer real_vkBeginCommandBuffer;
+static VKAPI_ATTR VkResult VKAPI_CALL kt_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) { uint64_t kt_b0 = kgsl_mapped(); VkResult r = real_vkBeginCommandBuffer(cb, bi); char info[160]; snprintf(info, sizeof info, "%s", ""); kt_note(33, kt_b0, info); return r; }
+static PFN_vkQueueSubmit real_vkQueueSubmit;
+static VKAPI_ATTR VkResult VKAPI_CALL kt_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) { uint64_t kt_b0 = kgsl_mapped(); VkResult r = real_vkQueueSubmit(q, n, si, f); char info[160]; snprintf(info, sizeof info, "%u command buffers", si->commandBufferCount); kt_note(34, kt_b0, info); return r; }
+static PFN_vkCreateImage real_vkCreateImage;
+static VKAPI_ATTR VkResult VKAPI_CALL kt_vkCreateImage(VkDevice dev, const VkImageCreateInfo *ci, const VkAllocationCallbacks *cb, VkImage *out) { uint64_t kt_b0 = kgsl_mapped(); VkResult r = real_vkCreateImage(dev, ci, cb, out); char info[160]; snprintf(info, sizeof info, "%ux%ux%u format %d levels %u layers %u samples %u", ci->extent.width, ci->extent.height, ci->extent.depth, ci->format, ci->mipLevels, ci->arrayLayers, ci->samples); kt_note(35, kt_b0, info); return r; }
+static void kt_install(void) {
+    const char *e = getenv("DM_VK_KGSL_TRACE"); if (!(e && atoi(e)) || !kgsl_mapped()) return; g_kt_on = 1;
+    real_vkCmdDraw = vkCmdDraw; vkCmdDraw = kt_vkCmdDraw;
+    real_vkCmdDrawIndexed = vkCmdDrawIndexed; vkCmdDrawIndexed = kt_vkCmdDrawIndexed;
+    real_vkCmdDrawIndirect = vkCmdDrawIndirect; vkCmdDrawIndirect = kt_vkCmdDrawIndirect;
+    real_vkCmdDrawIndexedIndirect = vkCmdDrawIndexedIndirect; vkCmdDrawIndexedIndirect = kt_vkCmdDrawIndexedIndirect;
+    real_vkCmdDispatch = vkCmdDispatch; vkCmdDispatch = kt_vkCmdDispatch;
+    real_vkCmdBeginRenderPass = vkCmdBeginRenderPass; vkCmdBeginRenderPass = kt_vkCmdBeginRenderPass;
+    real_vkCmdBeginRendering = vkCmdBeginRendering; vkCmdBeginRendering = kt_vkCmdBeginRendering;
+    real_vkCmdEndRenderPass = vkCmdEndRenderPass; vkCmdEndRenderPass = kt_vkCmdEndRenderPass;
+    real_vkCmdEndRendering = vkCmdEndRendering; vkCmdEndRendering = kt_vkCmdEndRendering;
+    real_vkCmdPipelineBarrier = vkCmdPipelineBarrier; vkCmdPipelineBarrier = kt_vkCmdPipelineBarrier;
+    real_vkCmdCopyImage = vkCmdCopyImage; vkCmdCopyImage = kt_vkCmdCopyImage;
+    real_vkCmdCopyBufferToImage = vkCmdCopyBufferToImage; vkCmdCopyBufferToImage = kt_vkCmdCopyBufferToImage;
+    real_vkCmdCopyImageToBuffer = vkCmdCopyImageToBuffer; vkCmdCopyImageToBuffer = kt_vkCmdCopyImageToBuffer;
+    real_vkCmdBlitImage = vkCmdBlitImage; vkCmdBlitImage = kt_vkCmdBlitImage;
+    real_vkCmdClearColorImage = vkCmdClearColorImage; vkCmdClearColorImage = kt_vkCmdClearColorImage;
+    real_vkCmdClearDepthStencilImage = vkCmdClearDepthStencilImage; vkCmdClearDepthStencilImage = kt_vkCmdClearDepthStencilImage;
+    real_vkCmdClearAttachments = vkCmdClearAttachments; vkCmdClearAttachments = kt_vkCmdClearAttachments;
+    real_vkCmdResolveImage = vkCmdResolveImage; vkCmdResolveImage = kt_vkCmdResolveImage;
+    real_vkCmdFillBuffer = vkCmdFillBuffer; vkCmdFillBuffer = kt_vkCmdFillBuffer;
+    real_vkCmdUpdateBuffer = vkCmdUpdateBuffer; vkCmdUpdateBuffer = kt_vkCmdUpdateBuffer;
+    real_vkCmdCopyBuffer = vkCmdCopyBuffer; vkCmdCopyBuffer = kt_vkCmdCopyBuffer;
+    real_vkCmdBindDescriptorSets = vkCmdBindDescriptorSets; vkCmdBindDescriptorSets = kt_vkCmdBindDescriptorSets;
+    real_vkCmdBindPipeline = vkCmdBindPipeline; vkCmdBindPipeline = kt_vkCmdBindPipeline;
+    real_vkCmdBindVertexBuffers = vkCmdBindVertexBuffers; vkCmdBindVertexBuffers = kt_vkCmdBindVertexBuffers;
+    real_vkCmdBindIndexBuffer = vkCmdBindIndexBuffer; vkCmdBindIndexBuffer = kt_vkCmdBindIndexBuffer;
+    real_vkCmdPushConstants = vkCmdPushConstants; vkCmdPushConstants = kt_vkCmdPushConstants;
+    real_vkCmdSetViewport = vkCmdSetViewport; vkCmdSetViewport = kt_vkCmdSetViewport;
+    real_vkCmdSetScissor = vkCmdSetScissor; vkCmdSetScissor = kt_vkCmdSetScissor;
+    real_vkCreateImageView = vkCreateImageView; vkCreateImageView = kt_vkCreateImageView;
+    real_vkCreateFramebuffer = vkCreateFramebuffer; vkCreateFramebuffer = kt_vkCreateFramebuffer;
+    real_vkAllocateDescriptorSets = vkAllocateDescriptorSets; vkAllocateDescriptorSets = kt_vkAllocateDescriptorSets;
+    real_vkUpdateDescriptorSets = vkUpdateDescriptorSets; vkUpdateDescriptorSets = kt_vkUpdateDescriptorSets;
+    real_vkEndCommandBuffer = vkEndCommandBuffer; vkEndCommandBuffer = kt_vkEndCommandBuffer;
+    real_vkBeginCommandBuffer = vkBeginCommandBuffer; vkBeginCommandBuffer = kt_vkBeginCommandBuffer;
+    real_vkQueueSubmit = vkQueueSubmit; vkQueueSubmit = kt_vkQueueSubmit;
+    real_vkCreateImage = vkCreateImage; vkCreateImage = kt_vkCreateImage;
+    VKLOG("GPU memory trace on (DM_VK_KGSL_TRACE): the driver's own allocations charged to the recorded commands");
+}
+static VKAPI_ATTR void VKAPI_CALL acct_free(VkDevice dev, VkDeviceMemory m, const VkAllocationCallbacks *cb) {
+    if (m) { pthread_mutex_lock(&g_macct_mu); uint64_t key = (uint64_t)(uintptr_t)m; macct_t *e = nvn_hm_get(&g_macct_map, &key);
+        if (e) { nvn_hm_del(&g_macct_map, &key); g_macct[e->tag].live -= e->size; g_macct[e->tag].n--; g_macct_total -= e->size; free(e); }
+        pthread_mutex_unlock(&g_macct_mu); }
+    real_vkFreeMemory(dev, m, cb);
+}
+void vk_mem_acct_report(const char *why) { pthread_mutex_lock(&g_macct_mu); macct_table(why); pthread_mutex_unlock(&g_macct_mu); }
+static void mem_acct_install(void) {
+    const char *e = getenv("DM_VK_MEM_ACCT"); if (e && !atoi(e)) return;
+    Dl_info di; if (dladdr((void *)mem_acct_install, &di)) g_lib_base = di.dli_fbase;
+    real_vkAllocateMemory = vkAllocateMemory; real_vkFreeMemory = vkFreeMemory; real_vkBindImageMemory = vkBindImageMemory; real_vkBindBufferMemory = vkBindBufferMemory;
+    vkAllocateMemory = acct_alloc; vkFreeMemory = acct_free; vkBindImageMemory = acct_bind_image; vkBindBufferMemory = acct_bind_buffer;
+    real_vkCreateGraphicsPipelines = vkCreateGraphicsPipelines; real_vkCreateComputePipelines = vkCreateComputePipelines; vkCreateGraphicsPipelines = acct_gpipe; vkCreateComputePipelines = acct_cpipe;
+    VKLOG("device memory accounting on (DM_VK_MEM_ACCT=0: off): a line at each 512 MB more per tag, each allocation of 64 MB or more, the table at each 512 MB more in all");
+}
 static int drv_has_gpu(PFN_vkGetInstanceProcAddr g) {
     PFN_vkCreateInstance ci = (PFN_vkCreateInstance)g(NULL, "vkCreateInstance"); VkInstance in; int ok = 0;
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "dmhost", 1, "nxnative", 1, VK_API_VERSION_1_3};
@@ -231,6 +463,7 @@ void vk_init(void) {
     VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
     VkPhysicalDeviceFeatures2 ff = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, v12 ? (void *)&f11 : xs};
     vkGetPhysicalDeviceFeatures2(V.pd, &ff);
+    if (v12) g_uab = f12.descriptorBindingSampledImageUpdateAfterBind && f12.descriptorBindingSampledImageUpdateAfterBind && f12.descriptorBindingPartiallyBound ? 1 + (f12.descriptorBindingStorageImageUpdateAfterBind && f12.descriptorBindingUniformTexelBufferUpdateAfterBind && f12.descriptorBindingStorageTexelBufferUpdateAfterBind && f12.descriptorBindingStorageBufferUpdateAfterBind) : 0;   // (enabled below with the rest of the queried chain)
     // without timeline semaphores (Vulkan 1.1 drivers: the Adreno 618 / 619 of 2021, 512.530) each submission signals a fence of a ring instead (slots_init).
     // DM_VK_X_FENCES=1 (start-up): the fences on a device that has them; with DM_VK_X_BC_CPU=1 below, a device of today stands in for those drivers
     { const char *e = getenv("DM_VK_X_FENCES");
@@ -302,6 +535,7 @@ void vk_init(void) {
     vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)p_vkGetInstanceProcAddr(V.inst, "vkGetDeviceProcAddr");
 #define VK_LOADD(f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f); if (!f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f "KHR"); if (!f) f = (PFN_##f)p_vkGetInstanceProcAddr(V.inst, #f);   // a promoted function by its extension's name (Vulkan 1.1 / 1.2 devices)
     VK_DEV_FNS(VK_LOADD)
+    mem_acct_install(); kt_install(); uab_install();   // device memory accounting (DM_VK_MEM_ACCT): every vkAllocateMemory / vkFreeMemory through the function table goes through it
     // A driver can report the timeline-semaphore feature (and Vulkan 1.3) and still export no vkWaitSemaphores: the emulator's ranchu / gfxstream driver does
     // (both the device and the instance dispatcher return null for it and for vkGetSemaphoreCounterValue), and the first wait then called address 0
     // (SIGSEGV pc=0, lr=wait_fence+0x70, thread 'dm-vk-complete', South Park: The Stick of Truth). The feature query is not proof the entry points load:
@@ -397,7 +631,7 @@ static VkResult pool_copied_alloc(vkpool_t *p, uint64_t size, int cached) {
     if (type == UINT32_MAX) { vkDestroyBuffer(V.dev, b, NULL); return VK_ERROR_FEATURE_NOT_PRESENT; }
     BDA_ALLOC_FLAGS(NULL);
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, bda_next, req.size, type};
-    VkDeviceMemory m; r = vkAllocateMemory(V.dev, &ai, NULL, &m);
+    VkDeviceMemory m; vk_mem_tag = "pool-copied"; r = vkAllocateMemory(V.dev, &ai, NULL, &m); vk_mem_tag = NULL;
     if (r) { vkDestroyBuffer(V.dev, b, NULL); return r; }
     void *map; r = vkBindBufferMemory(V.dev, b, m, 0);
     if (!r) r = vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &map);
@@ -420,6 +654,23 @@ static void pool_cache_sync(vkpool_t *p, int invalidate, uint64_t lo, uint64_t h
     else { VKCHK(vkFlushMappedMemoryRanges(V.dev, 1, &range)); }
     if (diag) mem_diag_note(invalidate ? 4 : 3, t, range.size == VK_WHOLE_SIZE ? p->hi - p->lo - range.offset : range.size);
 }
+// The pool's bytes into the hardware buffer's fresh (zero) pages: only the pages the game has touched (present or swapped, /proc/self/pagemap bits 63 and 62); an
+// untouched anonymous page is zero on both sides. A pool backed lazily (below) may be mostly untouched, and the copy is what a game thread waits on (nvn_dirty_freeze)
+static uint64_t g_zc_copied, g_zc_skipped;   // bytes copied and bytes skipped as untouched, for the lazy pools' line
+static void copy_resident(uint8_t *dst, const uint8_t *src, uint64_t size) {
+    static int fd = -2; if (fd == -2) fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    uint64_t pg = (uint64_t)getpagesize();
+    if (fd < 0 || ((uintptr_t)src & (pg - 1)) || (size & (pg - 1))) { memcpy(dst, src, size); g_zc_copied += size; return; }
+    enum { N = 4096 }; uint64_t ent[N];
+    for (uint64_t off = 0; off < size; ) {
+        uint64_t first = ((uintptr_t)src + off) / pg, n = (size - off) / pg; if (n > N) n = N;
+        ssize_t got = pread(fd, ent, n * sizeof *ent, (off_t)(first * sizeof *ent));
+        if (got < (ssize_t)(n * sizeof *ent)) { memcpy(dst + off, src + off, size - off); g_zc_copied += size - off; return; }   // (the rest whole: the read came short)
+        for (uint64_t i = 0; i < n; i++, off += pg) {
+            if (ent[i] & (3ull << 62)) { memcpy(dst + off, src + off, pg); g_zc_copied += pg; } else g_zc_skipped += pg;
+        }
+    }
+}
 // Zero copy: the pages of [mem, mem+size) become an AHardwareBuffer's, imported as a VkBuffer. 0 on success
 static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size) {
     AHardwareBuffer_Desc d = {(uint32_t)size, 1, 1, AHARDWAREBUFFER_FORMAT_BLOB,
@@ -439,7 +690,7 @@ static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size) {
     uint8_t *tmp = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fds[0], 0);
     int ok = tmp != MAP_FAILED;
     if (ok) {
-        memcpy(tmp, mem, size); munmap(tmp, size);
+        copy_resident(tmp, mem, size); munmap(tmp, size);
         ok = mmap(mem, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fds[0], 0) == mem;
         if (!ok) mem_diag_zc(6, "mmap-fixed", size, "errno", errno);
     } else mem_diag_zc(5, "mmap-temporary", size, "errno", errno);
@@ -456,7 +707,7 @@ static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size) {
     BDA_ALLOC_FLAGS(&ded);
     VkImportAndroidHardwareBufferInfoANDROID imp = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, bda_next, ahb};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, ap.allocationSize, vk_mem_type(ap.memoryTypeBits, 0, 0)};
-    vr = vkAllocateMemory(V.dev, &ai, NULL, &p->mem);
+    vk_mem_tag = "pool-zero-copy"; vr = vkAllocateMemory(V.dev, &ai, NULL, &p->mem); vk_mem_tag = NULL;
     if (!vr) { vr = vkBindBufferMemory(V.dev, p->buf, p->mem, 0); if (vr) mem_diag_zc(10, "vkBindBufferMemory", size, "VkResult", vr); }
     else mem_diag_zc(9, "vkAllocateMemory", size, "VkResult", vr);
     if (vr) { vkDestroyBuffer(V.dev, p->buf, NULL); AHardwareBuffer_release(ahb); return -2; }
@@ -501,14 +752,33 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     for (uint64_t o = 0; o < size; o += c) pool_add_one((const uint8_t *)mem + o, size - o < c ? size - o : c, a, a + size);
     if (size > c) VKLOG("memory pool %p +%#llx: %llu chunks of at most %#llx", mem, (unsigned long long)size, (unsigned long long)((size + c - 1) / c), c);
 }
-static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end) {
-    pthread_rwlock_wrlock(&g_pool_mu);
-    if (g_npool == MAXPOOL) { pthread_rwlock_unlock(&g_pool_mu); die("[vk] too many memory pools"); }
-    vkpool_t *p = &g_pool[g_npool]; memset(p, 0, sizeof *p);
-    p->lo = (uint64_t)(uintptr_t)mem; p->hi = p->lo + size; p->base = base; p->end = end; { static uint64_t ser; p->serial = ++ser; }
-    int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : getenv("DM_VK_NO_ZEROCOPY") ? -4 : zc_over(end - base) ? -5 : pool_zero_copy(p, (uint8_t *)mem, size);
+// Lazy backing (default; DM_VK_EAGER_POOLS=1 backs every pool at creation as before): a pool's chunk gets its hardware buffer (or GPU copy) only when the replay first
+// resolves an address in it to a VkBuffer (vk_pool_of). Nintendo Switch 2 Welcome Tour makes over 3,800 pools, 5.7 GB, in its first seconds, and the hardware buffers
+// committed every page of them (gralloc's system heap allocates eagerly, and the copy wrote every page) while the game itself had touched about 1.3 GB; with the first
+// scene's images on top the low-memory killer ended it at 10 GB. Most of those pools hold packaged textures, which the replay reads on the CPU (nvn_deswizzle into
+// scratch memory), so their buffers are never asked for. Until it is backed a chunk is the game's own anonymous pages: the dirty-page tracking works on them as on any
+// (nvn_dirty_add_range), and the host copies / fills / reads them as before.
+//   Backing later means the game may be writing the pool meanwhile: the chunk is frozen (nvn_dirty_freeze: a game write to it waits in the fault handler, a host write
+// waits before it starts), its protected pages given up (nvn_dirty_hold, so no state says "read-only" of pages the new mapping makes writable), made read-only, copied
+// (touched pages only), mapped over, then unfrozen. Raw global memory (shaders dereferencing addresses, vk_gmem_map) needs a device address for every pool such an
+// address can lie in: once a shader uses it, pools the game took an address in (mtl_pool_addressed) are backed when the table is rebuilt, and new pools at creation.
+static int g_pool_lazy = -1, g_gmem_used;
+static uint64_t g_pool_chunks, g_pool_backed, g_pool_bytes, g_pool_backed_bytes, g_pool_lazy_backed;   // chunks and bytes made / backed, chunks backed after creation
+static int pool_lazy_on(void) { if (g_pool_lazy < 0) { const char *e = getenv("DM_VK_EAGER_POOLS"); g_pool_lazy = !(e && atoi(e)); } return g_pool_lazy; }
+void vk_pool_stats(uint64_t *pools, uint64_t *backed, uint64_t *bytes, uint64_t *backed_bytes) { *pools = g_pool_chunks; *backed = g_pool_backed; *bytes = g_pool_bytes; *backed_bytes = g_pool_backed_bytes; }
+// The chunk's buffer: zero-copy where it can be, else a GPU copy refreshed before each submission. Under the write lock. late: after creation (the game may be writing it)
+static void pool_back_locked(vkpool_t *p, int late) {
+    uint8_t *mem = (uint8_t *)(uintptr_t)p->lo; uint64_t size = p->hi - p->lo;
+    int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : getenv("DM_VK_NO_ZEROCOPY") ? -4 : zc_over(p->end - p->base) ? -5 : 0, frozen = 0, held = 0;
+    if (!zc && late) {   // the game's writes to the chunk wait from here to the mapping; a write between the copy and the mapping would be lost
+        nvn_dirty_hold(mem, size); nvn_dirty_freeze(mem, size); held = 1;
+        if (!mprotect(mem, size, PROT_READ)) frozen = 1; else { static int said; if (!said++) VKLOG("[RED] memory pool %p +%#llx: read-only for its late backing refused (errno %d); backed without the wait", (void *)mem, (unsigned long long)size, errno); }
+    }
+    if (!zc) zc = pool_zero_copy(p, mem, size);
+    if (frozen && zc) mprotect(mem, size, PROT_READ | PROT_WRITE);   // (zero-copy done: the new mapping is writable by itself)
+    if (held) { nvn_dirty_unfreeze(); nvn_dirty_unhold(); }
     if (zc) {
-        static int said; if (!said++) VKLOG("[RED] memory pool %p +%#llx could not be zero-copy (%d): a GPU copy is refreshed before each submission (slow)", mem, (unsigned long long)size, zc);
+        static int said; if (!said++) VKLOG("[RED] memory pool %p +%#llx could not be zero-copy (%d): a GPU copy is refreshed before each submission (slow)", (void *)mem, (unsigned long long)size, zc);
         const char *e = getenv("DM_VK_POOL_CACHED"); int cached = e && atoi(e);
         VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
         if (cached && vkFlushMappedMemoryRanges && vkInvalidateMappedMemoryRanges) r = pool_copied_alloc(p, size, 1);
@@ -518,12 +788,56 @@ static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t
             VKCHK(pool_copied_alloc(p, size, 0));
         }
     }
+    p->backed = 1; g_pool_backed++; g_pool_backed_bytes += size; if (late) g_pool_lazy_backed++;
+    static uint64_t zc_bytes, cp_bytes; if (zc) cp_bytes += size; else zc_bytes += size;
+    static int nlog; if (nlog++ < 24) VKLOG("memory pool %p +%#llx: %s%s (zero-copy %.1f MB, copied %.1f MB)", (void *)mem, (unsigned long long)size, zc ? "copied" : "zero-copy", late ? ", backed at its first GPU use" : "", zc_bytes / 1048576.0, cp_bytes / 1048576.0);
+}
+static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end) {
+    pthread_rwlock_wrlock(&g_pool_mu);
+    if (g_npool == MAXPOOL) { pthread_rwlock_unlock(&g_pool_mu); die("[vk] too many memory pools"); }
+    vkpool_t *p = &g_pool[g_npool]; memset(p, 0, sizeof *p);
+    p->lo = (uint64_t)(uintptr_t)mem; p->hi = p->lo + size; p->base = base; p->end = end; { static uint64_t ser; p->serial = ++ser; }
+    g_pool_chunks++; g_pool_bytes += size;
+    if (!pool_lazy_on() || g_gmem_used) pool_back_locked(p, 0);
     pool_ord_insert(g_npool++); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
     int np = g_npool;
     pthread_rwlock_unlock(&g_pool_mu);
-    if (np >= 1024 && !(np & (np - 1))) VKLOG("%d memory pools live", np);
-    static uint64_t zc_bytes, cp_bytes; if (zc) cp_bytes += size; else zc_bytes += size;
-    static int nlog; if (nlog++ < 24) VKLOG("memory pool %p +%#llx: %s (zero-copy %.1f MB, copied %.1f MB)", mem, (unsigned long long)size, zc ? "copied" : "zero-copy", zc_bytes / 1048576.0, cp_bytes / 1048576.0);
+    if (np >= 1024 && !(np & (np - 1))) VKLOG("%d memory pools live; %llu chunks made so far (%.1f GB), %llu backed (%.1f GB; %llu of them at their first GPU use)", np, (unsigned long long)g_pool_chunks, g_pool_bytes / 1073741824.0, (unsigned long long)g_pool_backed, g_pool_backed_bytes / 1073741824.0, (unsigned long long)g_pool_lazy_backed);
+}
+// Pools not yet backed whose [lo, hi) lies in or crosses [addr, addr+len): backed (the write lock taken; the caller holds no pool lock). From the replay (vk_pool_of, vk_gmem_map)
+static vkpool_t *pool_find_locked(uint64_t addr, uint64_t len, int *across) {   // vk_pool_of's search, under either lock
+    int lo = 0, hi = g_npool;   // the last pool by lo that starts at or below addr
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_pool[g_pool_ord[m]].lo <= addr) lo = m + 1; else hi = m; }
+    if (lo > 0) { vkpool_t *p = &g_pool[g_pool_ord[lo - 1]]; if (addr + len <= p->hi) return p; }
+    for (int i = 0; i < g_npool; i++) if (addr >= g_pool[i].lo && addr + len <= g_pool[i].hi) return &g_pool[i];   // (pools over the same memory, and the range across two chunks it reports)
+                                       else if (across && addr >= g_pool[i].lo && addr < g_pool[i].hi && addr + len <= g_pool[i].end) *across = 1;
+    return NULL;
+}
+static vkpool_t *pool_back_at(uint64_t addr, uint64_t len) {
+    pthread_rwlock_wrlock(&g_pool_mu);
+    vkpool_t *p = pool_find_locked(addr, len, NULL);   // found again under the write lock: the table may have changed since the read
+    if (p && !p->backed) { pool_back_locked(p, 1); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+        static int said; if (!said++) VKLOG("memory pools are backed at their first GPU use (DM_VK_EAGER_POOLS=1: at creation); the first: %#llx +%#llx", (unsigned long long)p->lo, (unsigned long long)(p->hi - p->lo)); }
+    pthread_rwlock_unlock(&g_pool_mu);
+    return p;
+}
+// The game took a GPU address in [mem, mem+size) (hle_nvn.c pool_mark_addressed: a buffer or texture address, or the pool's): raw global memory may reach it, so once a
+// shader uses raw global memory such a pool is backed when the pool table is rebuilt (a changed generation makes vk_gmem_map rebuild it). From the game's threads
+void mtl_pool_addressed(const void *mem, uint64_t size) {
+    uint64_t a = (uint64_t)(uintptr_t)mem, e = a + (size ? size : 1); int changed = 0;
+    pthread_rwlock_rdlock(&g_pool_mu);
+    for (int i = 0; i < g_npool; i++) { vkpool_t *p = &g_pool[i]; if (p->lo < e && a < p->hi && !p->addressed) { p->addressed = 1; changed |= !p->backed; } }
+    pthread_rwlock_unlock(&g_pool_mu);
+    if (changed && __atomic_load_n(&g_gmem_used, __ATOMIC_ACQUIRE)) __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+}
+static void pools_back_addressed(void) {   // raw global memory in use: every addressed pool gets its buffer (and new pools get theirs at creation)
+    if (!__atomic_load_n(&g_gmem_used, __ATOMIC_ACQUIRE)) { __atomic_store_n(&g_gmem_used, 1, __ATOMIC_RELEASE); VKLOG("raw global memory in use: memory pools the game took addresses in are backed now, and new pools at creation"); }
+    int n = 0; uint64_t bytes = 0;
+    pthread_rwlock_wrlock(&g_pool_mu);
+    for (int i = 0; i < g_npool; i++) { vkpool_t *p = &g_pool[i]; if (p->addressed && !p->backed) { pool_back_locked(p, 1); n++; bytes += p->hi - p->lo; } }
+    if (n) __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+    pthread_rwlock_unlock(&g_pool_mu);
+    static int nl; if (n && nl++ < 8) VKLOG("raw global memory: %d addressed memory pool chunks backed (%.1f MB)", n, bytes / 1048576.0);
 }
 void mtl_pool_del(const void *mem) {
     for (;;) {   // every chunk of the pool
@@ -534,36 +848,35 @@ void mtl_pool_del(const void *mem) {
         pthread_rwlock_unlock(&g_pool_mu);
         if (p.zero_copy) pool_copy_back(&p);
         free(p.baseline);
-        vk_defer_free_buffer(p.buf, p.mem);   // the AHardwareBuffer goes with the imported memory's last reference
+        if (p.buf) vk_defer_free_buffer(p.buf, p.mem);   // the AHardwareBuffer goes with the imported memory's last reference (a lazy pool never backed has none)
         if (p.ahb) AHardwareBuffer_release(p.ahb);
     }
 }
-vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) {
+static vkpool_t *vk_pool_of_(uint64_t addr, uint64_t len, int back) {
     // the last pools this thread found, while none was added or removed: the replay looks up every buffer binding of every draw, and the read lock alone was ~6% of it
     static __thread struct { uint32_t gen; vkpool_t *p[4]; } c;   // gen: g_pool_gen + 1 (0: empty)
     uint32_t g = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE) + 1;
-    if (c.gen == g) for (int i = 0; i < 4; i++) { vkpool_t *p = c.p[i]; if (p && addr >= p->lo && addr + len <= p->hi) return p; }
+    if (c.gen == g) for (int i = 0; i < 4; i++) { vkpool_t *p = c.p[i]; if (p && addr >= p->lo && addr + len <= p->hi) return p; }   // (cached pools are backed: backing bumps the generation)
     vkpool_t *r = NULL; int across = 0;
     pthread_rwlock_rdlock(&g_pool_mu);
-    int lo = 0, hi = g_npool;   // the last pool by lo that starts at or below addr
-    while (lo < hi) { int m = (lo + hi) / 2; if (g_pool[g_pool_ord[m]].lo <= addr) lo = m + 1; else hi = m; }
-    if (lo > 0) { vkpool_t *p = &g_pool[g_pool_ord[lo - 1]]; if (addr + len <= p->hi) r = p; }
-    if (!r)   // not in that one: the scan as before (pools over the same memory, and the range across two chunks it reports)
-        for (int i = 0; i < g_npool; i++) if (addr >= g_pool[i].lo && addr + len <= g_pool[i].hi) { r = &g_pool[i]; break; }
-                                           else if (addr >= g_pool[i].lo && addr < g_pool[i].hi && addr + len <= g_pool[i].end) across = 1;
+    r = pool_find_locked(addr, len, &across);
+    int unbacked = r && !r->backed;
     pthread_rwlock_unlock(&g_pool_mu);
-    if (r) { if (c.gen != g) { memset(&c, 0, sizeof c); c.gen = g; } memmove(&c.p[1], &c.p[0], 3 * sizeof *c.p); c.p[0] = r; }
+    if (unbacked && back) { r = pool_back_at(addr, len); g = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE) + 1; }
+    if (r && (r->backed || !back)) { if (c.gen != g) { memset(&c, 0, sizeof c); c.gen = g; } if (r->backed) { memmove(&c.p[1], &c.p[0], 3 * sizeof *c.p); c.p[0] = r; } }
     if (!r && across) { static uint64_t n; uint64_t k = ++n; if (!(k & (k - 1))) LOG("[RED] [vk] %llu ranges across two chunks of a memory pool (ZC_CHUNK; this one %#llx +%#llx): no buffer for them", (unsigned long long)k, (unsigned long long)addr, (unsigned long long)len); }
     return r;
 }
+vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) { return vk_pool_of_(addr, len, 1); }
+vkpool_t *vk_pool_peek(uint64_t addr, uint64_t len) { return vk_pool_of_(addr, len, 0); }
 uint32_t vk_pool_gen(void) { return __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE); }   // pools added or removed (gfx_vk_exec.c's descriptor set memo: vk_pool_of's results hold while it is unchanged)
 int vk_buf_at(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     vkpool_t *p = vk_pool_of(addr, len ? len : 1);
     if (!p) return 0;
     *buf = p->buf; *off = addr - p->lo; return 1;
 }
-int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
-    vkpool_t *p = vk_pool_of(addr, len ? len : 1);
+int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {   // (CPU-side: the pool's memory, not its buffer)
+    vkpool_t *p = vk_pool_peek(addr, len ? len : 1);
     if (!p) return 0;
     if (buf) *buf = (void *)(uintptr_t)p->lo; if (off) *off = addr - p->lo; return 1;
 }
@@ -647,7 +960,13 @@ static VkQueryPool g_tsq; uint64_t g_gpu_ns;
 enum { CQ = 64 };
 static VkQueryPool g_cq;
 #define SCRATCH_BLOCK (8u << 20)
-typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize size, used; } scratch_blk;
+enum { SCRATCH_IDLE = 64 };
+static VkDeviceSize scratch_cap(void);
+enum { DP_KEEP = 16 };   // descriptor pools kept per slot across recycles (vk_alloc_set, slot_recycle)
+static uint64_t g_dp_made, g_dp_freed;   // descriptor pools made and destroyed
+static uint64_t kgsl_mapped(void);   // recycles of its slot a scratch block may go unused before it is freed (slot_recycle)
+static uint64_t g_scratch_freed;   // bytes of scratch blocks freed as idle
+typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize size, used; uint32_t idle; } scratch_blk;
 typedef struct { int kind; void *a; void *b; } dfree_t;   // 0 buffer+memory, 1 image+memory, 2 view
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; int q; } post_op;   // q: a timestamp counter's query in g_cq, or -1
 struct vksub {
@@ -658,7 +977,7 @@ struct vksub {
     int ncq;          // timestamp counter queries used in this submission (g_cq)
     scratch_blk *blk; int nblk, capblk;
     VkDescriptorPool *dp; int ndp, capdp, dp_cur;
-    uint32_t dp_used[9], dp_sets; int dp_counted; int no_ts;   // what pool dp_cur has given out (vk_alloc_set)
+    uint32_t dp_used[9], dp_sets; int dp_counted; int no_ts; VkDescriptorPool *dpx; int ndpx, capdpx;   // pools made for one set each (vk_alloc_set: a layout whose needs no shared pool holds), destroyed at the recycle   // what pool dp_cur has given out (vk_alloc_set)
     dfree_t *df; int ndf, capdf;
     post_op *post; int npost, cappost;
     struct { uint64_t lo, hi; } gw[64]; int ngw, readback_ranges;   // GPU writes into pool memory in this submission (sub_gpu_wrote), for pools_copy_back: nearby ones merged, and once full each joins the nearest
@@ -805,8 +1124,16 @@ static void slot_recycle(vksub_t *s) {   // the GPU has passed this slot's last 
         else if (d->kind == 3) vkDestroyBufferView(V.dev, (VkBufferView)d->a, NULL);
     }
     s->ndf = 0;
+    // scratch blocks are kept for the slot's next submissions, but one unused for SCRATCH_IDLE recycles of the slot goes (a scene's texture uploads can take hundreds of MB of
+    // scratch per slot, and the blocks were never freed; DM_VK_SCRATCH_KEEP=1 keeps them all). The GPU is past this slot's last submission here
+    { static int keep = -1; if (keep < 0) { const char *e = getenv("DM_VK_SCRATCH_KEEP"); keep = e && atoi(e); }
+      for (int i = s->nblk - 1; i >= 0; i--) { scratch_blk *b = &s->blk[i]; b->idle = b->used ? 0 : b->idle + 1;
+          if (!keep && i > 0 && b->idle > SCRATCH_IDLE) { vkDestroyBuffer(V.dev, b->b, NULL); vkFreeMemory(V.dev, b->m, NULL); g_scratch_freed += b->size; memmove(b, b + 1, (size_t)(s->nblk - 1 - i) * sizeof *b); s->nblk--; } } }
     for (int i = 0; i < s->nblk; i++) s->blk[i].used = 0;
-    for (int i = 0; i < s->ndp; i++) vkResetDescriptorPool(V.dev, s->dp[i], 0);
+    for (int i = 0; i < s->ndp; i++) { if (i < DP_KEEP) vkResetDescriptorPool(V.dev, s->dp[i], 0); else { vkDestroyDescriptorPool(V.dev, s->dp[i], NULL); g_dp_freed++; } }
+    for (int i = 0; i < s->ndpx; i++) vkDestroyDescriptorPool(V.dev, s->dpx[i], NULL);
+    if (s->ndpx) { static int nl; if (nl++ < 4) VKLOG("descriptor pools: %d one-set pools of this slot destroyed after its submission", s->ndpx); s->ndpx = 0; }
+    if (s->ndp > DP_KEEP) { static int nl; if (nl++ < 8) VKLOG("descriptor pools: %d of this slot's destroyed after its submission (%d kept; %.0f MB of GPU memory mapped now)", s->ndp - DP_KEEP, DP_KEEP, kgsl_mapped() / 1048576.0); s->ndp = DP_KEEP; }
     s->dp_cur = 0; s->dp_counted = -1;
     // The pool is not reset: each command buffer is reset as it is begun again (the pool allows it). A reset of the transient pool made Adreno's driver free the
     // command memory and map it again as the next submission grew (ioctl, mmap and munmap): in Xenoblade Chronicles 3's battles the submission's start took 21%
@@ -820,8 +1147,17 @@ static void vk_cmd_split_(void);
 static void pools_readback_barrier(VkCommandBuffer cb);
 void vk_cmd_split(void) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
     vk_cmd_split_(); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[6] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } }
+extern struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatches, pipes_built, rt_kept, ns_exec, ns_desc, ns_pipe, max_pass_draws; } g_vkst;   // (gfx_vk_exec.c; as gfx_vk_present.c declares it)
+extern uint64_t g_set_new, g_pkg_n, g_pkg_bytes;
+static struct { uint64_t draws, passes, dispatches, sets, pkg_n, pkg_bytes, kgsl, pipes, pipe_kgsl; int parts; } g_sub0;   // at this submission's start (sub_stats)
+static void sub_stats(const char *what, int part) {   // the submission so far: what a long one is made of (Nintendo Switch 2 Welcome Tour's scene load: GPU memory the driver allocates grows by gigabytes in one submission)
+    static int nl; if (nl++ >= 48 && part >= 0) return;
+    VKLOG("%s: part %d; so far %llu draws, %llu passes, %llu dispatches, %llu pipelines built (%.0f MB of GPU memory around their creation), %llu new descriptor sets, %llu texture uploads (%.0f MB); %.0f MB of GPU memory mapped (%.0f at the start)", what, part,
+          (unsigned long long)(g_vkst.draws - g_sub0.draws), (unsigned long long)(g_vkst.passes - g_sub0.passes), (unsigned long long)(g_vkst.dispatches - g_sub0.dispatches), (unsigned long long)(g_vkst.pipes_built - g_sub0.pipes), (g_pipe_kgsl - g_sub0.pipe_kgsl) / 1048576.0, (unsigned long long)(g_set_new - g_sub0.sets),
+          (unsigned long long)(g_pkg_n - g_sub0.pkg_n), (g_pkg_bytes - g_sub0.pkg_bytes) / 1048576.0, kgsl_mapped() / 1048576.0, g_sub0.kgsl / 1048576.0);
+}
 static void vk_cmd_split_(void) {
-    vksub_t *s = cur(); if (s->nmain_used == MAIN_CBS || s->nup_used == MAIN_CBS) return;
+    vksub_t *s = cur(); if (s->nmain_used == MAIN_CBS || s->nup_used == MAIN_CBS) { static int said; if (!said++) sub_stats("a long submission: no parts left, the rest goes in the last", s->nmain_used); return; }
     pools_readback_barrier(s->main);
     if (vkEndCommandBuffer(s->main) < 0) { s->cb_err = 1; static int n; if (n++ < 3) VKLOG("[RED] a part of a long submission was refused at its end (part %d)", s->nmain_used); }
     // what is recorded so far goes to the GPU now, as a submission of its own (with its uploads first): Adreno refuses a single submission past about
@@ -833,9 +1169,10 @@ static void vk_cmd_split_(void) {
         cbs[n++] = s->main;
         if (!s->cb_err) {
             VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, n, cbs, 0, NULL};
+            vk_stage_flush();   // (staged uploads before the part that may read them)
             pthread_mutex_lock(&g_vk_queue_mu); VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu);
             if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit (part): %d (device lost?)", r); }
-            { static int n; if (n++ < 3) VKLOG("a long submission: part %d sent early", s->nmain_used); }
+            sub_stats("a long submission: part sent early", s->nmain_used);
             s->nmain_sent = s->nmain_used;
             if (s->up_used) {   // the next part records its uploads into a fresh upload buffer
                 if (s->nup_used == s->nup_alloc) { VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
@@ -872,9 +1209,65 @@ void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b->b, &req);
     BDA_ALLOC_FLAGS(NULL);   // (POOL_USAGE carries the device-address usage)
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, bda_next, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
-    VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &b->m)); VKCHK(vkBindBufferMemory(V.dev, b->b, b->m, 0));
+    vk_mem_tag = "scratch"; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &b->m)); vk_mem_tag = NULL; VKCHK(vkBindBufferMemory(V.dev, b->b, b->m, 0));
     void *m; VKCHK(vkMapMemory(V.dev, b->m, 0, VK_WHOLE_SIZE, 0, &m)); b->p = m;
-    b->used = n; *buf = b->b; *off = 0; return b->p;
+    b->used = n; *buf = b->b; *off = 0;
+    { VkDeviceSize t = 0; for (int i = 0; i < s->nblk; i++) t += s->blk[i].size; static int said; if (!said && t >= (64u << 20)) { said = 1; VKLOG("scratch: a submission slot first passed 64 MB (%.0f MB; staging engages past %llu MB)", t / 1048576.0, (unsigned long long)(scratch_cap() >> 20)); } }
+    { VkDeviceSize t = 0; for (int i = 0; i < s->nblk; i++) t += s->blk[i].size; static VkDeviceSize last; if (t >= last + (256u << 20)) { last = t; VKLOG("scratch: %.0f MB of blocks in this submission's slot (%d blocks; the latest %.1f MB)", t / 1048576.0, s->nblk, b->size / 1048576.0); } }
+    return b->p;
+}
+// ---------------- bounded staging (vk_stage_*) ----------------
+// A scene's first texture uploads can run to gigabytes in one submission (Nintendo Switch 2 Welcome Tour's first scene after the title), each a scratch allocation
+// that lives until the submission completes: the staging alone was as much memory as the images. Past DM_VK_SCRATCH_MAX_MB (default 256; 0 = never) of scratch in
+// the submission, a texture's first upload goes through this one buffer and command buffer instead, which are submitted and waited for whenever the buffer is full,
+// and submitted before the submission itself (so its images are complete before the GPU reads them; a global barrier ends each flush)
+enum { STAGE_SIZE = 128 << 20 };
+static struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize used; VkCommandPool pool; VkCommandBuffer cb; VkFence fence; int open, init; uint64_t flushes, bytes, wait_ns; } g_stage;
+static VkDeviceSize scratch_cap(void) { static VkDeviceSize c = ~0ull; if (c == ~0ull) { const char *e = getenv("DM_VK_SCRATCH_MAX_MB"); c = (VkDeviceSize)(e ? atoi(e) : 256) << 20; } return c; }
+int vk_stage_wanted(void) {
+    if (!scratch_cap() || g_cur < 0) return 0;
+    vksub_t *s = cur(); VkDeviceSize t = 0; for (int i = 0; i < s->nblk; i++) t += s->blk[i].size;
+    return t > scratch_cap();
+}
+static void stage_init(void) {
+    if (g_stage.init) return; g_stage.init = 1;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, STAGE_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
+    VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &g_stage.b));
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, g_stage.b, &req);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
+    vk_mem_tag = "staging"; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &g_stage.m)); vk_mem_tag = NULL; VKCHK(vkBindBufferMemory(V.dev, g_stage.b, g_stage.m, 0));
+    void *m; VKCHK(vkMapMemory(V.dev, g_stage.m, 0, VK_WHOLE_SIZE, 0, &m)); g_stage.p = m;
+    VkCommandPoolCreateInfo ci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, V.qf};
+    VKCHK(vkCreateCommandPool(V.dev, &ci, NULL, &g_stage.pool));
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, g_stage.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+    VKCHK(vkAllocateCommandBuffers(V.dev, &cai, &g_stage.cb));
+    VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VKCHK(vkCreateFence(V.dev, &fi, NULL, &g_stage.fence));
+    VKLOG("texture uploads past %llu MB of scratch in a submission go through a %d MB staging buffer, submitted and waited for as it fills (DM_VK_SCRATCH_MAX_MB)", (unsigned long long)(scratch_cap() >> 20), STAGE_SIZE >> 20);
+}
+static void stage_begin(void) {
+    if (g_stage.open) return;
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHK(vkBeginCommandBuffer(g_stage.cb, &bi));
+    g_stage.open = 1; g_stage.used = 0;
+}
+void vk_stage_flush(void) {
+    if (!g_stage.open) return;
+    vk_img_barrier_all(g_stage.cb); VKCHK(vkEndCommandBuffer(g_stage.cb));
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &g_stage.cb, 0, NULL};
+    pthread_mutex_lock(&g_vk_queue_mu); VkResult r = vkQueueSubmit(V.q, 1, &si, g_stage.fence); pthread_mutex_unlock(&g_vk_queue_mu);
+    if (r) die("[vk] staging vkQueueSubmit: %d (device lost?)", r);
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    VKCHK(vkWaitForFences(V.dev, 1, &g_stage.fence, VK_TRUE, ~0ull)); VKCHK(vkResetFences(V.dev, 1, &g_stage.fence));
+    clock_gettime(CLOCK_MONOTONIC, &t1); g_stage.wait_ns += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+    g_stage.open = 0; g_stage.flushes++;
+    static int nl; if (nl++ < 8 || g_stage.flushes % 64 == 0) VKLOG("staging: flush %llu (%.1f MB; %.0f MB uploaded through it so far, %.1f ms waited)", (unsigned long long)g_stage.flushes, g_stage.used / 1048576.0, g_stage.bytes / 1048576.0, g_stage.wait_ns / 1e6);
+}
+VkCommandBuffer vk_stage_cmd(void) { stage_init(); stage_begin(); return g_stage.cb; }
+void *vk_stage_alloc(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off) {
+    if (n > STAGE_SIZE) return vk_scratch(n, align, buf, off);   // (recorded into the staging command buffer all the same: the scratch lives until the submission's slot recycles)
+    stage_init(); stage_begin(); if (!align) align = 16;
+    VkDeviceSize o = (g_stage.used + align - 1) & ~(align - 1);
+    if (o + n > STAGE_SIZE) { vk_stage_flush(); stage_begin(); o = 0; }
+    g_stage.used = o + n; g_stage.bytes += n; *buf = g_stage.b; *off = o; return g_stage.p + o;
 }
 // Raw global memory (gfx_vk.h RK_GMEM_MAP): a shader that loads or stores at an address it read from memory, which the translator could tie to no storage buffer (Ryujinx
 // GlobalToStorage.TryGenerateRawStorageOp), finds the pool holding the address in this table and goes through a PhysicalStorageBuffer pointer to the pool buffer's device address.
@@ -895,20 +1288,21 @@ static VkBuffer g_gmem_buf; static VkDeviceMemory g_gmem_mem; static uint32_t g_
 VkBuffer vk_gmem_map(VkDeviceSize *len) {
     *len = (VkDeviceSize)DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY;
     if (g_gmem_buf && g_gmem_gen == vk_pool_gen()) return g_gmem_buf;
+    pools_back_addressed();   // (lazy pools: a device address for every pool a raw pointer may lie in)
     VkBuffer b; VkDeviceMemory m; uint8_t *t;
     { VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, *len, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
       VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &b)); VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b, &req);
       VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
-      VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, b, m, 0));
+      vk_mem_tag = "gmem-table"; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); vk_mem_tag = NULL; VKCHK(vkBindBufferMemory(V.dev, b, m, 0));
       void *mp; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &mp)); t = mp; }
     memset(t, 0, *len);
     for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
-    int n = 1, over = 0, noaddr = 0; uint64_t end = 0; uint32_t gen;
+    int n = 1, over = 0, noaddr = 0, unbacked = 0; uint64_t end = 0; uint32_t gen;
     pthread_rwlock_rdlock(&g_pool_mu);
     gen = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE);
     for (int k = 0; k < g_npool; k++) {
         const vkpool_t *p = &g_pool[g_pool_ord[k]];
-        if (!p->gpu) { noaddr++; continue; }
+        if (!p->gpu) { if (p->backed) noaddr++; else unbacked++; continue; }   // (a lazy pool the game took no address in: no raw pointer can lie in it)
         uint64_t lo = p->lo > end ? p->lo : end, hi = p->hi;
         if (lo >= hi) continue;
         if (n == DMSH_GMEM_MAP_ENTRIES) { over++; continue; }
@@ -929,7 +1323,7 @@ VkBuffer vk_gmem_map(VkDeviceSize *len) {
     if (noaddr) VKRED_ONCE(141, "raw global memory: %d memory pool chunks have no device address; addresses in them are not reached", noaddr);
     if (g_gmem_buf) vk_defer_free_buffer(g_gmem_buf, g_gmem_mem);
     g_gmem_buf = b; g_gmem_mem = m; g_gmem_gen = gen; g_gmem_n = n - 1;
-    { static int said; if (!said++) VKLOG("raw global memory: pool table of %d ranges (pool generation %u), rebuilt whenever a pool comes or goes", n - 1, gen); }
+    { static int said; if (said++ < 4) VKLOG("raw global memory: pool table of %d ranges (pool generation %u; %d chunks the game took no address in left out), rebuilt whenever a pool comes or goes", n - 1, gen, unbacked); }
     return b;
 }
 static void df_add(int kind, void *a, void *b) {
@@ -960,14 +1354,14 @@ VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, V
     int c = 0; while (c < IMG_CLASSES && img_class_size(c) < req->size) c++;
     if (c == IMG_CLASSES || req->size > IMG_SLOT_MAX || req->alignment > 4096) {   // memory of its own
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req->size, type}; VkDeviceMemory m;
-        return vkAllocateMemory(V.dev, &ai, NULL, &m) ? VK_NULL_HANDLE : m;
+        vk_mem_tag = "image"; VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &m); vk_mem_tag = NULL; return r ? VK_NULL_HANDLE : m;
     }
     pthread_mutex_lock(&g_imgblk_mu);
     imgblk *b = g_imgblk[c]; while (b && (b->type != type || !b->nfree)) b = b->next;
     if (!b) {
         b = calloc(1, sizeof *b); b->type = type; b->cls = (uint32_t)c; VkDeviceSize bs = img_class_size(c) * 64; if (bs < (2 << 20)) bs = 2 << 20; if (bs > IMG_BLOCK) bs = IMG_BLOCK; b->nslot = (uint32_t)(bs / img_class_size(c));   // 64 slots, 2 MB to 32 MB
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, (VkDeviceSize)b->nslot * img_class_size(c), type};
-        if (vkAllocateMemory(V.dev, &ai, NULL, &b->m)) { pthread_mutex_unlock(&g_imgblk_mu); free(b); return VK_NULL_HANDLE; }
+        vk_mem_tag = "image-block"; VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &b->m); vk_mem_tag = NULL; if (r) { pthread_mutex_unlock(&g_imgblk_mu); free(b); return VK_NULL_HANDLE; }
         for (uint32_t i = 0; i < b->nslot; i++) b->bits[i >> 6] |= 1ull << (i & 63);
         b->nfree = b->nslot; b->next = g_imgblk[c]; g_imgblk[c] = b;
     }
@@ -989,10 +1383,25 @@ void vk_defer_free_bview(VkBufferView v) { df_add(3, (void *)v, NULL); }
 // Descriptor pools: the allocator counts what each set takes and moves to a new pool before any count runs out. Adreno's driver does not refuse an
 // allocation past a pool's sizes: it succeeds and the submission then fails as a whole at vkEndCommandBuffer (VK_ERROR_OUT_OF_HOST_MEMORY; NEO's
 // handheld frames with 32-slot texture arrays crossed the old 8192 combined-sampler limit at about the 712th draw)
+// A pool's memory is the driver's, sized by its capacities whatever the sets use (Adreno 830: about 12 MB for the old capacities below, in kgsl as "VK/others(37)").
+// Nintendo Switch 2 Welcome Tour's first scene load records one submission with hundreds of thousands of sets: 217 pools, 2.6 GB, and the low-memory killer.
+// The allocator moves to a new pool when a set's needs would cross a capacity (vk_dsl_register), so the capacities can be modest: a set of a layout with
+// more of a type than a pool holds just fills pools faster. DM_VK_DP_BIG=1: the old capacities. Pools beyond DP_KEEP per slot are destroyed when the slot
+// recycles (slot_recycle), so a load's pile of them goes with the load
 enum { DP_SETS = 4096 };
-static const uint32_t DP_CAP[9] = {[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC] = 16384, [VK_DESCRIPTOR_TYPE_SAMPLER] = 1024, [VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER] = 65536, [VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE] = 1024,
+static const uint32_t DP_CAP_BIG[9] = {[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC] = 16384, [VK_DESCRIPTOR_TYPE_SAMPLER] = 1024, [VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER] = 65536, [VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE] = 1024,
     [VK_DESCRIPTOR_TYPE_STORAGE_IMAGE] = 2048, [VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER] = 4096, [VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER] = 2048,
     [VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER] = 32768, [VK_DESCRIPTOR_TYPE_STORAGE_BUFFER] = 4096};
+static const uint32_t DP_CAP_SMALL[9] = {[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC] = 4096, [VK_DESCRIPTOR_TYPE_SAMPLER] = 512, [VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER] = 8192, [VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE] = 512,
+    [VK_DESCRIPTOR_TYPE_STORAGE_IMAGE] = 512, [VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER] = 1024, [VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER] = 512,
+    [VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER] = 8192, [VK_DESCRIPTOR_TYPE_STORAGE_BUFFER] = 2048};
+static const uint32_t *DP_CAP = DP_CAP_BIG;   // (DM_VK_DP_SMALL=1: the small ones; a pool costs the same 11.8 MB either way on the Adreno 830, so the big ones fill slower)
+// The process's GPU memory as the kernel maps it (sysfs; 0 when unreadable): what the driver allocates on its own (descriptor pools, command memory) shows here and nowhere in vkAllocateMemory
+static uint64_t kgsl_mapped(void) {
+    static int fd = -2; if (fd == -2) { char path[96]; snprintf(path, sizeof path, "/sys/class/kgsl/kgsl/proc/%d/gpumem_mapped", (int)getpid()); fd = open(path, O_RDONLY | O_CLOEXEC); }
+    if (fd < 0) return 0; char buf[32]; ssize_t n = pread(fd, buf, sizeof buf - 1, 0); if (n <= 0) return 0; buf[n] = 0; return strtoull(buf, NULL, 10);
+}
+uint64_t vk_kgsl_mapped(void) { return kgsl_mapped(); }
 static nvn_hmap g_dsl_need = {.klen = sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t g_dsl_mu = PTHREAD_MUTEX_INITIALIZER;
 void vk_dsl_register(VkDescriptorSetLayout l, const VkDescriptorSetLayoutBinding *b, uint32_t n) {   // what one set of this layout takes, by type
     uint32_t *need = calloc(9, sizeof *need);
@@ -1002,13 +1411,30 @@ void vk_dsl_register(VkDescriptorSetLayout l, const VkDescriptorSetLayoutBinding
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
     vksub_t *s = cur();
     pthread_mutex_lock(&g_dsl_mu); const uint32_t *need = nvn_hm_get(&g_dsl_need, &l); pthread_mutex_unlock(&g_dsl_mu);
+    int huge = 0; if (need) for (int t = 0; t < 9; t++) if (need[t] > DP_CAP[t]) huge = 1;
+    if (huge) {   // no shared pool ever holds a set of this layout: before this check the loop below made a new 11.8 MB pool per try, for ever (Nintendo Switch 2 Welcome
+        // Tour's first scene: 700 pools and 8 GB of GPU memory in 5 s, then the low-memory killer; the game's bindless texture layouts ask for more combined samplers than a pool's capacity)
+        VkDescriptorPoolSize sz[9]; uint32_t nz = 0; for (int t = 0; t < 9; t++) if (need[t]) sz[nz++] = (VkDescriptorPoolSize){(VkDescriptorType)t, need[t]};
+        VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, g_uab ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0, 1, nz, sz};
+        if (s->ndpx == s->capdpx) { s->capdpx = s->capdpx ? 2 * s->capdpx : 16; s->dpx = realloc(s->dpx, s->capdpx * sizeof *s->dpx); }
+        VkDescriptorPool dp; VKCHK(vkCreateDescriptorPool(V.dev, &pi, NULL, &dp)); s->dpx[s->ndpx++] = dp;
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dp, 1, &l}; VkDescriptorSet set; VkResult r = vkAllocateDescriptorSets(V.dev, &ai, &set);
+        if (r) die("[vk] vkAllocateDescriptorSets (a pool of its own): %d", r);
+        static uint64_t n; if (++n <= 4 || !(n & (n - 1))) VKLOG("descriptor set %llu with a pool of its own: layout needs ubo %u / ubo-dyn %u / ssbo %u / sampler %u / combined %u / sampled %u / storage-image %u / utb %u / stb %u (a shared pool holds %u combined; %d such pools in this slot)",
+            (unsigned long long)n, need[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER], need[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC], need[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER], need[VK_DESCRIPTOR_TYPE_SAMPLER], need[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER], need[VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE], need[VK_DESCRIPTOR_TYPE_STORAGE_IMAGE], need[VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER], need[VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER], DP_CAP[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER], s->ndpx);
+        return set;
+    }
     for (;;) {
         if (s->dp_cur == s->ndp) {
             VkDescriptorPoolSize sz[9]; uint32_t nz = 0;
             for (int t = 0; t < 9; t++) if (DP_CAP[t]) sz[nz++] = (VkDescriptorPoolSize){(VkDescriptorType)t, DP_CAP[t]};
-            VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, DP_SETS, nz, sz};
+            VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, g_uab ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0, DP_SETS, nz, sz};
             if (s->ndp == s->capdp) { s->capdp = s->capdp ? 2 * s->capdp : 4; s->dp = realloc(s->dp, s->capdp * sizeof *s->dp); }
-            VKCHK(vkCreateDescriptorPool(V.dev, &pi, NULL, &s->dp[s->ndp++]));
+            { static int chosen; if (!chosen) { chosen = 1; const char *e = getenv("DM_VK_DP_SMALL"); if (e && atoi(e)) { DP_CAP = DP_CAP_SMALL; nz = 0; for (int t = 0; t < 9; t++) if (DP_CAP[t]) sz[nz++] = (VkDescriptorPoolSize){(VkDescriptorType)t, DP_CAP[t]}; pi.poolSizeCount = nz; } } }
+            uint64_t k0 = kgsl_mapped();
+            VKCHK(vkCreateDescriptorPool(V.dev, &pi, NULL, &s->dp[s->ndp++])); g_dp_made++;
+            extern uint64_t g_set_new;
+            if (g_dp_made <= 8 || g_dp_made % 32 == 0 || s->ndp % 16 == 0) VKLOG("descriptor pool %llu made (%d in this slot; %llu freed): %.1f MB of GPU memory for it, %.0f MB mapped in all; %llu new sets so far", (unsigned long long)g_dp_made, s->ndp, (unsigned long long)g_dp_freed, (kgsl_mapped() - k0) / 1048576.0, kgsl_mapped() / 1048576.0, (unsigned long long)g_set_new);
         }
         if (s->dp_cur != s->dp_counted) { memset(s->dp_used, 0, sizeof s->dp_used); s->dp_sets = 0; s->dp_counted = s->dp_cur; }
         int fits = s->dp_sets < DP_SETS;
@@ -1043,6 +1469,7 @@ void mtl_sub_begin(void) {
     { const char *e = getenv("DM_VK_POOL_READBACK_RANGES"); s->readback_ranges = e && atoi(e); }
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     s->main = s->mains[0]; s->nmain_used = 1; s->cb_err = 0; s->up = s->ups[0]; s->nup_used = 1; s->nmain_sent = 0;
+    g_sub0.draws = g_vkst.draws; g_sub0.passes = g_vkst.passes; g_sub0.dispatches = g_vkst.dispatches; g_sub0.sets = g_set_new; g_sub0.pkg_n = g_pkg_n; g_sub0.pkg_bytes = g_pkg_bytes; g_sub0.kgsl = kgsl_mapped(); g_sub0.pipes = g_vkst.pipes_built; g_sub0.pipe_kgsl = g_pipe_kgsl;
     VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++;
     // copied pools: what the game wrote before submitting goes into the GPU copy before any part of the submission can reach the GPU (DM_VK_CB_DRAWS sends
     // parts early; synced at the commit, those parts read the copy as the last submission left it), and only once no earlier submission still reads it
@@ -1301,6 +1728,8 @@ uint64_t mtl_sub_commit(void) {
     }
     else vk_bisect_result(1);
     { extern uint32_t g_sub_ops[64]; memset(g_sub_ops, 0, sizeof g_sub_ops); }
+    vk_stage_flush();   // staged uploads (vk_stage_alloc) complete before this submission reads them
+    if (s->nmain_used > 2 || g_vkst.draws - g_sub0.draws > 4000 || kgsl_mapped() > g_sub0.kgsl + (512u << 20)) { sub_stats("submission ends", -1); kt_table(); }
     if (s->up_used) { vk_img_barrier_all(s->up); VKCHK(vkEndCommandBuffer(s->up)); }
     uint64_t f = ++g_fence;
     VkCommandBuffer cbs[1 + MAIN_CBS]; uint32_t ncb = 0; if (s->up_used) cbs[ncb++] = s->up; for (int i = s->nmain_sent; i < s->nmain_used; i++) cbs[ncb++] = s->mains[i];
@@ -1318,6 +1747,14 @@ uint64_t mtl_sub_commit(void) {
     c->npass = g_npass[g_cur]; memcpy(c->pmeta, g_pmeta[g_cur], sizeof(pass_meta) * (size_t)c->npass);
     if (s->npost) { c->ops = malloc(s->npost * sizeof *c->ops); memcpy(c->ops, s->post, s->npost * sizeof *c->ops); }
     pthread_mutex_lock(&g_cmu); if (g_ct) g_ct->next = c; else g_ch = c; g_ct = c; pthread_cond_signal(&g_ccv); pthread_mutex_unlock(&g_cmu);
+    // Command memory: Adreno keeps what a command buffer's recording mapped (a bound descriptor set's descriptors are copied into the stream: Nintendo Switch 2 Welcome
+    // Tour's first scene load recorded 3.3 GB in one submission, and the slots kept it), and a pool reset is the only way to give it back. A submission that mapped
+    // DM_VK_CMDMEM_RESET_MB (default 256; 0 = never) or more is waited for here (after its completion record is queued: the completion thread moves the fence) and its slot's pool reset with its resources released: a stall, at a scene load only
+    { static int64_t cap = -1; if (cap < 0) { const char *e = getenv("DM_VK_CMDMEM_RESET_MB"); cap = (int64_t)(e ? atoi(e) : 256) << 20; }
+      uint64_t now = kgsl_mapped(); if (cap && now > g_sub0.kgsl + (uint64_t)cap) {
+          struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); mtl_wait(f, ~0ull);
+          VKCHK(vkResetCommandPool(V.dev, s->pool, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT)); clock_gettime(CLOCK_MONOTONIC, &t1);
+          static int nl; if (nl++ < 12) VKLOG("command memory: submission %llu mapped %.0f MB of GPU memory; waited %.1f ms for it and released its slot's command pool: %.0f MB mapped now (was %.0f)", (unsigned long long)f, (now - g_sub0.kgsl) / 1048576.0, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, kgsl_mapped() / 1048576.0, now / 1048576.0); } }
     s->npost = 0; g_cur = -1;
     pthread_mutex_unlock(&g_sub_lock);
     return f;

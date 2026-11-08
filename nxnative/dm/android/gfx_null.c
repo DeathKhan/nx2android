@@ -23,6 +23,7 @@ static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct time
 typedef struct { uint64_t lo, hi; } pool_ent;
 static pool_ent *g_pools; static int g_npool, g_poolcap;
 static pthread_rwlock_t g_pool_mu = PTHREAD_RWLOCK_INITIALIZER;
+void mtl_pool_addressed(const void *mem, uint64_t size) { (void)mem; (void)size; }   // (the Vulkan backend's is in gfx_vk_core.c: lazy pools)
 void mtl_pool_add(const void *mem, uint64_t size) {
     pthread_rwlock_wrlock(&g_pool_mu);
     if (g_npool == g_poolcap) { g_poolcap = g_poolcap ? 2 * g_poolcap : 256; g_pools = realloc(g_pools, g_poolcap * sizeof *g_pools); }
