@@ -70,6 +70,12 @@ void mtl_exec(const uint8_t *p) {
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = 1; break; }
+        // Upstream's queue waits (hle_nvn.c nvnCommandBufferWaitEvent / WaitSync, ea0c98df3): the Apple scheduler parks the queue on them; this replay runs
+        // submissions in their order and does not wait, as when the calls were no-ops. An event wait whose predicate does not hold yet is named once (an
+        // ordering the logical queues would change: Ocarina of Time's lighting producer and consumer)
+        case OP_WAIT_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4);
+            uint32_t cur = __atomic_load_n(val, __ATOMIC_ACQUIRE); if (!(m == 0 ? cur == v : (uint32_t)(cur - v) < 0x80000000u)) (void)0; break; }
+        case OP_WAIT_SYNC: break;
         case OP_CLEAR_BUF: { const p_clear_buf *cb = (const p_clear_buf *)a; mtl_sub_fill(cb->addr, cb->size, cb->value); break; }
         case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, n); break; }
