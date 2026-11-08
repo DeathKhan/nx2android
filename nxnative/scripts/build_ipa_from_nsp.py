@@ -457,9 +457,8 @@ def configure_dotnet(env):
 
 
 # ---- NSP identification without nx_extract (the Android porter's reader of a dump's title ID: the ticket, else the content meta NCA's header through prod.keys' header_key) ----
-# TODO(upsync): scan_nsps below now takes the title IDs and versions from nx_extract --contents (package_reader), as upstream does, and no longer calls title_of; porter/pipeline.py
-# still calls scan_nsps(folder, exts, keys) and must switch to scan_nsps(folder, packages.contents, want) under package_reader(repo, keys, env). These helpers stay for the porter
-# until then (dumps.EXTS: nsz / xcz are read by nx_extract --contents as well)
+# scan_nsps takes the title IDs and versions from nx_extract --contents (package_reader) as upstream does, and porter/pipeline.py calls it that way. These helpers serve
+# legacy_contents (the earlier scan_nsps(folder, exts, keys) form, kept for the porter's tests) and the porter's own readers
 def dump_files(f):   # the files of a dump, [(name, offset in the file)]: NSP / NSZ = PFS0; XCI / XCZ = its secure partition (an HFS0 in the root HFS0 the card header points to); [] for anything else
     def fs(at, esize):   # a PFS0 (entries of 0x18 bytes) or HFS0 (0x40)
         f.seek(at); h = f.read(16)
@@ -602,6 +601,28 @@ def extract_flags(app):   # nx_extract's options shared by its extraction calls:
             + (['--allow-damaged'] if ALLOW_DAMAGED else []))
 
 
+def legacy_contents(exts, keys):
+    """A contents_of for scan_nsps without nx_extract (the porter's tests): each package's title ID from its ticket, else from its content meta NCA's header through prod.keys'
+    header_key, its kind from the title ID's low bits and its version from the [vN] tag in its name; the old error when none of them can be read"""
+    hk = header_key(keys) if keys else None
+    def contents(paths):
+        out, unknown = {}, []
+        for p in paths:
+            if p.suffix.lower()[1:] not in exts: continue
+            tid = title_of(p, hk)
+            if tid is None: unknown.append(p); out[p] = 'no ticket and no [title ID] in the name'; continue
+            low = tid & 0xFFF
+            out[p] = [('Application' if low == 0 else 'Patch' if low == 0x800 else 'AddOnContent', tid, name_version(p) or 0)]
+        if unknown and len(unknown) == len(out):
+            why = (': no prod.keys to read the title ID from the NCA headers' if not keys else f': no such file: {keys}' if not Path(keys).is_file()
+                   else ': prod.keys has no header_key' if not hk
+                   else ': pycryptodome is missing to read the NCA headers (pip install pycryptodome)' if not aes_ecb(hk[:16]) else ': no content meta NCA in them')
+            raise BuildError(f'no NSP with a readable title ID ({", ".join(p.name for p in unknown)}: no ticket and no [title ID] in the name{why}; '
+                             'or put the title ID in the base game\'s name, e.g. "Game [01009D901BC56000][v0].xci")')
+        return out
+    return contents
+
+
 def scan_nsps(nsp_dir, contents_of, want=None):
     """Group by game: {application title ID: {'base': path, 'base_version': N, 'updates': [(version, path)], 'dlc': [(title ID, version, path)]}}. Every package's title IDs and
     versions are those of its content metas, contents_of(paths) -> {path: [(type, title ID, version)] or why it has none} (package_reader), never its file name: a [v<N>] tag that says otherwise is
@@ -609,6 +630,8 @@ def scan_nsps(nsp_dir, contents_of, want=None):
     them: nx_extract takes the base game's, the update's or a DLC's NCAs from it by content meta type and title ID (--app). An NSZ / XCZ is listed as it is (its meta NCAs are not
     compressed) and converted afterwards (decompress_nsz). want: the game to pack when the folder holds several (--title-id / TITLE_ID: a cartridge dump with two games,
     Super Mario Galaxy + Super Mario Galaxy 2)"""
+    if not callable(contents_of):   # the fork's earlier form scan_nsps(folder, exts, keys): title IDs from the ticket or the NCA headers (title_of), versions from the names; no nx_extract
+        contents_of, want = legacy_contents(contents_of, want), None
     fams = {}
     def add(p, tid, version):
         low = tid & 0xFFF   # base …000, update …800, DLC = base + 0x1000 + index
