@@ -987,7 +987,9 @@ static int handle_event(AInputEvent *e) {
             return 0;
         }
         atomic_store(&g_overlay, 0); g_pad_used = 1; atomic_store(&g_pad_in, AInputEvent_getDeviceId(e)); dm_haptics_android_device(AInputEvent_getDeviceId(e));   // a controller is in use: the gamepad steps aside (until a touch)
-        if (atomic_load(&g_menu)) { if (down && AKeyEvent_getRepeatCount(e) == 0) menu_key(bit); return 1; }
+        static uint64_t swallow;   // keys the menu took: the game does not get them until they are up again (+ or B closing the menu: its repeats, its release)
+        if (atomic_load(&g_menu)) { if (down) swallow |= bit; if (down && AKeyEvent_getRepeatCount(e) == 0) menu_key(bit); return 1; }
+        if (swallow & bit) { if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) swallow &= ~bit; return 1; }
         if (down) g_btn |= bit; else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) g_btn &= ~bit;
         dm_pad_players(1); pad_publish(); return 1;
     }

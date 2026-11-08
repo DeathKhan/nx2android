@@ -294,21 +294,22 @@ static void ov_text(uint8_t *px, uint32_t w, uint32_t h, float cx, float cy, con
 }
 // colour drawing for the menu button and the panel: straight alpha, "over" blending, shapes antialiased by their distance
 typedef struct { uint8_t *px; uint32_t stride, x0, y0, w, h; } ov_canvas;   // a w x h window of rows `stride` texels wide, at (x0, y0)
+static inline void px_over(uint8_t *p, const uint8_t c[4]) {   // cv_blend at full coverage, in integers (a shape's inside)
+    unsigned a = c[3], da = p[3];
+    if (!da || a == 255) { p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; p[3] = (uint8_t)a; return; }
+    unsigned w = da * (255 - a), oa = a * 255 + w, inv = (1u << 24) / oa, ca = a * 255;   // (alpha x 255; one division)
+    for (int k = 0; k < 3; k++) p[k] = (uint8_t)(((c[k] * ca + p[k] * w) * (uint64_t)inv + (1u << 23)) >> 24);
+    p[3] = (uint8_t)((oa + 127) / 255);
+}
 static void cv_blend(const ov_canvas *cv, int x, int y, const uint8_t c[4], float cov) {
     if (x < 0 || y < 0 || (uint32_t)x >= cv->w || (uint32_t)y >= cv->h || cov <= 0) return;
     uint8_t *p = cv->px + 4 * ((size_t)(cv->y0 + y) * cv->stride + cv->x0 + x);
+    if (cov >= 1) { px_over(p, c); return; }
     float a = c[3] / 255.0f * (cov > 1 ? 1 : cov);
     if (!p[3] || a >= 1) { p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; p[3] = (uint8_t)(a * 255 + 0.5f); return; }   // (onto nothing, or opaque: no mixing)
     float da = p[3] / 255.0f, oa = a + da * (1 - a);
     for (int k = 0; k < 3; k++) p[k] = (uint8_t)((c[k] * a + p[k] * da * (1 - a)) / oa + 0.5f);
     p[3] = (uint8_t)(oa * 255 + 0.5f);
-}
-static inline void px_over(uint8_t *p, const uint8_t c[4]) {   // cv_blend at full coverage, in integers (a shape's inside)
-    unsigned a = c[3], da = p[3];
-    if (!da || a == 255) { p[0] = c[0]; p[1] = c[1]; p[2] = c[2]; p[3] = (uint8_t)a; return; }
-    unsigned w = da * (255 - a), oa = a * 255 + w;   // (alpha x 255)
-    for (int k = 0; k < 3; k++) p[k] = (uint8_t)((c[k] * a * 255 + p[k] * w + oa / 2) / oa);
-    p[3] = (uint8_t)((oa + 127) / 255);
 }
 // a filled rounded rectangle, its colour from c0 at the top to c1 at the bottom; the distance is worked out only near the edges and in the corners
 static void cv_rrect2(const ov_canvas *cv, float x0, float y0, float x1, float y1, float rad, const uint8_t c0[4], const uint8_t c1[4]) {
@@ -402,7 +403,7 @@ static void ov_accent_update(void) {
     static const uint8_t dark[4] = {18, 18, 22, 255}; memcpy(C_ON_ACCENT, l > 0.62f ? dark : C_WHITE, 4);
     memcpy(C_ACC_SEL, C_ACCENT, 3); C_ACC_SEL[3] = 44; memcpy(C_ACC_PRESS, C_ACCENT, 3); C_ACC_PRESS[3] = 84;
 }
-static const uint8_t C_PANEL0[4] = {34, 35, 43, 236}, C_PANEL1[4] = {19, 20, 25, 242}, C_RIM[4] = {255, 255, 255, 30}, C_TEXT[4] = {244, 244, 248, 255},
+static const uint8_t C_PANEL0[4] = {34, 35, 43, 246}, C_PANEL1[4] = {19, 20, 25, 250}, C_RIM[4] = {255, 255, 255, 30}, C_TEXT[4] = {244, 244, 248, 255},
                      C_SUB[4] = {146, 149, 162, 255}, C_DIM[4] = {186, 188, 199, 255}, C_FILL[4] = {255, 255, 255, 20}, C_FILL2[4] = {255, 255, 255, 34},
                      C_SEP[4] = {255, 255, 255, 16}, C_OFF[4] = {255, 255, 255, 52}, C_KNOB_OFF[4] = {222, 223, 230, 255}, C_SHADOW[4] = {0, 0, 0, 255},
                      C_BADGE[4] = {226, 227, 233, 255}, C_BADGE_TX[4] = {24, 24, 30, 255}, C_RED[4] = {255, 105, 97, 255};
@@ -419,33 +420,27 @@ static void ov_menu_icon(const ov_canvas *cv, const ov_ctl *c, const float b[4])
 // The panel's card: a soft shadow in the margin m around it (the raster's edge to the card's), the card's fill (lighter at the top) and a faint rim.
 // Returns the card's canvas (the raster less the margin)
 static ov_canvas ov_card(const ov_canvas *cv, float m, float rad) {
-    // The shadow's coverage is the same for every redraw of one size: worked out once (g_shadow) and copied into the margin and the corners after that
-    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint8_t *g_shadow; static uint32_t sw, shh; static float sm, srad;
+    // The card with its shadow is the same for every redraw of one size: drawn once into g_bg, copied in after that (one pass over the panel's texels)
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint8_t *g_bg; static uint32_t bw, bh; static float bm, brad;
     float w = cv->w - 2 * m, h = cv->h - 2 * m, cx = cv->w / 2.0f, cy = cv->h / 2.0f, dy = m * 0.30f;
     pthread_mutex_lock(&mu);
-    if (!g_shadow || sw != cv->w || shh != cv->h || sm != m || srad != rad) {
-        free(g_shadow); g_shadow = calloc((size_t)cv->w * cv->h, 1); sw = cv->w; shh = cv->h; sm = m; srad = rad;
-        for (int y = 0; g_shadow && y < (int)cv->h; y++) for (int x = 0; x < (int)cv->w; x++) {   // only outside the card, falling off over the margin
+    if (!g_bg || bw != cv->w || bh != cv->h || bm != m || brad != rad) {
+        free(g_bg); g_bg = calloc((size_t)cv->w * cv->h, 4); bw = cv->w; bh = cv->h; bm = m; brad = rad;
+        ov_canvas bg = {g_bg, cv->w, 0, 0, cv->w, cv->h};
+        for (int y = 0; g_bg && y < (int)cv->h; y++) for (int x = 0; x < (int)cv->w; x++) {   // the shadow: only outside the card, falling off over the margin
             float qx = fabsf(x + 0.5f - cx) - (w / 2 - rad), qy = fabsf(y + 0.5f - cy) - (h / 2 - rad);
             float ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0, d = sqrtf(ox * ox + oy * oy) + fminf(fmaxf(qx, qy), 0) - rad;
             if (d < 0) continue;
             float qy2 = fabsf(y + 0.5f - cy - dy) - (h / 2 - rad), oy2 = qy2 > 0 ? qy2 : 0, d2 = sqrtf(ox * ox + oy2 * oy2) + fminf(fmaxf(qx, qy2), 0) - rad;   // offset down
             float f = 1 - fmaxf(d2, 0) / (m * 0.95f); if (f <= 0) continue;
-            g_shadow[(size_t)y * cv->w + x] = (uint8_t)(0.42f * f * f * 255 + 0.5f);
+            cv_blend(&bg, x, y, C_SHADOW, 0.42f * f * f);
         }
+        ov_canvas in = {g_bg, cv->w, (uint32_t)m, (uint32_t)m, (uint32_t)w, (uint32_t)h};
+        if (g_bg) { cv_rrect2(&in, 0, 0, (float)in.w, (float)in.h, rad, C_PANEL0, C_PANEL1); cv_rring(&in, 0, 0, (float)in.w, (float)in.h, rad, 1.2f, C_RIM); }
     }
-    uint32_t band = (uint32_t)(m + rad + 2);   // rows this near the top or bottom: whole; the others: their margins only
-    for (uint32_t y = 0; g_shadow && y < cv->h; y++) {
-        int full = y < band || y + band >= cv->h; uint8_t *row = cv->px + 4 * ((size_t)(cv->y0 + y) * cv->stride + cv->x0); const uint8_t *s = g_shadow + (size_t)y * cv->w;
-        for (uint32_t x = 0; x < cv->w; x++) {
-            if (!full && x == (uint32_t)m + 1 && cv->w > 2 * (uint32_t)m + 2) x = cv->w - (uint32_t)m - 1;
-            if (s[x]) { uint8_t c[4] = {0, 0, 0, s[x]}; px_over(row + 4 * x, c); }
-        }
-    }
+    for (uint32_t y = 0; g_bg && y < cv->h; y++) memcpy(cv->px + 4 * ((size_t)(cv->y0 + y) * cv->stride + cv->x0), g_bg + 4 * (size_t)y * cv->w, (size_t)cv->w * 4);
     pthread_mutex_unlock(&mu);
     ov_canvas in = {cv->px, cv->stride, cv->x0 + (uint32_t)m, cv->y0 + (uint32_t)m, (uint32_t)w, (uint32_t)h};
-    cv_rrect2(&in, 0, 0, (float)in.w, (float)in.h, rad, C_PANEL0, C_PANEL1);
-    cv_rring(&in, 0, 0, (float)in.w, (float)in.h, rad, 1.2f, C_RIM);
     return in;
 }
 // a controller key's badge: a light disc with the letter (A, B, X, Y), or a rounded tab (L, R, +, -); returns its width
@@ -713,8 +708,10 @@ static void ov_card_size(float W, float H, uint32_t *w, uint32_t *h) {   // the 
 static void ov_panel(int st) {   // into the panel's rows of the upload buffer
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     ov_canvas cv = {g_ov.px, g_ov.tw, 0, g_ov.h + g_ov.sh, g_ov.pw, g_ov.ph};
-    for (uint32_t y = 0; y < g_ov.ph; y++) memset(g_ov.px + 4 * ((size_t)(cv.y0 + y) * g_ov.tw), 0, (size_t)g_ov.pw * 4);
-    if (!(st & OVE_ST) || (st >> 16 & 1)) ov_card_size((float)g_sext.width, (float)g_sext.height, &cv.w, &cv.h);   // (the editor's panels: the whole area)
+    uint32_t cw = 0, ch = 0; if (!(st & OVE_ST) || (st >> 16 & 1)) ov_card_size((float)g_sext.width, (float)g_sext.height, &cw, &ch);   // (the editor's panels: the whole area)
+    for (uint32_t y = 0; y < g_ov.ph; y++) { uint8_t *row = g_ov.px + 4 * ((size_t)(cv.y0 + y) * g_ov.tw);   // cleared where the card does not cover
+        if (y >= ch) memset(row, 0, (size_t)g_ov.pw * 4); else if (cw < g_ov.pw) memset(row + 4 * cw, 0, (size_t)(g_ov.pw - cw) * 4); }
+    if (cw) { cv.w = cw; cv.h = ch; }
     ov_panel_into(&cv, st, (float)g_sext.width, (float)g_sext.height, 1, ov_panel_margin((float)g_sext.height));
     clock_gettime(CLOCK_MONOTONIC, &t1); double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     static int logged; if (logged < 3 || ms > 12) { logged++; VKLOG("[menu] panel %ux%u rasterized in %.1f ms (font: %s)", g_ov.pw, g_ov.ph, ms, ovf_path() ? ovf_path() : "bitmap letters"); }
@@ -800,9 +797,8 @@ static float ov_glow(int64_t t, int64_t now) {   // a held button's glow: bright
     if (!t) return 0;
     float f = (float)(now - t) / OV_FLASH_NS; return f >= 1 ? 0.22f : 0.22f + 0.48f * (1 - f) * (1 - f);
 }
-// The frame rate counter: the game's frames shown per second, measured over half a second, in the window's top left corner on a dark pill. Its characters
-// (OV_FPS_CHARS) are rasterized at the window's resolution into the rows under the panel, one cell each (the digits white, the letters the accent's), and a
-// disc after them (the pill's ends); the counter is put together from them on every present, so a changing number needs no upload
+// The frame rate counter: the game's frames shown per second, measured over half a second, in the window's top left corner on a dark box. Its characters
+// (OV_FPS_CHARS) are rasterized at the window's resolution into the rows under the panel, one cell each (the digits white, the letters the accent's); the counter is put together from them on every present, so a changing number needs no upload
 static float ov_fps_cell(void) { return (ovf_ready() ? 7.0f : 6.0f) * g_ov.gs + 2; }   // a character cell's width in texels
 static void ov_fps_glyphs(void) {   // the characters into the rows under the panel
     ov_canvas cv = {g_ov.px, g_ov.tw, 0, g_ov.h + g_ov.sh + g_ov.ph, g_ov.tw, g_ov.gh};
@@ -812,7 +808,6 @@ static void ov_fps_glyphs(void) {   // the characters into the rows under the pa
         char one[2] = {OV_FPS_CHARS[i], 0}; const uint8_t *c = one[0] >= 'A' && one[0] <= 'Z' ? C_ACCENT : C_WHITE;
         if (px > 0) tx_c(&cv, i * cell + cell / 2, g_ov.gh / 2.0f, one, px, 1, c); else cv_text(&cv, i * cell + 1 + g_ov.gs * 0.5f, g_ov.gh / 2.0f, one, (int)g_ov.gs, c);
     }
-    static const uint8_t k[4] = {0, 0, 0, 255}; float r = g_ov.gh / 2.0f; cv_disc(&cv, strlen(OV_FPS_CHARS) * cell + r + 2, r, r - 1, k);
 }
 static void ov_fps(VkCommandBuffer cb, int64_t now) {
     static uint64_t n0; static int64_t t0; static int fps = -1;
@@ -821,11 +816,9 @@ static void ov_fps(VkCommandBuffer cb, int64_t now) {
     else if (now - t0 >= 500000000ll) { fps = (int)((double)(n - n0) * 1e9 / (double)(now - t0) + 0.5); t0 = now; n0 = n; }
     char s[16]; if (fps < 0) snprintf(s, sizeof s, "-- FPS"); else snprintf(s, sizeof s, "%d FPS", fps > 999 ? 999 : fps);
     float cw = ov_fps_cell() * (ovf_ready() ? 0.80f : 1), ch = (float)g_ov.gh, m = (float)g_sext.height * 0.02f, r = ch / 2, x = m + r * 0.9f, gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
-    float bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1], dx = strlen(OV_FPS_CHARS) * ov_fps_cell() + r + 2, x1 = x + strlen(s) * cw + r * 0.1f;
-    ov_rect(cb, m, m, m + r, m + ch, dx - r, gy, dx, gy + ch, 0.50f);                 // the pill: its left end, middle and right end
-    ov_rect(cb, m + r, m, x1, m + ch, bx - 2, by - 2, bx + 2, by + 2, 0.50f);
-    ov_rect(cb, x1, m, x1 + r, m + ch, dx, gy, dx + r, gy + ch, 0.50f);
-    for (int i = 0; s[i]; i++, x += cw) {
+    float bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1], x1 = x + (strlen(s) - (strchr(s, ' ') ? 0.55f : 0)) * cw + r * 0.1f;
+    ov_rect(cb, m, m, x1 + r * 0.9f, m + ch, bx - 2, by - 2, bx + 2, by + 2, 0.50f);   // the box: square-cornered, as much room each side
+    for (int i = 0; s[i]; x += s[i] == ' ' ? cw * 0.45f : cw, i++) {   // (a narrower space)
         const char *c = strchr(OV_FPS_CHARS, s[i]); if (!c || s[i] == ' ') continue;
         float u = (float)(c - OV_FPS_CHARS) * ov_fps_cell(), o = (ov_fps_cell() - cw) / 2;
         ov_rect(cb, x - o, m, x - o + ov_fps_cell(), m + ch, u, gy, u + ov_fps_cell(), gy + ch, 1);
