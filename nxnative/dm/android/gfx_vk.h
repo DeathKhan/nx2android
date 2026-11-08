@@ -221,6 +221,7 @@ enum { VK_NSETS = 6, TBL_SLOTS = 3, TBL_MIN = 256 };
 VkDescriptorSetLayout vk_tbl_dsl(void);
 int vk_tbl_n(void);
 vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo);   // the geometry shader translated for the draw's input primitive (shader_vk.py gs_variant_key); gs when there is none
+enum { VK_ATEST_SPEC_FUNC = 0x7a00, VK_ATEST_SPEC_REF = 0x7a01 };   // the alpha test variant's specialization constants (gfx_vk_shader.c spv_alpha_test)
 VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd);   // the module, or its variant (integer views; extra outputs; fragment depth written)
 void vk_shaders_open(const char *path);
 VkBuffer vk_support_buffer(void);

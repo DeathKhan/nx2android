@@ -29,7 +29,7 @@ static struct {
     uint8_t push[2][0x100];   // NVN2 push constants of the graphics stages [0] and compute [1] (OP_PUSH_CONST; DMSH_PUSH_SIZE bytes each)
     float vp[16][4]; float dnear, dfar; p_scissor sc; int sc_set; uint8_t vp_sw[16][4];   // vp_sw: viewport swizzles XOR the identity (p_vp_swizzle)
     int sref[2], smask[2], swmask[2];
-    p_poly_offset pofs; float blendc[4]; int depth_clamp, rast_discard, prim_restart;
+    p_poly_offset pofs; float blendc[4]; int depth_clamp, rast_discard, prim_restart; float alpha_ref;   // alpha_ref: SetAlphaRef (the alpha test, pkey atest)
     tex_t rt_col[8], rt_dep; view_t rt_cview[8], rt_dview; uint8_t rt_has_col[8], rt_has_cview[8], rt_has_dep, rt_has_dview; int rt_n; uint32_t rt_bad[8];   // rt_bad: the first word of a colour slot that is not a texture object (traces)
     int64_t row_stride, image_stride;
     // the open render pass
@@ -519,6 +519,7 @@ void vk_pass_dump_poll(uint64_t done_fence) {   // gfx_vk_present.c, every prese
             char rp[1100]; snprintf(rp, sizeof rp, "%s.f32", path); rawrow = malloc((size_t)d->w * 3 * sizeof *rawrow);
             if (rawrow) raw = fopen(rp, "wb");
         }
+        const char *pa = getenv("DM_VK_PASSDUMP_ALPHA"); int alpha = pa && atoi(pa);
         for (uint32_t y = 0; y < d->h; y++) { for (uint32_t x = 0; x < d->w; x++) {
             if (d->f == VK_FORMAT_R16G16B16A16_SFLOAT || d->f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || d->f == VK_FORMAT_R16_SFLOAT) { float v3[3];
                 if (d->f == VK_FORMAT_R16G16B16A16_SFLOAT) { const uint16_t *p = (const uint16_t *)d->p + ((size_t)y * d->w + x) * 4; for (int c = 0; c < 3; c++) v3[c] = half2f(p[c]); }
@@ -529,7 +530,8 @@ void vk_pass_dump_poll(uint64_t done_fence) {   // gfx_vk_present.c, every prese
                 for (int c = 0; c < 3; c++) { float v = v3[c]; if (v != v || v > 65000.f || v < -65000.f) { bad++; v = 1; } if (v > mx) mx = v; if (v < mn) mn = v; sum += v; row[3 * x + c] = (uint8_t)(v <= 0 ? 0 : v >= 1 ? 255 : v * 255 + .5f); } }
             else if (d->f == VK_FORMAT_R8_UNORM) row[3 * x] = row[3 * x + 1] = row[3 * x + 2] = ((const uint8_t *)d->p)[(size_t)y * d->w + x];
             else if (d->f == VK_FORMAT_A2B10G10R10_UNORM_PACK32) { uint32_t w = ((const uint32_t *)d->p)[(size_t)y * d->w + x]; for (int c = 0; c < 3; c++) row[3 * x + c] = (uint8_t)((w >> (10 * c) & 0x3ff) >> 2); }
-            else { const uint8_t *p = (const uint8_t *)d->p + ((size_t)y * d->w + x) * 4; int bgr = d->f == VK_FORMAT_B8G8R8A8_UNORM; row[3 * x] = p[bgr ? 2 : 0]; row[3 * x + 1] = p[1]; row[3 * x + 2] = p[bgr ? 0 : 2]; } }
+            else { const uint8_t *p = (const uint8_t *)d->p + ((size_t)y * d->w + x) * 4; int bgr = d->f == VK_FORMAT_B8G8R8A8_UNORM; row[3 * x] = p[bgr ? 2 : 0]; row[3 * x + 1] = p[1]; row[3 * x + 2] = p[bgr ? 0 : 2];
+                if (alpha) row[3 * x] = row[3 * x + 1] = row[3 * x + 2] = p[3]; } }   // DM_VK_PASSDUMP_ALPHA=1: the alpha channel as grey (8-bit RGBA / BGRA targets)
             fwrite(row, 1, (size_t)d->w * 3, f);
             if (raw) fwrite(rawrow, sizeof *rawrow, (size_t)d->w * 3, raw); }
         if (raw) fclose(raw); free(rawrow);
@@ -927,6 +929,7 @@ typedef struct {
     uint32_t clip_neg1, alt, fdz, dual;   // fdz: the fragment shader's variant that writes gl_FragDepth = gl_FragCoord.z (fdz below); dual: its dual-source variant (below)
     uint32_t flat;   // live flat-shader diagnostic mode, captured for asynchronous builds and pipeline lookup
     uint64_t um[3], im[3];   // each stage's sampled bindings given integer views (vk_shader_module)
+    uint32_t atest, aref;   // the alpha test: NVN_ALPHA_FUNC_* (0 none) and the reference's bits (the fragment shader's alpha test variant, its specialization constants). Last: older records read with zeros
 } pkey;
 static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pipe_ready = PTHREAD_COND_INITIALIZER;   // the replay thread and the prewarm threads
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]);
@@ -1073,6 +1076,10 @@ static void prewarm_start(void) {
     if (f && fread(fh, sizeof fh, 1, f) == 1 && fh[0] == hdr[0] && fh[1] == hdr[1]) {
         fseek(f, 0, SEEK_END); long n = (ftell(f) - (long)sizeof fh) / (long)sizeof(pkey); fseek(f, sizeof fh, SEEK_SET);
         if (n > 0) { g_pw = malloc((size_t)n * sizeof(pkey)); g_pw_n = fread(g_pw, sizeof(pkey), (size_t)n, f); }
+    } else if (f && fh[0] == hdr[0] && fh[1] == (uint32_t)offsetof(pkey, atest)) {   // records from before the alpha test fields (appended last): read with them zero
+        size_t os = offsetof(pkey, atest); fseek(f, 0, SEEK_END); long n = (ftell(f) - (long)sizeof fh) / (long)os; fseek(f, sizeof fh, SEEK_SET);
+        if (n > 0) { g_pw = calloc((size_t)n, sizeof(pkey)); uint8_t *r = malloc(os); for (long i = 0; i < n && fread(r, os, 1, f) == 1; i++) { memcpy(&g_pw[i], r, os); g_pw_n++; } free(r); }
+        VKLOG("prewarm: %zu pipelines recorded before the alpha test key fields, read with the test off", g_pw_n);
     }
     if (f) fclose(f);
     // rewrite the file with the records read (dropping a torn last record), then append to it
@@ -1115,7 +1122,11 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     const vkshader_t *fs = stg[1] && !k->raster_discard ? stg[1] : NULL; uint32_t xo[3] = {0};
     if (stg[0]) xo[0] = (stg[2] ? stg[2]->in_locs : fs ? fs->in_locs : 0) & ~stg[0]->out_locs;
     if (stg[2]) xo[2] = (fs ? fs->in_locs : 0) & ~stg[2]->out_locs;
-    for (int i = 0; i < 3; i++) if (stg[i] && !(i == 1 && k->raster_discard)) ss[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(fl[i], NULL), 0, fl[i], vk_shader_module(stg[i], k->um[i], k->im[i], k->alt && !k->um[i] && !k->im[i] && !xo[i] ? 1u << 31 : xo[i], i == 1 ? (k->fdz ? 1 : 0) | (k->dual ? 2 : 0) : 0), "main", NULL};   // (pNext: DM_VK_SUBGROUP_PIN)
+    for (int i = 0; i < 3; i++) if (stg[i] && !(i == 1 && k->raster_discard)) ss[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(fl[i], NULL), 0, fl[i], vk_shader_module(stg[i], k->um[i], k->im[i], k->alt && !k->um[i] && !k->im[i] && !xo[i] ? 1u << 31 : xo[i], i == 1 ? (k->fdz ? 1 : 0) | (k->dual ? 2 : 0) | (k->atest ? 4 : 0) : 0), "main", NULL};   // (pNext: DM_VK_SUBGROUP_PIN)
+    // the alpha test (pkey atest): the function and reference as the variant's specialization constants
+    static const VkSpecializationMapEntry at_me[2] = {{VK_ATEST_SPEC_FUNC, 0, 4}, {VK_ATEST_SPEC_REF, 4, 4}}; uint32_t at_v[2] = {k->atest, k->aref};
+    VkSpecializationInfo at_si = {2, at_me, sizeof at_v, at_v};
+    if (k->atest) for (uint32_t i = 0; i < ns; i++) if (ss[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) ss[i].pSpecializationInfo = &at_si;
     int flat = fs ? (int)k->flat : 0;
     if (flat & 1) {   // DM_VK_X_FLAT_VS: the fragment stage becomes flatdbg.frag
         static VkShaderModule fm; static pthread_mutex_t fm_mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&fm_mu); if (!fm) { VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof flatdbg_frag_spv, flatdbg_frag_spv}; VKCHK(vkCreateShaderModule(V.dev, &mi, NULL, &fm)); } pthread_mutex_unlock(&fm_mu);
@@ -1952,6 +1963,11 @@ static int prepare_draw(int prim, int indexed) {
     #define SRC1F(x) ((x) >= 0x10 && (x) <= 0x13)
     k.dual = (k.blend_en & 1) && S.sh[1] && !k.raster_discard && (SRC1F(k.bl[0].src) || SRC1F(k.bl[0].dst) || SRC1F(k.bl[0].srca) || SRC1F(k.bl[0].dsta));
     #undef SRC1F
+    // Maxwell's alpha test (nvnColorStateSetAlphaTest / SetAlphaRef): colour 0's alpha against the reference, the fragment dropped when the comparison fails. Not when colour 0
+    // is an integer target or absent (as OpenGL and nvn_mtl.m atest_key). Donkey Kong Bananza's Skills grid: ui2d clears each icon capture's rectangle of the UI target
+    // with a quad of alpha 0 and blending off under GREATER 0 before copying the rectangle; drawn without the test, every cell was an opaque black square
+    { uint32_t af = S.color.alpha_func; const vkfmt_t *f0 = S.ncol && S.rt_has_col[0] ? vk_fmt(S.rt_col[0].d.format) : NULL;
+      if (af >= 1 && af <= 7 && S.sh[1] && !k.raster_discard && S.cfmt[0] && f0 && !f0->is_int) { k.atest = af; if (af != 1) memcpy(&k.aref, &S.alpha_ref, 4); if (k.aref == 0x80000000u) k.aref = 0; } }
     k.clip_neg1 = !g_depth_zero;
     // layout and pipeline
     VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;   // set 0: the texture table (the same layout in every graphics pipeline layout, so a bound table set outlives pipeline changes)
@@ -2163,7 +2179,7 @@ static void trace_draw(const char *kind, int prim, uint32_t count, uint32_t inst
     if (S.rt_has_dep) { vkimg_t *im = vk_tex(&S.rt_dep); const tex_t *t = &S.rt_dep;
         VKLOG("  depth target: serial %llu → image %p: %ux%u fmt %d; nvn format %#x flags %#x size %llu pool %p+%#llx", (unsigned long long)t->serial, (void *)im, im ? im->w : 0, im ? im->h : 0,
               im ? im->fmt : 0, t->d.format, t->d.flags, (unsigned long long)t->L.size, (const void *)t->pool, (unsigned long long)t->off); }
-    VKLOG("  scissor set %d: %d %d %d %d; depth range %.3f %.3f; viewport count first %.1f %.1f %.1f %.1f", S.sc_set, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.dnear, S.dfar, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3]);
+    VKLOG("  scissor set %d: %d %d %d %d; depth range %.3f %.3f; viewport count first %.1f %.1f %.1f %.1f; alpha test %u ref %g", S.sc_set, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.dnear, S.dfar, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.color.alpha_func, S.alpha_ref);
     vkshader_t *vsh = S.sh[0]; uint32_t in_mask = vsh ? vsh->local[0] : 0;
     for (int l = 0; l < 16; l++) if (in_mask >> l & 1) { uint32_t a = S.vattr[l]; VKLOG("  location %d: attrib state %#x (stream %u) stride %d divisor %d buffer %#llx +%llu", l, a, (a >> 16) & 0x1f,
         S.vstream[(a >> 16) & 0xf].stride, S.vstream[(a >> 16) & 0xf].divisor, (unsigned long long)S.vbuf[(a >> 16) & 0xf].address, (unsigned long long)S.vbuf[(a >> 16) & 0xf].size); }
@@ -3198,7 +3214,7 @@ static void exec_ops(const uint8_t *p) {
             break; }
         case OP_POLY_OFFSET: S.pofs = *(const p_poly_offset *)a; break;
         // ---- records upstream added (upsync 2026-11-07) ----
-        case OP_ALPHA_REF: break;   // SetAlphaRef: the Android replay has no alpha test (ColorStateSetAlphaTest is recorded only, as before the upsync); nvn_mtl.m at_bind has one. TODO(upsync)
+        case OP_ALPHA_REF: S.alpha_ref = ((const p_alpha_ref *)a)->ref; break;   // SetAlphaRef: the alpha test's reference (pkey atest / aref)
         case OP_PUSH_CONST: push_constants((const p_push_const *)a); break;
         case OP_MULTI_DRAW: {   // MultiDraw*IndirectCount with more than MDI_INLINE draws: one record (hle_nvn.c); drawn as the inline form was, once (draw / draw_idx say so). TODO(switch2): vkCmdDraw*IndirectCount
             const p_multi_draw *m = (const p_multi_draw *)a; if (g_rc_skip) break;
