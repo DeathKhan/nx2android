@@ -68,8 +68,9 @@ def payoff(gap):   # the Gaps order: open gaps, then blocked, kept and unreviewe
 
 # The host's build-keyed rows: (table, the start of the row's label ('' = any), main build ('' = any), entry); the first that fits classifies a row
 HOST_BINDING = [
-    ('k_locks', 'Unity', '', {'what': "Unity's Application.targetFrameRate at a fixed address", 'now': 'build', 'goal': 'engine', 'purpose': 'frame rate',
-     'why': 'an IL2CPP player registers the setter by its icall name, so the field can be found in any Unity game; whether to raise it stays the profile\'s'}),
+    # (the Android fork's Unity rows: Graveyard Keeper 2's vsync count and frame time, Advance Wars 1+2's render frame interval; upstream's own Unity row went with 50aefc12b)
+    ('k_locks', 'Unity', '', {'what': "Unity's frame pacing globals at fixed addresses (vsync count, frame time, render frame interval)", 'now': 'build', 'goal': 'engine', 'purpose': 'frame rate',
+     'why': 'an IL2CPP player registers the setters by their icall names, as unity_fps.py finds targetFrameRate and QualitySettings.vSyncCount, so these fields could be found in any Unity game'}),
     ('k_locks', 'RE Engine', '', {'what': "RE Engine's frame limit at a fixed pointer", 'now': 'build', 'goal': 'engine', 'purpose': 'frame rate',
      'why': 'engine code other RE Engine games ship', 'blocked': 'one RE Engine game here'}),
     ('k_locks', 'NLG', '', {'what': "Next Level Games' frame limiter target at a fixed address", 'now': 'build', 'goal': 'engine', 'purpose': 'frame rate',

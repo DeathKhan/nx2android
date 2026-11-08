@@ -25,11 +25,10 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 | Now → goal | Patch | Purpose | Status | Evidence | Games | Where | Why |
 |---|---|---|---|---|---|---|---|
-| `build` → `engine` | Unity's Application.targetFrameRate at a fixed address | frame rate | gap | judgement | 3 | [Advance Wars 1+2: Re-Boot Camp](../../dm/games/0100300012F2A000/README.md); [Graveyard Keeper 2](../../dm/games/0100005027A18000/README.md); [Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md) | an IL2CPP player registers the setter by its icall name, so the field can be found in any Unity game; whether to raise it stays the profile's |
+| `build` → `engine` | Unity's frame pacing globals at fixed addresses (vsync count, frame time, render frame interval) | frame rate | gap | judgement | 2 | [Advance Wars 1+2: Re-Boot Camp](../../dm/games/0100300012F2A000/README.md); [Graveyard Keeper 2](../../dm/games/0100005027A18000/README.md) | an IL2CPP player registers the setters by their icall names, as unity_fps.py finds targetFrameRate and QualitySettings.vSyncCount, so these fields could be found in any Unity game |
 | `build` → `game` | 60 fps intervals and dynamic-resolution constants | frame rate | gap | checked: both releases' mains, where the host's rows for them were found | 2 | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md); [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md) | the game's own constants; the Asian release's function is the global one's 0x13c0 further on, so one function-matched rule could serve both releases |
 | `build` → `game` | NieR's frame interval and dynamic-resolution floor at fixed addresses | frame rate | gap | checked: both releases' mains, where these rows were found | 2 | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](../../dm/games/010056B015FE8000/README.md); [NieR:Automata The End of YoRHa Edition (0100B8E016F76000)](../../dm/games/0100B8E016F76000/README.md) | the game's own display object; the Asian release's function is the global one's 0x13c0 further on, so the rewriter's function match could give the host both releases' addresses |
 | `game` → `host` | one vertex shader's visibility counter (VertexCounterLowering) | shaders | gap | judgement | — | [Program.cs:301](../../dm/gfx/tools/dmsh_xlate/Program.cs#L301) | a general lowering of subgroup ballots in vertex shaders would cover any shader that counts that way |
-| `build` → `engine` | Unity QualitySettings.vSyncCount held at 1 | frame rate | gap | judgement | 1 | [Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md) | an IL2CPP player registers the setter by its icall name, so the place can be found in any Unity game; holding it at 1 stays this profile's choice (its logic steps by the count) |
 | `build` → `game` | display settings: present interval 2 → 1 (60 fps) | frame rate | gap | judgement | 1 | [Pokémon Legends: Arceus](../../dm/games/01001F5010DFA000/README.md) | the game's own display settings word; the function that builds it could be matched, as the capture demo's is |
 | `build` → `game` | frame limiter spin: its branch back cut | frame rate | gap | judgement | 1 | [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md) | the engine's own spin limiter; a function-matched rule could carry it over the game's updates |
 | `build` → `game` | frame step floor 2 → 1 vsync | frame rate | gap | judgement | 1 | [Paper Mario: The Origami King](../../dm/games/0100A3900C3E2000/README.md) | the game's own clock update clamps its step to two vsyncs; the same function as the frame step stub's |
@@ -44,8 +43,8 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `game` | task ring push and pop barriers | race | gap | judgement | 1 | [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md) | a data race in the game's own task ring |
 | `build` → `game` | UE3's GMalloc setup skipped, the host allocator in (hle_uemalloc.c) | address space | gap | judgement | 1 | [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md) | UE3 inlines the allocator's constructor into the GMalloc setup and has its own vtable layout (25 slots, 32-bit sizes), so the Unreal 4/5 discovery does not apply |
 | `build` → `game` | unused 272-byte slot pool: 4,194,304 → 65,536 slots | address space | gap | judgement | 1 | [Mario + Rabbids® Sparks of Hope](../../dm/games/0100317013770000/README.md) | Sparks of Hope's own init (Kingdom Battle has none) |
-| `build` → `sdk` | rows the rules would add the alignment cuts to (2d369d99, 12f16103, 311deab1) | address space | blocked: the games that reach them (Pokémon Brilliant Diamond, Monster Hunter Rise, 13 Sentinels: Aegis Rim; Brain Memory Training Academy; Ace Attorney Investigations Collection) have no Mac build: run one per build with the alignment cuts | checked: the rules resolved on each build's sdk, 2026-10-29 and 2026-10-30 | 12 | [sdk_patches.py](../../dm/tools/sdk_patches.py) | the rules give these builds the same node area cut and the three alignment cuts more; each row keeps the alignment out |
-| `build` → `sdk` | rows of builds not on the game drive (56ec2474, 9c73fb73, e01950c5) | address space | blocked: no copy on the drive to compare | judgement | 3 | [sdk_patches.py](../../dm/tools/sdk_patches.py) | likely what the rules give (each names one of their implementations) |
+| `build` → `sdk` | rows the rules would add the alignment cuts to (12f16103, 311deab1) | address space | blocked: the games that reach them (Brain Memory Training Academy; Ace Attorney Investigations Collection) have no Mac build: run one per build with the alignment cuts | checked: the rules resolved on each build's sdk, 2026-10-29 and 2026-10-30 | 5 | [sdk_patches.py](../../dm/tools/sdk_patches.py) | the rules give these builds the same node area cut and the three alignment cuts more; each row keeps the alignment out |
+| `build` → `sdk` | rows of builds not on the game drive (9c73fb73, e01950c5) | address space | blocked: no copy on the drive to compare | judgement | 2 | [sdk_patches.py](../../dm/tools/sdk_patches.py) | likely what the rules give (each names one of their implementations) |
 | `build` → `game` | Unity BucketAllocator ALLOC_BUCKET: 255 blocks of 4 MB → 63 | address space | blocked: no extracted main of either Subnautica on the game drive to fingerprint | checked: the bucket allocator of five Unity 2021 and later mains (not Subnautica's), 2026-10-29 | 2 | [Subnautica](../../dm/games/0100429011144000/README.md); [Subnautica: Below Zero](../../dm/games/010014C011146000/README.md) | Unity 2019's constructor call takes the block count as a constant; Unity 2021 and later read the bucket sizes from boot.config with a default of one block (Cult of the Lamb, Monster Train 2, Blasphemous 2, BALL x PIT, Donkey Kong Country Returns HD; checked 2026-10-29) and need no cut, so no Unity rule. A function-matched rule could carry it over the game's updates |
 | `build` → `sdk` | VammManager node area and alignment, SDK 4.4.0 (9de92bad) | address space | blocked: one game ships it | judgement | 1 | [sdk_patches.py](../../dm/tools/sdk_patches.py) | an older implementation no rule covers (its large regions aligned to 32 MB, not the rules' 2 MB); a rule once a second game ships it |
 | `build` → `engine` | Criterion's 60 fps mode, frame ticks and game step at fixed addresses | frame rate | blocked: one game on that engine here | judgement | 1 | [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md) | the studio's engine, which its other games ship |
@@ -75,7 +74,6 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [EA SPORTS FC 27](#ea-sports-fc-27) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition](#final-fantasy-crystal-chronicles-remastered-edition) | 8 | 0 | 0 | 0 | 0 | `build` → `engine` |
 | [FINAL FANTASY TACTICS - The Ivalice Chronicles](#final-fantasy-tactics---the-ivalice-chronicles) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [Fire Emblem Engage](#fire-emblem-engage) | 1 | 0 | 0 | 0 | 0 | `build` → `engine` |
 | [Fire Emblem: Three Houses](#fire-emblem-three-houses) | 7 | 0 | 0 | 0 | 0 | `build` → `game` |
 | [Graveyard Keeper 2](#graveyard-keeper-2) | 0 | 0 | 0 | 0 | 2 | `build` → `engine` |
 | [Hyrule Warriors: Age of Calamity](#hyrule-warriors-age-of-calamity) | 0 | 0 | 5 | 0 | 0 | `build` → `game` |
@@ -89,7 +87,6 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Nintendo Switch 2 Welcome Tour](#nintendo-switch-2-welcome-tour) | 0 | 1 | 0 | 0 | 0 | `build` |
 | [Paper Mario: The Origami King](#paper-mario-the-origami-king) | 2 | 0 | 1 | 0 | 0 | `build` → `game` ×3 |
 | [Paper Mario: The Thousand-Year Door](#paper-mario-the-thousand-year-door) | 1 | 0 | 1 | 0 | 0 | `build` → `game` |
-| [Pokémon Brilliant Diamond](#pokémon-brilliant-diamond) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [Pokémon Legends: Arceus](#pokémon-legends-arceus) | 1 | 0 | 0 | 1 | 0 | `game`, `build` → `game` |
 | [Subnautica](#subnautica) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
 | [Subnautica: Below Zero](#subnautica-below-zero) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
@@ -109,10 +106,10 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 [Advance Wars 1+2: Re-Boot Camp](../../dm/games/0100300012F2A000/README.md), `0100300012F2A000`.
 
-- **`build` → `engine`**, frame rate, gap, judgement: Unity's Application.targetFrameRate at a fixed address. An IL2CPP player registers the setter by its icall name, so the field can be found in any Unity game; whether to raise it stays the profile's
+- **`build` → `engine`**, frame rate, gap, judgement: Unity's frame pacing globals at fixed addresses (vsync count, frame time, render frame interval). An IL2CPP player registers the setters by their icall names, as unity_fps.py finds targetFrameRate and QualitySettings.vSyncCount, so these fields could be found in any Unity game
 
 - **1.0.0 `main`** `320a1774…`
-  - host [hle_fpslock.c:69](../../dm/host/hle_fpslock.c#L69): engine frame limit set to fps_target: Unity render frame interval
+  - host [hle_fpslock.c:66](../../dm/host/hle_fpslock.c#L66): engine frame limit set to fps_target: Unity render frame interval
 
 ### Animal Crossing: New Horizons
 
@@ -312,7 +309,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **`build` → `engine`**, frame rate, blocked: one Frostbite game here, judgement: Frostbite's frame regulator at a fixed pointer. Engine code other Frostbite games ship (the simulation's own rate is already set by name)
 
 - **1.8d.310c `main`** `a48c0de3…`
-  - host [hle_fpslock.c:59](../../dm/host/hle_fpslock.c#L59): engine frame limit set to fps_target: FIFA frame regulator
+  - host [hle_fpslock.c:56](../../dm/host/hle_fpslock.c#L56): engine frame limit set to fps_target: FIFA frame regulator
 
 ### FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition
 
@@ -340,15 +337,6 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x12554`: job pool wake: ldr x0,[x0] → str x0,[x0,#8] (pending = nonzero: the woken worker signals once more)
   - cut `+0x12558`: job pool wake: b SignalEvent → b 0x1254c (ldr x0,[x0]; b SignalEvent)
 
-### Fire Emblem Engage
-
-[Fire Emblem Engage](../../dm/games/0100A6301214E000/README.md), `0100A6301214E000`, [patches.py](../../dm/games/0100A6301214E000/patches.py).
-
-- **`build` → `engine`**, frame rate, gap, judgement: Unity QualitySettings.vSyncCount held at 1. An IL2CPP player registers the setter by its icall name, so the place can be found in any Unity game; holding it at 1 stays this profile's choice (its logic steps by the count)
-
-- **2.0.0 `main`** `8c08b971…` ([patches.py:11](../../dm/games/0100A6301214E000/patches.py#L11))
-  - cut `+0x32f92d4`: QualitySettings.set_vSyncCount wrapper: argument mov w19,w0 → mov w19,#1 (the 60 fps path of the game itself)
-
 ### Fire Emblem: Three Houses
 
 [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md), `010055D009F78000`, [patches.py](../../dm/games/010055D009F78000/patches.py).
@@ -368,11 +356,11 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 [Graveyard Keeper 2](../../dm/games/0100005027A18000/README.md), `0100005027A18000`.
 
-- **`build` → `engine`**, frame rate, gap, judgement: Unity's Application.targetFrameRate at a fixed address. An IL2CPP player registers the setter by its icall name, so the field can be found in any Unity game; whether to raise it stays the profile's
+- **`build` → `engine`**, frame rate, gap, judgement: Unity's frame pacing globals at fixed addresses (vsync count, frame time, render frame interval). An IL2CPP player registers the setters by their icall names, as unity_fps.py finds targetFrameRate and QualitySettings.vSyncCount, so these fields could be found in any Unity game
 
 - **1.0.4 `main`** `1d69f09f…`
-  - host [hle_fpslock.c:63](../../dm/host/hle_fpslock.c#L63): engine frame limit set to fps_target: Unity vsync count
-  - host [hle_fpslock.c:64](../../dm/host/hle_fpslock.c#L64): engine frame limit set to fps_target: Unity frame time
+  - host [hle_fpslock.c:60](../../dm/host/hle_fpslock.c#L60): engine frame limit set to fps_target: Unity vsync count
+  - host [hle_fpslock.c:61](../../dm/host/hle_fpslock.c#L61): engine frame limit set to fps_target: Unity frame time
 
 ### Hyrule Warriors: Age of Calamity
 
@@ -394,7 +382,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **`build` → `engine`**, frame rate, blocked: one game on that engine here, judgement: Next Level Games' frame limiter target at a fixed address. The studio's engine, which its other games ship
 
 - **1.4.0 `main`** `79e5950f…`
-  - host [hle_fpslock.c:44](../../dm/host/hle_fpslock.c#L44): engine frame limit set to fps_target: NLG frame limiter target
+  - host [hle_fpslock.c:41](../../dm/host/hle_fpslock.c#L41): engine frame limit set to fps_target: NLG frame limiter target
 
 ### Mario + Rabbids® Sparks of Hope
 
@@ -420,7 +408,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **`build` → `engine`**, frame rate, blocked: one RE Engine game here, judgement: RE Engine's frame limit at a fixed pointer. Engine code other RE Engine games ship
 
 - **16.0.2 `main`** `c9a3dd77…`
-  - host [hle_fpslock.c:40](../../dm/host/hle_fpslock.c#L40): engine frame limit set to fps_target: RE Engine frame limit
+  - host [hle_fpslock.c:37](../../dm/host/hle_fpslock.c#L37): engine frame limit set to fps_target: RE Engine frame limit
 
 ### Need For Speed™ Hot Pursuit Remastered
 
@@ -431,11 +419,11 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **1.0.3 `main`** `799d1061…` ([patches.py:7](../../dm/games/010029B0118E8000/patches.py#L7))
   - cut `+0x4835a4`: frame limiter spin: b.gt main+0x483588 → nop (the host paces the frames)
-  - host [hle_fpslock.c:49](../../dm/host/hle_fpslock.c#L49): engine frame limit set to fps_target: Criterion 60 fps mode
-  - host [hle_fpslock.c:50](../../dm/host/hle_fpslock.c#L50): engine frame limit set to fps_target: Criterion frame ticks
-  - host [hle_fpslock.c:51](../../dm/host/hle_fpslock.c#L51): engine frame limit set to fps_target: Criterion frame ticks / 10
-  - host [hle_fpslock.c:52](../../dm/host/hle_fpslock.c#L52): engine frame limit set to fps_target: Criterion 2D game step
-  - host [hle_fpslock.c:53](../../dm/host/hle_fpslock.c#L53): engine frame limit set to fps_target: Criterion 3D game step
+  - host [hle_fpslock.c:46](../../dm/host/hle_fpslock.c#L46): engine frame limit set to fps_target: Criterion 60 fps mode
+  - host [hle_fpslock.c:47](../../dm/host/hle_fpslock.c#L47): engine frame limit set to fps_target: Criterion frame ticks
+  - host [hle_fpslock.c:48](../../dm/host/hle_fpslock.c#L48): engine frame limit set to fps_target: Criterion frame ticks / 10
+  - host [hle_fpslock.c:49](../../dm/host/hle_fpslock.c#L49): engine frame limit set to fps_target: Criterion 2D game step
+  - host [hle_fpslock.c:50](../../dm/host/hle_fpslock.c#L50): engine frame limit set to fps_target: Criterion 3D game step
 
 ### NieR:Automata The End of YoRHa Edition (010056B015FE8000)
 
@@ -454,7 +442,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x9bf4d4`: dynamic resolution: optimal frame cost 32.01 -> 16.005 ms at 60 fps (second load)
   - cut `+0x9bf4f8`: dynamic resolution: good frame cost 30 -> 15 ms at 60 fps
   - launcher capabilities: DYNAMIC_RESOLUTION
-  - host [hle_fpslock.c:181](../../dm/host/hle_fpslock.c#L181): frame interval and dynamic-resolution floor
+  - host [hle_fpslock.c:178](../../dm/host/hle_fpslock.c#L178): frame interval and dynamic-resolution floor
 
 ### NieR:Automata The End of YoRHa Edition (0100B8E016F76000)
 
@@ -473,7 +461,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x9c08e8`: dynamic resolution lower bound follows the selected preset
   - cut `+0x9c08f4`: dynamic resolution lower bound follows the selected preset
   - launcher capabilities: DYNAMIC_RESOLUTION
-  - host [hle_fpslock.c:182](../../dm/host/hle_fpslock.c#L182): frame interval and dynamic-resolution floor
+  - host [hle_fpslock.c:179](../../dm/host/hle_fpslock.c#L179): frame interval and dynamic-resolution floor
 
 ### Nintendo Switch 2 Welcome Tour
 
@@ -506,15 +494,6 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **1.0.1 `main`** `0effe4af…` ([patches.py:5](../../dm/games/0100ECD018EBE000/patches.py#L5))
   - cut `+0x2e77a4`: frame step floor in 60 Hz vsyncs: mov w9,#2 → mov w9,#1 (the game steps by the vsyncs that passed, down to one)
   - frame step `+0x2e77f8`: frame step: the base clock steps by the host's vsyncs (state page target fps; 0 = the game's measured step)
-
-### Pokémon Brilliant Diamond
-
-[Pokémon Brilliant Diamond](../../dm/games/0100000011D90000/README.md), `0100000011D90000`.
-
-- **`build` → `engine`**, frame rate, gap, judgement: Unity's Application.targetFrameRate at a fixed address. An IL2CPP player registers the setter by its icall name, so the field can be found in any Unity game; whether to raise it stays the profile's
-
-- **1.3.0 `main`** `94ceae32…`
-  - host [hle_fpslock.c:34](../../dm/host/hle_fpslock.c#L34): engine frame limit set to fps_target: Unity targetFrameRate
 
 ### Pokémon Legends: Arceus
 
@@ -722,45 +701,26 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 Cuts of Nintendo SDK `sdk` builds ([sdk_patches.py](../../dm/tools/sdk_patches.py)), applied to every game that ships the build. They fit the SDK's address-space layout into an iPhone's guest block. The games listed are those whose profile registers the build.
 
 - **`sdk`**, address space, at goal, checked: 20 registered builds rewritten byte-identical with the rules alone, 2026-10-29 and 2026-10-30; the 2 MB alignment on every sdk build on the drive, 2026-10-30: node area 1 GB → 62 MB and regions of 4 MB and more aligned to 2 MB, as SDK 20: the SDK-wide rules. One rule per reviewed implementation; every sdk build without CUTS gets them
-- **`build` → `sdk`**, address space, blocked: the games that reach them (Pokémon Brilliant Diamond, Monster Hunter Rise, 13 Sentinels: Aegis Rim; Brain Memory Training Academy; Ace Attorney Investigations Collection) have no Mac build: run one per build with the alignment cuts, checked: the rules resolved on each build's sdk, 2026-10-29 and 2026-10-30: rows the rules would add the alignment cuts to (2d369d99, 12f16103, 311deab1). The rules give these builds the same node area cut and the three alignment cuts more; each row keeps the alignment out
-- **`build` → `sdk`**, address space, blocked: no copy on the drive to compare, judgement: rows of builds not on the game drive (56ec2474, 9c73fb73, e01950c5). Likely what the rules give (each names one of their implementations)
+- **`build` → `sdk`**, address space, blocked: the games that reach them (Brain Memory Training Academy; Ace Attorney Investigations Collection) have no Mac build: run one per build with the alignment cuts, checked: the rules resolved on each build's sdk, 2026-10-29 and 2026-10-30: rows the rules would add the alignment cuts to (12f16103, 311deab1). The rules give these builds the same node area cut and the three alignment cuts more; each row keeps the alignment out
+- **`build` → `sdk`**, address space, blocked: no copy on the drive to compare, judgement: rows of builds not on the game drive (9c73fb73, e01950c5). Likely what the rules give (each names one of their implementations)
 - **`build` → `sdk`**, address space, blocked: one game ships it, judgement: VammManager node area and alignment, SDK 4.4.0 (9de92bad). An older implementation no rule covers (its large regions aligned to 32 MB, not the rules' 2 MB); a rule once a second game ships it
 
 - **sdk** `9de92bad…` ([sdk_patches.py:9](../../dm/tools/sdk_patches.py#L9)): Mario + Rabbids Kingdom Battle 1.9.589692
   - cut `+0x93dfc`: VammManager node area limit: 1 GB to 64 MB
   - cut `+0x93e8c`: VammManager occupied node area: 1 GB to 64 MB
   - cut `+0x93fe0`: AllocateAddressRegion: align regions of 1 GB and more to 32 MB
-- **sdk** `2d369d99…` ([sdk_patches.py:21](../../dm/tools/sdk_patches.py#L21)): 13 Sentinels: Aegis Rim (Asia) 1.00, 13 Sentinels: Aegis Rim 1.10, Big Brain Academy: Brain vs. Brain 1.2.0, Mario Party Superstars 1.1.1, Metroid Dread 2.1.0, Monster Hunter Rise 16.0.2, Pokémon Brilliant Diamond 1.3.0
-  - cut `+0x34e0c8`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
-  - cut `+0x34e164`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `56ec2474…` ([sdk_patches.py:30](../../dm/tools/sdk_patches.py#L30)): Fire Emblem Engage 2.0.0
-  - cut `+0x346430`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
-  - cut `+0x3464cc`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `311deab1…` ([sdk_patches.py:38](../../dm/tools/sdk_patches.py#L38)): Ace Attorney Investigations Collection 1.0.0.2, ROMANCE OF THE THREE KINGDOMS 8 REMAKE 1.1.3
+- **sdk** `311deab1…` ([sdk_patches.py:18](../../dm/tools/sdk_patches.py#L18)): Ace Attorney Investigations Collection 1.0.0.2, ROMANCE OF THE THREE KINGDOMS 8 REMAKE 1.1.3
   - cut `+0x139468`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x1394fc`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `12f16103…` ([sdk_patches.py:46](../../dm/tools/sdk_patches.py#L46)): Brain Memory Training Academy 1.0.0, Unicorn Overlord (Asia) 1.05, Unicorn Overlord 1.05
+- **sdk** `12f16103…` ([sdk_patches.py:26](../../dm/tools/sdk_patches.py#L26)): Brain Memory Training Academy 1.0.0, Unicorn Overlord (Asia) 1.05, Unicorn Overlord 1.05
   - cut `+0x134778`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x13480c`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `9c73fb73…` ([sdk_patches.py:53](../../dm/tools/sdk_patches.py#L53)): Patrick's Parabox 1.0.1
+- **sdk** `9c73fb73…` ([sdk_patches.py:33](../../dm/tools/sdk_patches.py#L33)): Patrick's Parabox 1.0.1
   - cut `+0x37c3b0`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x37c44c`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `357efc19…` ([sdk_patches.py:63](../../dm/tools/sdk_patches.py#L63)): Bayonetta 3 1.2.0, Persona 5 Royal 1.0.2, Unpacking 2.01
-  - cut `+0x37bd30`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
-  - cut `+0x37bdcc`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-  - cut `+0x37bf2c`: AllocateAddressRegion: alignment of regions of 1 GB and more mov w10,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)
-- **sdk** `8af286d7…` ([sdk_patches.py:70](../../dm/tools/sdk_patches.py#L70)): Castlevania: Belmont's Curse 1.1.0
-  - cut `+0x1423fc`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
-  - cut `+0x142468`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `e01950c5…` ([sdk_patches.py:78](../../dm/tools/sdk_patches.py#L78)): Hollow Knight: Silksong 1.0.30000
+- **sdk** `e01950c5…` ([sdk_patches.py:41](../../dm/tools/sdk_patches.py#L41)): Hollow Knight: Silksong 1.0.30000
   - cut `+0x145bfc`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x145c68`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `14839413…` ([sdk_patches.py:88](../../dm/tools/sdk_patches.py#L88)): Graveyard Keeper 2 1.0.4, Tales of Eternia Remastered 2.0.0, Viractal 1.4.5
-  - cut `+0x14fbf0`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
-  - cut `+0x14fc5c`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `3ae34e68…` ([sdk_patches.py:95](../../dm/tools/sdk_patches.py#L95)): Captain Toad: Treasure Tracker 1.4.2, Return of the Obra Dinn 1.0.1, The Legend of Zelda: Link's Awakening 1.1.0, Untitled Goose Game 1.1.2
-  - cut `+0x336b50`: AddressRegionManager constructor: node area limit orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000
-  - cut `+0x336bf0`: AddressRegionManager constructor: length of the node area registered as an occupied region orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000
 
 ### SDK-wide function-matched rules
 
