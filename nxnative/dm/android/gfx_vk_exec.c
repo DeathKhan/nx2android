@@ -13,7 +13,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
-VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[5], int nsets);
+VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[VK_NSETS], int nsets);
 void vk_shader_c1(vkshader_t *s, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *len);
 VkBufferView vk_tbuf_view(const tex_t *t, int storage);
 void vk_sub_update(uint64_t dst, const void *data, uint64_t n);
@@ -861,7 +861,7 @@ static void *async_pipe_thread(void *arg) {
         pkey k = g_apq[g_apq_t % APQ]; g_apq_t++; pthread_mutex_unlock(&g_apq_mu);
         vkshader_t *stg[3] = {0}; VkPipeline p = (VkPipeline)1;
         for (int s = 0; s < 3; s++) if (k.key[s] && !(s == 1 && k.raster_discard)) stg[s] = vk_shader(k.key[s], s);
-        if (stg[0]) { VkDescriptorSetLayout dsl[5] = {0}; int nsets = 0;
+        if (stg[0]) { VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;
             for (int s = 0; s < 3; s++) if (stg[s]) { dsl[stg[s]->set] = stg[s]->dsl; if (stg[s]->set + 1 > nsets) nsets = stg[s]->set + 1; }
             uint64_t t0 = tick(); p = build_pipeline(&k, vk_pipeline_layout(dsl, nsets), stg);
             { static int n; if (n++ < 6) VKLOG("pipeline built in the background in %.1f ms (shaders %016llx %016llx)", (tick() - t0) / 1e6, (unsigned long long)k.key[0], (unsigned long long)k.key[1]); } }
@@ -935,7 +935,7 @@ static void *prewarm_thread(void *arg) {
         vkshader_t *stg[3] = {0}; int ok = 1;
         for (int s = 0; s < 3; s++) if (k->key[s] && !(s == 1 && k->raster_discard)) { stg[s] = vk_shader(k->key[s], s); if (!stg[s]) ok = 0; }
         if (!ok || !stg[0]) continue;
-        VkDescriptorSetLayout dsl[5] = {0}; int nsets = 0;
+        VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;
         for (int s = 0; s < 3; s++) if (stg[s]) { dsl[stg[s]->set] = stg[s]->dsl; if (stg[s]->set + 1 > nsets) nsets = stg[s]->set + 1; }
         VkPipeline p = build_pipeline(k, vk_pipeline_layout(dsl, nsets), stg);
         pthread_mutex_lock(&g_pipe_mu);
@@ -1236,7 +1236,7 @@ extern uint64_t g_ubd_gen; uint32_t vk_pool_gen(void);
 static int set_memo_ok(vkshader_t *s) {
     if (!s->setmemo) { int ok = 1, ncb = 0;
         for (int i = 0; i < s->nbind; i++) { const dmsv_bind *b = &s->b[i]; ncb += b->kind == RK_CBUF;
-            ok &= b->kind != RK_TEXD && b->kind != RK_SAMPD && b->kind != RK_SBUF_UBO && b->kind != RK_UBO_PTR && b->kind != RK_TEX_UBO && b->kind != RK_IMG_UBO && b->kind != RK_TBUF_UBO && b->samp != RS_UBO && i < 256;
+            ok &= b->kind != RK_TEXD && b->kind != RK_SAMPD && b->kind != RK_SBUF_UBO && b->kind != RK_UBO_PTR && (b->kind != RK_TEX_UBO || s->tbl[i]) && b->kind != RK_IMG_UBO && b->kind != RK_TBUF_UBO && b->samp != RS_UBO && i < 256;   // (a texture table binding is in the table set, tbl_set, not this one)
             ok &= !(b->kind >= RK_MESH_CTL && b->kind <= RK_MESH_IDX); }   // (the mesh emulation's buffers change every draw: mesh_draw)
         s->setmemo = ok && ncb <= MEMO_CB ? 1 : 2; }
     return s->setmemo == 1;
@@ -1275,7 +1275,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
     if (DM_GAME_TEX_DYN_SLOTS) for (int j = 0; j < s->nbind; j++)
         if (s->b[j].kind == RK_TEXD || s->b[j].kind == RK_SAMPD) dynslots = 1;
     for (int i = 0; i < s->nbind && nw < 96; i++) {
-        const dmsv_bind *b = &s->b[i];
+        const dmsv_bind *b = &s->b[i]; if (s->tbl[i]) continue;   // in the table set (tbl_set)
         VkWriteDescriptorSet *wr = &w[nw]; memset(wr, 0, sizeof *wr);
         wr->sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr->dstSet = set; wr->dstBinding = b->binding; wr->descriptorCount = 1;
         VkBuffer buf; VkDeviceSize off, len;
@@ -1415,6 +1415,49 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
     return set;
 }
 
+// ---------------- texture tables (gfx_vk.h: set 0 of every graphics pipeline layout) ----------------
+// The set for the handles a stage's table reads: element k of each slot's array is the texture of the handle word at off + 8k of the stage's uniform buffer reg, through a view of
+// the slot's kind (2D, 2D array, cube; what does not fit the kind, or has integer texels, gets the dummy), up to the buffer's bound size and the table's length; the rest dummies.
+// Sets are kept per submission by the handles' hash (and the texture, sampler and pool generations), as stage_set's are; a draw's set is bound only when it differs from the last
+// bound (draw). DM_VK_TBL_N=0 leaves the arrays in the stages' sets as before
+static struct { uint64_t h, epoch, tex, samp; uint32_t n, pool; VkDescriptorSet set; } g_tblc[64];
+static uint64_t g_tbl_builds, g_tbl_hits, g_tbl_binds, g_ns_tbl; static uint32_t g_tbl_max_n, g_tbl_max_bytes;
+static VkDescriptorSet tbl_set(int st, vkshader_t *s) {
+    uint64_t t0 = tick(); const int N = vk_tbl_n();
+    static uint32_t words[2 * 65536 / 8]; static VkDescriptorImageInfo *ii;   // the handles read (8 bytes each), and TBL_SLOTS x N descriptors
+    const p_bind_buf *u = s->tbl_reg >= 0 && s->tbl_reg < 16 ? &S.ubo[st][s->tbl_reg] : NULL; uint32_t n = 0;
+    if (u && u->addr && s->tbl_off >= 0) { uint64_t a = u->addr + (uint64_t)s->tbl_off, size = u->size ? u->size : 65536; if (size > 65536) size = 65536;
+        vkpool_t *p = vk_pool_peek(a, 8);
+        if (p && size > (uint64_t)s->tbl_off) { uint64_t bytes = size - (uint64_t)s->tbl_off; if (a + bytes > p->end) bytes = p->end > a ? p->end - a : 0;
+            n = (uint32_t)(bytes / 8); if (n > (uint32_t)N) n = (uint32_t)N; if (n) vk_ubd_read(a, (uint64_t)n * 8, (uint8_t *)words);
+            if (bytes > g_tbl_max_bytes || n > g_tbl_max_n) { g_tbl_max_bytes = bytes > g_tbl_max_bytes ? (uint32_t)bytes : g_tbl_max_bytes; g_tbl_max_n = n > g_tbl_max_n ? n : g_tbl_max_n;
+                static int nl; if (nl++ < 12) VKLOG("texture table: stage %d uniform buffer %d +%d bound with %llu bytes: %u handles read (table length %d)", st, s->tbl_reg, s->tbl_off, (unsigned long long)size, n, N); } } }
+    uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)n; for (uint32_t k = 0; k < n; k++) h = (h ^ words[2 * k]) * 0x100000001b3ull;   // the handle words (the high word of each 8 bytes is not read)
+    uint64_t gtex = g_tex_gen, gsamp = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE); uint32_t gpool = vk_pool_gen(); unsigned c = (unsigned)(h % (sizeof g_tblc / sizeof *g_tblc));
+    if (g_tblc[c].epoch == g_set_epoch && g_tblc[c].h == h && g_tblc[c].n == n && g_tblc[c].tex == gtex && g_tblc[c].samp == gsamp && g_tblc[c].pool == gpool && !g_tracing && !g_x_nosetc) { g_tbl_hits++; g_ns_tbl += tick() - t0; return g_tblc[c].set; }
+    if (!ii) ii = calloc((size_t)TBL_SLOTS * (size_t)N, sizeof *ii);
+    VkDescriptorSet set = vk_alloc_set(vk_tbl_dsl()); VkWriteDescriptorSet w[TBL_SLOTS];
+    for (int slot = 0; slot < TBL_SLOTS; slot++) {
+        const dmsv_bind *b = NULL; for (int i = 0; i < s->nbind && i < 96; i++) if (s->tbl[i] == 1 + slot) b = &s->b[i];
+        dmsv_bind vb = b ? *b : (dmsv_bind){.kind = RK_TEX_UBO, .desc = RD_SAMPLED, .dim = (uint8_t)(slot == 2 ? 3 : 1), .flags = (uint8_t)(slot == 1 ? 1 : 0), .samp = RS_TEX, .reg = (int16_t)s->tbl_reg, .off = s->tbl_off};
+        VkDescriptorImageInfo dummy = {vk_dummy_sampler(), vk_dummy_view(vb.dim, vb.flags & 1, 0, 0, 0), VK_IMAGE_LAYOUT_GENERAL}, *d = ii + (size_t)slot * (size_t)N;
+        for (uint32_t k = 0; k < n && b; k++) {
+            uint64_t hh = mem_handle(words[2 * k]); int tid = (int)(hh & 0xfffff); const view_t *v = NULL; const tex_t *t = NULL; int fits = 0;
+            if (tid && vk_tex_by_id(tid, &v, &t) && t) { int target = v && v->set_target ? v->target : t->d.target;
+                fits = vb.dim == 3 ? (t->d.width == t->d.height && (target == 8 || target == 9 || (target == 4 && t->d.depth >= 6))) : (target == 1 || target == 4 || target == 8 || target == 9);
+                if (fits && view_num(t, v)) fits = 0; }   // (the arrays declare floating-point texels)
+            if (fits) { tex_desc_for(st, &vb, hh, &d[k], 0); if (!d[k].imageView) d[k] = dummy; } else d[k] = dummy;
+        }
+        for (uint32_t k = b ? n : 0; k < (uint32_t)N; k++) d[k] = dummy;
+        w[slot] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)slot, 0, (uint32_t)N, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d, NULL, NULL};
+    }
+    vkUpdateDescriptorSets(V.dev, TBL_SLOTS, w, 0, NULL);
+    g_tblc[c] = (typeof(g_tblc[0])){h, g_set_epoch, gtex, gsamp, n, gpool, set};
+    g_tbl_builds++; g_ns_tbl += tick() - t0;
+    if (g_tbl_builds <= 4 || !(g_tbl_builds & (g_tbl_builds - 1))) VKLOG("texture tables: %llu sets built (%llu reused, %llu bound; %.1f ms in all), the longest %u handles of %u bytes bound; stage %d shader %016llx uniform buffer %d +%d: %u handles", (unsigned long long)g_tbl_builds, (unsigned long long)g_tbl_hits, (unsigned long long)g_tbl_binds, g_ns_tbl / 1e6, g_tbl_max_n, g_tbl_max_bytes, st, (unsigned long long)s->key, s->tbl_reg, s->tbl_off, n);
+    return set;
+}
+
 // ---------------- draws ----------------
 // What the draws of the command buffer being recorded set last: a draw that would set the same again records nothing. Vulkan keeps dynamic state and
 // bindings for the whole command buffer, across render passes and across pipelines that declare the same dynamic state (every one of ours, build_pipeline);
@@ -1422,7 +1465,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
 // its binds, most the same as the draw before; the driver's time grows with what is recorded (vkEndCommandBuffer too). DM_VK_X_NOBC=1: everything every draw
 extern uint64_t g_cmd_gen;
 static struct { uint64_t gen; VkViewport vp; VkRect2D sc; float bc[4]; int sm[2], sw[2], sr[2], line; p_poly_offset po; VkPipelineLayout lay; uint32_t nsets, ndofs;
-                VkDescriptorSet sets[5]; uint32_t dofs[3 * 96]; VkBuffer vb[17]; VkDeviceSize vo[17]; VkBuffer ib; VkDeviceSize io; VkIndexType it; } g_bc;
+                VkDescriptorSet sets[VK_NSETS], tbl; uint32_t dofs[3 * 96]; VkBuffer vb[17]; VkDeviceSize vo[17]; VkBuffer ib; VkDeviceSize io; VkIndexType it; } g_bc;
 
 static int bc_fresh(void) { if (g_bc.gen != g_cmd_gen || g_x_nobc || g_bc_stale) { g_bc_stale = 0; memset(&g_bc, 0, sizeof g_bc); g_bc.gen = g_cmd_gen; g_bc.it = (VkIndexType)-1; return 1; } return 0; }
 #define BC_SAME(field, val) (!fresh && !memcmp(&g_bc.field, &(val), sizeof g_bc.field))
@@ -1580,19 +1623,20 @@ static int prepare_draw(int prim, int indexed) {
     #undef SRC1F
     k.clip_neg1 = !g_depth_zero;
     // layout and pipeline
-    VkDescriptorSetLayout dsl[5] = {0}; int nsets = 0;
+    VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;   // set 0: the texture table (the same layout in every graphics pipeline layout, so a bound table set outlives pipeline changes)
     for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && k.raster_discard)) { dsl[S.sh[st]->set] = S.sh[st]->dsl; if (S.sh[st]->set + 1 > nsets) nsets = S.sh[st]->set + 1; }
     // the last draw's set layouts and what vk_pipeline_layout made of them (it fills absent stages with the empty layout): its lock and hash took ~10% of the
     // replay thread on Unicorn Overlord's battle map. Pipeline layouts are never destroyed
-    static VkDescriptorSetLayout l_in[5], l_out[5]; static int l_n = -1; static VkPipelineLayout l_lay; VkPipelineLayout layout;
+    static VkDescriptorSetLayout l_in[VK_NSETS], l_out[VK_NSETS]; static int l_n = -1; static VkPipelineLayout l_lay; VkPipelineLayout layout;
     if (nsets == l_n && !memcmp(dsl, l_in, sizeof l_in)) { memcpy(dsl, l_out, sizeof l_out); layout = l_lay; }
     else { memcpy(l_in, dsl, sizeof l_in); l_n = nsets; layout = l_lay = vk_pipeline_layout(dsl, nsets); memcpy(l_out, dsl, sizeof l_out); }
     // descriptor sets first: the views they are given decide which shader variants the pipeline takes (integer texels, vk_shader_module)
     g_var_now = var;
-    VkDescriptorSet sets[5] = {0};
-    uint32_t dofs[5][96], ndofs = 0, dall[3 * 96];
+    VkDescriptorSet sets[VK_NSETS] = {0}, tbl = VK_NULL_HANDLE;
+    uint32_t dofs[VK_NSETS][96], ndofs = 0, dall[3 * 96];
     uint64_t t1d = tick();
-    for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && k.raster_discard)) { sets[S.sh[st]->set] = stage_set(st, S.sh[st], dofs[S.sh[st]->set]); k.um[st] = g_num_um; k.im[st] = g_num_im; }
+    for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && k.raster_discard)) { sets[S.sh[st]->set] = stage_set(st, S.sh[st], dofs[S.sh[st]->set]); k.um[st] = g_num_um; k.im[st] = g_num_im;
+        if (S.sh[st]->ntbl && !tbl) tbl = tbl_set(st, S.sh[st]); }   // (two stages with tables of different sources: the first stage's; not seen)
     uint64_t tdesc = tick() - t1d; g_vkst.ns_desc += tdesc; if (g_prof_on) g_prof_ns[5] += tdesc;
     if (g_tracing) {
         VKLOG("  pipeline: topology %u restart %u discard %u cull %u front %u mode %u clamp %u bias %u; depth test %u write %u func %u stencil %u; attributes %u bindings %u; colour %u (format %u) samples %u a2c %u; blend enable %#x logic %u/%u; fragment depth variant %u (depth written by a shader at present %llu, now %llu)",
@@ -1615,22 +1659,23 @@ static int prepare_draw(int prim, int indexed) {
     if (p != S.bound_pipe) { uint64_t tb = g_prof_on ? tick() : 0; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); S.bound_pipe = p; if (g_prof_on) g_prof_ns[4] += tick() - tb; }
     set_dynamic(cb);
     if (var == 1) { vkCmdSetDepthBias(cb, 0, 0, 0); memset(&g_bc.po, 0xff, sizeof g_bc.po); }
-    uint32_t at[6] = {0};   // where each set's dynamic offsets start in dall
+    uint32_t at[VK_NSETS + 1] = {0};   // where each set's dynamic offsets start in dall
     for (int i = 0; i < nsets; i++) { at[i] = ndofs; for (int st = 0; st < 3; st++)   // the dynamic offsets: by set, then binding
         if (S.sh[st] && !(st == 1 && k.raster_discard) && S.sh[st]->set == i) { memcpy(dall + ndofs, dofs[i], sizeof(uint32_t) * (size_t)S.sh[st]->ndyn); ndofs += (uint32_t)S.sh[st]->ndyn; } }
     at[nsets] = ndofs;
-    for (int i = 0; i < nsets; i++) if (!sets[i]) sets[i] = vk_alloc_set(dsl[i]);   // an absent stage's set: from the empty layout vk_pipeline_layout filled in
+    for (int i = 1; i < nsets; i++) if (!sets[i]) sets[i] = vk_alloc_set(dsl[i]);   // an absent stage's set: from the empty layout vk_pipeline_layout filled in (set 0, the table, is bound apart below, only when a stage reads one)
     // DM_VK_SETSPLIT=1 (live): under the same layout, only the run of sets whose handle or dynamic offsets changed is bound again. Adreno's vkCmdBindDescriptorSets
     // took ~22% of the replay thread on Unicorn Overlord's battle map (one load in it), and a draw that moves only its vertex stage's offsets sent the fragment set too
     if (!(dbg_draw() & 4) && g_setsplit && !bc_fresh() && g_bc.lay == layout && g_bc.nsets == (uint32_t)nsets && g_bc.ndofs == ndofs) {
         int lo = -1, hi = -1;
-        for (int i = 0; i < nsets; i++) if (g_bc.sets[i] != sets[i] || memcmp(g_bc.dofs + at[i], dall + at[i], sizeof *dall * (at[i + 1] - at[i]))) { if (lo < 0) lo = i; hi = i; }
+        for (int i = 1; i < nsets; i++) if (g_bc.sets[i] != sets[i] || memcmp(g_bc.dofs + at[i], dall + at[i], sizeof *dall * (at[i + 1] - at[i]))) { if (lo < 0) lo = i; hi = i; }
         if (lo >= 0) { vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, (uint32_t)lo, (uint32_t)(hi - lo + 1), sets + lo, at[hi + 1] - at[lo], dall + at[lo]);
             memcpy(g_bc.sets + lo, sets + lo, sizeof *sets * (size_t)(hi - lo + 1)); memcpy(g_bc.dofs + at[lo], dall + at[lo], sizeof *dall * (at[hi + 1] - at[lo])); } }
     else if (!(dbg_draw() & 4)) { int fresh = bc_fresh();
-        if (fresh || g_bc.lay != layout || g_bc.nsets != (uint32_t)nsets || g_bc.ndofs != ndofs || memcmp(g_bc.sets, sets, sizeof *sets * (size_t)nsets) || memcmp(g_bc.dofs, dall, sizeof *dall * ndofs)) {
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, (uint32_t)nsets, sets, ndofs, dall);
+        if (fresh || g_bc.lay != layout || g_bc.nsets != (uint32_t)nsets || g_bc.ndofs != ndofs || memcmp(g_bc.sets + 1, sets + 1, sizeof *sets * (size_t)(nsets - 1)) || memcmp(g_bc.dofs, dall, sizeof *dall * ndofs)) {
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, (uint32_t)(nsets - 1), sets + 1, ndofs, dall);
             g_bc.lay = layout; g_bc.nsets = (uint32_t)nsets; g_bc.ndofs = ndofs; memcpy(g_bc.sets, sets, sizeof *sets * (size_t)nsets); memcpy(g_bc.dofs, dall, sizeof *dall * ndofs); } }
+    if (tbl && !(dbg_draw() & 4) && (g_bc.tbl != tbl || g_bc.gen != g_cmd_gen)) { vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &tbl, 0, NULL); g_bc.tbl = tbl; g_tbl_binds++; }   // the texture table: set 0, kept across pipelines (every graphics layout's set 0 is vk_tbl_dsl)
     // vertex buffers
     for (uint32_t i = 0; i < k.nbind; i++) {
         uint32_t b = k.bind[i].binding; VkBuffer buf; VkDeviceSize off;
@@ -1928,7 +1973,7 @@ static void draw_idx(const p_draw_idx *d) {
 static nvn_hmap g_cpipes = {.klen = 24};   // {shader, its integer-texel bindings}
 static pthread_mutex_t g_cpipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and compute_warm
 static VkPipeline compute_build(vkshader_t *cs, uint64_t um, uint64_t im) {   // (VkPipeline)1 when it fails
-    VkDescriptorSetLayout dsl[5] = {cs->dsl}; VkPipeline p;
+    VkDescriptorSetLayout dsl[VK_NSETS] = {cs->dsl}; VkPipeline p;
     int bs = build_begin();   // (the crash dump's note: build_pipeline)
     if (bs >= 0) { snprintf(g_build[bs].what, sizeof g_build[bs].what, "compute pipeline, shader %016llx, integer-texel views %#llx/%#llx", (unsigned long long)cs->key, (unsigned long long)um, (unsigned long long)im); g_build[bs].phase = 1; }
     // DM_VK_SPV_ALT=1 in env.txt (with DM_VK_SPV_DIR): compute shaders take the alternative code too, from the start (compute_warm builds them all then, and they are kept)
@@ -2013,7 +2058,7 @@ static void dispatch(const p_dispatch *d) {
     g_vkst.dispatches++;
     vk_end_pass_land();
     VkCommandBuffer cb = vk_cmd();
-    VkDescriptorSetLayout dsl[5] = {cs->dsl}; VkPipelineLayout layout = vk_pipeline_layout(dsl, 1);
+    VkDescriptorSetLayout dsl[VK_NSETS] = {cs->dsl}; VkPipelineLayout layout = vk_pipeline_layout(dsl, 1);
     // the group counts before the descriptors: the driver segment stage_set builds carries them at c0 + 0x200 (drv_segment), as nvn_mtl.m's does. Set after it, every
     // dispatch read the previous one's: Link's Awakening's light culling (tile = workgroup y × c0[0x200] + workgroup x) ran after a 2x1x1 dispatch, so of its 30x17
     // tiles it wrote only 0-61. An indirect dispatch's counts are on the GPU only (0 here; nvn_mtl.m copies them in)
@@ -2120,7 +2165,7 @@ static VkPipeline mesh_cpipe(vkshader_t *k) {   // the kernel's compute pipeline
 static int mesh_kernel(VkCommandBuffer cb, int st, vkshader_t *k, const mesh_buf *ind, VkDeviceSize ind_at, uint32_t groups) {   // the task (st 3) or mesh (st 4) kernel: its set from the host's stage state, a dispatch
     uint32_t dofs[96]; VkDescriptorSet set = stage_set(st, k, dofs);
     VkPipeline p = mesh_cpipe(k); if (p == (VkPipeline)1) return 0;
-    VkDescriptorSetLayout dsl[5] = {k->dsl}; VkPipelineLayout layout = vk_pipeline_layout(dsl, 1);
+    VkDescriptorSetLayout dsl[VK_NSETS] = {k->dsl}; VkPipelineLayout layout = vk_pipeline_layout(dsl, 1);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p); vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, (uint32_t)k->ndyn, dofs);
     if (ind) vkCmdDispatchIndirect(cb, ind->b, ind->off + ind_at); else vkCmdDispatch(cb, groups, 1, 1);
     vk_img_barrier_all(cb); return 1;

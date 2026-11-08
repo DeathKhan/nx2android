@@ -172,8 +172,9 @@ _Static_assert(sizeof(dmsv_bind) == 20, "dmsv_bind");
 typedef struct {
     uint64_t key; int stage;          // NVN stage: 0 vertex 1 fragment 2 geometry 3 tess control 4 tess eval 5 compute
     VkShaderModule mod;
-    VkDescriptorSetLayout dsl; int set;   // the set this stage's bindings were moved to (vertex 0, fragment 1, geometry 2, compute 0)
+    VkDescriptorSetLayout dsl; int set;   // the set this stage's bindings were moved to (vertex 1, fragment 2, geometry 3; compute 0: set 0 of a graphics layout is the texture table, vk_tbl_dsl)
     int nbind; const dmsv_bind *b;
+    uint8_t tbl[96]; int ntbl, tbl_reg, tbl_off;   // bindings moved to the texture table set (1 + slot: 2D, 2D array, cube; gfx_vk_exec.c tbl_set), their count, and the uniform buffer (register, byte offset) the handles come from
     const uint8_t *c1; uint32_t c1_len; VkBuffer c1_buf; VkDeviceSize c1_off;
     uint32_t local[3];
     uint8_t dyn[96]; int ndyn;          // bindings of uniform buffers bound with a dynamic offset (gfx_vk_exec.c stage_set), and their count
@@ -190,6 +191,14 @@ typedef struct {
     int mesh_kind; uint32_t mesh_threads, mesh_pay, mesh_task, mesh_verts, mesh_max_v, mesh_max_p, mesh_ncomp;
 } vkshader_t;
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader
+// Texture tables: a shader's arrays of TBL_MIN or more combined image samplers whose handles are consecutive words of one of the game's uniform buffers (element k = the handle at
+// off + 8k; Bezel Engine's material texture lists in Nintendo Switch 2 Welcome Tour: three arrays of 8192 in 420 fragment shaders, one each for 2D, 2D array and cube reads). They go
+// to set 0, whose layout (vk_tbl_dsl: TBL_SLOTS bindings of vk_tbl_n() each) is the same in every graphics pipeline layout, so a table set stays bound across pipelines and is bound
+// again only when the handles change; the arrays' lengths in the SPIR-V are cut to vk_tbl_n() (the UMin clamps on their indices with them). Adreno copies every bound set into
+// command memory at each vkCmdBindDescriptorSets: with the tables in the per-draw fragment sets a Welcome Tour scene submission mapped 2.4-3.3 GB. DM_VK_TBL_N: the length (0: off)
+enum { VK_NSETS = 6, TBL_SLOTS = 3, TBL_MIN = 256 };
+VkDescriptorSetLayout vk_tbl_dsl(void);
+int vk_tbl_n(void);
 vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo);   // the geometry shader translated for the draw's input primitive (shader_vk.py gs_variant_key); gs when there is none
 VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd);   // the module, or its variant (integer views; extra outputs; fragment depth written)
 void vk_shaders_open(const char *path);

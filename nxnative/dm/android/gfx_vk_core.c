@@ -1749,8 +1749,8 @@ uint64_t mtl_sub_commit(void) {
     pthread_mutex_lock(&g_cmu); if (g_ct) g_ct->next = c; else g_ch = c; g_ct = c; pthread_cond_signal(&g_ccv); pthread_mutex_unlock(&g_cmu);
     // Command memory: Adreno keeps what a command buffer's recording mapped (a bound descriptor set's descriptors are copied into the stream: Nintendo Switch 2 Welcome
     // Tour's first scene load recorded 3.3 GB in one submission, and the slots kept it), and a pool reset is the only way to give it back. A submission that mapped
-    // DM_VK_CMDMEM_RESET_MB (default 256; 0 = never) or more is waited for here (after its completion record is queued: the completion thread moves the fence) and its slot's pool reset with its resources released: a stall, at a scene load only
-    { static int64_t cap = -1; if (cap < 0) { const char *e = getenv("DM_VK_CMDMEM_RESET_MB"); cap = (int64_t)(e ? atoi(e) : 256) << 20; }
+    // DM_VK_CMDMEM_RESET_MB (default 1024, a safety net since the texture tables left the per-draw sets (gfx_vk.h vk_tbl_dsl); 0 = never) or more is waited for here (after its completion record is queued: the completion thread moves the fence) and its slot's pool reset with its resources released: a stall, at a scene load only
+    { static int64_t cap = -1; if (cap < 0) { const char *e = getenv("DM_VK_CMDMEM_RESET_MB"); cap = (int64_t)(e ? atoi(e) : 1024) << 20; }
       uint64_t now = kgsl_mapped(); if (cap && now > g_sub0.kgsl + (uint64_t)cap) {
           struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); mtl_wait(f, ~0ull);
           VKCHK(vkResetCommandPool(V.dev, s->pool, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT)); clock_gettime(CLOCK_MONOTONIC, &t1);

@@ -122,7 +122,7 @@ static VkShaderStageFlags stage_flag(int st) {
     switch (st) { case 0: return VK_SHADER_STAGE_VERTEX_BIT; case 1: return VK_SHADER_STAGE_FRAGMENT_BIT; case 2: return VK_SHADER_STAGE_GEOMETRY_BIT;
                   case 3: return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT; case 4: return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; default: return VK_SHADER_STAGE_COMPUTE_BIT; }
 }
-static int set_of(int st) { return st == 5 || st >= 6 ? 0 : st == 0 ? 0 : st == 1 ? 1 : st == 2 ? 2 : st; }   // 6 / 7: NVN2 task and mesh kernels, dispatched as compute (gfx_vk_exec.c mesh_draw)
+static int set_of(int st) { return st >= 5 ? 0 : st + 1; }   // graphics stages after the texture table's set 0 (vk_tbl_dsl); 5 compute, 6 / 7: NVN2 task and mesh kernels, dispatched as compute (gfx_vk_exec.c mesh_draw)
 static VkDescriptorType desc_type(int d) {
     switch (d) { case RD_UBO: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; case RD_SSBO: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; case RD_SAMPLED: return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                  case RD_STORAGE: return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; case RD_TBUF: return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER; case RD_STORAGE_TBUF: return VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
@@ -238,6 +238,73 @@ static VkDescriptorSetLayout shader_layout(const VkDescriptorSetLayoutBinding *b
     }
     return layout;
 }
+int vk_tbl_n(void) {   // the texture tables' length (gfx_vk.h): DM_VK_TBL_N, 2048 unless set, 0 off. Fixed for the process: every graphics pipeline layout shares the one layout.
+    // Welcome Tour binds its material texture list (cb12) with 15,872 bytes, 1,984 handles; tbl_set logs the longest bound, and an index past the length reads the last entry (the clamp)
+    static int n = -1; if (n < 0) { const char *e = getenv("DM_VK_TBL_N"); n = e ? atoi(e) : 2048; if (n < 0) n = 0; if (n > 65536) n = 65536; }
+    return n;
+}
+VkDescriptorSetLayout vk_tbl_dsl(void) {   // set 0 of every graphics pipeline layout: TBL_SLOTS arrays of vk_tbl_n() combined image samplers (2D, 2D array, cube)
+    static VkDescriptorSetLayout l; VkDescriptorSetLayout r = __atomic_load_n(&l, __ATOMIC_ACQUIRE); if (r) return r;
+    pthread_mutex_lock(&g_sh_mu);
+    if (!l) { VkDescriptorSetLayoutBinding lb[TBL_SLOTS]; uint32_t n = (uint32_t)(vk_tbl_n() ? vk_tbl_n() : 1);
+        for (uint32_t i = 0; i < TBL_SLOTS; i++) lb[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
+        VkDescriptorSetLayout m = shader_layout(lb, TBL_SLOTS); __atomic_store_n(&l, m, __ATOMIC_RELEASE); }
+    pthread_mutex_unlock(&g_sh_mu);
+    return l;
+}
+// Is the id used only where a texture table's array length (which 0: the length operand of OpTypeArray) or its index clamp (which 1: an operand of GLSL.std.450 UMin) may be?
+// Every other occurrence in an id position fails it; words known to be literals (strings, constants' values, decorations, image operand masks and so on) are passed over.
+// A false failure only keeps that shader's arrays out of the table (its own set, as before)
+static int spv_only_uses(const uint32_t *w, uint32_t nw, uint32_t id, int which) {
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) return 0;
+        if (op == 3 || op == 4 || op == 5 || op == 6 || op == 7 || op == 8 || op == 10 || op == 11 || op == 14 || op == 15 || op == 17 || op == 330) { i += n; continue; }   // strings and literals only
+        for (uint32_t k = 1; k < n; k++) { if (w[i + k] != id) continue;
+            if (which == 0 && op == 28 && k == 3) continue;                        // OpTypeArray's length
+            if (which == 1 && op == 12 && k >= 5 && w[i + 4] == 38) continue;       // an operand of UMin
+            if ((op == 43 || op == 50) && k == 2) continue;                         // its own definition
+            if ((op == 43 || op == 50 || op == 45) && k >= 3) continue;             // a constant's value words
+            if ((op == 71 && k >= 2) || (op == 72 && k >= 3) || (op == 16 && k >= 2) || (op == 331 && k == 2)) continue;   // decoration / execution mode literals
+            if ((op == 12 && k == 4) || (op == 52 && k == 3)) continue;             // the extended instruction's number; OpSpecConstantOp's opcode
+            if ((op == 21 || op == 22) && k >= 2) continue;                         // widths
+            if ((op == 23 || op == 24) && k == 3) continue;                         // component / column counts
+            if (op == 25 && k >= 3) continue;                                       // OpTypeImage's dim, depth, arrayed, ms, sampled, format
+            if ((op == 32 && k == 2) || (op == 59 && k == 3) || (op == 54 && k == 3)) continue;   // storage classes, function control
+            if ((op == 61 && k >= 4) || (op == 62 && k >= 3) || (op == 63 && k >= 3) || (op == 68 && k == 4)) continue;   // memory access, member index
+            if ((op == 81 && k >= 4) || (op == 82 && k >= 5) || (op == 79 && k >= 5)) continue;   // composite indices, shuffle components
+            if ((op == 246 && k == 3) || (op == 247 && k == 2) || (op == 250 && k >= 4) || (op == 251 && k >= 3)) continue;   // merge / branch literals, switch cases
+            if (((op >= 87 && op <= 99) || (op >= 305 && op <= 315)) && w[i + k] < 0x200 && k >= 4) continue;   // an image operands mask (the ids this is asked about are never that small in practice; a wrong guess fails the shader, not the draw)
+            return 0; }
+        i += n; }
+    return 1;
+}
+// cut the length of the texture-table arrays declared through the variables tv[] (ntv of them) from their old length to newn, and the UMin clamps of their indices with it
+static int spv_tbl_shrink(uint32_t *w, uint32_t nw, const uint32_t *tv, int ntv, uint32_t newn) {
+    uint32_t bound = w[3]; if (!bound || bound > (1u << 22)) return 0;
+    uint32_t *ptr_of = calloc(bound, 4), *pointee = calloc(bound, 4), *arr_len = calloc(bound, 4), *cval = calloc(bound, 4), *ctype = calloc(bound, 4); int ok = 1;
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { ok = 0; break; }
+        if (op == 59 && n >= 4 && w[i + 2] < bound) ptr_of[w[i + 2]] = w[i + 1];
+        if (op == 32 && n == 4 && w[i + 1] < bound) pointee[w[i + 1]] = w[i + 3];
+        if (op == 28 && n == 4 && w[i + 1] < bound) arr_len[w[i + 1]] = w[i + 3];
+        if (op == 43 && n == 4 && w[i + 2] < bound) { cval[w[i + 2]] = w[i + 3]; ctype[w[i + 2]] = w[i + 1]; }
+        i += n; }
+    uint32_t lens[TBL_SLOTS] = {0}, clamps[TBL_SLOTS] = {0}; int nl = 0, nc = 0;
+    for (int t = 0; t < ntv && ok; t++) {
+        uint32_t v = tv[t], p = v < bound ? ptr_of[v] : 0, a = p && p < bound ? pointee[p] : 0, l = a && a < bound ? arr_len[a] : 0;
+        if (!l || l >= bound || !ctype[l] || cval[l] <= newn) { ok = 0; break; }   // (an array already short enough never gets here: the caller checks the reflection's count)
+        int had = 0; for (int j = 0; j < nl; j++) had |= lens[j] == l; if (!had) lens[nl++] = l;
+        uint32_t c = 0; for (uint32_t id = 1; id < bound && !c; id++) if (ctype[id] == ctype[l] && cval[id] == cval[l] - 1 && id != l) c = id;   // the clamp constant: the same type, one less
+        if (!c) { ok = 0; break; }
+        had = 0; for (int j = 0; j < nc; j++) had |= clamps[j] == c; if (!had) clamps[nc++] = c;
+    }
+    for (int j = 0; j < nl && ok; j++) ok = spv_only_uses(w, nw, lens[j], 0);
+    for (int j = 0; j < nc && ok; j++) ok = spv_only_uses(w, nw, clamps[j], 1);
+    if (ok) {   // the constants' values, in place (OpConstant type id value)
+        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+            if (op == 43 && n == 4) { for (int j = 0; j < nl; j++) if (w[i + 2] == lens[j]) w[i + 3] = newn; for (int j = 0; j < nc; j++) if (w[i + 2] == clamps[j]) w[i + 3] = newn - 1; }
+            i += n; } }
+    free(ptr_of); free(pointee); free(arr_len); free(cval); free(ctype);
+    return ok;
+}
 static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet);
 vkshader_t *vk_shader(uint64_t key, int stage) { return vk_shader_q(key, stage, 0); }
 // A geometry shader's input primitive is fixed when it is translated, and Maxwell's shader header doesn't give it: shader_vk.py translates each geometry shader for
@@ -281,9 +348,27 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
         uint32_t w0 = s->local[0]; s->mesh_kind = (int)(w0 >> 24 & 3); s->mesh_threads = w0 & 0x3ff; s->mesh_pay = w0 >> 10 & 0x3ff; s->mesh_task = w0 >> 20 & 1; s->mesh_verts = w0 >> 21 & 7;
         s->mesh_max_v = s->local[1] & 0xffff; s->mesh_max_p = s->local[1] >> 16; s->mesh_ncomp = s->local[2]; s->local[0] = s->mesh_threads ? s->mesh_threads : 1; s->local[1] = s->local[2] = 1; }
     s->b = (const dmsv_bind *)(r + 20); s->c1 = r + 20 + 20 * s->nbind;
-    // SPIR-V with the stage's set
+    // texture tables (gfx_vk.h): the arrays of TBL_MIN+ combined image samplers read through one uniform buffer's handles, by slot; one source buffer per shader
+    uint32_t tbind[TBL_SLOTS] = {0}, tvar[TBL_SLOTS] = {0}; int thave[TBL_SLOTS] = {0}, tbig = 0; s->tbl_reg = -1;
+    if (vk_tbl_n() && stage <= 4) for (int i = 0; i < s->nbind && i < 96; i++) { const dmsv_bind *b = &s->b[i];
+        if (b->kind != RK_TEX_UBO || b->count < TBL_MIN || b->samp != RS_TEX || (b->flags & 2) || (b->dim != 1 && b->dim != 3) || b->reg < 0 || b->reg >= 16) continue;
+        int slot = b->dim == 3 ? 2 : (b->flags & 1) ? 1 : 0;
+        if (thave[slot] || (s->ntbl && (s->tbl_reg != b->reg || s->tbl_off != b->off))) { static int nl; if (nl++ < 8) VKLOG("shader %016llx: texture array binding %u (%u entries, uniform buffer %d +%d) left in its stage's set: the table has %s", (unsigned long long)key, b->binding, b->count, b->reg, b->off, thave[slot] ? "that slot already" : "another source buffer"); continue; }
+        thave[slot] = 1; tbind[slot] = b->binding; s->tbl[i] = (uint8_t)(1 + slot); s->ntbl++; s->tbl_reg = b->reg; s->tbl_off = b->off; if (b->count > (uint32_t)vk_tbl_n()) tbig = 1; }
+    if (s->ntbl) {   // their variables (OpDecorate Binding), then the arrays cut to the table's length when they are longer
+        for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break;
+            if (op == 71 && n >= 4 && w[i + 2] == 33) for (int t = 0; t < TBL_SLOTS; t++) if (thave[t] && w[i + 3] == tbind[t]) tvar[t] = w[i + 1];
+            i += n; }
+        uint32_t tv[TBL_SLOTS]; int ntv = 0; for (int t = 0; t < TBL_SLOTS; t++) if (thave[t]) { if (tvar[t]) tv[ntv++] = tvar[t]; else s->ntbl = 0; }
+        if (s->ntbl && tbig && !spv_tbl_shrink(w, nw, tv, ntv, (uint32_t)vk_tbl_n())) s->ntbl = 0;
+        if (!s->ntbl) { memset(s->tbl, 0, sizeof s->tbl); memset(thave, 0, sizeof thave); s->tbl_reg = -1; static int nl; if (nl++ < 8) VKLOG("[RED] shader %016llx: its texture arrays could not be moved to the table (their SPIR-V could not be cut to %d); left in its stage's set", (unsigned long long)key, vk_tbl_n()); }
+        else { static int nl; if (nl++ < 4) VKLOG("shader %016llx: %d texture arrays moved to the table set (uniform buffer %d +%d, %d entries each)", (unsigned long long)key, s->ntbl, s->tbl_reg, s->tbl_off, vk_tbl_n()); }
+    }
+    // SPIR-V with the stage's set (the table's variables: set 0, binding = slot)
     int f64_used = 0; uint32_t xb = 4;
-    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break; if (op == 71 && n >= 4 && w[i + 2] == 34) w[i + 3] = (uint32_t)s->set;   // OpDecorate DescriptorSet
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break;
+        if (op == 71 && n >= 4 && (w[i + 2] == 34 || w[i + 2] == 33)) { int slot = -1; for (int t = 0; t < TBL_SLOTS; t++) if (thave[t] && tvar[t] == w[i + 1]) slot = t;   // OpDecorate DescriptorSet / Binding
+            if (w[i + 2] == 34) w[i + 3] = slot >= 0 ? 0 : (uint32_t)s->set; else if (slot >= 0) w[i + 3] = (uint32_t)slot; }
         if (op == 22 && n == 3 && w[i + 2] == 64) f64_used = 1;   // OpTypeFloat 64
         if (op == 16 && n >= 3 && w[i + 2] == 11) s->xfb = 1;     // OpExecutionMode Xfb: a vertex shader that captures transform feedback (shader_vk.py xfb_layout)
         if (op == 16 && n >= 3 && (w[i + 2] == 12 || w[i + 2] == 14 || w[i + 2] == 15)) s->depth_repl = 1;   // OpExecutionMode DepthReplacing / DepthGreater / DepthLess
@@ -345,7 +430,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     uint32_t dynmax = dyn_on ? V.props.limits.maxDescriptorSetUniformBuffersDynamic / 2 : 0;
     VkDescriptorSetLayoutBinding lb[96]; uint32_t nl = 0;
     for (int i = 0; i < s->nbind && nl < 96; i++) {
-        const dmsv_bind *b = &s->b[i];
+        const dmsv_bind *b = &s->b[i]; if (s->tbl[i]) continue;   // (in the table set)
         int dyn = b->desc == RD_UBO && (b->kind == RK_CBUF || b->kind == RK_DRV) && b->count == 1 && (uint32_t)s->ndyn < dynmax;
         s->dyn[i] = (uint8_t)dyn; s->ndyn += dyn;
         lb[nl++] = (VkDescriptorSetLayoutBinding){b->binding, dyn ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : desc_type(b->desc), b->count ? b->count : 32, stage_flag(stage), NULL};
@@ -389,15 +474,18 @@ static uint32_t spvi_type(spvi *c, uint32_t old, uint32_t k) {
     if (c->nmap < 64) c->map[c->nmap++] = (typeof(c->map[0])){old, k, id};
     return id;
 }
-static uint32_t *spv_int_images(const uint32_t *w, uint32_t nw, const uint16_t *bind, const uint8_t *kind, int nb, uint32_t *onw) {
+static uint32_t *spv_int_images(const uint32_t *w, uint32_t nw, const uint16_t *bind, const uint8_t *kind, int nb, uint32_t set, uint32_t *onw) {
     spvi c = {.w = w, .fn = nw, .bound = w[3]};
     for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16; if (!n) return NULL; if ((w[i] & 0xffff) == 54) { c.fn = i; break; } i += n; }   // the first OpFunction
     uint32_t base = c.bound; c.at = calloc(base, sizeof *c.at); c.nt = malloc(4096 * 4);
     uint8_t *taint = calloc(base, 1);   // ids that are (pointers to) the retyped images: their kind
+    uint32_t *vset = malloc((size_t)base * 4); memset(vset, 0xff, (size_t)base * 4);   // each variable's DescriptorSet: the bindings named are the stage's set's (a texture table variable in set 0 can carry the same number)
+    for (uint32_t i = 5; i < c.fn;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (op == 71 && n >= 4 && w[i + 2] == 34 && w[i + 1] < base) vset[w[i + 1]] = w[i + 3]; i += n; }
     for (uint32_t i = 5; i < c.fn;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
         if (op >= 19 && op <= 39 && w[i + 1] < base) c.at[w[i + 1]] = i;   // OpType*
-        if (op == 71 && n >= 4 && w[i + 2] == 33) for (int k = 0; k < nb; k++) if (w[i + 3] == bind[k] && w[i + 1] < base) taint[w[i + 1]] = kind[k];   // OpDecorate Binding
+        if (op == 71 && n >= 4 && w[i + 2] == 33) for (int k = 0; k < nb; k++) if (w[i + 3] == bind[k] && w[i + 1] < base && vset[w[i + 1]] == set) taint[w[i + 1]] = kind[k];   // OpDecorate Binding
         i += n; }
+    free(vset);
     // the functions, rewritten apart: every new type they need is known before the declarations are written
     uint32_t *fb = malloc(((size_t)(nw - c.fn) * 2 + 16) * 4), nf = 0, *mv = malloc(1024 * 4), nmv = 0; int ok = 1;
     for (uint32_t i = 5; i < c.fn && ok;) { uint32_t n = w[i] >> 16;   // the retyped variables, with their new pointer types
@@ -516,7 +604,7 @@ static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im,
     for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == (fd | dual << 1)) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
     uint16_t bind[64]; uint8_t kind[64]; int nb = 0;
     for (int i = 0; i < s->nbind && i < 64; i++) if ((um | im) >> i & 1) { bind[nb] = s->b[i].binding; kind[nb++] = um >> i & 1 ? 1 : 2; }
-    uint32_t nw = s->nspv, *w = nb ? spv_int_images(s->spv, s->nspv, bind, kind, nb, &nw) : NULL; VkShaderModule m = s->mod;
+    uint32_t nw = s->nspv, *w = nb ? spv_int_images(s->spv, s->nspv, bind, kind, nb, (uint32_t)s->set, &nw) : NULL; VkShaderModule m = s->mod;
     if (xo && (w || !nb)) { uint32_t n2 = 0, *w2 = spv_add_outputs(w ? w : s->spv, nw, xo, &n2); free(w); w = w2; nw = n2;
         if (w && s->stage == 0) { uint32_t n3 = 0, *w3 = spv_vs_init(w, nw, &n3); if (w3) { free(w); w = w3; nw = n3; } } }   // the added outputs start as (0, 0, 0, 1) too
     if (fd && (w || !(nb || xo))) { uint32_t n2 = 0, *w2 = spv_frag_depth(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
@@ -562,11 +650,11 @@ void vk_shader_c1(vkshader_t *s, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize 
     *buf = s->c1_buf; *off = 0; *len = (s->c1_len + 255) & ~255u;
 }
 // pipeline layouts by the set layouts of their stages (an empty layout fills the sets of absent stages)
-VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[5], int nsets) {
-    static VkDescriptorSetLayout empty; static nvn_hmap cache = {.klen = 5 * sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[VK_NSETS], int nsets) {
+    static VkDescriptorSetLayout empty; static nvn_hmap cache = {.klen = VK_NSETS * sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mu);
     if (!empty) { VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; VKCHK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &empty)); }
-    VkDescriptorSetLayout k[5]; for (int i = 0; i < 5; i++) { k[i] = i < nsets && sets[i] ? sets[i] : (i < nsets ? empty : VK_NULL_HANDLE); if (i < nsets) sets[i] = k[i]; }   // absent stages get the empty layout (the caller allocates their sets from it)
+    VkDescriptorSetLayout k[VK_NSETS]; for (int i = 0; i < VK_NSETS; i++) { k[i] = i < nsets && sets[i] ? sets[i] : (i < nsets ? empty : VK_NULL_HANDLE); if (i < nsets) sets[i] = k[i]; }   // absent stages get the empty layout (the caller allocates their sets from it)
     VkPipelineLayout pl = nvn_hm_get(&cache, k);
     if (!pl) {
         VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, (uint32_t)nsets, k};
