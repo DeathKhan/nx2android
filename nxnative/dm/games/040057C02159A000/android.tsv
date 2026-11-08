@@ -21,3 +21,8 @@ env	DM_ADAPTIVE_FPS=0
 
 # The Joy-Con 2 mouse (hle_hid.c): the mouse exhibits ("This exhibit requires mouse controls") read player 1's right Joy-Con 2 as one; the right stick and the touchscreen move it, R clicks
 env	DM_MOUSE=1
+
+# The pause menu frame cap (hle_framecap.c) by host pacing: Bezel runs its update stage at a fixed 1/60 s step as many times a frame as the elapsed time asks (nn::bezel
+# CoreSystem main+0x723a44 counts the steps, (elapsed - remainder) / step; main+0x7243a4 runs stage 0x10 that many times), so a frame held 33.3 ms on screen runs two
+# updates and the game keeps real time
+env	DM_FRAME_CAP_MODE=pace

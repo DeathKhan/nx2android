@@ -66,15 +66,41 @@ int main(void) {
 }
 '''
 
+# A game paced by the host (profile env DM_FRAME_CAP_MODE=pace, no gate): Nintendo Switch 2 Welcome Tour, whose Bezel engine runs as many fixed 1/60 s updates a frame as the
+# elapsed time asks, so the cap is only the present period, live from Off to 30 and back
+HARNESS_PACE = r'''
+#include <assert.h>
+#include <stdlib.h>
+int t_gate = 0, t_ms;
+void gate_obs_set(int id, void (*fn)(uint64_t *, int)) { (void)id; (void)fn; }
+int main(void) {
+    setenv("DM_FRAME_CAP_MODE", "pace", 1);
+    assert(dm_frame_cap_how() == DM_FRAME_CAP_PACE);
+    assert(dm_frame_cap_period(16666667) == 16666667);       // off: the game's own period
+    dm_frame_cap_set(30); assert(dm_frame_cap_period(16666667) == 33333333);
+    assert(dm_frame_cap_period(50000000) == 50000000);       // a longer period the game asks for stays
+    assert(dm_frame_cap_period(0) == 0);                     // no period (unpaced) stays unpaced
+    dm_frame_cap_set(60); assert(dm_frame_cap_period(16666667) == 16666667);
+    dm_frame_cap_set(0); assert(dm_frame_cap_period(16666667) == 16666667);
+    puts("ok"); return 0;
+}
+'''
+
 
 class FrameCap(unittest.TestCase):
     def test_cap_and_resolution(self):
+        self.run_harness(HARNESS)
+
+    def test_cap_paced_by_host(self):
+        self.run_harness(HARNESS_PACE)
+
+    def run_harness(self, harness):
         cc = shutil.which('cc') or shutil.which('clang')
         if not cc:
             self.skipTest('a C compiler is required')
         with tempfile.TemporaryDirectory() as d:
             Path(d, 'dm.h').write_text(STUB)
-            Path(d, 't.c').write_text('#include "dm.h"\n' + HARNESS)
+            Path(d, 't.c').write_text('#include "dm.h"\n' + harness)
             Path(d, 'hle_framecap.c').write_text(SOURCE.read_text(encoding='utf-8'))   # beside the stand-in dm.h
             exe = Path(d, 't')
             subprocess.run([cc, '-std=gnu11', '-I', d, str(Path(d, 'hle_framecap.c')), str(Path(d, 't.c')), '-o', str(exe), '-lm'], check=True)
