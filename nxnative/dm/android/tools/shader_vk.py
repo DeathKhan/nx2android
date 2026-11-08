@@ -17,6 +17,9 @@
 #   storage buffers the wrapper adds, named dm_mesh_*, binding kinds mesh_*); the bundle keeps it under stage 6 / 7 with shader_meshwrap.facts in its header words, and a pass-through
 #   vertex shader per mesh shader under shader_meshwrap.mesh_vs_key (stage 0), which the backend draws the mesh kernel's vertices with (gfx_vk_exec.c mesh_draw).
 #   NVN's VertexA + VertexB merge, transform feedback (+0x6dc) and early fragment tests (+0x718) are NVN control fields, read on the Switch 1 path only. The bundle format is unchanged.
+# Padded waves (android_pad_wave 32 in game.tsv): compute kernels of LocalSize 32xNx1 that use subgroup operations are padded to 64xNx1 (shader_padwave.py: the upper 32 lanes
+#   mirror the lower ones, their side effects predicated off), for the Adreno 830 driver, whose compiler fails a 32-lane workgroup with wave-wide operations (Ocarina of Time's
+#   NDVE movie-enhancement kernels: VK_ERROR_UNKNOWN or std::bad_alloc from vkCreateComputePipelines). Off by default: other games' bundles are unchanged.
 # Raw global memory (dm/gfx/nvn/dmsh_abi.h DMSH_KIND_GMEM_MAP / DMSH_KIND_GMEM_LOG): a load or store at an address the shader read from memory, which the translator could tie to no
 #   storage buffer (Ryujinx GlobalToStorage.TryGenerateRawStorageOp), goes through the host's memory pool table, a storage buffer the translator reserves under the sentinel constant
 #   buffer slot 0xff (DMSH_GMEM_MAP_CB_SLOT) at offset 0, and its write log at offset DMSH_GMEM_LOG_CB_OFFSET (1). They are binding kinds gmem_map (17) and gmem_log (18) here, as
@@ -40,6 +43,7 @@ import dmsh_abi as abi              # noqa: E402  the shader library ABI (dm/gfx
 import dmsh_ampere, dmsh_meshstage    # noqa: E402  NVN2 (Switch 2) control sections and task / mesh stage memory, the Mac chain's own modules (backend-neutral)
 import shader_pvgs                    # noqa: E402  the pass-through geometry shader of a fragment shader with per-vertex inputs (per_vertex = gs)
 import shader_meshwrap                # noqa: E402  task / mesh kernels wrapped for the compute emulation, and their pass-through vertex shaders
+import shader_padwave                 # noqa: E402  32-lane compute workgroups padded to 64 lanes for a 64-lane-wave GPU (android_pad_wave)
 from shader_split import glslc_stage   # the package reader also recognizes headerless compute code
 
 ap = argparse.ArgumentParser()
@@ -65,6 +69,10 @@ SB_ALIGN = 256
 # the translator emulates 32-lane warps inside it: lane id & 31, the ballot word of the lane's own 32, shuffles inside its 32, votes by ballot. Its 128 path picks the word by
 # lane id >> 5, so it holds for 64 too. At 32 the warp code read only the first 32 lanes' ballot (Tears of the Kingdom: 32 shaders vote, ballot or shuffle)
 SUBGROUP = int(GAME.get("android_subgroup_size", "128"))
+# android_pad_wave 32 (game.tsv): compute kernels of LocalSize 32xNx1 that use subgroup operations are padded to 64xNx1 (shader_padwave.py; see the header). Ocarina of Time's
+# NDVE kernels: Qualcomm's 512.800.72 compiler returns VK_ERROR_UNKNOWN (or throws std::bad_alloc) for them at 32 lanes and compiles the same code at 64. 0 (the default): off
+PAD_WAVE = int(GAME.get('android_pad_wave', '0'), 0)
+if PAD_WAVE not in (0, 32): sys.exit(f'android_pad_wave {PAD_WAVE}: 32 (padded to 64) or 0')
 # Exact HMMA operand exchange without shared-memory barriers. Explicit per-job
 # selection preserves Metal's native matrix rewrite; opt-in until device A/B completes.
 HMMA_SHUFFLE = os.environ.get('DMSH_HMMA_SHUFFLE', '0') == '1'
@@ -532,6 +540,7 @@ def main():
         for ln in r.stderr.splitlines():
             if ln.strip(): errs[ln.strip()[:120]] += 1
     entries, fails, pooled = [], collections.Counter(), collections.Counter()   # pooled: shaders per stage whose texture and sampler pool arrays go to the backend's pool tables
+    padded = {}   # key → shader_padwave.pad's account of a compute kernel padded from PAD_WAVE to 2 * PAD_WAVE lanes
     pv_fs = {}   # fragment shaders whose per-vertex reads became flat inputs (per_vertex = gs): their SPIR-V and the flat locations, for the geometry shaders below
     for k in keys:
         spv_p, res_p = os.path.join(w, k + '.spv'), os.path.join(w, k + '.res.json')
@@ -542,6 +551,9 @@ def main():
             mi, mlay, msize = mesh_jobs[k]
             try: spv = shader_meshwrap.wrap(spv, mi, mlay, msize); mesh_vs = shader_meshwrap.vertex_shader(mi) if mi['kind'] == 'ms' else None
             except ValueError as e: fails['mesh: ' + str(e)] += 1; print(f'[RED] {k} ({stages[k]}): not drawn: {e}', flush=True); continue
+        if PAD_WAVE and stages[k] == 'cs' and k not in mesh_jobs and shader_padwave.wants_pad(spv, PAD_WAVE):   # (before the reflection: the bundle header carries the padded local size)
+            try: spv, pst = shader_padwave.pad(spv, 2 * PAD_WAVE); padded[k] = pst
+            except ValueError as e: fails['pad_wave: ' + str(e)] += 1; print(f'[RED] {k} (cs): not padded to {2 * PAD_WAVE} lanes, left at {PAD_WAVE}: {e}', flush=True)
         binds, local, io = spirv_bindings(spv)
         if k in handle_remaps:
             spv = remap_handles(spv, *handle_remaps[k])
@@ -585,6 +597,11 @@ def main():
     print(f'{len(entries)} of {len(keys) + 5 * pv_gs + nvn2_notes["mesh shaders with a pass-through vertex shader"]} shaders → {a.out} ({os.path.getsize(a.out) / 2**20:.1f} MB, version {ver}: SPIR-V {raw / 2**20:.1f} MB'
           f'{f", {stored / 2**20:.1f} MB compressed" if ver > 1 else ""}); failed: {dict(fails)}; binding kinds: {dict(kinds_all)}')
     for e, n in errs.most_common(8): print(f'  translator: {n:5d}  {e}')
+    if padded:
+        se = collections.Counter()
+        for st_ in padded.values(): se.update(st_['stores']); se['atomics'] += st_['atomics']; se['image_writes'] += st_['image_writes']
+        print(f'{len(padded)} compute kernels of {PAD_WAVE}xNx1 lanes with subgroup operations padded to {2 * PAD_WAVE}xNx1 (android_pad_wave; shader_padwave.py), side effects predicated: {dict(se)}: '
+              f'{" ".join(f"{k} ({"x".join(map(str, v["local"]))})" for k, v in sorted(padded.items()))}', flush=True)
     if pooled: print(f'{sum(pooled.values())} shaders index the texture and sampler pools by handle ID (bound from the pool tables, gfx_vk_exec.c tbl_set; DM_VK_POOL_N): {dict(pooled)}', flush=True)
     arch = collections.Counter('sm86' if jobs[k].get('arch') == 'sm86' else 'maxwell' for k in keys)
     if arch['sm86']: print(f'NVN2 (Switch 2) shaders: {arch["sm86"]} of {len(keys)} translated as Ampere' + ''.join(f'; {n} {e}' for e, n in nvn2_notes.most_common()), flush=True)
