@@ -122,7 +122,7 @@ static VkShaderStageFlags stage_flag(int st) {
     switch (st) { case 0: return VK_SHADER_STAGE_VERTEX_BIT; case 1: return VK_SHADER_STAGE_FRAGMENT_BIT; case 2: return VK_SHADER_STAGE_GEOMETRY_BIT;
                   case 3: return VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT; case 4: return VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT; default: return VK_SHADER_STAGE_COMPUTE_BIT; }
 }
-static int set_of(int st) { return st == 5 ? 0 : st == 0 ? 0 : st == 1 ? 1 : st == 2 ? 2 : st; }
+static int set_of(int st) { return st == 5 || st >= 6 ? 0 : st == 0 ? 0 : st == 1 ? 1 : st == 2 ? 2 : st; }   // 6 / 7: NVN2 task and mesh kernels, dispatched as compute (gfx_vk_exec.c mesh_draw)
 static VkDescriptorType desc_type(int d) {
     switch (d) { case RD_UBO: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; case RD_SSBO: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; case RD_SAMPLED: return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                  case RD_STORAGE: return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; case RD_TBUF: return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER; case RD_STORAGE_TBUF: return VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
@@ -277,6 +277,9 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     // reflection
     const uint8_t *r = g_bundle + e->refl_off; uint32_t hdr[5]; memcpy(hdr, r, 20);
     s->nbind = (int)hdr[0]; s->c1_len = hdr[1]; memcpy(s->local, hdr + 2, 12);
+    if (stage == 6 || stage == 7) {   // a task / mesh kernel: the header words are shader_meshwrap.facts, not a local size (its LocalSize is in the SPIR-V)
+        uint32_t w0 = s->local[0]; s->mesh_kind = (int)(w0 >> 24 & 3); s->mesh_threads = w0 & 0x3ff; s->mesh_pay = w0 >> 10 & 0x3ff; s->mesh_task = w0 >> 20 & 1; s->mesh_verts = w0 >> 21 & 7;
+        s->mesh_max_v = s->local[1] & 0xffff; s->mesh_max_p = s->local[1] >> 16; s->mesh_ncomp = s->local[2]; s->local[0] = s->mesh_threads ? s->mesh_threads : 1; s->local[1] = s->local[2] = 1; }
     s->b = (const dmsv_bind *)(r + 20); s->c1 = r + 20 + 20 * s->nbind;
     // SPIR-V with the stage's set
     int f64_used = 0; uint32_t xb = 4;
@@ -575,3 +578,5 @@ VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[5], int nsets) {
 // The pass-through geometry shader shader_vk.py generates for a fragment shader that reads inputs per vertex (Ampere LDTRAM) on a device without VK_KHR_fragment_shader_barycentric:
 // keyed by the fragment shader's key and shader_pvgs.PV_GS_SALT, with the usual topology variants beside it (vk_shader_gs_topo)
 vkshader_t *vk_shader_pv_gs(vkshader_t *fs) { if (!fs) return NULL; vkshader_t *g = vk_shader_q(fs->key ^ 0x61C8864680B583EBull, 2, 1); if (g) g->pv_gs = 1; return g; }
+// The pass-through vertex shader shader_vk.py generates for each mesh kernel (shader_meshwrap.vertex_shader): keyed by the mesh key and shader_meshwrap.MESH_VS_SALT, a vertex-stage entry
+vkshader_t *vk_shader_mesh_vs(vkshader_t *ms) { return ms ? vk_shader_q(ms->key ^ 0x2545F4914F6CDD1Dull, 0, 1) : NULL; }

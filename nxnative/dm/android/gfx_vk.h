@@ -36,7 +36,7 @@
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) \
     X(vkCmdSetDepthBias) X(vkCmdSetLineWidth) X(vkCmdDraw) X(vkCmdPushConstants) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) X(vkCmdDispatchIndirect) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreateDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateComputePipelines) X(vkCreatePipelineCache) \
-    X(vkGetPipelineCacheData) X(vkCreateDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
+    X(vkGetPipelineCacheData) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
     X(vkCreateBufferView) X(vkDestroyBufferView) X(vkGetAndroidHardwareBufferPropertiesANDROID) X(vkGetBufferDeviceAddress) \
     X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
@@ -68,8 +68,10 @@ uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryProperty
 void vk_init(void);   // once, from mtl_init or the first use
 
 // ---- memory pools (gfx_vk_core.c): the guest's pool memory is GPU memory (AHardwareBuffer mapped over it) ----
-typedef struct { uint64_t lo, hi; VkBuffer buf; VkDeviceMemory mem; void *ahb; int zero_copy, noncoherent; uint8_t *shadow, *baseline; uint64_t serial, base, end; int flags, synced, baseline_complete; uint64_t stamp, stamp0; const void *span; uint64_t gpu; } vkpool_t;   // serial: unique per pool made (caches of views over a pool's buffer key on it); [base, end): the game's pool, of which [lo, hi) is one chunk (ZC_CHUNK); flags: the NVN pool's (vk_pool_set_flags); baseline: last synchronized GPU-copy contents; baseline_complete: refreshed by a full completion merge, consumed by the next sync; synced, stamp, stamp0, span: a copied pool's incremental sync
-vkpool_t *vk_pool_of(uint64_t addr, uint64_t len);   // the pool containing [addr, addr+len), NULL if none
+typedef struct { uint64_t lo, hi; VkBuffer buf; VkDeviceMemory mem; void *ahb; int zero_copy, noncoherent; uint8_t *shadow, *baseline; uint64_t serial, base, end; int flags, synced, baseline_complete; uint64_t stamp, stamp0; const void *span; uint64_t gpu; int backed, addressed; } vkpool_t;   // backed: has its VkBuffer (lazy pools get one at their first GPU reference, vk_pool_of); addressed: the game took a GPU address in it (mtl_pool_addressed); serial: unique per pool made (caches of views over a pool's buffer key on it); [base, end): the game's pool, of which [lo, hi) is one chunk (ZC_CHUNK); flags: the NVN pool's (vk_pool_set_flags); baseline: last synchronized GPU-copy contents; baseline_complete: refreshed by a full completion merge, consumed by the next sync; synced, stamp, stamp0, span: a copied pool's incremental sync
+vkpool_t *vk_pool_of(uint64_t addr, uint64_t len);   // the pool containing [addr, addr+len), NULL if none; backed (its buffer made) if it was not yet
+vkpool_t *vk_pool_peek(uint64_t addr, uint64_t len);   // the same without backing it: for CPU-side range checks (p->buf may be VK_NULL_HANDLE)
+void vk_pool_stats(uint64_t *pools, uint64_t *backed, uint64_t *bytes, uint64_t *backed_bytes);   // chunks made and backed so far, and their bytes (lazy pools: gfx_vk_core.c)
 // gpu (vkpool_t): the buffer's device address (0 without has_bda); its delta from the chunk's guest address lo is what the raw global memory table carries
 VkBuffer vk_gmem_map(VkDeviceSize *len);   // the memory pool table for raw global memory (dmsh_abi.h DMSH_GMEM_MAP_*; RK_GMEM_MAP), rebuilt when the pools change; *len: its bytes
 int vk_buf_at(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);   // GPU buffer + offset of a pool address range
@@ -84,6 +86,14 @@ void vk_readback_unknown(void);   // force full cached-pool merge for this submi
 int vk_sub_open(void);                 // a submission is being recorded
 VkCommandBuffer vk_upload_cmd(void);   // the current submission's upload command buffer (runs before the main one)
 void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off);   // host-visible memory that lives until this submission completes
+// Bounded staging for a texture's first upload once this submission's scratch is over DM_VK_SCRATCH_MAX_MB (gfx_vk_tex.c pkg_upload): one 128 MB buffer and a command
+// buffer of its own, submitted and waited for when full and before this submission goes to the queue (gfx_vk_core.c)
+int vk_stage_wanted(void);                            // this submission's scratch is over the cap: upload through the staging buffer
+VkCommandBuffer vk_stage_cmd(void);                   // the staging command buffer, begun
+void *vk_stage_alloc(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off);   // room in it (flushed first when full; a request over its size falls back to vk_scratch)
+void vk_stage_flush(void);                            // submit what it holds and wait
+extern __thread const char *vk_mem_tag;              // device memory accounting (gfx_vk_core.c mem_acct): the tag the next vkAllocateMemory on this thread is counted under
+void vk_mem_acct_report(const char *why);             // the per-tag table, logged
 void vk_defer_free_buffer(VkBuffer b, VkDeviceMemory m);   // destroyed once the GPU has passed the current submission
 void vk_defer_free_image(VkImage i, VkDeviceMemory m);
 VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, VkDeviceSize *off, void **sub);   // NULL on failure; *sub: a slot of a shared block, or NULL (memory of its own)
@@ -125,6 +135,7 @@ struct vkimg {
     uint64_t pool; int64_t off, size; int flags;   // its storage (pool, offset, layout size) and NVN texture flags: images over the same memory find each other
     struct vkimg *ovl[8]; int novl;   // the other images over some of the same memory (a texture of another description over it: on the Switch it sees these texels)
     uint64_t wseq, rseen;             // when it was last rendered to (gfx_vk_tex.c g_wseq); the newest overlapping write already reported
+    uint64_t vkbytes;                 // the image's device memory (vkGetImageMemoryRequirements size): what the texture budget counts (gfx_vk_budget.c)
     uint64_t zc_gen;                  // a texture over a movie picture slot (movie_zc_vk.c zc_tex_refresh): the slot's change count last converted into it
 };
 vkimg_t *vk_tex(const tex_t *t);                                 // the image of a texture object (created, uploaded or refreshed as needed)
@@ -141,10 +152,18 @@ VkBufferView vk_dummy_tbuf(int storage);
 void vk_end_pass_land(void);   // vk_end_pass, then the deferred uniform updates land (before copies, dispatches, the submission's end)
 void vk_img_barrier_all(VkCommandBuffer cb);   // version 1: one global memory barrier (all images stay in GENERAL)
 void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im);   // first use: transition from UNDEFINED to GENERAL (and upload a packaged texture)
+// ---- texture memory budget (gfx_vk_budget.c): the images' device memory kept under DM_VK_IMAGE_BUDGET_MB by dropping the least recently drawn ----
+typedef struct { void *h; uint32_t i; vkimg_t *im; } vk_img_ref;   // an image and where its table holds it (gfx_vk_tex.c)
+size_t vk_img_list(vk_img_ref **out, size_t *cap);   // every live image into *out (realloc'd as needed); the caller holds the image lock (called from vk_tex)
+void vk_img_evict(const vk_img_ref *r);               // drops it (img_drop; the memory goes once the GPU is past this submission); under the image lock
+uint64_t vk_img_vkbytes(void);                        // device memory of the live images
+void vk_img_budget_make_room(uint64_t incoming);      // before a new image of incoming bytes: evicts down to the budget (gfx_vk_budget.c); under the image lock, inside a submission
+void vk_img_budget_stats(uint64_t *budget, uint64_t *evicted, uint64_t *evicted_bytes, uint64_t *sweeps);
 
 // ---- shaders (gfx_vk_shader.c) ----
 enum { RK_SUPPORT, RK_CBUF, RK_C1, RK_DRV, RK_SBUF, RK_UBO_PTR, RK_SBUF_UBO, RK_TEX, RK_TBUF, RK_IMG, RK_IMG_TBUF, RK_TEX_C2A, RK_TEX_UBO, RK_TBUF_UBO, RK_IMG_UBO, RK_TEXD, RK_SAMPD,
        RK_GMEM_MAP, RK_GMEM_LOG,   // raw global memory (dmsh_abi.h DMSH_KIND_GMEM_MAP / _LOG): the pool table (vk_gmem_map) and the write log of the stores through it (stage_set); ids in step with shader_vk.py KIND
+       RK_MESH_CTL, RK_MESH_TASKOUT, RK_MESH_LAUNCH, RK_MESH_VTX, RK_MESH_IDX,   // the mesh emulation's buffers (shader_meshwrap.py dm_mesh_*; gfx_vk_exec.c mesh_draw sets them before stage_set)
        RK_UNKNOWN = 255 };
 enum { RD_UBO, RD_SSBO, RD_SAMPLED, RD_STORAGE, RD_TBUF, RD_STORAGE_TBUF, RD_IMAGE, RD_SAMPLER };
 enum { RS_NONE, RS_TEX, RS_SLOT, RS_ID, RS_UBO };
@@ -166,6 +185,9 @@ typedef struct {
     uint32_t in_locs, out_locs;         // the vec4 (or per-vertex vec4) inputs and outputs it declares, by location
     int setmemo;                        // gfx_vk_exec.c stage_set: 1 its set may be memoized per stage, 2 not (it reads handles or addresses from uniform buffer memory), 0 not known yet
     int pv_gs;   // a geometry shader shader_vk.py generated for a fragment shader that reads inputs per vertex (shader_pvgs.py): bound in place of a program's missing geometry stage
+    // an NVN2 task (1) or mesh (2) kernel (bundle stage 6 / 7; shader_meshwrap.facts in its header words): its workgroup's threads, its payload's words, whether the mesh shader has a task,
+    // a primitive's vertices, the most vertices and primitives a workgroup, and the words a vertex has in the emulation's vertex buffer (gfx_vk_exec.c mesh_draw)
+    int mesh_kind; uint32_t mesh_threads, mesh_pay, mesh_task, mesh_verts, mesh_max_v, mesh_max_p, mesh_ncomp;
 } vkshader_t;
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader
 vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo);   // the geometry shader translated for the draw's input primitive (shader_vk.py gs_variant_key); gs when there is none
@@ -183,3 +205,4 @@ void vk_present_init(void);
 uint64_t vk_present(const tex_t *t, double period, const int crop[4]);
 enum { PT_DISPATCH = 0xd15 };   // vk_pass_ts: a dispatch timed as a pass (its format field)
 vkshader_t *vk_shader_pv_gs(vkshader_t *fs);   // the generated pass-through geometry shader of a fragment shader with per-vertex inputs, NULL when the bundle has none
+vkshader_t *vk_shader_mesh_vs(vkshader_t *ms);   // the generated pass-through vertex shader of a mesh kernel (shader_meshwrap.mesh_vs_key), NULL when the bundle has none

@@ -13,7 +13,9 @@
 #   the c1 segment lies between control +0x40 and +0x44, a compute shader's per-shader c[0] layout comes from the control section (job nvn2_cs: the translator maps its push constants
 #   to c[24], its uniform and storage entries to NVN's compute tables at c0 0x210 / 0x310 and its handles to c[2], so the reflection reads as a Switch 1 shader's), and its thread
 #   group is at control +0x58 (+0x64 shared memory). A task (control +0x56 = 6) or mesh (7) shader is translated as a compute kernel with its stage memory in shared memory (job
-#   stage_memory, dmsh_meshstage.py); the bundle keeps it under stage 6 / 7 in the entry's stage word (the Vulkan backend has no task / mesh draw path yet and reads neither).
+#   stage_memory, dmsh_meshstage.py), then wrapped for the backend's emulation of mesh shading without VK_EXT_mesh_shader (shader_meshwrap.py: the stage memory filled from and copied to
+#   storage buffers the wrapper adds, named dm_mesh_*, binding kinds mesh_*); the bundle keeps it under stage 6 / 7 with shader_meshwrap.facts in its header words, and a pass-through
+#   vertex shader per mesh shader under shader_meshwrap.mesh_vs_key (stage 0), which the backend draws the mesh kernel's vertices with (gfx_vk_exec.c mesh_draw).
 #   NVN's VertexA + VertexB merge, transform feedback (+0x6dc) and early fragment tests (+0x718) are NVN control fields, read on the Switch 1 path only. The bundle format is unchanged.
 # Raw global memory (dm/gfx/nvn/dmsh_abi.h DMSH_KIND_GMEM_MAP / DMSH_KIND_GMEM_LOG): a load or store at an address the shader read from memory, which the translator could tie to no
 #   storage buffer (Ryujinx GlobalToStorage.TryGenerateRawStorageOp), goes through the host's memory pool table, a storage buffer the translator reserves under the sentinel constant
@@ -37,6 +39,7 @@ import dmsh_facts, dmsh_chain, dmsv   # noqa: E402  (DM_GAME picks the profile)
 import dmsh_abi as abi              # noqa: E402  the shader library ABI (dm/gfx/nvn/dmsh_abi.h): the raw global memory slot
 import dmsh_ampere, dmsh_meshstage    # noqa: E402  NVN2 (Switch 2) control sections and task / mesh stage memory, the Mac chain's own modules (backend-neutral)
 import shader_pvgs                    # noqa: E402  the pass-through geometry shader of a fragment shader with per-vertex inputs (per_vertex = gs)
+import shader_meshwrap                # noqa: E402  task / mesh kernels wrapped for the compute emulation, and their pass-through vertex shaders
 from shader_split import glslc_stage   # the package reader also recognizes headerless compute code
 
 ap = argparse.ArgumentParser()
@@ -136,6 +139,7 @@ def job_common(key, stage, cp, c1, **extra):   # the job every shader gets (the 
     return {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'debug': False, 'reduced': True, 'sb_align': SB_ALIGN, 'subgroup': SUBGROUP, 'gather_bias': GATHER_BIAS, 'gs_passthrough': False, **extra}
 
 nvn2_notes = collections.Counter()
+mesh_jobs = {}   # key → (dmsh_meshstage.info, its stage memory layout, its bytes) of a task or mesh shader, for shader_meshwrap after the translation
 def nvn2_job(key, stage, rec, ci, w):
     """dmsh_build.py job_for's NVN2 (Switch 2) branch: the record's control section is NVN2's (dmsh_ampere.is_nvn2). The code area holds Ampere code, control +0x38 bytes of it (the
     0x80-byte SPH included in the graphics stages; compute has no header), and the shader's c1 segment between control +0x40 and +0x44 (dmsh_ampere.c1_segment); the translator's Ampere
@@ -159,6 +163,7 @@ def nvn2_job(key, stage, rec, ci, w):
         lay, size = dmsh_meshstage.memory(mesh)
         if dmsh_meshstage.own_shared(code[0x80:]): nvn2_notes[f'{stage}: shared memory of its own lies over the stage memory'] += 1
         extra.update(stage_memory=lay, local=[mesh['threads'], 1, 1], shared=size); code = code[0x80:]; stage = 'cs'; facts = False   # its threads and memory come from its control section
+        mesh_jobs[key] = (mesh, lay, size)
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
     j = job_common(key, stage, cp, c1, **extra)
     if not facts: return j, c1
@@ -269,6 +274,7 @@ def classify(stage, b, res):
         n = int(m.group(1))
         e.update(kind='cbuf', reg=n - 3) if 3 <= n <= 16 else e.update(kind='c1' if n == 1 else 'drvcb', bank=n); return e
     if nm == 'support_buffer': e.update(kind='support'); return e
+    if nm.startswith('dm_mesh_'): e.update(kind=nm[3:] if nm[3:] in KIND else '?'); return e   # the mesh emulation's buffers (shader_meshwrap.py; gfx_vk_exec.c mesh_draw binds them)
     m = re.fullmatch(r'[a-z]+_s(\d+)', nm)
     if m:
         idx = int(m.group(1)); sb = sorted(res.get('sbufs', []), key=lambda x: x['binding'])
@@ -323,7 +329,8 @@ def classify(stage, b, res):
 # binding: u8 kind, u8 desc (descriptor type), u8 dim (SPIR-V Dim, 0xff none), u8 flags (1 arrayed, 2 multisampled, 4 written), u16 binding, u16 count,
 #          i16 reg, u8 samp (sampler source), u8 fmt (SPIR-V image format), i32 off, i32 samp_arg
 KIND = {'support': 0, 'cbuf': 1, 'c1': 2, 'drvcb': 3, 'sbuf': 4, 'ubo_ptr': 5, 'sbuf_ubo': 6, 'tex': 7, 'tbuf': 8, 'img': 9, 'img_tbuf': 10, 'tex_c2a': 11,
-        'tex_ubo': 12, 'tbuf_ubo': 13, 'img_ubo': 14, 'texd': 15, 'sampd': 16, 'gmem_map': 17, 'gmem_log': 18, '?': 255}   # in step with gfx_vk.h RK_*
+        'tex_ubo': 12, 'tbuf_ubo': 13, 'img_ubo': 14, 'texd': 15, 'sampd': 16, 'gmem_map': 17, 'gmem_log': 18,
+        'mesh_ctl': 19, 'mesh_taskout': 20, 'mesh_launch': 21, 'mesh_vtx': 22, 'mesh_idx': 23, '?': 255}   # in step with gfx_vk.h RK_*
 DESC = {'ubo': 0, 'ssbo': 1, 'sampled': 2, 'storage': 3, 'tbuf': 4, 'storage_tbuf': 5, 'image': 6, 'sampler': 7, '?': 255}
 SAMP_NONE, SAMP_TEX, SAMP_SLOT, SAMP_ID, SAMP_UBO = 0, 1, 2, 3, 4
 kinds_all = collections.Counter()
@@ -487,6 +494,11 @@ def main():
         spv_p, res_p = os.path.join(w, k + '.spv'), os.path.join(w, k + '.res.json')
         if not os.path.exists(spv_p): fails['no output'] += 1; continue
         spv = open(spv_p, 'rb').read(); res = json.load(open(res_p)) if os.path.exists(res_p) else {}
+        mesh_vs = None
+        if k in mesh_jobs:   # a task or mesh kernel: wrapped for the compute emulation, and a mesh shader's pass-through vertex shader beside it (shader_meshwrap.py)
+            mi, mlay, msize = mesh_jobs[k]
+            try: spv = shader_meshwrap.wrap(spv, mi, mlay, msize); mesh_vs = shader_meshwrap.vertex_shader(mi) if mi['kind'] == 'ms' else None
+            except ValueError as e: fails['mesh: ' + str(e)] += 1; print(f'[RED] {k} ({stages[k]}): not drawn: {e}', flush=True); continue
         binds, local, io = spirv_bindings(spv)
         if k in handle_remaps:
             spv = remap_handles(spv, *handle_remaps[k])
@@ -498,8 +510,11 @@ def main():
         cl = [classify(st, b, res) for b in binds]
         for e in cl: kinds_all[e['kind']] += 1
         # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
-        hdr3 = (local or jobs[k].get('local') or [1, 1, 1]) if st in ('cs', 'ts', 'ms') else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
+        hdr3 = shader_meshwrap.facts(mesh_jobs[k][0]) if k in mesh_jobs else (local or jobs[k].get('local') or [1, 1, 1]) if st == 'cs' else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
         entries.append((gs_var[k] if k in gs_var else int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3)))
+        if mesh_vs:
+            vb, _, vio = spirv_bindings(mesh_vs); entries.append((shader_meshwrap.mesh_vs_key(int(k, 16)), STAGES['vs'], mesh_vs, refl_bin([classify('vs', b, {}) for b in vb], b'', vio[1])))
+            nvn2_notes['mesh shaders with a pass-through vertex shader'] += 1
         if st == 'ps' and res.get('per_vertex_gs'): pv_fs[k] = (spv, res['per_vertex_gs'])
     # the pass-through geometry shaders of the fragment shaders with per-vertex inputs (see the header): triangles under pv_gs_key, the other input primitives under
     # gs_variant_key of it, chosen by the draw's topology as a game's own (gfx_vk_shader.c vk_shader_gs_topo). No bindings, no c1: the reflection is empty
@@ -514,7 +529,7 @@ def main():
                     f'(flat locations {sorted({t for _, m in pv_fs.values() for v in m.values() for t in v})})', flush=True)
     if a.zstd: print(f'compressing {len(entries)} shaders (zstd level {a.zstd}, {a.jobs} threads) ...', flush=True)
     ver, raw, stored = dmsv.write(a.out, entries, level=a.zstd, jobs=a.jobs)
-    print(f'{len(entries)} of {len(keys) + 5 * pv_gs} shaders → {a.out} ({os.path.getsize(a.out) / 2**20:.1f} MB, version {ver}: SPIR-V {raw / 2**20:.1f} MB'
+    print(f'{len(entries)} of {len(keys) + 5 * pv_gs + nvn2_notes["mesh shaders with a pass-through vertex shader"]} shaders → {a.out} ({os.path.getsize(a.out) / 2**20:.1f} MB, version {ver}: SPIR-V {raw / 2**20:.1f} MB'
           f'{f", {stored / 2**20:.1f} MB compressed" if ver > 1 else ""}); failed: {dict(fails)}; binding kinds: {dict(kinds_all)}')
     for e, n in errs.most_common(8): print(f'  translator: {n:5d}  {e}')
     arch = collections.Counter('sm86' if jobs[k].get('arch') == 'sm86' else 'maxwell' for k in keys)

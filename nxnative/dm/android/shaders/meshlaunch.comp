@@ -1,0 +1,29 @@
+#version 450
+// The mesh emulation's launch list (gfx_vk_exec.c mesh_draw, shader_meshwrap.py): after the task kernel ran, each task workgroup's payload word 1 says how many mesh workgroups it
+// launches. One workgroup of this kernel sums them (a prefix scan per 256 tasks), writes each mesh workgroup's {task, number among the task's launches} into the launch list from word
+// LAUNCH_HDR, and the header: words 0-2 the mesh dispatch's workgroup counts, 4-8 the indexed indirect draw's arguments (max_p * verts indices a mesh workgroup, one instance),
+// 9 the total that did not fit (0 when all did), capped at cap mesh workgroups (the buffers the host sized). A task's launches are capped at 1024, as Metal's grid is
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Ctl { uint ctl[]; };        // ctl[1]: task workgroups
+layout(set = 0, binding = 1) readonly buffer Task { uint taskout[]; };   // the task payloads, pay words each
+layout(set = 0, binding = 2) writeonly buffer Launch { uint launch[]; };
+layout(push_constant) uniform P { uint pay, cap, idx_per_wg; } p;
+const uint HDR = 16u, GROUP = 256u;
+shared uint cnt[GROUP];
+void main() {
+    uint T = ctl[1], lid = gl_LocalInvocationIndex, total = 0u;
+    for (uint t0 = 0u; t0 < T; t0 += GROUP) {
+        uint t = t0 + lid, n = t < T ? min(taskout[t * p.pay + 1u], 1024u) : 0u;
+        cnt[lid] = n; barrier();
+        for (uint s = 1u; s < GROUP; s <<= 1u) { uint v = lid >= s ? cnt[lid - s] : 0u; barrier(); cnt[lid] += v; barrier(); }   // inclusive scan
+        uint base = total + cnt[lid] - n;
+        for (uint k = 0u; k < n; k++) { uint m = base + k; if (m < p.cap) { launch[HDR + 2u * m] = t; launch[HDR + 2u * m + 1u] = k; } }
+        total += cnt[GROUP - 1u]; barrier();
+    }
+    if (lid == 0u) {
+        uint tot = min(total, p.cap);
+        launch[0] = tot; launch[1] = 1u; launch[2] = 1u;
+        launch[4] = tot * p.idx_per_wg; launch[5] = 1u; launch[6] = 0u; launch[7] = 0u; launch[8] = 0u;
+        launch[9] = total > p.cap ? total : 0u;
+    }
+}

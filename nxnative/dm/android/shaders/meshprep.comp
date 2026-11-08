@@ -1,0 +1,15 @@
+#version 450
+// An indirect task / mesh draw (nvnCommandBufferDrawMeshTasksIndirect: the record {count, first} at a game address, written by the GPU earlier in the frame) for the mesh emulation
+// (gfx_vk_exec.c mesh_draw): one invocation copies the record into the control words the kernels read (ctl[0] first, ctl[1] count, capped) and the launch header's dispatch
+// arguments: words 12-14 the task dispatch (or the mesh dispatch of a program without a task shader, also at 0-2), and without a task the draw's arguments at 4-8 too
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) readonly buffer Rec { uint rec[]; };        // the pool buffer from the 256-byte boundary below the record (p.off words to it)
+layout(set = 0, binding = 1) writeonly buffer Ctl { uint ctl[]; };
+layout(set = 0, binding = 2) writeonly buffer Launch { uint launch[]; };
+layout(push_constant) uniform P { uint off, cap, has_task, idx_per_wg; } p;
+void main() {
+    uint count = min(rec[p.off], p.cap), first = rec[p.off + 1u];
+    ctl[0] = first; ctl[1] = count;
+    launch[12] = count; launch[13] = 1u; launch[14] = 1u;
+    if (p.has_task == 0u) { launch[0] = count; launch[1] = 1u; launch[2] = 1u; launch[4] = count * p.idx_per_wg; launch[5] = 1u; launch[6] = 0u; launch[7] = 0u; launch[8] = 0u; launch[9] = 0u; }
+}
