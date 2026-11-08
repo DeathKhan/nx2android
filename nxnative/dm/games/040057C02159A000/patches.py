@@ -14,3 +14,10 @@ OBS = {
     (0x138f4c, 27 | 8 << 8, 'aa1f03f5', 'TlsHeapCentral::AllocPages_: failure tail, x0 = AllocPhy_ result or the null span page (OBS_REGS)'),
   ],
 }
+
+# How general each entry is (dm/tools/docs_patches.py "Binding"): these are observation gates, bound to the builds they read registers from
+BINDING = [
+    {'what': 'OBS_REGS gates at the Bezel GPU-block constructor and the SDK page allocator', 'now': 'build', 'goal': 'build', 'purpose': 'runtime',
+     'why': 'bring-up instrumentation (registers at a site, logged); the addresses are these builds\' own and the gates patch nothing'},
+]
+

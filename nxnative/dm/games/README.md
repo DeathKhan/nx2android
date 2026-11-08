@@ -132,6 +132,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [NieR:Automata The End of YoRHa Edition](010056B015FE8000/README.md) | `010056B015FE8000` | 1.0.3 | 12.3.9 | PlatinumGames' engine | NVN |
 | [NieR:Automata The End of YoRHa Edition, Asian release](0100B8E016F76000/README.md) | `0100B8E016F76000` | 1.0.3 | 12.3.9 | PlatinumGames' engine | NVN |
 | [OCTOPATH TRAVELER](010057D006492000/README.md) | `010057D006492000` | 1.0.5 | 3.5.1 | Unreal Engine 4.18 | NVN |
+| [Nintendo Switch 2 Welcome Tour](040057C02159A000/README.md) | `040057C02159A000` | 1.0.4 | 20.5.29 (Ounce) | Bezel Engine | NVN2 |
 | [Octopath Traveler 0](01005270232F2000/README.md) | `01005270232F2000` | 1.0.5 | 19.3.13 | Unreal Engine 5 | NVN |
 | [OCTOPATH TRAVELER II](0100A3501946E000/README.md) | `0100A3501946E000` | 1.1.1 | 12.3.2 | Unreal Engine 4.27 | NVN |
 | [ŌKAMI HD](0100276009872000/README.md) | `0100276009872000` | 1.0.0 (base) | 4.5.0 | Clover Studio's PS2 engine, remastered; CRIWARE | NVN |
