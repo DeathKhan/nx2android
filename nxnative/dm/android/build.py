@@ -118,7 +118,9 @@ if a.exe:
     print(r.stderr.strip() if r.returncode else f'linked {out / "dmhost"}', file=sys.stderr if r.returncode else sys.stdout)
     if r.returncode: sys.exit(1)
 if a.lib:
-    r = subprocess.run([CC] + LDFLAGS + ['-shared', '-Wl,-soname,libdmhost.so', '-o', str(out / 'libdmhost.so')] + [str(o) for o in objs + vobjs] + LIBS, capture_output=True, text=True, errors='replace')
+    # --no-undefined: a symbol nothing on the link line defines fails the build here, not dlopen at launch (mtl_tex_cpu_rewritten, defined only in nvn_mtl.m, was
+    # referenced by builds whose profile sets tex_dirty_upload: a -shared link reports nothing, and the app could not load the library)
+    r = subprocess.run([CC] + LDFLAGS + ['-shared', '-Wl,--no-undefined', '-Wl,-soname,libdmhost.so', '-o', str(out / 'libdmhost.so')] + [str(o) for o in objs + vobjs] + LIBS, capture_output=True, text=True, errors='replace')
     print(r.stderr.strip() if r.returncode else f'linked {out / "libdmhost.so"}', file=sys.stderr if r.returncode else sys.stdout)
     if r.returncode: sys.exit(1)
     if a.release:   # the static symbol table goes too (the dynamic one stays: ANativeActivity_onCreate)
