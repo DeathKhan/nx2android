@@ -253,7 +253,7 @@ int vk_tbl_n(void) {   // the texture tables' length (gfx_vk.h): DM_VK_TBL_N, 20
 // is shared by every graphics pipeline layout. Logged once; an index past the length reads the last entry (the clamp), and tbl_set notes a registered ID past the length
 static int pool_lengths(int *tex, int *samp) {
     static int nt = -1, ns; if (nt < 0) {
-        const char *e = getenv("DM_VK_POOL_N"); int n = e ? atoi(e) : 4096; if (n < 0) n = 0; if (n > 65536) n = 65536;
+        const char *e = getenv("DM_VK_POOL_N"); int n = e ? atoi(e) : 65536; if (n < 0) n = 0; if (n > 65536) n = 65536;   // 65536: Ocarina of Time registers texture IDs past 33,000 in its first scene (tbl_set fills up to the highest registered)
         int s = n ? 4096 : 0, tbl = vk_tbl_n() * TBL_SLOTS;
         long limi = (long)V.props.limits.maxPerStageDescriptorSampledImages - tbl - 256, lims = (long)V.props.limits.maxPerStageDescriptorSamplers - tbl - 256;
         if (limi > (long)V.props.limits.maxDescriptorSetSampledImages - tbl - 256) limi = (long)V.props.limits.maxDescriptorSetSampledImages - tbl - 256;

@@ -834,8 +834,9 @@ static void pool_copy_back(vkpool_t *p) {   // the pages go back to anonymous me
 }
 // Pools over ZC_CHUNK are made of chunks of at most that size, each a pool entry with an AHardwareBuffer of its own: the Adreno 830's gralloc allocator service
 // (vendor.qti.hardware.display.allocator-service, snapalloc) aborts on a BLOB of 812 MB ("ubsan: mul-overflow" in SnapConstraintManager::AlignmentToAlignedConstraints),
-// and the whole Android UI restarts with it; 400 MB ones work (13 Sentinels: Aegis Rim's 0x32c00000-byte pool). A range across two chunks has no buffer (vk_pool_of)
-#define ZC_CHUNK 0x10000000ull
+// and the whole Android UI restarts with it; 400 MB ones work (13 Sentinels: Aegis Rim's 0x32c00000-byte pool). A range across two chunks has no buffer (vk_pool_of): Ocarina of
+// Time's 288 MB pool (0x12000000) was two chunks of 256 MB and thousands of its ranges a scene crossed the seam, so chunks are 400 MB (the size known to work)
+#define ZC_CHUNK 0x19000000ull
 static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end);
 // DM_VK_ZEROCOPY_MAX_MB=<n>: pools bigger than n MB are copied, not zero-copy, and kept whole (a copied pool takes no hardware buffer, so no chunks). The Legion Y700
 // 2023's gralloc aborts the process (no error returned) allocating a hardware buffer for Unicorn Overlord's 860 MB pool, while its pools up to 250 MB are fine
@@ -948,6 +949,14 @@ void mtl_pool_del(const void *mem) {
         if (p.ahb) AHardwareBuffer_release(p.ahb);
     }
 }
+__thread const char *vk_pool_tag;
+vkpool_t *vk_pool_holding(uint64_t addr, uint64_t len) {
+    vkpool_t *r = NULL;
+    pthread_rwlock_rdlock(&g_pool_mu);
+    for (int i = 0; i < g_npool && !r; i++) if (addr >= g_pool[i].lo && addr < g_pool[i].hi && addr + len <= g_pool[i].end) r = &g_pool[i];
+    pthread_rwlock_unlock(&g_pool_mu);
+    return r;
+}
 static vkpool_t *vk_pool_of_(uint64_t addr, uint64_t len, int back) {
     // the last pools this thread found, while none was added or removed: the replay looks up every buffer binding of every draw, and the read lock alone was ~6% of it
     static __thread struct { uint32_t gen; vkpool_t *p[4]; } c;   // gen: g_pool_gen + 1 (0: empty)
@@ -960,7 +969,7 @@ static vkpool_t *vk_pool_of_(uint64_t addr, uint64_t len, int back) {
     pthread_rwlock_unlock(&g_pool_mu);
     if (unbacked && back) { r = pool_back_at(addr, len); g = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE) + 1; }
     if (r && (r->backed || !back)) { if (c.gen != g) { memset(&c, 0, sizeof c); c.gen = g; } if (r->backed) { memmove(&c.p[1], &c.p[0], 3 * sizeof *c.p); c.p[0] = r; } }
-    if (!r && across) { static uint64_t n; uint64_t k = ++n; if (!(k & (k - 1))) LOG("[RED] [vk] %llu ranges across two chunks of a memory pool (ZC_CHUNK; this one %#llx +%#llx): no buffer for them", (unsigned long long)k, (unsigned long long)addr, (unsigned long long)len); }
+    if (!r && across) { static uint64_t n; uint64_t k = ++n; if (!(k & (k - 1))) LOG("[RED] [vk] %llu ranges across two chunks of a memory pool (ZC_CHUNK; this one %#llx +%#llx, for %s): no buffer for them", (unsigned long long)k, (unsigned long long)addr, (unsigned long long)len, vk_pool_tag ? vk_pool_tag : "other"); }
     return r;
 }
 vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) { return vk_pool_of_(addr, len, 1); }

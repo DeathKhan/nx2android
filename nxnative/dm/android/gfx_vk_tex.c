@@ -171,9 +171,20 @@ static VkFormat srgb_twin(VkFormat f) {
 // Graveyard Keeper 2, Advance Wars and DKCR drew the same pictures. A colour view in another format than the image's and its twin is logged [RED] (vk_tex_view):
 // such a game wants DM_VK_UBWC=2 in its profile
 static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 3; } return v; }
+// A float colour format the device cannot store to from a shader (Adreno: E5B9G9R9 and B10G11R11 have no STORAGE_IMAGE feature) is promoted to R16G16B16A16_SFLOAT when the image needs
+// image stores (the IMAGE flag, or a storage bind's preflight): the image is the host's own copy, never the guest's bytes, so its format is free; the same channels, more precision.
+// Ocarina of Time's compute passes store into its E5B9G9R9 HDR buffers (VkFormat 123), whose stores were dropped before ("storage binding format 123 cannot support image stores")
+static VkFormat storage_promote(const vkfmt_t *f) {
+    if (!f || (f->vk != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && f->vk != VK_FORMAT_B10G11R11_UFLOAT_PACK32)) return VK_FORMAT_UNDEFINED;
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, f->vk, &fp); if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) return VK_FORMAT_UNDEFINED;
+    vkGetPhysicalDeviceFormatProperties(V.pd, VK_FORMAT_R16G16B16A16_SFLOAT, &fp); return fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_UNDEFINED;
+}
 static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f, VkImageUsageFlags extra_usage) {
     vkimg_t *im = calloc(1, sizeof *im);
     const nvn_texdesc *d = &t->d;
+    vkfmt_t pf; VkFormat pv = (extra_usage & VK_IMAGE_USAGE_STORAGE_BIT) || (d->flags & NVN_TEXTURE_FLAGS_IMAGE) ? storage_promote(f) : VK_FORMAT_UNDEFINED;
+    if (pv) { pf = *f; pf.vk = pv; pf.swz = (VkComponentMapping){0}; f = &pf; im->promoted = 1; extra_usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        static int nl; if (nl++ < 8) VKLOG("image %ux%ux%u nvn format %#x (vk %d) promoted to R16G16B16A16_SFLOAT for image stores (flags %#x, target %d)", d->width, d->height, d->depth, d->format, pv, d->flags, d->target); }
     im->w = d->width ? d->width : 1; im->h = d->target == 0 || d->target == 3 ? 1 : (d->height ? d->height : 1);
     im->d = d->target == 2 ? (d->depth ? d->depth : 1) : 1; im->layers = layers_of(d);
     im->levels = d->levels ? d->levels : 1; im->samples = d->samples > 1 ? d->samples : 1; im->target = d->target; im->nvn_format = d->format;
@@ -254,6 +265,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
               (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
               (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_block_h, im->packaged > 1 ? " (again)" : ""); } }
     if (im->packaged < 100) im->packaged++;
+    if (im->promoted) { VKRED_ONCE(171, "a packaged upload of an image promoted for image stores (nvn format %#x, %ux%u): skipped, its texels are not the guest's layout", t->d.format, t->d.width, t->d.height); return; }
     int staged = im->layout != VK_IMAGE_LAYOUT_GENERAL && vk_stage_wanted();   // a first upload with the submission's scratch over its cap: through the bounded staging buffer (gfx_vk_core.c)
     VkCommandBuffer cb = staged ? vk_stage_cmd() : vk_upload_cmd();
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
@@ -339,7 +351,7 @@ static int range_mapped(const uint8_t *mem, size_t len) {
 }
 int vk_tex_pool_ok(const tex_t *t) {
     if (!t || !t->mem || !t->L.size || t->magic != MAGIC('T', 'E', 'X', 0) || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
-    if (!vk_pool_peek((uint64_t)(uintptr_t)t->mem, t->L.size)) return 0;   // its pool chunk is gone (mtl_pool_del)
+    if (!vk_pool_holding((uint64_t)(uintptr_t)t->mem, t->L.size)) return 0;   // its pool is gone (mtl_pool_del); across the pool's chunks is fine for a CPU read
     const vkfmt_t *f = vk_fmt(t->d.format); if (!f) return 0;
     akey k; memset(&k, 0, sizeof k); k.pool = (uint64_t)(uintptr_t)t->pool; k.off = t->off; k.d = t->d;   // the storage key, as vk_tex makes it
     k.d.flags &= NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT | (f->depth || f->stencil ? 0 : NVN_TEXTURE_FLAGS_IMAGE);
@@ -431,8 +443,9 @@ int vk_tex_storage_prepare(const tex_t *t) {
     if (im->usage & VK_IMAGE_USAGE_STORAGE_BIT) return 1;
     const vkfmt_t *f = vk_fmt(t->d.format); VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(V.pd, im->fmt, &fp);
-    if (!f || f->vk != im->fmt || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
-        !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+    VkFormat pv = storage_promote(f);   // a format the device cannot store to: the new image takes the promoted one (img_new), the contents blitted over
+    if (!f || (f->vk != im->fmt && !im->promoted) || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
+        (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !pv)) {
         VKRED_ONCE(161, "storage binding format %d cannot support image stores", im->fmt); return 0;
     }
     // Called in a preflight for every stage before any descriptors are collected or a new render pass begins.
@@ -442,10 +455,14 @@ int vk_tex_storage_prepare(const tex_t *t) {
     if (!next) return 0;
     VkCommandBuffer cb = vk_cmd();
     vk_tex_prepare(cb, im); vk_tex_prepare(cb, next); vk_img_barrier_all(cb);
-    for (uint32_t level = 0; level < im->levels; level++) {
-        uint32_t w = im->w >> level, h = im->h >> level, d = im->d >> level;
+    int blit = next->fmt != im->fmt; VkFormatProperties np; vkGetPhysicalDeviceFormatProperties(V.pd, next->fmt, &np);
+    if (blit && (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(np.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) || im->samples > 1)) { blit = -1; VKRED_ONCE(173, "image promoted for image stores (format %d → %d): its contents could not be blitted over, it starts from zeros", im->fmt, next->fmt); }
+    for (uint32_t level = 0; level < im->levels && blit >= 0; level++) {
+        uint32_t w = im->w >> level, h = im->h >> level, d = im->d >> level; w = w ? w : 1; h = h ? h : 1; d = d ? d : 1;
+        if (blit) { VkImageBlit r = {{im->aspect, level, 0, im->layers}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, (int32_t)d}}, {im->aspect, level, 0, im->layers}, {{0, 0, 0}, {(int32_t)w, (int32_t)h, (int32_t)d}}};
+            vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, next->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r, VK_FILTER_NEAREST); continue; }
         VkImageCopy copy = {{im->aspect, level, 0, im->layers}, {0, 0, 0},
-                           {im->aspect, level, 0, im->layers}, {0, 0, 0}, {w ? w : 1, h ? h : 1, d ? d : 1}};
+                           {im->aspect, level, 0, im->layers}, {0, 0, 0}, {w, h, d}};
         vkCmdCopyImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, next->img, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     }
     vk_img_barrier_all(cb);
@@ -454,10 +471,10 @@ int vk_tex_storage_prepare(const tex_t *t) {
     if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem);
     g_img_vkbytes -= im->vkbytes; g_img_vkbytes += next->vkbytes;
     im->img = next->img; im->mem = next->mem; im->sub = next->sub; im->usage = next->usage; im->cflags = next->cflags;
-    im->layout = next->layout; im->fixed_fmt = next->fixed_fmt; im->fmt2 = next->fmt2; im->vkbytes = next->vkbytes;
+    im->layout = next->layout; im->fixed_fmt = next->fixed_fmt; im->fmt2 = next->fmt2; im->vkbytes = next->vkbytes; im->fmt = next->fmt; im->promoted = next->promoted;
     free(next);
-    static int noted; if (noted++ < 16) VKLOG("storage binding promoted %ux%u format %d: preserved %u levels, %u layers; usage %#x",
-        im->w, im->h, im->fmt, im->levels, im->layers, im->usage);
+    static int noted; if (noted++ < 16) VKLOG("storage binding promoted %ux%u format %d%s (texture serial %llu, nvn format %#x): preserved %u levels, %u layers; usage %#x",
+        im->w, im->h, im->fmt, im->promoted ? " (format promoted for image stores)" : "", (unsigned long long)t->serial, t->d.format, im->levels, im->layers, im->usage);
     return 1;
 }
 // Packaged textures give up their write protection (nvn_dirty_release; drawn again, they are uploaded and protected again) when not drawn for PKG_IDLE presents, and the
@@ -532,7 +549,7 @@ static int linear_tex(const tex_t *t) { return t->pool && (t->d.flags & (NVN_TEX
 static int linear_storage(const tex_t *t) { return t->pool && (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)); }
 extern uint64_t g_up_gen;
 static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {   // 1 = the image holds its storage as of this upload buffer
-    if (!linear_storage(t) || im->levels != 1 || im->d != 1 || im->layers != 1 || f->bw > 1 || f->bh > 1 || !f->bpb || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
+    if (im->promoted || !linear_storage(t) || im->levels != 1 || im->d != 1 || im->layers != 1 || f->bw > 1 || f->bh > 1 || !f->bpb || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
     size_t stride = t->d.stride ? t->d.stride : (size_t)im->w * f->bpb; VkBuffer b; VkDeviceSize o;
     if (stride % f->bpb || stride < (size_t)im->w * f->bpb || !vk_buf_at((uint64_t)(uintptr_t)t->mem, (uint64_t)stride * (im->h - 1) + (uint64_t)im->w * f->bpb, &b, &o) || o % f->bpb) return 0;
     // the GPU wrote it (a clear, a copy, a storage write): it holds that until the CPU writes its storage again, which its pages, set read-only, tell
@@ -716,7 +733,7 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     if (aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) && !as_attachment)
         aspect = (!f->depth || t->stencil || (vw && vw->set_dsmode && vw->dsmode == 1)) ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;   // (STENCIL8 alone may be stored combined)
     VkComponentMapping swz = sample_swizzle(&f->swz,t,vw,as_attachment || storage);
-    VkFormat fmt = f->vk;
+    VkFormat fmt = im->promoted ? im->fmt : f->vk;   // (a promoted image: its own float format, whatever the view asks; the formats' classes differ)
     const vkfmt_t *imf = vk_fmt(im->nvn_format);   // (a BC format decoded on the CPU counts as compressed: its view keeps the decoded image's format)
     if ((im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || (f->compressed || f->dec) != (imf->compressed || imf->dec) || (f->dec && f->dbpp != imf->dbpp)) fmt = im->fmt;   // depth views and block-size changes keep the image's format
     if (im->fixed_fmt && fmt != im->fmt && fmt != srgb_twin(im->fmt)) { fmt = im->fmt; static int n; if (n++ < 8) VKLOG("[RED] view format %d of a format-listed image (%d, DM_VK_UBWC): the image's own used", f->vk, im->fmt); }

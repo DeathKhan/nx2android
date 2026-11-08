@@ -610,7 +610,7 @@ void vk_prof_end(void) {
 static void lin_back(void) {
     for (int i = 0; i < S.ncol && i < 8; i++) {
         vkimg_t *im = P_att[i].im; const tex_t *t = S.rt_has_col[i] ? &S.rt_col[i] : NULL; const vkfmt_t *f = t ? vk_fmt(t->d.format) : NULL;
-        if (!im || !t || !t->mem || !(t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) || !f || !f->bpb || f->bw > 1 || im->levels != 1 || im->layers != 1 || im->d != 1) continue;
+        if (!im || im->promoted || !t || !t->mem || !(t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET) || !f || !f->bpb || f->bw > 1 || im->levels != 1 || im->layers != 1 || im->d != 1) continue;
         size_t stride = t->d.stride ? t->d.stride : (size_t)im->w * f->bpb, len = stride * (im->h - 1) + (size_t)im->w * f->bpb; VkBuffer b; VkDeviceSize o;
         if (stride % f->bpb || stride < (size_t)im->w * f->bpb || !vk_buf_at((uint64_t)(uintptr_t)t->mem, len, &b, &o) || o % f->bpb) continue;
         VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
@@ -1378,7 +1378,8 @@ static void stage_storage_prepare(int st, vkshader_t *s) {
         else if (b->kind == RK_IMG_UBO) h = mem_handle(ubo_word(st, b->reg, b->off));
         else continue;
         const tex_t *t = NULL; int tid = (int)(h & 0xfffff);
-        if (tid && vk_tex_by_id(tid, NULL, &t) && t) { (void)vk_tex_storage_prepare(t); tex_t image = *t; image.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; mtl_tex_gpu_written(&image); }   // shader stores write its storage (as nvn_mtl.m)
+        if (tid && vk_tex_by_id(tid, NULL, &t) && t) { int ok = vk_tex_storage_prepare(t); tex_t image = *t; image.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; mtl_tex_gpu_written(&image);   // shader stores write its storage (as nvn_mtl.m)
+            static int nl; if ((!ok || t->d.format == 0x3D + 3 || t->d.format == 0x3D + 2) && nl++ < 8) VKLOG("storage image preflight: stage %d shader %016llx binding %u texture ID %d serial %llu %ux%u nvn format %#x: %s", st, (unsigned long long)s->key, b->binding, tid, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, ok ? "storage usage ready" : "[RED] no image stores"); }
     }
 }
 // Reuse within a submission (the cache is emptied when it begins, vk_exec_reset): descriptor sets by their whole content (layout, and every buffer range,
@@ -1489,10 +1490,11 @@ static void drv_shared(int st, int bank, VkBuffer *buf, VkDeviceSize *off, int d
 // minutes at one spot, 0 with this). A constant buffer is bound from a copy of the whole range out of CPU memory (vk_ubd_read, as a deferred update's shadow); a storage or index
 // range is memory the GPU may write, so it is counted and named, not copied
 extern uint64_t g_ubd_gen;
-static uint64_t g_cross[4];   // ranges across a chunk's end: constant buffers copied, storage buffers, vertex buffers (their bound range), index buffers (the draw's indices)
+static uint64_t g_cross[6];   // ranges across a chunk's end: constant buffers copied, storage buffers, vertex buffers (their bound range), index buffers (the draw's indices), storage and index ranges bound from a copy
 static void vk_cross(int k, uint64_t a, uint64_t n, const vkpool_t *p) {
     // vertex buffers: the stream's bound range, which a draw may read only part of (Pokopia, 16 MB chunks: 32,768 such bindings in 3 minutes of ~1 MB ranges, no wrong frame)
-    static const char *const what[4] = {"constant buffer ranges (bound from a copy)", "storage buffer ranges", "vertex buffer bound ranges (a draw may read less)", "index ranges"};
+    static const char *const what[6] = {"constant buffer ranges (bound from a copy)", "storage buffer ranges the shader writes, or over 16 MB (clipped to the chunk)", "vertex buffer bound ranges (a draw may read less)", "index ranges over 16 MB or of indirect draws (clipped)",
+                                        "read-only storage buffer ranges (bound from a CPU copy: GPU writes to them since the last copy-back are not seen)", "index ranges (bound from a CPU copy)"};
     uint64_t c = ++g_cross[k]; if (!(c & (c - 1))) VKLOG("%s%llu %s across a memory pool chunk's end (this one %#llx +%#llx, the chunk ends at %#llx)", k == 1 || k == 3 ? "[RED] " : "", (unsigned long long)c, what[k],
                                                            (unsigned long long)a, (unsigned long long)n, (unsigned long long)p->hi);
 }
@@ -1500,7 +1502,7 @@ static void vk_cross(int k, uint64_t a, uint64_t n, const vkpool_t *p) {
 static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
     const p_bind_buf *u = b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
     uint64_t n = u && u->size ? (u->size > 65536 ? 65536 : u->size) : 65536; VkBuffer buf; VkDeviceSize off;
-    vkpool_t *p = g_var_now != 9 && u && u->addr ? vk_pool_of(u->addr, 1) : NULL;
+    vk_pool_tag = "uniform"; vkpool_t *p = g_var_now != 9 && u && u->addr ? vk_pool_of(u->addr, 1) : NULL;
     if (!p) { *bi = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536}; return; }
     buf = p->buf; off = u->addr - p->lo;
     if (off + n > p->hi - p->lo) {
@@ -1531,8 +1533,18 @@ static void sbuf_desc(int st, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
     if (b->kind == RK_SBUF && b->reg >= 0 && b->reg < 16) { a = S.ssbo[st][b->reg].addr; n = S.ssbo[st][b->reg].size; }
     else if (b->kind == RK_UBO_PTR && b->reg >= 0 && b->reg < 16) { a = S.ubo[st][b->reg].addr; n = S.ubo[st][b->reg].size; }
     else if (b->kind == RK_SBUF_UBO) { a = (uint64_t)ubo_word(st, b->reg, b->off) | (uint64_t)ubo_word(st, b->reg, b->off + 4) << 32; }
-    vkpool_t *p = a ? vk_pool_of(a, 1) : NULL;
-    if (p) { buf = p->buf; off = a - p->lo; if (n && off + n > p->hi - p->lo && p->hi < p->end) vk_cross(1, a, n, p); if (!n || off + n > p->hi - p->lo) n = p->hi - p->lo - off;
+    vk_pool_tag = "storage"; vkpool_t *p = a ? vk_pool_of(a, 1) : NULL;
+    if (p) { buf = p->buf; off = a - p->lo;
+        if (n && off + n > p->hi - p->lo && p->hi < p->end && a + n <= p->end) {   // into the pool's next chunk: a range this shader only reads, up to 16 MB, is bound from a copy of CPU memory (as cbuf_desc; one a submission), as the translator's 256-byte boundary below it
+            if (!(b->flags & 4) && n <= (16u << 20)) {
+                static struct { uint64_t a, n, ep, gen; VkBuffer b; VkDeviceSize o; } sc[16]; unsigned k = (unsigned)(a >> 8) % 16; uint64_t a0 = a - a % SB_ALIGN, n0 = n + a % SB_ALIGN;
+                if (sc[k].a != a || sc[k].n != n || sc[k].ep != g_set_epoch || sc[k].gen != g_ubd_gen) { uint8_t *d = vk_scratch(n0, SB_ALIGN, &buf, &off); vk_ubd_read(a0, n0, d); vk_cross(4, a, n, p);
+                    sc[k].a = a; sc[k].n = n; sc[k].ep = g_set_epoch; sc[k].gen = g_ubd_gen; sc[k].b = buf; sc[k].o = off; } else { buf = sc[k].b; off = sc[k].o; }
+                *bi = (VkDescriptorBufferInfo){buf, off, n0}; return;
+            }
+            vk_cross(1, a, n, p);
+        }
+        if (!n || off + n > p->hi - p->lo) n = p->hi - p->lo - off;
         // bound from the 256-byte boundary below it, the boundary the translator offsets every access from (shader_vk.py SB_ALIGN; a multiple of any device's minimum alignment)
         const VkDeviceSize al = SB_ALIGN; if (V.props.limits.minStorageBufferOffsetAlignment > al) VKRED_ONCE(41, "storage buffer alignment %llu above %llu", (unsigned long long)V.props.limits.minStorageBufferOffsetAlignment, (unsigned long long)al);
         *bi = (VkDescriptorBufferInfo){buf, off - off % al, n + off % al};
@@ -1807,7 +1819,9 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, int pool) {   // s: the sh
         for (int ps = 0; ps < POOL_TEX_SLOTS; ps++, d += NP) {
             dmsv_bind vb = {.kind = RK_TEXP, .desc = RD_IMAGE, .dim = (uint8_t)(ps == 2 ? 3 : ps == 3 ? 2 : 1), .flags = (uint8_t)(ps == 1 ? 1 : 0), .samp = RS_NONE, .reg = -1, .off = -1};
             VkDescriptorImageInfo dummy = {VK_NULL_HANDLE, vk_dummy_view(vb.dim, vb.flags & 1, 0, 0, 0), VK_IMAGE_LAYOUT_GENERAL}; d[0] = dummy;
-            for (int k = 1; k < NP; k++) {
+            int hw = vk_tex_id_max() - g_pool_tex_base + 1; if (hw > NP) hw = NP;   // IDs past the highest registered: the dummy without a lookup (the table's length is the device's, 65536; a scene registers tens of thousands)
+            for (int k = hw > 1 ? hw : 1; k < NP; k++) d[k] = dummy;
+            for (int k = 1; k < hw; k++) {
                 uint64_t hh = mem_handle((uint64_t)k); const view_t *v = NULL; const tex_t *t = NULL; int fits = 0;
                 if (vk_tex_by_id((int)(hh & 0xfffff), &v, &t) && t) { int target = v && v->set_target ? v->target : t->d.target;
                     fits = ps == 2 ? (t->d.width == t->d.height && (target == 8 || target == 9 || (target == 4 && t->d.depth >= 6))) : ps == 3 ? target == 2 : (target == 1 || target == 4 || target == 8 || target == 9);
@@ -1821,7 +1835,8 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, int pool) {   // s: the sh
         }
         vk_tex_pool_fill(0);
         d[0] = (VkDescriptorImageInfo){vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
-        for (int k = 1; k < NS; k++) { VkSampler sm = vk_samp_by_id((int)(mem_handle((uint64_t)k << 20) >> 20 & 0xfff)); if (sm) filled[POOL_TEX_SLOTS]++; d[k] = (VkDescriptorImageInfo){sm ? sm : vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; }
+        { int hw = vk_samp_id_max() - g_pool_samp_base + 1; if (hw > NS) hw = NS;
+          for (int k = 1; k < NS; k++) { VkSampler sm = k < hw ? vk_samp_by_id((int)(mem_handle((uint64_t)k << 20) >> 20 & 0xfff)) : VK_NULL_HANDLE; if (sm) filled[POOL_TEX_SLOTS]++; d[k] = (VkDescriptorImageInfo){sm ? sm : vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; } }
         w[nwr++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, POOL_SAMP_B, 0, (uint32_t)NS, VK_DESCRIPTOR_TYPE_SAMPLER, d, NULL, NULL};
         g_pool_builds++;
         if (g_pool_builds <= 4 || !(g_pool_builds & (g_pool_builds - 1))) VKLOG("texture pool tables: build %llu (stage %d shader %016llx): %u 2D, %u 2D-array, %u cube, %u 3D textures of %d entries, %u samplers of %d; %d first uses made (%u deferred to a later fill, %u left the dummy: no contents and too large, or storage gone); the highest IDs registered %d / %d (pool bases %d / %d)",
@@ -2089,7 +2104,7 @@ static int prepare_draw(int prim, int indexed) {
     for (uint32_t i = 0; i < k.nbind; i++) {
         uint32_t b = k.bind[i].binding; VkBuffer buf; VkDeviceSize off;
         if (b == 16) { buf = vk_zero_buffer(); off = 0; }
-        else if (!vk_buf_at(S.vbuf[b].address, 1, &buf, &off)) { buf = vk_zero_buffer(); off = 0; VKRED_ONCE(51, "vertex buffer outside the memory pools"); }
+        else if ((vk_pool_tag = "vertex", !vk_buf_at(S.vbuf[b].address, 1, &buf, &off))) { buf = vk_zero_buffer(); off = 0; VKRED_ONCE(51, "vertex buffer outside the memory pools"); }
         else if (S.vbuf[b].size) { vkpool_t *vp = vk_pool_peek(S.vbuf[b].address, 1); if (vp && S.vbuf[b].address + S.vbuf[b].size > vp->hi && vp->hi < vp->end) vk_cross(2, S.vbuf[b].address, S.vbuf[b].size, vp); }
         if (g_var_now == 5) { buf = vk_zero_buffer(); off = 0; }
         if (!(dbg_draw() & 2) && b < 17) { int fresh = bc_fresh(); if (fresh || g_bc.vb[b] != buf || g_bc.vo[b] != off) { vkCmdBindVertexBuffers(cb, b, 1, &buf, &off); g_bc.vb[b] = buf; g_bc.vo[b] = off; } }
@@ -2540,8 +2555,11 @@ static void draw_idx(const p_draw_idx *d) {
     VkIndexType it = d->itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : d->itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
     uint32_t isz = d->itype == 0 ? 1 : d->itype == 1 ? 2 : 4;
     VkBuffer ib; VkDeviceSize io;
-    if (!vk_buf_at(d->ibuf, 1, &ib, &io)) { VKRED_ONCE(56, "index buffer outside the memory pools"); return; }
-    if (!d->ind) { vkpool_t *ip = vk_pool_peek(d->ibuf, 1); uint64_t in = (uint64_t)d->count * isz; if (ip && d->ibuf + in > ip->hi && ip->hi < ip->end) vk_cross(3, d->ibuf, in, ip); }
+    vk_pool_tag = "index"; if (!vk_buf_at(d->ibuf, 1, &ib, &io)) { VKRED_ONCE(56, "index buffer outside the memory pools"); return; }
+    if (!d->ind) { vkpool_t *ip = vk_pool_peek(d->ibuf, 1); uint64_t in = (uint64_t)d->count * isz;
+        if (ip && d->ibuf + in > ip->hi && ip->hi < ip->end) {   // the draw's indices run into the pool's next chunk: up to 16 MB of them bound from a copy of CPU memory (the game writes its index buffers on the CPU)
+            if (in <= (16u << 20) && d->ibuf + in <= ip->end) { uint8_t *dst = vk_scratch(in, 4, &ib, &io); memcpy(dst, (const void *)(uintptr_t)d->ibuf, in); vk_cross(5, d->ibuf, in, ip); }
+            else vk_cross(3, d->ibuf, in, ip); } }
     if (g_ubolog_key && S.sh[0] && S.sh[0]->key == g_ubolog_key && g_ubolog_n > 0) {   // DM_VK_UBO_LOG: the index data the draw reads (CPU view at replay)
         const uint8_t *ix = (const uint8_t *)(uintptr_t)d->ibuf; uint64_t h = 1469598103934665603ull; uint32_t mn = ~0u, mx = 0;
         for (uint32_t i = 0; i < (uint32_t)d->count; i++) { uint32_t v = isz == 1 ? ix[i] : isz == 2 ? ((const uint16_t *)ix)[i] : ((const uint32_t *)ix)[i]; h = (h ^ v) * 1099511628211ull; if (v < mn) mn = v; if (v > mx) mx = v; }
@@ -3064,7 +3082,8 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
                   to_texture ? "→" : "←", (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.format, c->tex->d.flags, (unsigned long long)c->src,
                   c->r.xoffset, c->r.yoffset, (unsigned)c->r.width, (unsigned)c->r.height, (long long)S.row_stride, (long long)S.image_stride); } } }
     VkBuffer b; VkDeviceSize o;
-    if (!vk_buf_at(c->src, 1, &b, &o)) { VKRED_ONCE(70, "buffer of a buffer ↔ texture copy outside the memory pools"); return; }
+    if (im->promoted) { VKRED_ONCE(172, "buffer ↔ texture copy of an image promoted for image stores (nvn format %#x, %ux%u): skipped, its texels are not the guest's layout", c->tex->d.format, c->tex->d.width, c->tex->d.height); return; }
+    vk_pool_tag = "buffer-texture copy"; if (!vk_buf_at(c->src, 1, &b, &o)) { VKRED_ONCE(70, "buffer of a buffer ↔ texture copy outside the memory pools"); return; }
     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb);
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1;
     uint32_t rowlen = S.row_stride > 0 && f->bpb ? (uint32_t)(S.row_stride / f->bpb) * bw : 0;

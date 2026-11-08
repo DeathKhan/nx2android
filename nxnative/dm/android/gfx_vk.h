@@ -74,6 +74,8 @@ void vk_init(void);   // once, from mtl_init or the first use
 typedef struct { uint64_t lo, hi; VkBuffer buf; VkDeviceMemory mem; void *ahb; int zero_copy, noncoherent; uint8_t *shadow, *baseline; uint64_t serial, base, end; int flags, synced, baseline_complete; uint64_t stamp, stamp0; const void *span; uint64_t gpu; int backed, addressed; } vkpool_t;   // backed: has its VkBuffer (lazy pools get one at their first GPU reference, vk_pool_of); addressed: the game took a GPU address in it (mtl_pool_addressed); serial: unique per pool made (caches of views over a pool's buffer key on it); [base, end): the game's pool, of which [lo, hi) is one chunk (ZC_CHUNK); flags: the NVN pool's (vk_pool_set_flags); baseline: last synchronized GPU-copy contents; baseline_complete: refreshed by a full completion merge, consumed by the next sync; synced, stamp, stamp0, span: a copied pool's incremental sync
 vkpool_t *vk_pool_of(uint64_t addr, uint64_t len);   // the pool containing [addr, addr+len), NULL if none; backed (its buffer made) if it was not yet
 vkpool_t *vk_pool_peek(uint64_t addr, uint64_t len);   // the same without backing it: for CPU-side range checks (p->buf may be VK_NULL_HANDLE)
+vkpool_t *vk_pool_holding(uint64_t addr, uint64_t len);   // the chunk addr lies in when [addr, addr+len) lies in its pool (across chunks too): for CPU reads of the pool's memory, no buffer
+extern __thread const char *vk_pool_tag;   // what the lookup is for (set by the caller: "uniform", "storage", "vertex", "index", "copy"...), named when a range across two chunks has no buffer
 void vk_pool_stats(uint64_t *pools, uint64_t *backed, uint64_t *bytes, uint64_t *backed_bytes);   // chunks made and backed so far, and their bytes (lazy pools: gfx_vk_core.c)
 // gpu (vkpool_t): the buffer's device address (0 without has_bda); its delta from the chunk's guest address lo is what the raw global memory table carries
 VkBuffer vk_gmem_map(VkDeviceSize *len);   // the memory pool table for raw global memory (dmsh_abi.h DMSH_GMEM_MAP_*; RK_GMEM_MAP), rebuilt when the pools change; *len: its bytes
@@ -145,6 +147,8 @@ struct vkimg {
     uint64_t depth_sub;   // the submission (gfx_vk_exec.c g_set_epoch) whose passes last used it as their depth attachment
     uint64_t depth_cut;   // and the command buffer within it (gfx_vk_exec.c g_cuts)
     int fixed_fmt;   // created with a format list (DM_VK_UBWC): views only in its format or its sRGB twin
+    int promoted;    // created in a storage-capable float format (R16G16B16A16_SFLOAT) in place of one the device cannot store to (E5B9G9R9, B10G11R11; gfx_vk_tex.c storage_promote): views, copies
+                     // and attachments take its format; its bytes are never the guest's, so raw uploads and buffer copies of it are skipped (the image is the host's own, as every vkimg)
     VkFormat fmt2;   // with fixed_fmt: the other format of its list (its sRGB twin), VK_FORMAT_UNDEFINED when the list is its format alone
     VkImageView full;               // a view of the whole image as created
     VkBufferView tbuf;              // buffer textures: a texel buffer view of the pool
@@ -226,7 +230,7 @@ enum { VK_NSETS = 6, TBL_SLOTS = 3, TBL_MIN = 256 };
 // word (Ocarina of Time's gsys materials read theirs from records in storage buffers). Set 0 holds, after the texture tables, POOL_TEX_SLOTS sampled-image arrays of vk_pool_n()
 // (element k = the registered texture of ID k through a 2D, 2D-array, cube or 3D view; the arrays declare floating-point texels) and a sampler array of vk_pool_samp_n() (element
 // k = sampler ID k), rebuilt when a registration changes (gfx_vk_exec.c tbl_set) and bound with the table set; the SPIR-V arrays and their index clamps are cut to those lengths
-// (gfx_vk_shader.c). DM_VK_POOL_N: the texture length (4096 unless set; 0: such shaders are not drawn), bounded by the device's per-stage descriptor limits
+// (gfx_vk_shader.c). DM_VK_POOL_N: the texture length (65536 unless set; 0: such shaders are not drawn), bounded by the device's per-stage descriptor limits
 enum { POOL_TEX_SLOTS = 4, POOL_B0 = TBL_SLOTS, POOL_SAMP_B = TBL_SLOTS + POOL_TEX_SLOTS, SET0_BINDINGS = TBL_SLOTS + POOL_TEX_SLOTS + 1 };
 VkDescriptorSetLayout vk_tbl_dsl(void);
 int vk_tbl_n(void);
