@@ -74,6 +74,13 @@ Per-build knowledge stays where upstream keeps it: the rewriter's cuts in `patch
 
 RomFS in the data pack is hard-linked to the extraction when the volume allows it, so it takes no extra space.
 
+The Android translator is built from the checked-out C# sources by `porter.pipeline.build_translator`; it does not select the pinned Mac `dmsh_xlate_bin` launcher. Its cache fingerprints the source and .NET SDK, and the shader cache also fingerprints the four generated DLLs. `build-manifest.json` records their SHA-256 values. Compiler intermediates are removed after the build.
+
+For a developer-only shader rebuild, `devtools/build_shader_bundle.py` uses that same compiler path under this checkout's `dist/android-shader-tools/`, with temporary shaders under `target/`. Pass `--game ID --profile /path/to/profile/ID --dotnet /path/to/dotnet`; the explicit profile takes precedence over the registered profile. `--baseline old.dmsv --validate` requires identical shader keys and reflection and validates every module with `spirv-val --target-env vulkan1.2` before replacing the requested output. The adjacent `.evidence.json` records bundle and compiler hashes, profile, options and validation results. Keep output under `dist/` and retain the prior installed bundle until runtime checks pass. This is a build path; normal APK/data installation still goes through the porter.
+
+`--hmma-shuffle 1` is an Android shader-build experiment: warp-local packed register exchanges replace the software HMMA helper's shared-memory transport while retaining its FP32 fused operations and final half packing. It is off by default, and does not change the Mac helper selected for Metal matrix lowering. Target-device equivalence and performance must be checked before using it for a bundle.
+
+
 ## Saves
 
 The app keeps the game's save in its internal storage (`$DM_SAVE`, and `<DM_SAVE>_device` for a game that mounts a device save too: `hle_fs.c`), which a reinstall keeps, an uninstall deletes, and adb cannot read in a release build (it is not debuggable). The save manager (`dm/android/saves_android.c`) copies it in and out through the app's files folder, which adb, porter and the PC reach without a permission:

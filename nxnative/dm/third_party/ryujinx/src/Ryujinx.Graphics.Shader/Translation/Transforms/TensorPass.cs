@@ -229,7 +229,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Transforms
 
             Debug.Assert(memoryId.Type == OperandType.Constant && operation.SourcesCount == 1 + HmmaInArguments);
 
-            int functionId = context.Hfm.GetOrCreateFunctionId(HelperFunctionName.Hmma16816F16, memoryId.Value);
+            HelperFunctionName helper = context.GpuAccessor.QueryHostUseHmmaShuffle()
+                ? HelperFunctionName.Hmma16816F16Shuffle : HelperFunctionName.Hmma16816F16;
+            int functionId = context.Hfm.GetOrCreateFunctionId(helper, memoryId.Value);
 
             Operand d0 = operation.GetDest(0);
             Operand d1 = operation.GetDest(1);
@@ -267,7 +269,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Transforms
             Operand g = emit.ShiftRightU32(lane, Const(2));
             Operand t = emit.BitwiseAnd(lane, Const(3));
 
-            emit.Copy(operation.Dest, InstEmit.LdsmLane(emit, g, t, operation.GetSource(2), operation.GetSource(0).Value, operation.GetSource(3).Value, operation.GetSource(1).Value));
+            emit.Copy(operation.Dest, InstEmit.LdsmLane(emit, g, t, operation.GetSource(2), operation.GetSource(0).Value, operation.GetSource(3).Value, operation.GetSource(1).Value, context.GpuAccessor.QueryHostSubgroupSize()));
 
             LinkedListNode<INode> last = node;
 

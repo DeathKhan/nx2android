@@ -169,7 +169,7 @@ static VkFormat srgb_twin(VkFormat f) {
 // Graveyard Keeper 2, Advance Wars and DKCR drew the same pictures. A colour view in another format than the image's and its twin is logged [RED] (vk_tex_view):
 // such a game wants DM_VK_UBWC=2 in its profile
 static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 3; } return v; }
-static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
+static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f, VkImageUsageFlags extra_usage) {
     vkimg_t *im = calloc(1, sizeof *im);
     const nvn_texdesc *d = &t->d;
     im->w = d->width ? d->width : 1; im->h = d->target == 0 || d->target == 3 ? 1 : (d->height ? d->height : 1);
@@ -177,7 +177,7 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     im->levels = d->levels ? d->levels : 1; im->samples = d->samples > 1 ? d->samples : 1; im->target = d->target; im->nvn_format = d->format;
     im->fmt = f->vk; im->vtype = vtype_of(d->target); im->aspect = aspect_of(f);
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, f->vk, &fp);
-    VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | extra_usage;
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if ((d->flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
@@ -212,7 +212,7 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     if (!(im->mem = vk_image_memory(&req, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT), &moff, &im->sub))) {
         VKRED_ONCE(11, "image memory allocation failed (%llu bytes)", (unsigned long long)req.size); vkDestroyImage(V.dev, im->img, NULL); free(im); return NULL; }
     VKCHK(vkBindImageMemory(V.dev, im->img, im->mem, moff));
-    im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    im->layout = VK_IMAGE_LAYOUT_UNDEFINED; im->vkbytes = req.size;
     return im;
 }
 void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) {
@@ -308,8 +308,8 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 // after 20 minutes) and Android's low-memory killer ended the game. A new image takes over: the images of the same pool over its memory that were not looked up in the
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 60 };
-static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+static uint64_t g_img_n, g_img_bytes, g_img_evicted, g_img_vkbytes;   // live images and their bytes (guest layout; vkbytes: device memory), images evicted so far (vk_tex_sweep's line)
+static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; g_img_vkbytes -= im->vkbytes; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
@@ -337,8 +337,9 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     vkimg_t *im = keyed ? nvn_hm_get(&g_by_key, &k) : nvn_hm_get(&g_by_serial, &t->serial);
     if (!im) {
         if (keyed) evict_overlaps(k.pool, t->off, (int64_t)t->L.size);
-        im = img_new(t, f); if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
-        im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = t->d.flags; g_img_n++; g_img_bytes += t->L.size;
+        if (vk_sub_open()) vk_img_budget_make_room(t->L.size);   // (the texture budget: the least recently drawn go once the GPU is past this submission)
+        im = img_new(t, f, 0); if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
+        im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = t->d.flags; g_img_n++; g_img_bytes += t->L.size; g_img_vkbytes += im->vkbytes;
         if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);
     }
     im->used = g_tex_frame;
@@ -369,6 +370,45 @@ static vkimg_t *vk_tex_(const tex_t *t) {
         }
     } else if (first) vk_tex_prepare(vk_upload_cmd(), im);
     return im;
+}
+// Binding as an image establishes storage usage even when the NVN texture builder omitted IMAGE.
+// Keep the storage-key object and all CPU/GPU ownership metadata. Only its native allocation/views change;
+// prior descriptors retain the old handles until the submission fence, and subsequent lookups see the copy.
+int vk_tex_storage_prepare(const tex_t *t) {
+    tex_t snapshot = *t; t = &snapshot;   // registrations are thread-local scratch; ending a pass may perform other lookups
+    vkimg_t *im = vk_tex(t);
+    if (!im) return 0;
+    if (im->usage & VK_IMAGE_USAGE_STORAGE_BIT) return 1;
+    const vkfmt_t *f = vk_fmt(t->d.format); VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(V.pd, im->fmt, &fp);
+    if (!f || f->vk != im->fmt || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
+        !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+        VKRED_ONCE(161, "storage binding format %d cannot support image stores", im->fmt); return 0;
+    }
+    // Called in a preflight for every stage before any descriptors are collected or a new render pass begins.
+    // The main command buffer places the copy after earlier rendering; the upload buffer would copy too soon.
+    vk_end_pass_land();
+    vkimg_t *next = img_new(t, f, VK_IMAGE_USAGE_STORAGE_BIT);
+    if (!next) return 0;
+    VkCommandBuffer cb = vk_cmd();
+    vk_tex_prepare(cb, im); vk_tex_prepare(cb, next); vk_img_barrier_all(cb);
+    for (uint32_t level = 0; level < im->levels; level++) {
+        uint32_t w = im->w >> level, h = im->h >> level, d = im->d >> level;
+        VkImageCopy copy = {{im->aspect, level, 0, im->layers}, {0, 0, 0},
+                           {im->aspect, level, 0, im->layers}, {0, 0, 0}, {w ? w : 1, h ? h : 1, d ? d : 1}};
+        vkCmdCopyImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, next->img, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    }
+    vk_img_barrier_all(cb);
+    vk_tex_view_drop_all(im);
+    if (im->full) { vk_defer_free_view(im->full); im->full = VK_NULL_HANDLE; }
+    if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem);
+    g_img_vkbytes -= im->vkbytes; g_img_vkbytes += next->vkbytes;
+    im->img = next->img; im->mem = next->mem; im->sub = next->sub; im->usage = next->usage; im->cflags = next->cflags;
+    im->layout = next->layout; im->fixed_fmt = next->fixed_fmt; im->fmt2 = next->fmt2; im->vkbytes = next->vkbytes;
+    free(next);
+    static int noted; if (noted++ < 16) VKLOG("storage binding promoted %ux%u format %d: preserved %u levels, %u layers; usage %#x",
+        im->w, im->h, im->fmt, im->levels, im->layers, im->usage);
+    return 1;
 }
 // Packaged textures give up their write protection (nvn_dirty_release; drawn again, they are uploaded and protected again) when not drawn for PKG_IDLE presents, and the
 // least recently drawn ones beyond that while the protected runs, each splitting its pool's mapping, are more than PKG_RUNS (textures stay protected until the game writes them).
@@ -408,7 +448,10 @@ void vk_tex_sweep(void) {
     pthread_mutex_unlock(&g_img_mu);
     free(v);
     static uint64_t total; total += idle + lru;
-    if (g_tex_frame % 3000 == 0) VKLOG("images: %llu live, %.0f MB of textures, %llu evicted so far (a newer texture over their memory)", (unsigned long long)g_img_n, g_img_bytes / 1048576.0, (unsigned long long)g_img_evicted);
+    if (g_tex_frame % 3000 == 0) { uint64_t bu, be, bb, bs, pn, pb, pby, pbb; vk_img_budget_stats(&bu, &be, &bb, &bs); vk_pool_stats(&pn, &pb, &pby, &pbb);
+        VKLOG("images: %llu live, %.0f MB of textures (%.0f MB of device memory, budget %.0f MB: %llu evicted, %.0f MB, in %llu sweeps), %llu evicted so far (a newer texture over their memory); memory pools: %llu chunks (%.2f GB), %llu backed (%.2f GB)",
+              (unsigned long long)g_img_n, g_img_bytes / 1048576.0, g_img_vkbytes / 1048576.0, bu / 1048576.0, (unsigned long long)be, bb / 1048576.0, (unsigned long long)bs, (unsigned long long)g_img_evicted,
+              (unsigned long long)pn, pby / 1073741824.0, (unsigned long long)pb, pbb / 1073741824.0); }
     if ((idle || lru) && (g_tex_frame % 3000 == 0 || lru)) VKLOG("packaged textures: %llu not drawn for %d presents and %llu least recently drawn released their write protection (%llu pages; %llu so far); %d protected runs",
                     (unsigned long long)idle, PKG_IDLE, (unsigned long long)lru, (unsigned long long)(nvn_dirty_released() - before), (unsigned long long)total, runs);
 }
@@ -527,9 +570,11 @@ static VkComponentMapping sample_swizzle(const VkComponentMapping *format, const
         apply(swz_comp(sw[3]),format,VK_COMPONENT_SWIZZLE_A)};
 }
 __thread VkFormat vk_view_fmt; __thread uint32_t vk_view_layers;
-VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, int as_attachment, vkimg_t **img_out) {
+VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, int view_kind, vkimg_t **img_out) {
+    int as_attachment = view_kind == 1, storage = view_kind == 2;
     vkimg_t *im = vk_tex(t); if (img_out) *img_out = im;
     if (!im) return VK_NULL_HANDLE;
+    if (storage && !(im->usage & VK_IMAGE_USAGE_STORAGE_BIT)) { VKRED_ONCE(162, "storage image used without successful preflight"); return VK_NULL_HANDLE; }
     if (as_attachment) { im->wseq = ++g_wseq; im->gpu_w = 1; } else if (im->novl) alias_check(im);
     vk_watch(im, as_attachment ? "attachment" : "sampled or image");
     if (!as_attachment) { void vk_texdump_note(vkimg_t *im); vk_texdump_note(im); }
@@ -555,11 +600,12 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
         type = want;
     }
     if (as_attachment) { type = im->layers > 1 && nly > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : (im->vtype == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D); nlv = 1; }
+    if (storage) nlv = 1;   // a storage image view addresses one mip, independent of its sampled-view range
     if (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_3D) nly = 1;
     VkImageAspectFlags aspect = im->aspect;
     if (aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) && !as_attachment)
         aspect = (!f->depth || t->stencil || (vw && vw->set_dsmode && vw->dsmode == 1)) ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;   // (STENCIL8 alone may be stored combined)
-    VkComponentMapping swz = sample_swizzle(&f->swz,t,vw,as_attachment);
+    VkComponentMapping swz = sample_swizzle(&f->swz,t,vw,as_attachment || storage);
     VkFormat fmt = f->vk;
     const vkfmt_t *imf = vk_fmt(im->nvn_format);   // (a BC format decoded on the CPU counts as compressed: its view keeps the decoded image's format)
     if ((im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || (f->compressed || f->dec) != (imf->compressed || imf->dec) || (f->dec && f->dbpp != imf->dbpp)) fmt = im->fmt;   // depth views and block-size changes keep the image's format
@@ -567,16 +613,17 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     pthread_mutex_lock(&g_view_mu);
     vview *head = nvn_hm_get(&g_views, &im);
     for (vview *v = head; v; v = v->next)
-        if (v->type == type && v->fmt == fmt && v->lv0 == lv0 && v->nlv == nlv && v->ly0 == ly0 && v->nly == nly && v->aspect == aspect && v->attach == (as_attachment != 0) && !memcmp(&v->swz, &swz, sizeof swz)) { pthread_mutex_unlock(&g_view_mu); vk_view_fmt = fmt; vk_view_layers = nly; return v->v; }
+        if (v->type == type && v->fmt == fmt && v->lv0 == lv0 && v->nlv == nlv && v->ly0 == ly0 && v->nly == nly && v->aspect == aspect && v->attach == view_kind && !memcmp(&v->swz, &swz, sizeof swz)) { pthread_mutex_unlock(&g_view_mu); vk_view_fmt = fmt; vk_view_layers = nly; return v->v; }
     VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, 0};
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, fmt, &fp);
     uci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (as_attachment) uci.usage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) | (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
+    if (storage) { if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(163, "storage view format %d is unsupported", fmt); return VK_NULL_HANDLE; } uci.usage = VK_IMAGE_USAGE_STORAGE_BIT; }
+    else if (as_attachment) uci.usage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) | (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
     else if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) uci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, im->img, type, fmt, swz, {aspect, lv0, nlv, ly0, nly}};
     VkImageView view; VkResult r = vkCreateImageView(V.dev, &ci, NULL, &view);
     if (r) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(15, "vkCreateImageView failed (%d): type %d format %d levels %u+%u layers %u+%u of image %ux%ux%u", r, type, fmt, lv0, nlv, ly0, nly, im->w, im->h, im->layers); return VK_NULL_HANDLE; }
-    vview *nv = calloc(1, sizeof *nv); *nv = (vview){view, type, fmt, lv0, nlv, ly0, nly, swz, aspect, as_attachment != 0, head};
+    vview *nv = calloc(1, sizeof *nv); *nv = (vview){view, type, fmt, lv0, nlv, ly0, nly, swz, aspect, view_kind, head};
     nvn_hm_put(&g_views, &im, nv);
     pthread_mutex_unlock(&g_view_mu);
     vk_view_fmt = fmt; vk_view_layers = nly;
@@ -747,7 +794,7 @@ VkImageView vk_dummy_view(int dim, int arrayed, int ms, int storage, int is_int)
             t.d.format = is_int ? 0x27 : 0x25; t.d.width = t.d.height = 1; t.d.depth = d == 3 ? 12 : 6; t.d.levels = 1; t.d.samples = ms ? 4 : 0;
             t.d.target = d == 0 ? 3 : d == 2 ? 2 : d == 3 ? 9 : ms ? 6 : 4; t.d.flags = storage ? NVN_TEXTURE_FLAGS_IMAGE : 0;
             if (d == 2) t.d.depth = 1;
-            *pi = img_new(&t, vk_fmt(t.d.format));
+            *pi = img_new(&t, vk_fmt(t.d.format), 0);
             VkCommandBuffer cb = vk_upload_cmd(); vk_tex_prepare(cb, *pi);
             VkClearColorValue z = {{0}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
             if (!ms) vkCmdClearColorImage(cb, (*pi)->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
@@ -828,3 +875,25 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     mtl_wait(mtl_sub_commit(), ~0ull);
     for (size_t z = 0; z < depth; z++) for (size_t y = 0; y < rows; y++) memcpy(dst + z * img + y * row, p + (z * rows + y) * pitch, pitch < row ? pitch : row);
 }
+
+// ---------------- texture memory budget (gfx_vk_budget.c): the live images and dropping one ----------------
+// Both tables' images into *out (grown as needed); the caller holds g_img_mu (vk_tex calls vk_img_budget_make_room under it)
+size_t vk_img_list(vk_img_ref **out, size_t *cap) {
+    size_t n = 0;
+    for (int m = 0; m < 2; m++) {
+        nvn_hmap *h = m ? &g_by_serial : &g_by_key;
+        for (uint32_t i = 0; i < h->cap; i++) {
+            vkimg_t *im = h->vals[i]; if (!im) continue;
+            if (n == *cap) { *cap = *cap ? 2 * *cap : 4096; vk_img_ref *nw = realloc(*out, *cap * sizeof **out); if (!nw) return n; *out = nw; }
+            (*out)[n++] = (vk_img_ref){h, i, im};
+        }
+    }
+    return n;
+}
+void vk_img_evict(const vk_img_ref *r) {   // under g_img_mu, from a list taken under the same hold of the lock (a deletion shifts later entries back: the image is looked for again if its slot changed)
+    nvn_hmap *h = r->h; uint32_t i = r->i;
+    if (i >= h->cap || h->vals[i] != r->im) { for (i = 0; i < h->cap && h->vals[i] != r->im; i++) {} if (i == h->cap) return; }
+    uint8_t key[64]; _Static_assert(sizeof(akey) <= 64, "akey"); memcpy(key, h->keys + (size_t)i * h->klen, h->klen);
+    nvn_hm_del(h, key); img_drop(r->im); g_img_evicted++;
+}
+uint64_t vk_img_vkbytes(void) { return g_img_vkbytes; }

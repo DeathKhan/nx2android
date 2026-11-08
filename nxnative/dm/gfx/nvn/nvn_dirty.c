@@ -106,10 +106,28 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     }
 }
 static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t *count);
+// A frozen range (nvn_dirty_freeze): the caller has made it read-only outside this module's page states while it replaces its mapping (gfx_vk_core.c: a memory pool backed
+// at its first GPU use, its bytes copied into the hardware buffer, which is then mapped over them). A write into it waits here until it is unfrozen, then is re-executed:
+// the new mapping is writable, or protected again by this module and the fault comes back as one of its own. Only atomics: usable in the fault handler
+static _Atomic uintptr_t g_frz_lo, g_frz_hi; static _Atomic int g_frz_red;
+static int frozen_wait(uintptr_t a) {   // 1 = waited on a frozen range holding a (now unfrozen); 0 = not frozen
+    uint64_t t0 = 0;
+    for (unsigned n = 1;; n++) {
+        uintptr_t lo = atomic_load(&g_frz_lo), hi = atomic_load(&g_frz_hi);
+        if (a < lo || a >= hi) return n > 1;
+        if (n & 0xff) continue;
+        uint64_t now = mach_absolute_time(); if (!t0) t0 = now;
+        if ((now - t0) * g_tb.numer / g_tb.denom > (uint64_t)BUSY_WAIT_MS * 1000000ull) { if (!atomic_exchange(&g_frz_red, 1)) LOG("[RED] dirty-page tracking: a write to %p waited over %d ms on a frozen range", (void *)a, BUSY_WAIT_MS); return 1; }
+        sched_yield();
+    }
+}
+void nvn_dirty_freeze(const void *addr, size_t len) { atomic_store(&g_frz_lo, (uintptr_t)addr); atomic_store(&g_frz_hi, (uintptr_t)addr + len); }
+void nvn_dirty_unfreeze(void) { atomic_store(&g_frz_hi, 0); atomic_store(&g_frz_lo, 0); }
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     if (!is_write) return 0;
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
+    if (frozen_wait(a)) return 1;   // re-executed against the new mapping
     for (int i = 0; i < n; i++) {   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         range_t *r = rg(i); if (!live_at(i) || a < r->base || a >= r->end) continue;
         uintptr_t pg = (a - r->base) >> g_shift; uint32_t sp = atomic_load(&r->span[pg]);
@@ -154,7 +172,7 @@ static void release_range(const void *addr, size_t len, _Atomic uint64_t *count)
         release_pages(r, (lo - r->base) >> g_shift, (hi - 1 - r->base) >> g_shift, count);
     }
 }
-static void prep_write(void *addr, size_t len) { release_range(addr, len, &g_preps); }
+static void prep_write(void *addr, size_t len) { frozen_wait((uintptr_t)addr); if (len > 1) frozen_wait((uintptr_t)addr + len - 1); release_range(addr, len, &g_preps); }   // (a frozen range: the host's write waits for its mapping)
 // A caller that no longer needs a span watched (a packaged texture not drawn for a while, gfx_vk_tex.c vk_tex_sweep) gives up its protection: the pages are stamped as written, so
 // the texture is uploaded and protected again when it is drawn. Textures stay protected until the game writes them, so the protected runs, each splitting its pool's mapping,
 // would grow with every place the player has seen

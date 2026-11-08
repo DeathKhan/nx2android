@@ -305,6 +305,15 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// Use a software HMMA helper that exchanges packed fragments by subgroup
+        /// shuffle. Offline Metal keeps the scratch helper for its native matrix rewrite.
+        /// </summary>
+        bool QueryHostUseHmmaShuffle()
+        {
+            return false;
+        }
+
+        /// <summary>
         /// Queries host support for readable images without a explicit format declaration on the shader.
         /// </summary>
         /// <returns>True if formatted image load is supported, false otherwise</returns>

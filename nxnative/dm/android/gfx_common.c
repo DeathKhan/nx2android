@@ -75,7 +75,6 @@ void mtl_queue_forget(uint64_t serial) { (void)serial; }
 void mtl_set_queue_origin_lower_left(int on) { mtl_set_origin_lower_left(on); }   // the raster flip is per queue upstream; here the one flag, set under the submit lock at each submit
 // Memory pools: every pool is resident and reachable by address (vk_pool_of), so no residency hints are needed; a pool's physical storage going away is handled by mtl_pool_del
 void mtl_sp_phys_gone(const void *mem, uint64_t size) { (void)mem; (void)size; }
-void mtl_pool_addressed(const void *mem, uint64_t size) { (void)mem; (void)size; }
 int mtl_addr_known(uint64_t addr, uint64_t len) { return mtl_addr(addr, len, NULL, NULL); }
 // Programs: the Vulkan backend has no per-queue binding tables to drop and loads shader modules at first use
 void mtl_prog_forget(const prog_t *p) { (void)p; }

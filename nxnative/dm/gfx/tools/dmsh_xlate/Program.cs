@@ -141,6 +141,9 @@ static class SwshXlate
             if (f == null) { Notes.Add($"image handle {handle:X} slot {slot} has no format in the answer table, using R8G8B8A8Unorm"); return TextureFormat.R8G8B8A8Unorm; }
             return Enum.TryParse(f, true, out TextureFormat tf) ? tf : TextureFormat.R8G8B8A8Unorm;
         }
+        // Android can choose the exact scalar HMMA helper with warp-local shuffles.
+        // Metal jobs omit this and retain the helper its native matrix rewrite expects.
+        public bool QueryHostUseHmmaShuffle() => _job["hmma_shuffle"] is JsonValue v && (bool)v;
         int Local(int i) => _job["local"] is JsonArray a && a.Count > i ? (int)a[i] : 1;
         public int QueryComputeLocalSizeX() => Local(0);
         public int QueryComputeLocalSizeY() => Local(1);

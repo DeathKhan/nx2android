@@ -18,9 +18,10 @@ FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_atomic.py', '
 # This target-specific lowering lives in the vendored translator. Include its
 # sources as well as the rebuilt DLL fingerprint; no old shader cache can bypass it.
 FILES += ['../third_party/ryujinx/src/Ryujinx.Graphics.Shader/' + f for f in (
-    'Instructions/InstEmitSurface.cs', 'IntermediateRepresentation/TextureFlags.cs',
+    'IGpuAccessor.cs', 'Translation/HelperFunctionName.cs',
+    'Instructions/InstEmitSurface.cs', 'Instructions/InstEmitAmpereTensor.cs', 'IntermediateRepresentation/TextureFlags.cs',
     'Translation/TranslationFlags.cs', 'Translation/HostCapabilities.cs',
-    'Translation/Transforms/GeometryToCompute.cs', 'Translation/TranslatorContext.cs', 'Translation/Translator.cs', 'Translation/EmitterContext.cs', 'Translation/ShaderDefinitions.cs', 'CodeGen/Spirv/Instructions.cs',
+    'Translation/Transforms/GeometryToCompute.cs', 'Translation/Transforms/TensorPass.cs', 'Translation/HelperFunctionManager.cs', 'Translation/TranslatorContext.cs', 'Translation/Translator.cs', 'Translation/EmitterContext.cs', 'Translation/ShaderDefinitions.cs', 'CodeGen/Spirv/Instructions.cs',
     'StructuredIr/ShaderProperties.cs', 'Translation/Optimizations/BindlessElimination.cs', 'Translation/Optimizations/Optimizer.cs',
     'Translation/Optimizations/GlobalToStorage.cs', 'CodeGen/Spirv/SpirvGenerator.cs')]
 INPUT_TABLES = ['shader_facts.tsv', 'shader_map.tsv', 'shader_map.tsv.conflicts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'bf_want.tsv', 'geo_mesh.tsv', 'dual_want.tsv']   # in the game profile folder

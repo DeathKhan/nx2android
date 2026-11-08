@@ -62,6 +62,10 @@ SB_ALIGN = 256
 # the translator emulates 32-lane warps inside it: lane id & 31, the ballot word of the lane's own 32, shuffles inside its 32, votes by ballot. Its 128 path picks the word by
 # lane id >> 5, so it holds for 64 too. At 32 the warp code read only the first 32 lanes' ballot (Tears of the Kingdom: 32 shaders vote, ballot or shuffle)
 SUBGROUP = int(GAME.get("android_subgroup_size", "128"))
+# Exact HMMA operand exchange without shared-memory barriers. Explicit per-job
+# selection preserves Metal's native matrix rewrite; opt-in until device A/B completes.
+HMMA_SHUFFLE = os.environ.get('DMSH_HMMA_SHUFFLE', '0') == '1'
+
 # Adreno rounds a gather coordinate that sits on a texel edge the other way from Maxwell, so a gather can pick the wrong 2x2 texels. Eden moves gather coordinates
 # 1/512 texel on Qualcomm and Turnip (#4565, TotK's large dark squares); Ryujinx's TexturePass does the same with 8 bits (Program.cs QueryHostGatherBiasPrecision).
 # Tears of the Kingdom on the Adreno 830 drew dark boxes of whole 16x16 tiles in its tiled lighting (607 shaders gather, 38 of them compute): in 2 of 12 camera
@@ -133,7 +137,7 @@ def gs_variant_key(key, t):   # the bundle key of a geometry shader translated f
     return key ^ ((t + 1) * 0x9E3779B97F4A7C15 & 0xFFFFFFFFFFFFFFFF)
 
 def job_common(key, stage, cp, c1, **extra):   # the job every shader gets (the translation options are the Android chain's; see dmsh_xlate/Program.cs), then the per-shader facts
-    return {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'debug': False, 'reduced': True, 'sb_align': SB_ALIGN, 'subgroup': SUBGROUP, 'gather_bias': GATHER_BIAS, 'gs_passthrough': False, **extra}
+    return {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'debug': False, 'reduced': True, 'sb_align': SB_ALIGN, 'subgroup': SUBGROUP, 'hmma_shuffle': HMMA_SHUFFLE, 'gather_bias': GATHER_BIAS, 'gs_passthrough': False, **extra}
 
 nvn2_notes = collections.Counter()
 def nvn2_job(key, stage, rec, ci, w):
@@ -177,7 +181,7 @@ def job_for(key, stage, rec, w):   # dmsh_build.py job_for; transform feedback i
     elif code[:4] == bytes.fromhex('79563412'): code = code[0x100:]
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
     xfb = xfb_layout(key, rec[ci:]) if stage in ('vs', 'gs') else None   # a geometry shader captures what it emits (Xenoblade Chronicles 3's particle update, 293ecebc0136519b)
-    j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'debug': False, 'reduced': True, 'sb_align': SB_ALIGN, 'subgroup': SUBGROUP, 'gather_bias': GATHER_BIAS, 'gs_passthrough': False, **({'xfb': xfb} if xfb else {})}
+    j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'debug': False, 'reduced': True, 'sb_align': SB_ALIGN, 'subgroup': SUBGROUP, 'hmma_shuffle': HMMA_SHUFFLE, 'gather_bias': GATHER_BIAS, 'gs_passthrough': False, **({'xfb': xfb} if xfb else {})}
     if stage == 'cs':   # Runtime captures have no facts-table row; their control section still declares the workgroup.
         x, y, z, shared = struct.unpack_from('<4I', rec, ci + 0x748)
         j.update(local=[x, y, z], shared=(shared + 15) // 16 * 16)

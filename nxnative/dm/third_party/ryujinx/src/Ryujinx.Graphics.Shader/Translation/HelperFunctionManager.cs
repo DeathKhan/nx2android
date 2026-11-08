@@ -179,6 +179,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                 HelperFunctionName.SharedStore8 => GenerateSharedStore8(id),
                 HelperFunctionName.SharedStore16 => GenerateSharedStore16(id),
                 HelperFunctionName.Hmma16816F16 => GenerateHmma16816F16(id),
+                HelperFunctionName.Hmma16816F16Shuffle => GenerateHmma16816F16Shuffle(),
                 _ => throw new ArgumentException($"Invalid function name {functionName}"),
             };
         }
@@ -267,6 +268,64 @@ namespace Ryujinx.Graphics.Shader.Translation
             context.Copy(Argument(TensorPass.HmmaInArguments), d[1]);
 
             context.Return(d[0]);
+
+            return new Function(ControlFlowGraph.Create(context.GetOperations()).Blocks, "dmsh_hmma16816_f16", true, TensorPass.HmmaInArguments, 1);
+        }
+
+        // The same packed operands and FP32 FMA order as the shared helper,
+        // exchanged directly within each logical NVIDIA warp. A word kw belongs
+        // to lane 4*row+(kw&3); B is stored transposed, so its row is the output
+        // column. No scratch-memory write remains, hence no memory barrier.
+        private static Function GenerateHmma16816F16Shuffle()
+        {
+            EmitterContext context = new();
+            Operand lane = Argument(0);
+            Operand g = context.ShiftRightU32(lane, Const(2));
+            Operand t = context.BitwiseAnd(lane, Const(3));
+            Operand warpBase = context.BitwiseAnd(context.Load(StorageKind.Input, IoVariable.SubgroupLaneId), Const(~31));
+            Operand[,] acc = new Operand[2, 2];
+
+            for (int q = 0; q < 2; q++)
+            {
+                Operand cw = Argument(8 + q);
+                acc[q, 0] = context.UnpackHalf2x16Low(cw);
+                acc[q, 1] = context.UnpackHalf2x16High(cw);
+            }
+
+            // Consume one k-pair before gathering the next. The four accumulators
+            // are independent: interleaving them preserves each one's exact FMA
+            // order while avoiding 32 simultaneously live packed matrix words.
+            for (int kw = 0; kw < 8; kw++)
+            {
+                Operand[] a = new Operand[2], b = new Operand[2];
+                Operand aSource = context.BitwiseOr(warpBase, context.IAdd(context.ShiftLeft(g, Const(2)), Const(kw & 3)));
+
+                for (int q = 0; q < 2; q++)
+                {
+                    a[q] = context.Shuffle(Argument(2 + q + 2 * (kw >> 2)), aSource);
+                }
+
+                for (int j = 0; j < 2; j++)
+                {
+                    Operand col = context.IAdd(context.ShiftLeft(t, Const(1)), Const(j));
+                    Operand source = context.BitwiseOr(warpBase, context.IAdd(context.ShiftLeft(col, Const(2)), Const(kw & 3)));
+                    b[j] = context.Shuffle(Argument(6 + (kw >> 2)), source);
+                }
+
+                for (int q = 0; q < 2; q++)
+                {
+                    for (int j = 0; j < 2; j++)
+                    {
+                        acc[q, j] = context.FPFusedMultiplyAdd(context.UnpackHalf2x16Low(a[q]), context.UnpackHalf2x16Low(b[j]), acc[q, j]);
+                        acc[q, j] = context.FPFusedMultiplyAdd(context.UnpackHalf2x16High(a[q]), context.UnpackHalf2x16High(b[j]), acc[q, j]);
+                    }
+                }
+            }
+
+            Operand d0 = context.PackHalf2x16(acc[0, 0], acc[0, 1]);
+            Operand d1 = context.PackHalf2x16(acc[1, 0], acc[1, 1]);
+            context.Copy(Argument(TensorPass.HmmaInArguments), d1);
+            context.Return(d0);
 
             return new Function(ControlFlowGraph.Create(context.GetOperations()).Blocks, "dmsh_hmma16816_f16", true, TensorPass.HmmaInArguments, 1);
         }
@@ -529,17 +588,23 @@ namespace Ryujinx.Graphics.Shader.Translation
         private static Operand GenerateSharedAtomicCasLoop(EmitterContext context, Operand wordOffset, int id, Func<Operand, Operand> opCallback)
         {
             Operand lblLoopHead = Label();
+            Operand lblDone = Label();
 
+            // Packed subword writers share the containing word. Keep the initial observation
+            // atomic and reuse the value returned by a failed CAS instead of loading again.
+            Operand oldValue = context.AtomicOr(StorageKind.SharedMemory, Const(id), wordOffset, Const(0));
             context.MarkLabel(lblLoopHead);
 
-            Operand oldValue = context.Load(StorageKind.SharedMemory, id, wordOffset);
             Operand newValue = opCallback(oldValue);
 
             Operand casResult = context.AtomicCompareAndSwap(StorageKind.SharedMemory, id, wordOffset, oldValue, newValue);
 
             Operand casFail = context.ICompareNotEqual(casResult, oldValue);
-
-            context.BranchIfTrue(lblLoopHead, casFail);
+            // Test before updating: the code generator may inline the comparison at its branch.
+            context.BranchIfFalse(lblDone, casFail);
+            context.Copy(oldValue, casResult);
+            context.Branch(lblLoopHead);
+            context.MarkLabel(lblDone);
 
             return oldValue;
         }

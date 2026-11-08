@@ -768,6 +768,14 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         {
             AstTextureOperation texOp = (AstTextureOperation)operation;
 
+            // OpImageRead of an Unknown-format storage image requires this
+            // capability independently of the image-write capability. Consult
+            // the declared resource format, which can be refined by other uses.
+            if (context.Properties.Images[texOp.GetTextureSetAndBinding()].Format == TextureFormat.Unknown)
+            {
+                context.AddCapability(Capability.StorageImageReadWithoutFormat);
+            }
+
             AggregateType componentType = texOp.Format.GetComponentType();
 
             bool isArray = (texOp.Type & SamplerType.Array) != 0;

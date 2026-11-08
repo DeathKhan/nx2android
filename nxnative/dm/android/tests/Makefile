@@ -2,10 +2,13 @@
 B = build
 CC ?= cc
 .DEFAULT_GOAL := run
-run: $(B)/t_movie_zc
+run: $(B)/t_movie_zc $(B)/t_ubo_extent
 	$(B)/t_movie_zc
+	$(B)/t_ubo_extent
 $(B)/t_movie_zc: t_movie_zc.c ../movie_zc.c ../movie_zc.h | $(B)
 	$(CC) -O1 -g -Wall -Werror -fsanitize=address,undefined -o $@ t_movie_zc.c ../movie_zc.c -lpthread
+$(B)/t_ubo_extent: t_ubo_extent.c ../gfx_vk_ubo_extent.c ../gfx_vk_ubo_extent.h | $(B)
+	$(CC) -O1 -g -Wall -Werror -fsanitize=address,undefined -o $@ t_ubo_extent.c ../gfx_vk_ubo_extent.c
 $(B):
 	mkdir -p $(B)
 clean:

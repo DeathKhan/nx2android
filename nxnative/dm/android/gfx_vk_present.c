@@ -990,13 +990,18 @@ static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, doub
     pthread_mutex_unlock(&g_pq_mu);
     return n;
 }
-void dm_perf_frame(double period); void dm_perf_window(ANativeWindow *w, double fps); void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns);   // perf_android.c
+void dm_perf_frame(double period); void dm_perf_frame_id(uint64_t frame, double period);
+void dm_perf_window(ANativeWindow *w, double fps); void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns);
+static void present_perf_end(double period) {
+    uint64_t frame = vk_frame_current();
+    vk_perf_frame_seal(frame);   // Includes any screenshot submission; presentation blits have their own queue fences.
+    dm_perf_frame_id(frame, period);
+}   // perf_android.c
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     vk_init();
     { uint64_t vk_replay_ns(void); double vk_gpu_ms_recent(void);   // what else the frame costs: its replay and its GPU time
       static uint64_t last_exec; uint64_t ex = vk_replay_ns(), rp = ex - last_exec; last_exec = ex; double g = vk_gpu_ms_recent(); int64_t gn = g > 0 ? (int64_t)(g * 1e6) : 0;
       dm_perf_frame_cost((int64_t)rp, gn); }
-    dm_perf_frame(period);   // paced to the game's frame period, and its work time reported to ADPF
     // A longer period goes to the window only once it has held for 60 presents; a shorter one at once. Super Mario Bros. Wonder's own controller (main+0xcfd24) asks
     // for interval 2 for a frame or a few and then 1 again: each ask was a vote (176 in 3 minutes of its first level on the Y700, 27-60 a run in issue #64's log of an
     // Adreno 750 phone with a 60 Hz display), and where the display changes its mode for a vote, the switch itself lengthens the next frames (issue #45: 30-40 fps)
@@ -1013,6 +1018,8 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     if (n % 600 == 0) {
         extern struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatches, pipes_built, rt_kept, ns_exec, ns_desc, ns_pipe, max_pass_draws; } g_vkst; extern uint64_t g_ubd_landed, g_ubd_superseded, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_gpu_ns, g_pkg_n, g_pkg_bytes, g_pkg_ns, g_set_hits, g_set_new, g_ubd_racy, g_ns_set_build, g_ns_set_hash, g_ns_set_new, g_set_memo, g_set_memo_bad;
         static uint64_t psb, psh, psn, pe, pd, pp, ps, pb, pdr, pg, pkn, pkb, pkt, psm;
+        extern uint64_t g_desc_alloc_ns, g_desc_alloc_calls, g_desc_alloc_sets; extern int g_desc_timing;
+        static uint64_t pda, pdc, pds;
         VKLOG("replay up to present %llu: draws %llu, skipped (no program %llu, no target %llu, no pipeline %llu), passes %llu, clears folded %llu, dispatches %llu, pipelines %llu; presents shown %llu, no image %llu, never drawn %llu; uniform updates landed %llu (superseded %llu, shadows %llu, CPU reads racing a GPU write %llu), same targets kept %llu, most draws in one pass %llu",
               (unsigned long long)n, (unsigned long long)g_vkst.draws, (unsigned long long)g_vkst.skip_prog, (unsigned long long)g_vkst.skip_rt, (unsigned long long)g_vkst.skip_pipe,
               (unsigned long long)g_vkst.passes, (unsigned long long)g_vkst.folded, (unsigned long long)g_vkst.dispatches, (unsigned long long)g_vkst.pipes_built,
@@ -1021,11 +1028,14 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         VKLOG("replay per frame (last 600): %.0f draws, replay %.2f ms (descriptor sets %.2f, pipeline keys %.2f), queue submit %.2f ms, uniform shadows %.0f KB; GPU busy %.2f ms; texture uploads %.1f (%.2f MB, %.2f ms); descriptor sets reused %llu, new %llu (collecting %.2f ms, hashing %.2f, new ones %.2f), kept per stage %.0f a frame (memo differences %llu)",
               nd, (g_vkst.ns_exec - pe) / 6e8, (g_vkst.ns_desc - pd) / 6e8, (g_vkst.ns_pipe - pp) / 6e8, (g_ns_submit - ps) / 6e8, (g_ubd_bytes - pb) / 600.0 / 1024, (g_gpu_ns - pg) / 6e8, (g_pkg_n - pkn) / 600.0, (g_pkg_bytes - pkb) / 600.0 / 1048576, (g_pkg_ns - pkt) / 6e8, (unsigned long long)g_set_hits, (unsigned long long)g_set_new, (g_ns_set_build - psb) / 6e8, (g_ns_set_hash - psh) / 6e8, (g_ns_set_new - psn) / 6e8,
               (g_set_memo - psm) / 600.0, (unsigned long long)g_set_memo_bad);
+        VKLOG("descriptor allocation per frame (last 600, timing %s): %.3f ms, %.1f driver calls, %.1f sets allocated (includes absent-stage sets)",
+              g_desc_timing ? "on" : "off; DM_VK_DESC_TIMING=1", (g_desc_alloc_ns - pda) / 6e8, (g_desc_alloc_calls - pdc) / 600.0, (g_desc_alloc_sets - pds) / 600.0);
+        pda = g_desc_alloc_ns; pdc = g_desc_alloc_calls; pds = g_desc_alloc_sets;
         void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }
-    if (!im) { no_img++; return present_enqueue(NULL, NULL, n, period); }
-    if (im->layout != VK_IMAGE_LAYOUT_GENERAL) { undrawn++; return present_enqueue(NULL, NULL, n, period); }   // never drawn into: nothing to show yet
+    if (!im) { no_img++; present_perf_end(period); return present_enqueue(NULL, NULL, n, period); }
+    if (im->layout != VK_IMAGE_LAYOUT_GENERAL) { undrawn++; present_perf_end(period); return present_enqueue(NULL, NULL, n, period); }   // never drawn into: nothing to show yet
     shown++; atomic_fetch_add(&g_fps_frames, 1);
     if (shot_wanted(n)) shot(im, n);
     { void vk_pass_dump_poll(uint64_t done); uint64_t vk_fence_done(void); vk_pass_dump_poll(vk_fence_done()); void vk_pass_frame(void); vk_pass_frame(); void vk_tex_sweep(void); vk_tex_sweep(); }
@@ -1033,6 +1043,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         void vk_pipeline_cache_save(void); pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
         pthread_create(&th, &a, (void *(*)(void *))(void *)vk_pipeline_cache_save, NULL); pthread_attr_destroy(&a);
     }
+    present_perf_end(period);
     return present_enqueue(im, crop, n, period);
 }
 // OpenGL ES games (gl_android.c): their frames are AHardwareBuffers the device's GL driver drew, imported as images and shown as an NVN window texture is
