@@ -43,6 +43,8 @@ public final class ExternalActivity extends NativeActivity implements ExternalDi
     private static native float[] externalOverlay(int width, int height);
     private static native int externalMenuState();
     private static native int[] externalMenuPixels(int width, int height, int state);
+    private static native int externalMenuKey();
+    private static native float[] externalMenuRect(int width, int height);
     private ExternalDisplay external;
     private View pad;
     private Dialog phonePad;
@@ -130,7 +132,7 @@ public final class ExternalActivity extends NativeActivity implements ExternalDi
         private final Bitmap[] atlases = new Bitmap[2];
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
         private boolean audioPress;
-        private int menuState = -1, rasterState = -2, rasterWidth, rasterHeight;
+        private int menuState = -1, rasterState = -2, rasterKey, rasterWidth, rasterHeight;
         private Bitmap menuRaster;
 
         OriginalPad() throws IOException {
@@ -189,23 +191,24 @@ public final class ExternalActivity extends NativeActivity implements ExternalDi
         }
         private Bitmap menuRaster(int state) {
             int W = getWidth(), H = getHeight();
-            if (menuRaster != null && rasterState == state && rasterWidth == W && rasterHeight == H) return menuRaster;
+            int key = externalMenuKey();   // the state and every row's value (a value the state's bits do not carry still redraws it)
+            if (menuRaster != null && rasterState == state && rasterKey == key && rasterWidth == W && rasterHeight == H) return menuRaster;
             int[] pixels = externalMenuPixels(W, H, state);
             if (pixels == null || pixels.length < 3 || pixels[0] <= 0 || pixels[1] <= 0 || pixels.length != 2 + pixels[0] * pixels[1]) return null;
             if (menuRaster == null || menuRaster.getWidth() != pixels[0] || menuRaster.getHeight() != pixels[1])
                 menuRaster = Bitmap.createBitmap(pixels[0], pixels[1], Bitmap.Config.ARGB_8888);
             menuRaster.setPixels(pixels, 2, pixels[0], 0, 0, pixels[0], pixels[1]);
-            rasterState = state; rasterWidth = W; rasterHeight = H; return menuRaster;
+            rasterState = state; rasterKey = key; rasterWidth = W; rasterHeight = H; return menuRaster;
         }
         private void drawMenu(Canvas c, float[] data) {
             Bitmap bitmap = menuRaster(menuState); if (bitmap == null) return;
-            float W = getWidth(), H = getHeight(), scale = Math.min(data[1], .92f / (6 * .115f + 2 * .03f));
-            float w = Math.min(.95f * H * scale, W * .96f), h = (6 * .115f + 2 * .03f) * H * scale;
-            paint.setAlpha(255); c.drawBitmap(bitmap, null, new RectF((W-w)/2, (H-h)/2, (W+w)/2, (H+h)/2), paint);
+            float[] r = externalMenuRect(getWidth(), getHeight()); if (r == null || r.length != 4) return;   // the card with its shadow's margin, pixel for pixel
+            c.drawColor(Color.argb(140, 0, 0, 0));
+            paint.setAlpha(255); c.drawBitmap(bitmap, null, new RectF(r[0], r[1], r[0] + r[2], r[1] + r[3]), paint);
         }
         private void drawEditor(Canvas c, float[] data, int state) {
             Bitmap bitmap = menuRaster(state); if (bitmap == null) return;
-            float W = getWidth(), H = getHeight(), scale = Math.min(data[1], .92f / (6 * .115f + 2 * .03f));
+            float W = getWidth(), H = getHeight(), scale = Math.min(data[1], .86f / .788f);   // overlay_layout.h ov_menu_scale (OV_MENU_H)
             if ((state & 4) != 0) {
                 paint.setStyle(Paint.Style.STROKE); paint.setStrokeWidth(Math.max(1, H*.001f)); paint.setColor(Color.argb(51,255,255,255));
                 float step=H/20; for(float x=step;x<W;x+=step)c.drawLine(x,0,x,H,paint); for(float y=step;y<H;y+=step)c.drawLine(0,y,W,y,paint);

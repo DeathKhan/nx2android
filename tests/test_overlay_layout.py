@@ -88,6 +88,20 @@ int main(void) {
         for (int row = 0; row < OVM_ROWS; row++) {
             float r[4]; ov_menu_rowrect(p, row, r);
             assert(ov_menu_row_at(r[0] + r[2] / 2, r[1] + r[3] / 2, W, H) == row);
+            assert(r[1] >= p[1] && r[1] + r[3] <= p[1] + p[3] && r[0] >= p[0] && r[0] + r[2] <= p[0] + p[2]);
+            if (row) { float q[4]; ov_menu_rowrect(p, row - 1, q); assert(r[1] >= q[1] + q[3] - 0.01f); }   // in order, not overlapping
+            float c[3]; ov_menu_choice(p, row, c);   // a choice's box: in the row; its left half steps back, the right half and the label forward
+            assert(c[0] > r[0] && c[0] + c[2] <= r[0] + r[2]);
+            assert(ov_menu_choice_dir(c[0] + c[2] * 0.25f, p, row) == -1 && ov_menu_choice_dir(c[0] + c[2] * 0.75f, p, row) == 1 && ov_menu_choice_dir(r[0] + 1, p, row) == 1);
+            float t[3]; ov_menu_track(p, row, t);   // the slider's ends set its ends
+            assert(t[2] > 0 && ov_menu_track_value(t[0] - 5, p, row) == OV_OPACITY_MIN && ov_menu_track_value(t[0] + t[2] + 5, p, row) == OV_OPACITY_MAX);
+        }
+        { float f[4], q[4]; ov_menu_footrect(p, f); ov_menu_rowrect(p, OVM_ROWS - 1, q); assert(f[1] >= q[1] + q[3] - 0.01f && f[1] + f[3] <= p[1] + p[3] + 0.01f && f[3] > 0); }
+        for (int t = 0; t < OVM_TABS; t++) {   // each tab: its tabs row, rows of a known kind, Resume; each tab's x opens it
+            float r[4]; ov_menu_rowrect(p, 0, r);
+            assert(ov_menu_tab_at(r[0] + r[2] * (t + 0.5f) / OVM_TABS, p) == t);
+            assert(ov_menu_item(t, 0) == OVM_TAB && ov_menu_item(t, OVM_ROWS - 1) == OVM_RESUME);
+            for (int row = 1; row < OVM_ROWS - 1; row++) { int it = ov_menu_item(t, row); assert(it == -1 || (it >= 0 && it < OVM_TAB && ov_menu_kind(it) >= OVR_TOGGLE)); }
         }
         for (int axis = 0; axis < 2; axis++) for (int i = -10; i <= 110; i++) {
             float extent = screens[s][axis], half = H * 0.12f;
