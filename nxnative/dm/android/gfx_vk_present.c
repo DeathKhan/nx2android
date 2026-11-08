@@ -290,11 +290,11 @@ static void ov_box_ring(uint8_t *px, uint32_t w, uint32_t h, const ov_ctl *c, co
     }
 }
 static void ov_text(uint8_t *px, uint32_t w, uint32_t h, float cx, float cy, const char *s, int scale) {
-    int n = (int)strlen(s), x0 = (int)(cx - n * 6 * scale / 2.0f), y0 = (int)(cy - 7 * scale / 2.0f);
-    for (int i = 0; i < n; i++) {
-        unsigned c = (unsigned char)s[i]; const unsigned char *g = FONT5X7[(c >= 32 && c < 127 ? c : 63) - 32];
+    int n = glyph_count(s), x0 = (int)(cx - n * 6 * scale / 2.0f), y0 = (int)(cy - 7 * scale / 2.0f);
+    for (int i = 0, cell = 0; s[i]; cell++) {
+        const unsigned char *g = glyph5x7(utf8_next(s, &i));
         for (int col = 0; col < 5; col++) for (int row = 0; row < 7; row++) if (g[col] >> row & 1)
-            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) ov_plot(px, w, h, x0 + i * 6 * scale + col * scale + dx, y0 + row * scale + dy, 220, 255);
+            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) ov_plot(px, w, h, x0 + cell * 6 * scale + col * scale + dx, y0 + row * scale + dy, 220, 255);
     }
 }
 // colour drawing for the menu button and the panel: straight alpha, "over" blending, shapes antialiased by their distance
@@ -369,13 +369,13 @@ static void cv_line(const ov_canvas *cv, float ax, float ay, float bx, float by,
         float ex = px - dx * h, ey = py - dy * h; cv_blend(cv, x, y, c, t / 2 + 0.5f - sqrtf(ex * ex + ey * ey));
     }
 }
-static float cv_text_w(const char *s, int scale) { return (float)strlen(s) * 6 * scale - scale; }
+static float cv_text_w(const char *s, int scale) { return (float)glyph_count(s) * 6 * scale - scale; }   // (glyphs, not bytes: UTF-8, upstream nx2android #102)
 static void cv_text(const ov_canvas *cv, float x, float cy, const char *s, int scale, const uint8_t c[4]) {   // the 5x7 letters; x: the left edge
     int x0 = (int)(x + 0.5f), y0 = (int)(cy - 7 * scale / 2.0f + 0.5f);
-    for (int i = 0; s[i]; i++) {
-        unsigned ch = (unsigned char)s[i]; const unsigned char *g = FONT5X7[(ch >= 32 && ch < 127 ? ch : 63) - 32];
+    for (int i = 0, cell = 0; s[i]; cell++) {
+        const unsigned char *g = glyph5x7(utf8_next(s, &i));
         for (int col = 0; col < 5; col++) for (int row = 0; row < 7; row++) if (g[col] >> row & 1)
-            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) cv_blend(cv, x0 + i * 6 * scale + col * scale + dx, y0 + row * scale + dy, c, 1);
+            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) cv_blend(cv, x0 + cell * 6 * scale + col * scale + dx, y0 + row * scale + dy, c, 1);
     }
 }
 // Text: the TrueType font (overlay_font.c) at px pixels to the em, or, without one, the 5x7 letters at the whole scale nearest the same capital height
