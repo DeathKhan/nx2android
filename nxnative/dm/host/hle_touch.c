@@ -45,6 +45,14 @@ void dm_touch_set(const dm_touch *t, int n) {
     void (*o)(const dm_touch *, int) = atomic_load_explicit(&dm_touch_observer, memory_order_relaxed); if (o) o(t, n);
 }
 void dm_touch_script(const dm_touch *t, int n) { touch_apply(t, n); }
+// The lowest-numbered finger down now, in normalized picture coordinates (the Joy-Con 2 mouse's pointer, hle_hid.c DM_MOUSE): 1 when there is one
+int dm_touch_primary(float *x, float *y) {
+    int r = 0;
+    pthread_mutex_lock(&g_tl);
+    for (int id = 0; id < 16 && !r; id++) if (g_gf[id].down) { *x = g_gf[id].x; *y = g_gf[id].y; r = 1; }
+    pthread_mutex_unlock(&g_tl);
+    return r;
+}
 
 int dm_opmode(void);   // hle_oe.c: 0 handheld, 1 console
 static int32_t clampi(float v, int hi) { int32_t r = (int32_t)(v * (float)(hi + 1)); return r < 0 ? 0 : r > hi ? hi : r; }
