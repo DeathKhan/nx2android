@@ -13,12 +13,8 @@ HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "offline: 
 HLE_FORCE("nnsslInitialize", "connects to the ssl service; the network library's global init needs it to succeed, offline creates no session (cut)", Result, h_ssl_Initialize, void) { return RES_OK; }
 HLE_FORCE("nnsslFinalize", "pairs with nnsslInitialize (cut)", Result, h_ssl_Finalize, void) { return RES_OK; }
 
-// TODO(upsync): upstream also changed the offline socket layer, now in hle_socket.c here; port:
-//  - EventFd / EventFdRead / EventFdWrite as real host counters (fd 0x4000.., 64 of them, Horizon flags: bit 0 reads one at a time, bits 1|2 never block) with Close releasing them and
-//    Poll waiting on them with dm_guest_cond_wait_ns (gRPC in nn::npln, Ocarina of Time, aborts in grpc_init without a wake-up descriptor)
-//  - Poll of a descriptor the host never made: nothing ready at the timeout, 0 (not -1/ENETDOWN; Star Fox's HTTP thread takes any failure but EINTR as fatal)
-//  - SDK 21 overloads: GetPeerName(int, sockaddr *, u32 *), Shutdown(int, ShutdownMethod), Read, Write, GetHostEntByName(const char *), SetAllocator(MemoryResource *) ignored,
-//    and the C library's "poll" (nnmusl) routed to the host's Poll
+// The offline socket layer lives in hle_socket.c here (with local play over the LAN); upstream's hle_net.c socket section (EventFd host counters, Poll of descriptors the
+// host never made, Select as Poll, event descriptors numbered from 0, the SDK 21 overloads and the C library's poll) is ported there (upsync of eddae74f3)
 
 // ---------- ssl: offline, Initialize and a context's Create / Destroy succeed, everything else that contacts the service fails ----------
 // A context is a session of the local ssl service, so on Horizon Create works with no network and only a connection needs one; DRAGON QUEST BUILDERS 2 ends its startup when Create fails (main+0x861260).

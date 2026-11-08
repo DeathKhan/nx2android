@@ -30,16 +30,114 @@ static int sk_seterr(int e) { t_skerr = e; return -1; }
 void dm_guest_sleep_ns(int64_t ns);
 static int sk_idle(int64_t ms) { dm_guest_sleep_ns((ms < 0 ? 100 : ms) * 1000000); return 0; }
 typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
+// Event descriptors (upstream hle_net.c, ported here with the offline socket layer: its EventFd as host counters, and eddae74f3's numbering and Select as Poll).
+// EventFd is a local descriptor of the bsd service and works with no network, so it is real offline: gRPC (nn::npln, Ocarina of Time at startup) wakes its pollers with one, and
+// with no wakeup descriptor its poll engine's factory returns null and grpc_init calls abort. They are the host's only descriptors offline: Socket still fails. The flags are
+// Horizon's: gRPC creates its descriptor with 6 and consumes after a poll says it is ready; bit 0 reads one at a time, bits 1 and 2 never block. The numbers are the bsd
+// service's: the lowest free one, from 0 (Minecraft's NetherNet threads put theirs in a 1024-bit fd_set on the stack for Select; numbered from 0x4000 the bit landed 2 KB past
+// the set). With the LAN on (DM_LAN) the guest's descriptors are host sockets (fd_new) and EventFd stays cut. Error numbers are Linux's here (see the header): EAGAIN 11
+void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns);   // hle_thread.c
+enum { EFD_MAX = 64, SK_POLLIN = 1, SK_POLLOUT = 4, SK_POLLRDNORM = 0x40, SK_POLLWRNORM = 4, SK_POLLNVAL = 0x20, SK_EAGAIN = 11 };
+static struct { uint64_t count; int used, flags; } g_efd[EFD_MAX];
+static pthread_mutex_t g_efd_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_efd_c = PTHREAD_COND_INITIALIZER;
+static int efd_used(int fd) { return fd >= 0 && fd < EFD_MAX && g_efd[fd].used; }   // with g_efd_m held
+static int efd_create(uint64_t v, int flags) {
+    pthread_mutex_lock(&g_efd_m);
+    for (int i = 0; i < EFD_MAX; i++) if (!g_efd[i].used) { g_efd[i].used = 1; g_efd[i].count = v; g_efd[i].flags = flags; pthread_mutex_unlock(&g_efd_m); return i; }
+    pthread_mutex_unlock(&g_efd_m);
+    LOG("[RED] net: more than %d event descriptors", EFD_MAX);
+    return sk_seterr(SK_EMFILE);
+}
+static int efd_close(int fd) {
+    pthread_mutex_lock(&g_efd_m);
+    int ok = efd_used(fd);
+    if (ok) { g_efd[fd].used = 0; pthread_cond_broadcast(&g_efd_c); }
+    pthread_mutex_unlock(&g_efd_m);
+    return ok ? 0 : sk_fail();
+}
+static int efd_read(int fd, uint64_t *out) {
+    pthread_mutex_lock(&g_efd_m);
+    int r = -1;
+    for (;;) {
+        if (!efd_used(fd)) { t_skerr = SK_EBADF; break; }
+        uint64_t *c = &g_efd[fd].count; int f = g_efd[fd].flags;
+        if (*c) { if (f & 1) { *out = 1; *c -= 1; } else { *out = *c; *c = 0; } r = 0; break; }
+        if (f & 6) { t_skerr = SK_EAGAIN; break; }
+        dm_guest_cond_wait_ns(&g_efd_c, &g_efd_m, dm_detclock_enabled() ? 1000000 : 100000000);
+    }
+    pthread_mutex_unlock(&g_efd_m);
+    return r;
+}
+static int efd_write(int fd, uint64_t v) {
+    pthread_mutex_lock(&g_efd_m);
+    int ok = efd_used(fd);
+    if (ok) { g_efd[fd].count += v; pthread_cond_broadcast(&g_efd_c); }
+    pthread_mutex_unlock(&g_efd_m);
+    return ok ? 0 : sk_seterr(SK_EBADF);
+}
+// With g_efd_m held: fills revents, returns how many descriptors have any. open: the descriptors open when the wait began; one closed since is POLLNVAL, any other is one the host
+// never made, with nothing to say (off_poll)
+static int efd_ready(sk_pollfd *p, uint64_t n, uint64_t open) {
+    int ready = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        p[i].revents = 0;
+        if (p[i].fd < 0 || p[i].fd >= EFD_MAX || !(open >> p[i].fd & 1)) continue;
+        if (!efd_used(p[i].fd)) { p[i].revents = SK_POLLNVAL; ready++; continue; }   // closed while waiting
+        if (g_efd[p[i].fd].count) p[i].revents |= p[i].events & (SK_POLLIN | SK_POLLRDNORM);
+        p[i].revents |= p[i].events & (SK_POLLOUT | SK_POLLWRNORM);
+        if (p[i].revents) ready++;
+    }
+    return ready;
+}
+// A descriptor the host never made: on a console a socket with nothing to say reports no event at the timeout, so that is the answer for every such descriptor: nothing ready, the
+// timeout waited out, 0 (Star Fox's HTTP thread takes any failure but EINTR as fatal). The event descriptors are waited on
 static int off_poll(void *fds, uint64_t n, int ms) {
     sk_pollfd *p = fds;
-    for (uint64_t i = 0; i < n; i++) if (p[i].fd >= 0) return sk_fail();
+    uint64_t open = 0;   // EFD_MAX is 64: one bit per descriptor
+    pthread_mutex_lock(&g_efd_m);
+    for (uint64_t i = 0; i < n; i++) if (p[i].fd >= 0) {
+        if (efd_used(p[i].fd)) { open |= 1ull << p[i].fd; continue; }
+        static int once; if (!once++) LOG("socket: Poll of %llu descriptors with one the host never made (fd %d, events %#x; %d ms): nothing ready at the timeout", (unsigned long long)n, p[i].fd, p[i].events, ms);
+    }
+    pthread_mutex_unlock(&g_efd_m);
     for (uint64_t i = 0; i < n; i++) p[i].revents = 0;
-    return sk_idle(ms);
+    if (!open) return sk_idle(ms);
+    int64_t limit = (ms < 0 ? 100 : (int64_t)ms) * 1000000;   // as sk_idle: an endless wait comes back with 0 after 100 ms
+    uint64_t start = guest_ns();
+    pthread_mutex_lock(&g_efd_m);
+    int ready;
+    while (!(ready = efd_ready(p, n, open))) {
+        int64_t left = limit - (int64_t)(guest_ns() - start);
+        if (left <= 0) break;
+        dm_guest_cond_wait_ns(&g_efd_c, &g_efd_m, dm_detclock_enabled() && left > 1000000 ? 1000000 : left);
+    }
+    pthread_mutex_unlock(&g_efd_m);
+    return ready;
 }
-static int off_select(int nfds, const uint64_t *r, const uint64_t *w, const uint64_t *e, const int64_t *tv) {   // fd_set: 1024 bits; timeval: {i64 seconds, i64 microseconds}
-    const uint64_t *sets[3] = {r, w, e};
-    for (int k = 0; k < 3; k++) for (int fd = 0; sets[k] && fd < nfds && fd < 1024; fd++) if (sets[k][fd >> 6] >> (fd & 63) & 1) return sk_fail();
-    return sk_idle(tv ? tv[0] * 1000 + tv[1] / 1000 : -1);
+// Select is Poll over the descriptors in its sets: the read set asks POLLIN, the write set POLLOUT, and the sets come back with the ready ones. A descriptor closed during the wait
+// fails with EBADF, as select does. Only the host's numbers (below EFD_MAX) are passed on
+static int off_select(int nfds, uint64_t *r, uint64_t *w, uint64_t *e, const int64_t *tv) {   // fd_set: 1024 bits; timeval: {i64 seconds, i64 microseconds}
+    uint64_t *sets[3] = {r, w, e};
+    static const int16_t ask[3] = {SK_POLLIN, SK_POLLOUT, 0};
+    sk_pollfd p[EFD_MAX]; int np = 0;
+    if (nfds > 1024) nfds = 1024;
+    for (int fd = 0; fd < nfds && fd < EFD_MAX; fd++) {
+        int in = 0; int16_t ev = 0;
+        for (int k = 0; k < 3; k++) if (sets[k] && sets[k][fd >> 6] >> (fd & 63) & 1) { in = 1; ev |= ask[k]; }
+        if (in) p[np++] = (sk_pollfd){fd, ev, 0};
+    }
+    int64_t ms = tv ? tv[0] * 1000 + tv[1] / 1000 : -1;
+    if (ms > 0x7fffffff) ms = 0x7fffffff;
+    off_poll(p, (uint64_t)np, (int)ms);
+    for (int k = 0; k < 3; k++) if (sets[k]) for (int fd = 0; fd < nfds; fd++) sets[k][fd >> 6] &= ~(1ull << (fd & 63));
+    int n = 0;
+    for (int i = 0; i < np; i++) {
+        if (p[i].revents & SK_POLLNVAL) return sk_seterr(SK_EBADF);
+        if (p[i].revents & (SK_POLLIN | SK_POLLRDNORM) && r) { r[p[i].fd >> 6] |= 1ull << (p[i].fd & 63); n++; }
+        if (p[i].revents & SK_POLLOUT && w) { w[p[i].fd >> 6] |= 1ull << (p[i].fd & 63); n++; }
+    }
+    return n;
 }
 
 // DM_LAN_TRACE=1: one line per call with the LAN on (its arguments and result, the error number on failure)
@@ -290,8 +388,8 @@ HLE_FORCE("nnsocketListen", WHY, int, h_nsk_Listen, int s, int n) { return LAN ?
 HLE_FORCE("_ZN2nn6socket6AcceptEiPNS0_8SockAddrEPj", WHY, int, h_sk_Accept, int s, void *a, unsigned *n) { return LAN ? lan_accept(s, a, n) : sk_fail(); }
 HLE_FORCE("_ZN2nn6socket6AcceptEiP8sockaddrPj", WHY, int, h_sk_Accept2, int s, void *a, unsigned *n) { return LAN ? lan_accept(s, a, n) : sk_fail(); }
 HLE_FORCE("nnsocketAccept", WHY, int, h_nsk_Accept, int s, void *a, unsigned *n) { return LAN ? lan_accept(s, a, n) : sk_fail(); }
-HLE_FORCE("_ZN2nn6socket5CloseEi", WHY, int, h_sk_Close, int s) { return LAN ? lan_close(s) : sk_fail(); }
-HLE_FORCE("nnsocketClose", WHY, int, h_nsk_Close, int s) { return LAN ? lan_close(s) : sk_fail(); }
+HLE_FORCE("_ZN2nn6socket5CloseEi", WHY, int, h_sk_Close, int s) { return LAN ? lan_close(s) : efd_close(s); }   // offline: an event descriptor
+HLE_FORCE("nnsocketClose", WHY, int, h_nsk_Close, int s) { return LAN ? lan_close(s) : efd_close(s); }
 HLE_FORCE("_ZN2nn6socket8ShutdownEii", WHY, int, h_sk_Shutdown, int s, int how) { return LAN ? lan_shutdown(s, how) : sk_fail(); }
 HLE_FORCE("nnsocketShutdown", WHY, int, h_nsk_Shutdown, int s, int how) { return LAN ? lan_shutdown(s, how) : sk_fail(); }
 HLE_FORCE("_ZN2nn6socket11GetPeerNameEiPNS0_8SockAddrEPj", WHY, int, h_sk_GetPeerName, int s, void *a, unsigned *n) { return LAN ? lan_name(s, a, n, 1) : sk_fail(); }
@@ -336,9 +434,19 @@ HLE_FORCE("_ZN2nn6socket6SendToEiPKvmNS0_7MsgFlagEPKNS0_8SockAddrEj", WHY, long,
 HLE_FORCE("_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", WHY, long, h_sk_SendTo2, int s, const void *b, unsigned long n, int f, const void *a, unsigned al) { return LAN ? lan_sendto(s, b, n, f, a, al) : sk_fail(); }
 HLE_FORCE("nnsocketRecvMsg", "bsd socket service (cut)", int, h_nsk_RecvMsg, void) { return sk_fail(); }
 HLE_FORCE("nnsocketSendMsg", "bsd socket service (cut)", int, h_nsk_SendMsg, void) { return sk_fail(); }
-HLE_FORCE("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", "bsd socket service (cut)", int, h_sk_EventFd, unsigned long v, int f) { (void)v; (void)f; return sk_fail(); }
-HLE_FORCE("_ZN2nn6socket11EventFdReadEiPm", "bsd socket service (cut)", int, h_sk_EventFdRead, int s, unsigned long *v) { (void)s; (void)v; return sk_fail(); }
-HLE_FORCE("_ZN2nn6socket12EventFdWriteEim", "bsd socket service (cut)", int, h_sk_EventFdWrite, int s, unsigned long v) { (void)s; (void)v; return sk_fail(); }
+// Event descriptors: host counters offline (efd_create); cut with the LAN on, where the guest's numbers are host sockets
+HLE_FORCE("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", "a descriptor of the bsd service that works offline: a host counter (cut with the LAN on)", int, h_sk_EventFd, unsigned long v, int f) { return LAN ? sk_fail() : efd_create(v, f); }
+HLE_FORCE("_ZN2nn6socket11EventFdReadEiPm", "reads the host counter", int, h_sk_EventFdRead, int s, unsigned long *v) { if (LAN) return sk_fail(); uint64_t c = 0; int r = efd_read(s, &c); if (!r && v) *v = c; return r; }
+HLE_FORCE("_ZN2nn6socket12EventFdWriteEim", "adds to the host counter and wakes its pollers", int, h_sk_EventFdWrite, int s, unsigned long v) { return LAN ? sk_fail() : efd_write(s, v); }
+// SDK 21 overloads (upstream hle_net.c; Star Fox imports them): plain sockaddr, the ShutdownMethod enum, Read / Write and a name lookup without options; SetAllocator keeps nothing.
+// The C library's poll (SDK 21's nnmusl) needs the socket state of the initialization cut and fails with EFAULT without it, which Star Fox's loop takes as fatal: the host's Poll
+HLE_FORCE("_ZN2nn6socket11GetPeerNameEiP8sockaddrPj", WHY, int, h_sk_GetPeerName21, int s, void *a, unsigned *n) { return LAN ? lan_name(s, a, n, 1) : sk_fail(); }
+HLE_FORCE("_ZN2nn6socket8ShutdownEiNS0_14ShutdownMethodE", WHY, int, h_sk_Shutdown21, int s, int how) { return LAN ? lan_shutdown(s, how) : sk_fail(); }
+HLE_FORCE("_ZN2nn6socket4ReadEiPvm", WHY, long, h_sk_Read, int s, void *b, unsigned long n) { return LAN ? lan_recvfrom(s, b, n, 0, NULL, NULL) : sk_fail(); }
+HLE_FORCE("_ZN2nn6socket5WriteEiPKvm", WHY, long, h_sk_Write, int s, const void *b, unsigned long n) { return LAN ? lan_sendto(s, b, n, 0, NULL, 0) : sk_fail(); }
+HLE_FORCE("_ZN2nn6socket16GetHostEntByNameEPKc", "name resolution (cut): NULL", void *, h_sk_GetHostEnt21, const char *n) { (void)n; t_skerr = SK_ENETDOWN; return NULL; }
+HLE_FORCE("_ZN2nn6socket12SetAllocatorEPNS_14MemoryResourceE", "socket library allocator; no session is created, ignored", void, h_sk_SetAlloc, void *r) { (void)r; }
+HLE_FORCE("poll", "the C library's poll: the host's Poll (offline: event descriptors; the host's poll with the LAN on)", int, h_libc_Poll, void *f, unsigned long n, int t) { return LAN ? lan_poll(f, n, t) : off_poll(f, n, t); }
 HLE_FORCE("_ZN2nn6socket17ResolverGetOptionEPNS0_14ResolverOptionENS0_17ResolverOptionKeyE", "resolver (cut)", int, h_sk_ResGet, void *o, int k) { (void)o; (void)k; return sk_fail(); }
 HLE_FORCE("_ZN2nn6socket17ResolverSetOptionERKNS0_14ResolverOptionE", "resolver (cut)", int, h_sk_ResSet, const void *o) { (void)o; return sk_fail(); }
 HLE_FORCE("nnsocketResolverGetOption", "resolver (cut)", int, h_nsk_ResGet, void *o, int k) { (void)o; (void)k; return sk_fail(); }
