@@ -941,6 +941,7 @@ void mtl_pool_del(const void *mem) {
         if (i == g_npool) { pthread_rwlock_unlock(&g_pool_mu); return; }
         vkpool_t p = g_pool[i]; g_pool[i] = g_pool[--g_npool]; pool_ord_remove(i); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
         pthread_rwlock_unlock(&g_pool_mu);
+        { void vk_cpu_storage_gone(uint64_t lo, uint64_t hi); vk_cpu_storage_gone(p.lo, p.hi); }   // its GPU-written spans and taken textures (gfx_vk_tex.c)
         if (p.zero_copy) pool_copy_back(&p);
         free(p.baseline);
         if (p.buf) vk_defer_free_buffer(p.buf, p.mem);   // the AHardwareBuffer goes with the imported memory's last reference (a lazy pool never backed has none)

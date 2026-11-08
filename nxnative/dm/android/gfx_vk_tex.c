@@ -9,6 +9,7 @@
 #include "nvn_tex.h"
 #include "../gfx/tex/nvn_deswizzle.h"
 #include "nvn_hmap.h"
+#include "gfx_vk_cpu_storage.h"   // storage the GPU writes, uncompressed textures taken from storage (nvn_mtl.m gws_span / cpu_unc)
 #include <string.h>
 #include "../gfx/tex/nvn_bc.h"
 
@@ -279,6 +280,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
 }
 static int packaged_tex(const tex_t *t);
 static int cpu_content_tex(const tex_t *t, const vkfmt_t *f);
+static int unc_rule(void); static void cpu_unc_dropped(uint64_t serial);
 static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
 static void vk_tex_view_drop_all(vkimg_t *im);
 // Images over the same memory with different descriptions (the storage key differs) are separate Vulkan images: on the Switch a texture sees what another
@@ -346,6 +348,7 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     im->used = g_tex_frame;
     pthread_mutex_unlock(&g_img_mu);
     if (!vk_sub_open()) return __atomic_load_n(&im->looked, __ATOMIC_ACQUIRE) ? im : NULL;   // looked up outside a submission (present): nothing can be recorded, a new image has no contents yet
+    if (unc_rule()) vcs_unc_drop(cpu_unc_dropped);   // taken uncompressed textures over storage the GPU wrote since: GPU textures from now on (nvn_mtl.m cpu_unc_drop)
     int first = !__atomic_exchange_n(&im->looked, 1, __ATOMIC_ACQ_REL);   // its first use is the first lookup inside a submission, not its creation (which may have been outside one)
     // a texture's first use: written by the CPU since it was registered (profile tex_dirty_upload), it is CPU-written from now on, as at nvn_mtl.m's first resolution;
     // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
@@ -511,8 +514,39 @@ static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-
     for (; i < n; i++) if (p[i]) return 1;
     return 0;
 }
+// Uncompressed 2D textures (port of nvn_mtl.m tex_cpu_content / mtl_tex_cpu_rewritten, upstream #1390 / e2b76d4e via #1604, #1558): NVN has no flag that tells one from a render
+// target, but storage the GPU has not written holds only what the CPU wrote, so there such a texture is taken from its storage at first use too, and once the GPU writes that storage
+// it becomes a GPU texture again (gfx_vk_cpu_storage.c). Ocarina of Time's terrain tiles' height (260x260 R32F) and blend / hole (RGBA8) maps, which the CPU fills in the pool its
+// normal maps are drawn into, were images of zeros (holes, wrong materials); Mario Kart World's terrain patches likewise. On the Mac this holds for every game; here it is on for the
+// profiles that ask the host to follow CPU texture writes (tex_dirty_upload or tex_flush_upload), so other games (Donkey Kong Bananza, Welcome Tour) keep the rule they were tuned
+// with, as the GPU-written spans it needs protect render-target pages. DM_NVN_STORAGE_UNC=1 / 0 (start-up) turns it on / off for any game
+static int unc_rule(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_UNC"); on = e && *e ? *e != '0' : (DM_GAME_TEX_DIRTY_UPLOAD || DM_GAME_TEX_FLUSH_UPLOAD);
+                  if (on) VKLOG("uncompressed textures over storage the GPU has not written are taken from their storage (tex_dirty_upload / tex_flush_upload, DM_NVN_STORAGE_UNC)"); }
+    return on;
+}
+static int tex_unc(const tex_t *t, const vkfmt_t *f) { return f && !f->compressed && t->d.target != NVN_TEXTURE_TARGET_3D; }   // the uncompressed 2D kind, which the GPU can render into
+// Whether the texture's storage can be what the host takes its content from (nvn_mtl.m tex_storage_ok)
+static int tex_storage_ok(const tex_t *t, const vkfmt_t *f, int unc) {
+    if (!t->mem || !t->pool || t->has_layout || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    if (unc && (!f || f->depth || f->stencil || (t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE)))) return 0;   // not what only the GPU or a decoder fills
+    if (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
+    return !((t->d.flags & (NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))
+             || ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(f && f->compressed)));
+}
+static void cpu_unc_take(const tex_t *t) { vcs_unc_take(t->serial, (uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size); }
+static int cpu_content_unc(const tex_t *t, const vkfmt_t *f) {   // first use, uncompressed 2D (above)
+    if (!unc_rule() || !tex_storage_ok(t, f, 1)) return 0;
+    if (vcs_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size) || !mem_any(t->mem, t->L.size)) return 0;
+    static int n; if (n++ < 8) VKLOG("texture %ux%u nvn format %#x at %p (pool flags %#x): uncompressed, written by the CPU before its first use in storage the GPU has not written: uploaded from its storage",
+                                     t->d.width, t->d.height, t->d.format, (const void *)t->mem, t->pool->flags);
+    mtl_tex_cpu_written(t); cpu_unc_take(t);
+    return 1;
+}
 static int cpu_content_tex(const tex_t *t, const vkfmt_t *f) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; }
+    if (on && tex_unc(t, f) && t->d.target != 2) return cpu_content_unc(t, f);
     if (!on || !t->pool || t->has_layout || !(f->compressed || t->d.target == 2) || t->d.samples > 1) return 0;
     if (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) return 0;
     if (t->d.flags & (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE)) return 0;
@@ -526,6 +560,32 @@ static int packaged_tex(const tex_t *t) {
     pthread_mutex_lock(&g_cw_mu); int r = nvn_hm_get(&g_cpu_written, &t->serial) != NULL; pthread_mutex_unlock(&g_cw_mu);
     return r;
 }
+// A GPU write into a texture's storage is recorded (render target, clear, copy, shader image): uncompressed textures over it are no longer taken from storage (nvn_mtl.m)
+void mtl_tex_gpu_written(const tex_t *t) {
+    if (!unc_rule() || !t || !t->mem || !t->L.size || !t->pool || (t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL))) return;
+    vcs_gpu_written((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size);
+}
+static void cpu_unc_dropped(uint64_t serial) {   // vcs_unc_drop: the GPU wrote its storage; it keeps the content it has and CPU writes are no longer uploaded
+    pthread_mutex_lock(&g_cw_mu); nvn_hm_del(&g_cpu_written, &serial); pthread_mutex_unlock(&g_cw_mu);
+    static int nl; if (nl++ < 8) VKLOG("storage the GPU writes: an uncompressed texture taken from it is a GPU texture from now on (serial %llu)", (unsigned long long)serial);
+}
+// nvn_ft_poll (hle_nvn.c, tex_dirty_upload): the CPU wrote the pages of a registered texture after its first use (nvn_mtl.m mtl_tex_cpu_rewritten). A texture whose storage can hold
+// its content is taken from it; an uncompressed 2D one not while the GPU has written that storage and the CPU has not rewritten it since (MTL_REWRITE_GPU_NOW: asked again at the
+// CPU's next write). Any other texture is left to the GPU when the GPU can render into it (uncompressed), else uploaded
+int mtl_tex_cpu_rewritten(const tex_t *t) {
+    const vkfmt_t *f = vk_fmt(t->d.format); int unc = tex_unc(t, f);
+    if (tex_storage_ok(t, f, unc)) {
+        if (unc && vcs_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size)) return MTL_REWRITE_GPU_NOW;
+        mtl_tex_cpu_written(t);
+        if (unc) cpu_unc_take(t);
+        return MTL_REWRITE_UPLOADED;
+    }
+    // nvn_mtl.m asks the host texture's usage (render target or shader write): every uncompressed texture made without a CPU fill has it there, a block-compressed one never
+    if (!(f && f->compressed)) return MTL_REWRITE_GPU;
+    mtl_tex_cpu_written(t);
+    return MTL_REWRITE_UPLOADED;
+}
+void vk_cpu_storage_gone(uint64_t lo, uint64_t hi) { vcs_range_gone((uintptr_t)lo, (uintptr_t)hi); }   // a pool chunk goes (gfx_vk_core.c mtl_pool_del)
 void mtl_tex_init(const tex_t *t) { (void)t; }
 void mtl_tex_release(tex_t *t) { (void)t; }   // images belong to their storage key, dropped with the pool
 int mtl_tex_gpu_owned(uint64_t serial) { (void)serial; return 0; }

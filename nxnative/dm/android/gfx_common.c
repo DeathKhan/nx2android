@@ -81,9 +81,8 @@ int mtl_addr_known(uint64_t addr, uint64_t len) { return mtl_addr(addr, len, NUL
 void mtl_prog_forget(const prog_t *p) { (void)p; }
 void mtl_prog_prefetch(const prog_t *p) { (void)p; }
 // Textures: image (storage) use comes from the builder's IMAGE flag at creation (gfx_vk_tex.c), and a GPU write is seen through nvn_ft_written before a storage copy.
-// TODO(upsync): a RegisterImage of a texture built without IMAGE needs the image re-created with STORAGE usage; a GPU-written texture should drop out of cpu_content_tex as upstream's tex_cpu_content does
+// TODO(upsync): a RegisterImage of a texture built without IMAGE needs the image re-created with STORAGE usage. GPU-written storage and mtl_tex_cpu_rewritten: gfx_vk_tex.c / gfx_vk_cpu_storage.c
 void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
-void mtl_tex_gpu_written(const tex_t *t) { (void)t; }
 // Acquire syncs (WindowAcquireTexture's sync, fenced 2) wait like any fence; the wait ledger that tells them apart is nvn_mtl.m's
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }
 // The picture's shape (a sized vi layer, a taller screen): the swapchain presenter letterboxes to the window texture's own size. TODO(upsync): honour these as present_shape does

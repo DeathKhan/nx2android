@@ -1378,7 +1378,7 @@ static void stage_storage_prepare(int st, vkshader_t *s) {
         else if (b->kind == RK_IMG_UBO) h = mem_handle(ubo_word(st, b->reg, b->off));
         else continue;
         const tex_t *t = NULL; int tid = (int)(h & 0xfffff);
-        if (tid && vk_tex_by_id(tid, NULL, &t) && t) (void)vk_tex_storage_prepare(t);
+        if (tid && vk_tex_by_id(tid, NULL, &t) && t) { (void)vk_tex_storage_prepare(t); tex_t image = *t; image.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; mtl_tex_gpu_written(&image); }   // shader stores write its storage (as nvn_mtl.m)
     }
 }
 // Reuse within a submission (the cache is emptied when it begins, vk_exec_reset): descriptor sets by their whole content (layout, and every buffer range,
