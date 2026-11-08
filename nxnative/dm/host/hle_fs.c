@@ -244,7 +244,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     if (!ro && !txn) mkdir(dir, 0755);
     LOG("fs mount %s: → %s%s%s", name, txn ? g_mnt[g_nmnt - 1].dir : dir, ro || txn_err ? " (read-only)" : txn ? " (transactional save: work directory, swapped in atomically on Commit)" : "", g_mnt[g_nmnt - 1].overlay[0] ? " (overlay first)" : "");
     // A read-only mount the host may not list: every lookup in it fails with EACCES and the game sees no files at all (issue #9: Mario vs. Donkey Kong then dereferenced a null at its first heap setup, which read as a crash of its own)
-    if (ro && !txn) { DIR *d = opendir(dir); int e = errno; struct stat st;
+    if (ro && !txn && !g_mnt[g_nmnt - 1].img) { DIR *d = opendir(dir); int e = errno; struct stat st;   // (an image mount is a file: nothing to list)
         if (d) closedir(d);
         else if (e == ENOENT) ;   // a game with no RomFS of its own, or a stand-in that is not there: lookups answer "not found" as they should
         else if (!stat(dir, &st))
