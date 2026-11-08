@@ -213,7 +213,7 @@ void vk_exec_reset(void) {   // a new submission: NVN state does not carry over 
 // A pass is begun lazily: begin_pass() only sets it up (pass_open 2), and the first command that must run inside it begins it (pass_commit, pass_open 1).
 // Until then a clear of a whole attachment becomes that attachment's load op, so a tiler clears in tile memory instead of loading the
 // attachment from memory and clearing it with a draw; a pass that is set up and never used is dropped.
-static VkRenderingAttachmentInfo P_ca[8], P_da, P_sa; static VkRenderingInfo P_ri; static int P_cleared;
+static VkRenderingAttachmentInfo P_ca[8], P_da, P_sa; static VkRenderingInfo P_ri; static int P_cleared; static int P_split;   // the pass goes on with the one before it (a DM_VK_PASS_SPLIT cut)
 // NVN may bind one subresource in multiple colour slots while masking all but
 // one writer. Separate Vulkan attachments would load/store the same image twice
 // (MK8's full-resolution normals in slots 3/4), which can lose the writer's contents.
@@ -587,6 +587,7 @@ static void lin_back(void) {
 void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
+    if (S.pass_open == 1) { extern uint32_t g_vk_pass_flags; g_vk_pass_flags = (uint32_t)(S.ncol & 15) | (S.daspect ? 16u : 0) | (S.daspect && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 32u : 0) | (S.ncol && P_ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 64u : 0) | (P_split ? 128u : 0); }
     if (S.pass_open == 1) { vk_occ_end(); if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
@@ -707,7 +708,7 @@ static int begin_pass(void) {
     if (cut_touch) lrz_touch(dim, (g_lrz_touch & LRZ_CUT) != 0);   // (after the barrier: the earlier command buffer's depth writes come first)
     if (g_x_depth) { da.loadOp = sa.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; da.storeOp = sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; }
     if (g_x_color) for (int i = 0; i < ncol; i++) ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    P_da = da; P_sa = sa; P_cleared = 0;
+    P_da = da; P_sa = sa; P_cleared = 0; P_split = psplit;
     P_ri = (VkRenderingInfo){VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, layers, 0, (uint32_t)ncol, P_ca,
                              (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? &P_da : NULL, (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? &P_sa : NULL};
     S.pass_open = 2; S.pass_w = w; S.pass_h = h; S.samples = samples; S.ncol = ncol; S.bound_pipe = VK_NULL_HANDLE;

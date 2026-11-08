@@ -1145,16 +1145,17 @@ static VkCommandBuffer g_slot_main_cb(void) { return g_slot[g_cur].main; }
 // DM_VK_PASS_TIMES=1: a timestamp before and after every render pass (the replay's per-frame line then lists the passes that cost the most GPU time)
 enum { PASSQ = 512 };   // passes (and dispatches) timed per submission
 static VkQueryPool g_pq; static int g_pq_on = -1;
-typedef struct { uint32_t w, h, fmt, draws, fidx, part; uint64_t cpu_ns; } pass_meta;   // part: the command buffer it was recorded in; cpu_ns: host time its end was recorded   // fidx: the pass's place in its frame (submissions are cut every DM_VK_CB_DRAWS draws)
+typedef struct { uint32_t w, h, fmt, draws, fidx, part, flags; uint64_t cpu_ns; } pass_meta;   // part: the command buffer it was recorded in; cpu_ns: host time its end was recorded   // fidx: the pass's place in its frame (submissions are cut every DM_VK_CB_DRAWS draws)
 enum { FPASSQ = 512 }; static int g_fpass;   // passes of the frame so far
 void vk_pass_frame(void) { g_fpass = 0; }   // a present: the next pass is the frame's first
 static pass_meta g_pmeta[NSLOT][PASSQ]; static int g_npass[NSLOT];
 static double g_pacc[FPASSQ]; static uint32_t g_pcnt[FPASSQ]; static pass_meta g_plast[FPASSQ]; static int g_pmax;   // by the pass's place in its frame (the completion thread adds)
 static int pass_times_on(void) { if (g_pq_on < 0) { const char *e = getenv("DM_VK_PASS_TIMES"); g_pq_on = e && atoi(e); } return g_pq_on && g_pq; }
+uint32_t g_vk_pass_flags;   // the pass being ended (gfx_vk_exec.c vk_end_pass): colour attachments (bits 0-3), depth (4), depth loaded (5), colour 0 loaded (6), split continuation (7)
 void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws) {
     if (!pass_times_on() || g_cur < 0) return; int *n = &g_npass[g_cur]; if (*n >= PASSQ) return;
     vkCmdWriteTimestamp(g_slot_main_cb(), end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_pq, (uint32_t)(g_cur * PASSQ * 2 + *n * 2 + end));
-    if (end) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g_pmeta[g_cur][*n] = (pass_meta){w, h, fmt, draws, (uint32_t)(g_fpass < FPASSQ - 1 ? g_fpass : FPASSQ - 1), (uint32_t)(g_slot[g_cur].nmain_used - 1), (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec}; (*n)++; g_fpass++; }
+    if (end) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g_pmeta[g_cur][*n] = (pass_meta){w, h, fmt, draws, (uint32_t)(g_fpass < FPASSQ - 1 ? g_fpass : FPASSQ - 1), (uint32_t)(g_slot[g_cur].nmain_used - 1), g_vk_pass_flags, (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec}; (*n)++; g_fpass++; }
 }
 void vk_pass_report(void) {   // the most expensive passes since the last report, then the counters start again
     if (!pass_times_on()) return;
@@ -1971,6 +1972,14 @@ static void chain_maybe(const cpend *c, const uint64_t *t, int np) {
                   (unsigned long long)c->frame, np, (c->t_commit - b0) / 1e6, gs ? (gs - b0) / 1e6 : -1, ge ? (ge - b0) / 1e6 : -1, busy / 1e6, idle / 1e6, ge ? ((double)ge - (double)c->t_commit) / 1e6 : -1);
     for (int i = 0; i < c->nparts && i < MAIN_CBS && o < (int)sizeof b - 60; i++) if (pn[i]) o += snprintf(b + o, sizeof b - (size_t)o, " %d: %.2f, %.2f-%.2f, %d;", i, (c->part_ns[i] - b0) / 1e6, (pst[i] - b0) / 1e6, (pen[i] - b0) / 1e6, pn[i]);
     VKLOG("%s", b);
+    { const char *e = getenv("DM_VK_PASS_TIMES"); if (!e || atoi(e) < 2) return; }   // =2: every pass of it too, in order (start on the same clock, duration, size, format, draws, attachments)
+    o = 0; for (int i = 0; i < np; i++) { uint64_t hs, he; const pass_meta *m = &c->pmeta[i];
+        if (t[2 * i + 1] <= t[2 * i] || !gpu_clock_host_ns(ck, t[2 * i], &hs) || !gpu_clock_host_ns(ck, t[2 * i + 1], &he)) continue;
+        if (m->fmt == PT_DISPATCH) o += snprintf(b + o, sizeof b - (size_t)o, " %d@%.2f+%.3f D%ux%ux%u;", i, (hs - b0) / 1e6, (double)(he - hs) / 1e6, m->w, m->h, m->draws);
+        else o += snprintf(b + o, sizeof b - (size_t)o, " %d@%.2f+%.3f %ux%u f%u d%u c%u%s%s%s%s;", i, (hs - b0) / 1e6, (double)(he - hs) / 1e6, m->w, m->h, m->fmt, m->draws & 0xffff, m->flags & 15,
+                           m->flags & 16 ? (m->flags & 32 ? " DL" : " Dc") : "", m->flags & 64 ? " CL" : "", m->flags & 128 ? " S" : "", "");
+        if (o > (int)sizeof b - 120) { VKLOG("chain passes:%s", b); o = 0; } }
+    if (o) VKLOG("chain passes:%s", b);
 }
 static void *completion_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "dm-vk-complete");
