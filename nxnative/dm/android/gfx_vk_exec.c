@@ -2543,7 +2543,7 @@ static VkPipeline compute_build(vkshader_t *cs, uint64_t um, uint64_t im) {   //
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(VK_SHADER_STAGE_COMPUTE_BIT, cs->local), 0, VK_SHADER_STAGE_COMPUTE_BIT, vk_shader_module(cs, um, im, alt && !um && !im ? 1u << 31 : 0, 0), "main", NULL}, vk_pipeline_layout(dsl, 1), VK_NULL_HANDLE, -1};   // (pNext: DM_VK_SUBGROUP_PIN)
     if (bs >= 0) g_build[bs].phase = 2;
     VkResult r = vkCreateComputePipelines(V.dev, V.pcache, 1, &ci, NULL, &p); build_end(bs);
-    if (r) { LOG("[RED] [vk] compute pipeline failed: %016llx", (unsigned long long)cs->key); p = (VkPipeline)1; }
+    if (r) { LOG("[RED] [vk] compute pipeline failed (%d): %016llx, local %ux%ux%u, %u bytes of SPIR-V", r, (unsigned long long)cs->key, cs->local[0], cs->local[1], cs->local[2], cs->nspv * 4); p = (VkPipeline)1; }
     return p;
 }
 // Compute pipelines made ahead. One depends only on its shader (and integer-texel variants, rare), and building one costs Adreno 45-105 ms: Super Mario Odyssey's
@@ -2756,12 +2756,33 @@ static int upscaler_native_dispatch(uint64_t key, int *trace) {
     VKLOG("upscaler network %016llx: original compute dispatch (%d diagnostic dispatches remaining)", (unsigned long long)key, left - 1);
     return 1;
 }
+// ---- dispatches left out (DM_VK_SKIP_CS=<key>,<key>…, a bring-up switch): a compute shader the device's driver cannot build (Ocarina of Time's NDVE movie
+// networks, 1.3-1.8 MB of SPIR-V with 500-1,000 subgroup shuffles: Adreno 830's compiler refuses the first and throws std::bad_alloc on the second, which ends
+// the app) is neither built nor run; the first dispatch of each named shader logs its binding contract (textures, images, storage buffers, group counts), the
+// facts a replacement (upscaler_replace's kind) needs
+static uint64_t g_skip_keys[64]; static uint8_t g_skip_noted[64]; static int g_skip_n = -1;
+static int skip_kernel(uint64_t key, const p_dispatch *d) {
+    if (g_skip_n < 0) { g_skip_n = 0; const char *e = getenv("DM_VK_SKIP_CS");
+        for (const char *q = e; q && *q && g_skip_n < 64; ) { char *end; uint64_t k = strtoull(q, &end, 16); if (end == q) break; g_skip_keys[g_skip_n++] = k; q = *end == ',' ? end + 1 : end; }
+        if (g_skip_n) VKLOG("[RED] %d compute shaders are skipped, not run (DM_VK_SKIP_CS)", g_skip_n); }
+    for (int i = 0; i < g_skip_n; i++) if (g_skip_keys[i] == key) {
+        if (!g_skip_noted[i]) { g_skip_noted[i] = 1; vkshader_t *cs = S.sh[5];
+            char line[1024]; int o = snprintf(line, sizeof line, "skipped dispatch %016llx %dx%dx%d%s local %ux%ux%u:", (unsigned long long)key, d->x, d->y, d->z, d->ind ? " (indirect)" : "", cs->local[0], cs->local[1], cs->local[2]);
+            for (int j = 0; j < cs->nbind && o < (int)sizeof line - 48; j++) { const dmsv_bind *b = &cs->b[j];
+                o += snprintf(line + o, sizeof line - (size_t)o, " [kind %d desc %d reg %d dim %d count %d flags %#x]", b->kind, b->desc, b->reg, b->dim, b->count, b->flags); }
+            for (int r = 0; r < 16 && o < (int)sizeof line - 40; r++) if (S.ssbo[5][r].addr) o += snprintf(line + o, sizeof line - (size_t)o, " s%d %#llx+%#llx", r, (unsigned long long)S.ssbo[5][r].addr, (unsigned long long)S.ssbo[5][r].size);
+            VKLOG("%s", line); }
+        return 1;
+    }
+    return 0;
+}
 static void dispatch(const p_dispatch *d) {
     vkshader_t *cs = S.sh[5]; int native_trace = 0;
     if (!cs) { VKRED_ONCE(60, "dispatch with no compute shader in the bundle: skipped"); return; }
     if (g_ups_n && upscaler_kernel(cs->key)) {
         if (!upscaler_native_dispatch(cs->key, &native_trace) && upscaler_replace(cs, d)) return;
     }
+    if (skip_kernel(cs->key, d)) return;
     g_vkst.dispatches++;
     vk_end_pass_land();
     stage_storage_prepare(5, cs);

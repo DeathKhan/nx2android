@@ -885,12 +885,24 @@ class Port:
         if self.o.shared_font:   # the host serves it for every shared-font type but the button icons (hle_sdk16.c font_get)
             font_env, font_files = font_env + [f'DM_SHARED_FONT={datapack.files_folder(self.package)}/standard.ttf'], {**font_files, 'standard.ttf': self.o.shared_font}
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
+        env = self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else []) + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else [])
+        files = {**self.fps_files, **font_files}
+        # Reuse: the pack is 186,000 hard links for a Switch 2 game (Ocarina of Time: 2:45 on an idle disk, 11 min beside another reader), made again on every run though an
+        # app-only rebuild changes none of it. Its inputs are the stages' own keys (the rewrite's and the shader bundle's key files, the RomFS image's stamp), the profile, the
+        # DLC / system data trees and the rows written into it; with the same key and the pack's manifest in place, the pack stands
+        kf = dst.with_name(dst.name + '.key')
+        stamps = [Path(str(self.patched) + '.key'), self.dmsv.with_name(self.dmsv.name + '.key'), self.game / 'RomFS.img.inputs.json', Path(__file__).with_name('datapack.py')]
+        key = nsp.fingerprint(('files', stamps + sorted(files.values())), ('files', nsp.profile_files(self.g)), ('tree', self.aoc) if self.aoc else 'no aoc', ('tree', self.sysdata) if self.sysdata else 'no sysdata',
+                              (self.pkg_ver, self.display, self.lang, self.package, list(env), TOUCH_SETTINGS if self.o.touch else None, sorted(files)))
+        if (dst / datapack.MANIFEST).is_file() and nsp.reused(kf, key) is not None:
+            man = datapack.read_manifest(dst); self.data_path = dst; self.result['data'] = str(dst)
+            PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB, reused (inputs unchanged)'); return
+        nsp.rmtree(kf)
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
-                             aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
-                             + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
-                             files={**self.fps_files, **font_files},
-                             progress=lambda what: PROG.set(step=f'linking {what}'))
+                             aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=env, settings=TOUCH_SETTINGS if self.o.touch else None,
+                             files=files, progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result['data'] = str(dst)
+        kf.write_text(f'{key}\n')
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')
 
     def button_font(self):
