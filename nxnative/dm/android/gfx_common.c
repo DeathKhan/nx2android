@@ -70,7 +70,8 @@ int mtl_probe_ramp_on(void) { static int on = -1; if (on < 0) { const char *e = 
 // Submission and queue state. The Vulkan replay keeps one set of GPU state across queues (as the Android port did before the upsync), so a queue switch restores nothing;
 // the first submission's prepare step (prewarm, pipeline prebuild) is the Metal backend's: the Vulkan backend builds pipelines at their first draw (gfx_vk_shader.c)
 void mtl_prepare(void) {}
-void mtl_queue_activate(uint64_t serial) { (void)serial; }
+uint64_t g_nvn_active_queue;   // the NVN queue whose submission is being replayed (gfx_vk_exec.c: its render-enable state, DM_VK_RC_QUEUE)
+void mtl_queue_activate(uint64_t serial) { g_nvn_active_queue = serial; }
 void mtl_queue_forget(uint64_t serial) { (void)serial; }
 void mtl_set_queue_origin_lower_left(int on) { mtl_set_origin_lower_left(on); }   // the raster flip is per queue upstream; here the one flag, set under the submit lock at each submit
 // Memory pools: every pool is resident and reachable by address (vk_pool_of), so no residency hints are needed; a pool's physical storage going away is handled by mtl_pool_del

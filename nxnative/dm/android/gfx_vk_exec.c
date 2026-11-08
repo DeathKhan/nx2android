@@ -178,16 +178,27 @@ static void x_read(void) { original_index_read(); set_profile_poll(); const char
 // one counts with its known counter 0 (vk_sub_complete writes 0 there under the key) and any other one is unknown, which keeps drawing. Inside a block evaluated false, draws and
 // clears are dropped. Mario vs. Donkey Kong (gsys, as Tears of the Kingdom and Animal Crossing) clears its HDR scene target under such a condition after lighting it: drawn
 // anyway, its levels were black under the HUD
+// Upstream ea0c98df3 / 04419bc25 (port): a timestamp report's known counter outlives the submission that replayed it until the GPU has completed that submission (vk_fence_done):
+// a later submission's condition, replayed while the report's bytes are not written yet, read the old ones (with DM_NVN_ASYNC or a GPU behind, the next submission is replayed
+// before the last one completes). A later buffer write over a known report (copy, fill, inline update) makes it unknown again (keeps drawing). DM_VK_RC_KEEP=0 (start-up): per
+// submission, as before. Render-enable state belongs to the NVN queue upstream and survives its submissions: DM_VK_RC_QUEUE=1 (start-up; off by default here) keeps g_rc_skip per
+// queue across submissions instead of clearing it at each
 static int g_rc_skip;   // a render-enable block evaluated false is active
 #define RC_PEND 256
-static struct { uint64_t addr; int kind; } g_rc_pend[RC_PEND]; static int g_rc_npend;   // reports replayed in this submission: kind 1 = timestamp (counter 0), 2 = another counter (unknown)
+static struct { uint64_t addr, fence; int kind; } g_rc_pend[RC_PEND]; static int g_rc_npend;   // reports replayed and not yet landed: kind 1 = timestamp (counter 0), 2 = another counter or overwritten (unknown); fence: the submission's
+static int rc_keep(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_RC_KEEP"); on = !(e && *e == '0'); } return on; }
+static int rc_queue_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_RC_QUEUE"); on = e && *e == '1'; if (on) VKLOG("DM_VK_RC_QUEUE=1: render-enable state kept per queue across submissions"); } return on; }
+static void rc_overwrite(uint64_t d, uint64_t n) {   // a buffer write replayed over [d, d + n): reports there are unknown until it lands
+    for (int i = 0; i < g_rc_npend; i++) if (g_rc_pend[i].addr < d + n && d < g_rc_pend[i].addr + 16) { g_rc_pend[i].kind = 2; g_rc_pend[i].fence = mtl_last_fence() + 1; }
+}
 static uint64_t g_rc_occ[4096];   // addresses ever written by a non-timestamp report (open addressing): conditions on them keep drawing
 static void rc_occ_add(uint64_t a) { for (uint32_t i = (uint32_t)(a >> 4) & 4095, k = 0; k < 4096; k++, i = (i + 1) & 4095) { if (g_rc_occ[i] == a) return; if (!g_rc_occ[i]) { g_rc_occ[i] = a; return; } } }
 static int rc_occ_has(uint64_t a) { for (uint32_t i = (uint32_t)(a >> 4) & 4095, k = 0; k < 4096; k++, i = (i + 1) & 4095) { if (g_rc_occ[i] == a) return 1; if (!g_rc_occ[i]) return 0; } return 0; }
 static void rc_note(uint64_t a, int kind) {
     if (kind == 2) rc_occ_add(a);
-    for (int i = 0; i < g_rc_npend; i++) if (g_rc_pend[i].addr == a) { g_rc_pend[i].kind = kind; return; }
-    if (g_rc_npend < RC_PEND) { g_rc_pend[g_rc_npend].addr = a; g_rc_pend[g_rc_npend++].kind = kind; }
+    uint64_t f = mtl_last_fence() + 1;   // the submission being replayed (as OP_FENCE_SYNC)
+    for (int i = 0; i < g_rc_npend; i++) if (g_rc_pend[i].addr == a) { g_rc_pend[i].kind = kind; g_rc_pend[i].fence = f; return; }
+    if (g_rc_npend < RC_PEND) { g_rc_pend[g_rc_npend].addr = a; g_rc_pend[g_rc_npend].fence = f; g_rc_pend[g_rc_npend++].kind = kind; }
 }
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at replay time
     if (rc_occ_has(a)) return 0;
@@ -202,7 +213,16 @@ static void render_cond(const p_render_cond *rc) {
 
 void vk_exec_reset(void) {   // a new submission: NVN state does not carry over between command buffers, the replay starts from the defaults
     static int inited; if (!inited) { inited = 1; state_reset(); crash_add_note_hook(build_dump); prewarm_start(); compute_warm_start(); }
-    g_rc_npend = 0; g_rc_skip = 0;
+    if (rc_keep() && g_rc_npend) {   // reports whose submission has not completed keep what is known of them (above)
+        uint64_t done = vk_fence_done(); int n = 0;
+        for (int i = 0; i < g_rc_npend; i++) if (g_rc_pend[i].fence > done) g_rc_pend[n++] = g_rc_pend[i];
+        g_rc_npend = n;
+    } else g_rc_npend = 0;
+    if (rc_queue_on()) {   // render-enable state per NVN queue (mtl_queue_activate, gfx_common.c), saved at the next submission's start
+        extern uint64_t g_nvn_active_queue; enum { RCQ = 16 }; static struct { uint64_t serial; int skip; } q[RCQ]; static uint64_t cur; static unsigned nq;
+        if (cur) { unsigned i = 0; while (i < nq && q[i].serial != cur) i++; if (i == nq && nq < RCQ) q[nq++].serial = cur; if (i < nq) q[i].skip = g_rc_skip; }
+        cur = g_nvn_active_queue; g_rc_skip = 0; for (unsigned i = 0; i < nq; i++) if (q[i].serial == cur) g_rc_skip = q[i].skip;
+    } else g_rc_skip = 0;
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_cb_draws = 0; g_ord_parts = 0; g_psplit_now = 0; g_set_epoch++; x_read();
     g_sub_hist[g_sub_hn++ % 8] = g_vkst.draws - g_sub_d0; g_sub_d0 = g_vkst.draws;   // (part_pace: the submission just ended)
     if (g_prof_on) { extern uint64_t g_pkg_ns, g_pkg_n; memset(g_prof_ns, 0, sizeof g_prof_ns); g_prof_t0 = tick(); g_prof_pkg0 = g_pkg_ns; g_prof_npkg0 = g_pkg_n; g_prof_pipes0 = g_vkst.pipes_built; }
@@ -3190,11 +3210,11 @@ static void exec_ops(const uint8_t *p) {
             uint32_t cur = __atomic_load_n(val, __ATOMIC_ACQUIRE); if (!(m == 0 ? cur == v : (uint32_t)(cur - v) < 0x80000000u)) VKRED_ONCE(130, "event wait not satisfied at replay (word %#x, mode %u, target %#x): replayed in submission order", cur, m, v); break; }
         case OP_WAIT_SYNC: break;
         // (DM_VK_TRACE_PASS=-2 lists the buffer writes too: copies, clears and uniform updates, by address)
-        case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n);
+        case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n); if (g_rc_npend) rc_overwrite(d, n);
             if (g_x_tracepass == -2) VKLOG("--- copy %#llx → %#llx, %llu bytes, after pass %d", (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n, g_sub_pass - 1); break; }
-        case OP_CLEAR_BUF: { const p_clear_buf *c = (const p_clear_buf *)a; mtl_sub_fill(c->addr, c->size, c->value);
+        case OP_CLEAR_BUF: { const p_clear_buf *c = (const p_clear_buf *)a; mtl_sub_fill(c->addr, c->size, c->value); if (g_rc_npend) rc_overwrite(c->addr, c->size);
             if (g_x_tracepass == -2) VKLOG("--- buffer clear %#llx, %llu bytes to %#x, after pass %d", (unsigned long long)c->addr, (unsigned long long)c->size, c->value, g_sub_pass - 1); break; }
-        case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); vk_sub_update(d, a + 16, n);
+        case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); vk_sub_update(d, a + 16, n); if (g_rc_npend) rc_overwrite(d, n);
             if (g_x_tracepass == -2) VKLOG("--- uniform update %#llx, %llu bytes, after pass %d", (unsigned long long)d, (unsigned long long)n, g_sub_pass - 1); break; }
         case OP_SET_RT: set_rt((const p_set_rt *)a); break;
         case OP_CLEAR_COLOR: if (!g_rc_skip) clear_color((const p_clear_color *)a); break;
