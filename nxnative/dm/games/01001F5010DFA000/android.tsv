@@ -9,3 +9,7 @@ status	playable
 tested	v262144 Lenovo Legion Y700 TB322FC (Snapdragon 8 Elite, Adreno 830, Android 16)
 package	org.nx2a.plarceus
 orientation	landscape
+
+# The pause menu frame cap (hle_framecap.c) by host pacing: the game steps its time by the clock (the same walk at 60 and pinned at 30, above), so a frame held 33.3 ms
+# on screen keeps real time. Off / 60 run the 60 fps cut (patches.py); 30 holds the present period at two vsyncs
+env	DM_FRAME_CAP_MODE=pace
