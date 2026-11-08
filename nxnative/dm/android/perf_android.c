@@ -431,6 +431,10 @@ void dm_perf_frame(double period) { dm_perf_frame_id(UINT64_MAX, period); }
 // The window's frame rate: the game's rate, so the display can pick a mode it divides (60 / 120 Hz rather than 144 Hz for a 60 fps game).
 void dm_perf_window(ANativeWindow *w, double fps) {
     if (!w || fps <= 0) return;
+    // Not below the display's slowest mode (DM_WINDOW_RATE_MIN, default 60): the Odin 3 has 60 and 120 Hz modes only, and a 20 fps ask (Ocarina of Time holding 3 vsyncs in its
+    // first scene) had the display reconfigured every 3 s while the game's vsync waits starved (frames of 5 s, then none); a 20 or 30 fps game is as well served at 60 Hz
+    static double minr = -1; if (minr < 0) { const char *e = getenv("DM_WINDOW_RATE_MIN"); minr = e && *e ? atof(e) : 60; }
+    if (fps < minr) fps = minr;
     int r = ANativeWindow_setFrameRate(w, (float)fps, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
     LOG("[perf] window frame rate %.0f fps%s", fps, r ? " refused" : "");
 }

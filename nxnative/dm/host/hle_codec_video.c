@@ -115,7 +115,16 @@ static void spt_unarm(void *e) { pthread_mutex_lock(&g_spt_mu); for (int k = 0; 
 #define CV_NATIVE_ALIGN 0x4000ull
 static uint32_t native_stride(uint32_t w) { return (w * 4 + 63) & ~63u; }
 static uint64_t native_size(uint32_t w, uint32_t h) { return ((uint64_t)native_stride(w) * h + CV_NATIVE_ALIGN - 1) & ~(CV_NATIVE_ALIGN - 1); }
+// An NV12 pool (output format 3): the SDK's decoder writes each picture into the pool's memory itself, Y rows (stride w) then the UV plane at w × h, and a game may read it from there
+// with its own GPU copies rather than ReadDecoderOutputImageNv12 (Ocarina of Time's movie player: CopyBufferToTexture from picture 0 into its 1920x1080 R8 and 960x540 RG8 textures;
+// the pictures the host kept for the Read calls never reached the pool, and its movies were black). The memory pool is the GPU's too (zero-copy), so the copy reads what is written here
+#define CV_FMT_NV12 3
 static void pool_native_write(cv_pool *p, uint32_t i, const vpx_image_t *im) {
+    if (p->fmt == CV_FMT_NV12 && p->mem && (i + 1) * native_size(p->w, p->h) <= p->size && (uint64_t)p->w * p->h * 3 / 2 <= native_size(p->w, p->h)) {
+        md_nv12(im, p->mem + i * native_size(p->w, p->h), p->w, p->h);
+        static int once; if (!once++) LOG("[codec] NV12 pool %p: pictures are written into the pool's memory (Y rows then UV at w x h, %ux%u), as the console's decoder does", (void *)p->mem, p->w, p->h);
+        if (!p->native) return;
+    }
     if (!p->native || !p->mem || (i + 1) * native_size(p->w, p->h) > p->size) return;
     uint8_t *dst = p->mem + i * native_size(p->w, p->h);
     uint32_t stride = native_stride(p->w);
@@ -253,6 +262,18 @@ HLE_FORCE("_ZN2nn5codec29ReadDecoderOutputImageRgbaHdrEPKNS0_25VideoDecoderImage
 // The picture of pool image i (the region x, y, w, h; Bananza reads it whole) as RGBA or as NV12
 #ifdef __ANDROID__
 // A CPU read of a pool whose decoder keeps its pictures in the codec's buffers: there are no bytes to give (black this once); the decoder switches to the CPU path at its next packet
+// The game copies a picture out of the pool's memory with the GPU (Ocarina of Time: CopyBufferToTexture from picture 0 into its Y and UV textures): the pictures must be in the pool's
+// memory, which zero copy leaves empty (the frames stay in the codec's buffers), so the decoder of that pool takes the CPU path, as for a CPU read (gfx_vk_exec.c copy_b2t)
+static void cv_zc_cpu_read(cv_pool *p);
+void dm_codec_pool_gpu_read(uint64_t addr, uint64_t len) {
+    cv_pool *hit = NULL;
+    pthread_mutex_lock(&g_cv_mu);
+    for (int k = 0; k < 16 && !hit; k++) { cv_dec *d = g_cv[k]; if (!d) continue;
+        for (int i = 0; i < CV_BUFS && !hit; i++) { cv_pool *p = d->buf[i].pool;
+            if (p && p->mem && addr >= (uint64_t)(uintptr_t)p->mem && addr + len <= (uint64_t)(uintptr_t)p->mem + p->size) hit = p; } }
+    pthread_mutex_unlock(&g_cv_mu);
+    if (hit) { static int once; if (!once++) LOG("[codec] the game copies pictures out of the pool's memory with the GPU: the CPU path, which writes them there"); cv_zc_cpu_read(hit); }
+}
 static void cv_zc_cpu_read(cv_pool *p) {
     pthread_mutex_lock(&g_cv_mu);
     for (int k = 0; k < 16; k++) { cv_dec *d = g_cv[k]; if (!d) continue; pthread_mutex_lock(&d->mu);

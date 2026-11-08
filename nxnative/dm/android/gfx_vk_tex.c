@@ -281,7 +281,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
 static int packaged_tex(const tex_t *t);
 static int cpu_content_tex(const tex_t *t, const vkfmt_t *f);
 static int unc_rule(void); static void cpu_unc_dropped(uint64_t serial);
-static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
+static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f); static int linear_storage(const tex_t *t);
 static void vk_tex_view_drop_all(vkimg_t *im);
 // Images over the same memory with different descriptions (the storage key differs) are separate Vulkan images: on the Switch a texture sees what another
 // one over its memory rendered, here it does not. They are linked both ways at creation (up to 8 each), and a sampled image older than an overlapping
@@ -354,8 +354,17 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
     int nvn_ft_written(const tex_t *);
     // a texture over a movie decoder's picture slot: the GPU converts the decoded picture into it (movie_zc_vk.c); nothing is taken from its storage (the host no longer writes it)
-    if (t->mem && zc_tex_refresh(im, t->mem, t->L.size)) { if (first && im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(vk_upload_cmd(), im); }
-    else if (t->mem && lin_copy(im, t, f)) {}
+    // DM_VK_LIN_DIAG=1 (start-up): which path each linear texture takes at its first use (Ocarina of Time's movie planes stayed black)
+    static int lin_diag = -1; if (lin_diag < 0) { const char *e = getenv("DM_VK_LIN_DIAG"); lin_diag = e && atoi(e); }
+    int zc_hit = t->mem && zc_tex_refresh(im, t->mem, t->L.size);
+    int lin_hit = !zc_hit && t->mem && lin_copy(im, t, f);
+    if (lin_diag && first && t->mem && (linear_storage(t) || (t->d.width >= 960 && t->d.height >= 540))) { VkBuffer b_; VkDeviceSize o_;
+        VKLOG("linear texture ser=%llu %ux%u nvn format %#x flags %#x stride %u size %llu mem %p pool flags %#x: %s (zc slot %s, pool buffer %s, levels %u layers %u bpb %u)",
+              (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.flags, t->d.stride, (unsigned long long)t->L.size, (const void *)t->mem, t->pool ? t->pool->flags : 0,
+              zc_hit ? "zero-copy slot" : lin_hit ? "lin_copy from the pool buffer" : packaged_tex(t) ? "packaged (CPU re-upload)" : nvn_ft_written(t) ? "dirty at first use" : "GPU-only image (nothing uploads it)", zc_tex_wants(t->mem, t->L.size) ? "yes" : "no",
+              vk_buf_at((uint64_t)(uintptr_t)t->mem, t->L.size, &b_, &o_) ? "yes" : "NO", im->levels, im->layers, f ? f->bpb : 0); }
+    if (zc_hit) { if (first && im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(vk_upload_cmd(), im); }
+    else if (lin_hit) {}
     else if (t->mem && (packaged_tex(t) || (first && (nvn_ft_written(t) || cpu_content_tex(t, f))))) {
         im->pkg_used = g_tex_frame;
         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
@@ -580,8 +589,11 @@ int mtl_tex_cpu_rewritten(const tex_t *t) {
         if (unc) cpu_unc_take(t);
         return MTL_REWRITE_UPLOADED;
     }
-    // nvn_mtl.m asks the host texture's usage (render target or shader write): every uncompressed texture made without a CPU fill has it there, a block-compressed one never
-    if (!(f && f->compressed)) return MTL_REWRITE_GPU;
+    // nvn_mtl.m asks the host texture's usage (render target or shader write). Here the question is answered by what the GPU has done: storage the GPU wrote (vcs: a render, a clear,
+    // a copy, an image store) keeps the texture the GPU's until the CPU rewrites it; storage the GPU never wrote holds only what the CPU put there, whatever the texture's flags.
+    // Ocarina of Time's movie planes (1920x1080 R8 + 960x540 RG8, NVN flags COMPRESSIBLE, so outside tex_storage_ok) are filled by nn::codec's CPU reads of the decoded pictures and
+    // never rendered into: as "GPU-owned" they stayed black
+    if (!(f && f->compressed) && vcs_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size)) return MTL_REWRITE_GPU_NOW;
     mtl_tex_cpu_written(t);
     return MTL_REWRITE_UPLOADED;
 }

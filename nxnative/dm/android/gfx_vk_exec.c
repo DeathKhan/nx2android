@@ -3018,6 +3018,14 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
     vk_end_pass_land();
     vkimg_t *im = vk_tex(c->tex); const vkfmt_t *f = vk_fmt(c->tex->d.format);
     if (!im || !f) return;
+    int zc_tex_wants(const void *, uint64_t); if (to_texture && zc_tex_wants((const void *)(uintptr_t)c->src, 1)) { void dm_codec_pool_gpu_read(uint64_t, uint64_t); dm_codec_pool_gpu_read(c->src, 1); }   // a picture slot read by the GPU: the codec's CPU path fills it
+    { static int lin_diag = -1; if (lin_diag < 0) { const char *e = getenv("DM_VK_LIN_DIAG"); lin_diag = e && atoi(e); }   // (gfx_vk_tex.c: the same switch)
+      static uint64_t seen[16]; static int nseen;
+      if (lin_diag && c->tex->d.width >= 960 && nseen < 16) { int k = 0; while (k < nseen && seen[k] != c->tex->serial) k++;
+        if (k == nseen) { seen[nseen++] = c->tex->serial;
+            VKLOG("buffer %s texture copy: texture ser=%llu %ux%u nvn format %#x flags %#x, buffer %#llx, region %d,%d %ux%u, row stride %lld image stride %lld",
+                  to_texture ? "→" : "←", (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.format, c->tex->d.flags, (unsigned long long)c->src,
+                  c->r.xoffset, c->r.yoffset, (unsigned)c->r.width, (unsigned)c->r.height, (long long)S.row_stride, (long long)S.image_stride); } } }
     VkBuffer b; VkDeviceSize o;
     if (!vk_buf_at(c->src, 1, &b, &o)) { VKRED_ONCE(70, "buffer of a buffer ↔ texture copy outside the memory pools"); return; }
     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb);
