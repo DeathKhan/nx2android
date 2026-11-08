@@ -226,6 +226,7 @@ typedef struct {
     // an NVN2 task (1) or mesh (2) kernel (bundle stage 6 / 7; shader_meshwrap.facts in its header words): its workgroup's threads, its payload's words, whether the mesh shader has a task,
     // a primitive's vertices, the most vertices and primitives a workgroup, and the words a vertex has in the emulation's vertex buffer (gfx_vk_exec.c mesh_draw)
     int mesh_kind; uint32_t mesh_threads, mesh_pay, mesh_task, mesh_verts, mesh_max_v, mesh_max_p, mesh_ncomp;
+    int wmem;                           // gfx_vk_exec.c shader_wmem: 1 it writes memory (stores to storage buffers or images, atomics), 2 not, 0 not known yet
 } vkshader_t;
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader
 // Texture tables: a shader's arrays of TBL_MIN or more combined image samplers whose handles are consecutive words of one of the game's uniform buffers (element k = the handle at
