@@ -103,6 +103,7 @@ const char *cap_queue_unsupported(const cap_queue_state *state);
 typedef struct { FILE *f; uint64_t raw, stored; int err; } cap_writer;
 int cap_open(cap_writer *w, const char *path);
 void cap_put(cap_writer *w, uint32_t tag, uint32_t submit, const void *data, uint64_t n, int compress);
+void cap_put2(cap_writer *w, uint32_t tag, uint32_t submit, const void *a, uint64_t an, const void *b, uint64_t bn);   // two parts, stored raw, no copy
 int cap_close(cap_writer *w);
 // Reading: the whole file into memory, then chunk by chunk (data decompressed)
 typedef struct { uint8_t *buf; size_t n, pos; } cap_reader;

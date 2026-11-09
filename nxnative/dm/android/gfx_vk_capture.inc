@@ -435,10 +435,8 @@ static uint64_t cap_reg_write(uint32_t submit) {
         size_t nb = (size_t)((r->size + 4095) / 4096);
         for (size_t k = 0; k < nb; k++) { uint64_t o = (uint64_t)k * 4096; size_t len = (size_t)MIN(4096, r->size - o); if (cap_hash_block((const uint8_t *)(uintptr_t)r->lo + o, len) != r->hash[k]) moved += len; }
         cap_regn hh = {g_cap_rid[i], r->kind, r->lo, r->size}; r->pending = 0;
-        uint8_t *b = malloc(sizeof hh + r->size); if (!b) { cap_fail("out of memory for a region"); continue; }
-        memcpy(b, &hh, sizeof hh); memcpy(b + sizeof hh, (const void *)(uintptr_t)r->lo, (size_t)r->size);
-        cap_reg_hash(r, b + sizeof hh);
-        cap_put(&g_cap_w, CAP_REGN, submit, b, sizeof hh + r->size, 1); free(b);
+        cap_put2(&g_cap_w, CAP_REGN, submit, &hh, sizeof hh, (const void *)(uintptr_t)r->lo, r->size);   // straight from the pool: a copy of gigabytes was a low-memory kill
+        cap_reg_hash(r, (const uint8_t *)(uintptr_t)r->lo);   // as written (the game's other threads may write meanwhile: such bytes show as a change at the next submit)
     }
     return moved;
 }

@@ -195,6 +195,14 @@ void cap_put(cap_writer *w, uint32_t tag, uint32_t submit, const void *data, uin
     w->raw += n; w->stored += c.stored + sizeof c;
     free(z);
 }
+// A chunk of two parts stored as they are (no copy of either): a region's header and its bytes in the game's memory, where a copy of a pool of
+// gigabytes to make one buffer had Android's low-memory killer take the game (Ocarina of Time, 5.6 GB resident)
+void cap_put2(cap_writer *w, uint32_t tag, uint32_t submit, const void *a, uint64_t an, const void *b, uint64_t bn) {
+    if (!w->f) return;
+    cap_chunk c = {tag, CAP_RAW, an + bn, an + bn, submit, 0};
+    if (fwrite(&c, sizeof c, 1, w->f) != 1 || (an && fwrite(a, 1, (size_t)an, w->f) != an) || (bn && fwrite(b, 1, (size_t)bn, w->f) != bn)) w->err = 1;
+    w->raw += an + bn; w->stored += an + bn + sizeof c;
+}
 int cap_close(cap_writer *w) {
     if (!w->f) return 0;
     cap_put(w, CAP_END_, 0, NULL, 0, 0);

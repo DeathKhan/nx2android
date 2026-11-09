@@ -12,6 +12,8 @@
 #include "dmsh_chain.h"
 #include <sys/mman.h>
 #include <sys/param.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 void crash_install(void);
 int vk_cap_fill(const tex_t *t, const uint8_t *d, size_t n, char *why, size_t nwhy);
@@ -132,12 +134,14 @@ static int rp_ppm(const char *path, const uint8_t *px, uint32_t w, uint32_t h, u
 }
 static void rp_hex(const uint8_t *md, char out[65]) { for (int i = 0; i < 32; i++) snprintf(out + 2 * i, 3, "%02x", md[i]); }
 
+static int opt_accept;   // --accept: replay a capture that names what format 1 cannot reproduce (event waits: replayed in submission order, as the live run does)
 int main(int argc, char **argv) {
     const char *path = NULL, *outp = NULL; int warm = 1; uint64_t maxpx = 0;
     setvbuf(stdout, NULL, _IOLBF, 0); setvbuf(stderr, NULL, _IOLBF, 0); crash_install();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--warm") && i + 1 < argc) warm = MAX(1, atoi(argv[++i]));
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
+        else if (!strcmp(argv[i], "--accept")) opt_accept = 1;
         else if (!strcmp(argv[i], "--max-pixels") && i + 1 < argc) maxpx = strtoull(argv[++i], NULL, 10);
         else if (argv[i][0] != '-' && !path) path = argv[i];
         else { fprintf(stderr, "usage: %s <capture> [--warm n] [--out prefix] [--max-pixels n]\n", argv[0]); return 2; }
@@ -145,12 +149,23 @@ int main(int argc, char **argv) {
     if (!path) { fprintf(stderr, "usage: %s <capture> [--warm n] [--out prefix] [--max-pixels n]\n", argv[0]); return 2; }
     uint64_t tl0 = now_ns();
     nvn_serial_floor(1ull << 61);   // the replay layer's own serials stay clear of the captured ones (nvn_replay.m)
-    cap_reader rd; int lr = cap_load(&rd, path);
-    if (lr <= 0) RFAIL("%s: %s", path, lr < 0 ? "not a capture of format 1" : "cannot read");
-    for (;;) { cap_chunk c; uint8_t *d; int r = cap_next(&rd, &c, &d); if (r < 0) RFAIL("%s: corrupt chunk at byte %zu", path, rd.pos); if (!r) break;
-        if (c.tag == CAP_FAIL) RFAIL("%s: capture refused: %.*s", path, (int)MIN(c.raw, 1024), (const char *)d);
+    // The file mapped (private: decoding writes into the segment and registry chunks in place, copy on write) and the chunks pointing into it: a capture of
+    // gigabytes is not read into memory and then copied again chunk by chunk (cap_load / cap_next), which the device's memory would not hold beside the regions
+    int fd = open(path, O_RDONLY); struct stat fst;
+    if (fd < 0 || fstat(fd, &fst) || fst.st_size < 16) RFAIL("%s: cannot read", path);
+    uint8_t *fb = mmap(NULL, (size_t)fst.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0); close(fd);
+    if (fb == MAP_FAILED) RFAIL("%s: cannot map", path);
+    { uint32_t ver; memcpy(&ver, fb + 8, 4); if (memcmp(fb, CAP_MAGIC, 8) || ver != CAP_VERSION) RFAIL("%s: not a capture of format 1", path); }
+    for (size_t pos = 16;;) { cap_chunk c;
+        if (pos + sizeof c > (size_t)fst.st_size) RFAIL("%s: truncated at byte %zu (no end chunk)", path, pos);
+        memcpy(&c, fb + pos, sizeof c); pos += sizeof c;
+        if (c.tag == CAP_END_) break;
+        if (c.stored > (uint64_t)fst.st_size - pos) RFAIL("%s: corrupt chunk at byte %zu", path, pos);
+        if (c.codec != CAP_RAW || c.stored != c.raw) RFAIL("%s: chunk at byte %zu is compressed (codec %u): a capture made on a Mac (LZFSE) cannot be read here", path, pos, c.codec);
+        uint8_t *d = fb + pos; pos += c.stored;
+        if (c.tag == CAP_FAIL) { if (!opt_accept) RFAIL("%s: capture refused: %.*s (--accept replays it anyway)", path, (int)MIN(c.raw, 1024), (const char *)d);
+            fprintf(stderr, "[RED] nvn_replay_vk: the capture says: %.*s; replayed anyway (--accept): in submission order, as the live run replays it\n", (int)MIN(c.raw, 1024), (const char *)d); continue; }
         rp_ch = realloc(rp_ch, (rp_nch + 1) * sizeof *rp_ch); rp_ch[rp_nch++] = (rp_chunk){c, d}; }
-    cap_unload(&rd);
     char *head = NULL; size_t hn = 0; const char *lay = NULL; size_t ln = 0; const char *stat = ""; size_t sn = 0;
     for (size_t i = 0; i < rp_nch; i++) { if (rp_ch[i].c.tag == CAP_HEAD) { head = (char *)rp_ch[i].d; hn = rp_ch[i].c.raw; } else if (rp_ch[i].c.tag == CAP_LAYT) { lay = (const char *)rp_ch[i].d; ln = rp_ch[i].c.raw; }
         else if (rp_ch[i].c.tag == CAP_STAT) { stat = (const char *)rp_ch[i].d; sn = rp_ch[i].c.raw; } }
