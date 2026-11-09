@@ -80,6 +80,7 @@ static _Atomic int g_set_res = DM_RES_BALANCED;   // the Resolution level (DM_RE
 static const char *const RES_KEYS[DM_RES_N] = {"performance", "balanced", "quality", "max"};
 static _Atomic int g_set_cap;    // the frame cap's index in OVM_CAPS (0 off; settings.txt fpscap= in fps; hle_framecap.c holds the game to it)
 static _Atomic int g_set_fpspos;   // the frame rate counter's corner (OVM_FPSPOS_KEYS: 0 top left for every game until the player picks another; settings.txt fpspos=)
+static _Atomic int g_set_padlabel = -1;   // the pause menu's Face buttons (settings.txt labels=): -1 until the player chooses there, then 0 by position, 1 by label
 static int fpspos_index(const char *s) { for (int i = 0; i < 4; i++) if (!strncmp(s, OVM_FPSPOS_KEYS[i], 2)) return i; return -1; }
 int dm_overlay_fps_pos(void) { return atomic_load(&g_set_fpspos); }
 static int cap_index(int fps) { for (int i = 0; i < OVM_NCAPS; i++) if (OVM_CAPS[i] == fps) return i; return 0; }
@@ -95,7 +96,7 @@ static void settings_load(void) {
     char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[128];
     if (!f) return;
     g_set_extra[0] = 0;
-    while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
+    while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_padlabel, v != 0); else if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
         else if (sscanf(line, "docked=%d", &v) == 1) { setenv("DM_OPMODE", v ? "1" : "0", 1); atomic_store(&g_set_res, v ? DM_RES_MAX : DM_RES_BALANCED); }   // over env.txt's: the host reads it once, at its first query
         else if (!strncmp(line, "res=", 4)) { for (int k = 0; k < DM_RES_N; k++) if (!strncmp(line + 4, RES_KEYS[k], strlen(RES_KEYS[k]))) { atomic_store(&g_set_res, k); setenv("DM_OPMODE", k == DM_RES_MAX ? "1" : "0", 1); } }   // (after docked=)
@@ -126,6 +127,7 @@ static void settings_save(void) {
             atomic_load(&g_set_fps), atomic_load(&g_set_opacity), atomic_load(&g_set_grid), OVM_CAPS[atomic_load(&g_set_cap)], RES_KEYS[atomic_load(&g_set_res)],
             atomic_load(&g_set_accent) & 0xffffff);
     fprintf(f, "fpspos=%s\n", OVM_FPSPOS_KEYS[atomic_load(&g_set_fpspos) & 3]);
+    if (atomic_load(&g_set_padlabel) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_padlabel));   // (only once chosen: until then env.txt decides)
     fputs(g_set_extra, f);   // the lines settings_load did not know
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
@@ -240,7 +242,12 @@ static uint64_t g_btn; static float g_ax[8]; static int g_pad_used;   // lx ly r
 // right one A (as the iOS front end maps). A device whose buttons carry Nintendo's labels in Nintendo's places and reports them by label (the AYN Odin 3: its right button, labelled A,
 // sends BUTTON_A) wants them as labelled: env.txt DM_PAD_LABELS=1, which porter install writes for such devices
 // upstream nx2android names the same switch DM_PAD_XBOX=1 (its Super Mario Odyssey and Super Mario Bros. Wonder profile rows): it turns this on too
-static int pad_labels(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PAD_LABELS"), *x = getenv("DM_PAD_XBOX"); v = (e && atoi(e) > 0) || (x && atoi(x) > 0); } return v; }
+static int pad_labels(void) {   // read at every key: a change in the menu applies at once, its own A and B too (upstream nx2android #185)
+    int v = atomic_load(&g_set_padlabel); if (v >= 0) return v;
+    static int env = -1; if (env < 0) { const char *n[3] = {"DM_PAD_LABELS", "DM_PAD_LABEL", "DM_PAD_XBOX"}; env = 0;   // ours (the porter's for the Odin), upstream's, its first name
+                                         for (int i = 0; i < 3; i++) { const char *e = getenv(n[i]); if (e && atoi(e) > 0) env = 1; } }
+    return env;
+}
 int dm_pad_labels(void) { return pad_labels(); }   // (gfx_vk_present.c: the menu's key hints name the buttons as labelled)
 static uint64_t key_bit(int32_t k) {
     switch (k) {
@@ -483,6 +490,7 @@ int dm_menu_value(int item) {
     case OVM_MODE: return atomic_load(&g_set_res);
     case OVM_ACCENT: return accent_index(atomic_load(&g_set_accent));
     case OVM_FPSPOS: return dm_overlay_fps_pos();
+    case OVM_PADLABEL: return pad_labels();
     case OVM_FRAMECAP: return dm_frame_cap_how() == DM_FRAME_CAP_NONE ? OVM_NA : atomic_load(&g_set_cap);
     default: return 0;
     }
@@ -512,6 +520,7 @@ static void menu_set(int item, int v) {   // a row's new value (a switch, a choi
         if (OVM_CAPS[v]) LOG("[menu] frame cap %d", OVM_CAPS[v]); else LOG("[menu] frame cap off");
     }
     else if (item == OVM_ACCENT && v >= 0 && v < OVM_ACCENTS_N) atomic_store(&g_set_accent, OVM_ACCENTS[v]);
+    else if (item == OVM_PADLABEL && v >= 0 && v < 2) { atomic_store(&g_set_padlabel, v); LOG("[menu] face buttons by %s", v ? "label" : "position"); }
     else if (item == OVM_OPACITY) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
     else return;
     settings_save();
