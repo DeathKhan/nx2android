@@ -2441,3 +2441,6 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
 }
 void mtl_finish(void) { mtl_wait(g_fence, ~0ull); }
 void mtl_drain(void) { mtl_finish(); vk_pipeline_cache_save(); }
+// The pipeline archive at going to the background and at quit (hle_nvn.c dm_gfx_suspend / dm_gfx_quit; upstream nxnative 4a815619e): here the driver's pipeline cache, written
+// now (it is small and written whole; wait_ms bounds nothing here, the write is synchronous)
+void mtl_arch_save(int wait_ms, int ending) { (void)wait_ms; (void)ending; vk_pipeline_cache_save(); }
