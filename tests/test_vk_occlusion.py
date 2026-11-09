@@ -25,10 +25,11 @@ class OcclusionCounter(unittest.TestCase):
         runtime = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text()
         start = runtime.index('enum { OCC_BLOCK')
         helpers = runtime[start:runtime.index('void mtl_init(', start)]
+        trace_field = next(line.split('//')[0].strip() for line in runtime.splitlines() if '} occ[MAIN_CBS];' in line)
         post = function(runtime, 'static void post(')
         report = function(runtime, 'void mtl_sub_counter(')
         start = runtime.index('        for (int i = 0; i < c->n; i++) {')
-        completion = runtime[start:runtime.index('        pthread_mutex_lock(&g_cmu);', start)]
+        completion = runtime[start:runtime.index('        completion_events_publish(c);', start)]
         wait = function(runtime, 'static void slot_recycle(')
         wait = wait[wait.index('{') + 1:wait.index('    pthread_mutex_lock(&g_df_mu);')]
         code = r'''
@@ -45,21 +46,44 @@ typedef uintptr_t VkCommandBuffer;
 typedef int VkResult;
 typedef struct { int sType; const void *pNext; unsigned flags; int queryType; unsigned queryCount; } VkQueryPoolCreateInfo;
 enum { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO=1,VK_QUERY_TYPE_OCCLUSION=0,
-       VK_QUERY_CONTROL_PRECISE_BIT=1,VK_QUERY_RESULT_64_BIT=1,VK_SUCCESS=0,
+       VK_QUERY_CONTROL_PRECISE_BIT=1,VK_QUERY_RESULT_64_BIT=1,VK_QUERY_RESULT_WITH_AVAILABILITY_BIT=2,VK_SUCCESS=0,
        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT=0,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT=1,
        NVN_COUNTER_TYPE_TIMESTAMP=0,NVN_COUNTER_TYPE_TIMESTAMP_TOP=0x10,NVN_COUNTER_TYPE_SAMPLES_PASSED=1,CQ=256 };
 #define DM_GAME_RENDER_COND 0
+#define MAIN_CBS 32
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode,v; uint64_t addr; uint32_t type; int q; } post_op;
-typedef struct { VkQueryPool *oq; int noq,capoq,nocc,nmain_used,ncq; VkCommandBuffer main; post_op *post; int npost,cappost; uint64_t fence; } vksub_t;
+typedef struct { VkQueryPool *oq; int noq,capoq,nocc,nmain_used,ncq; VkCommandBuffer main,mains[MAIN_CBS]; int nmain_sent,nup_used; TRACE_FIELD post_op *post; int npost,cappost; uint64_t fence; } vksub_t;
 static vksub_t g_slot[2];
 static int g_cur, g_prereset, in_pass, begin_calls, end_calls, reset_calls, get_calls, last_flags, creates;
 static int cpu_waits,gpu_waits,complete_on_wait,expect_die;
 static jmp_buf death;
 static VkQueryPool g_cq;
+static void *g_lib_base;
+static int diagnostic_reads,diagnostic_releases;
 static struct { int dev,has_occ_precise; struct { struct { double timestampPeriod; } limits; } props; } V;
 typedef struct { uint64_t values[256]; unsigned char available[256],reset[256]; } mock_pool;
 static mock_pool pools[32];
-static void log_ignore(const char *fmt,...){(void)fmt;}
+typedef struct { VkCommandBuffer cb; int kind; VkQueryPool pool; uint32_t q; uint64_t value; } queued_query;
+static queued_query queued[4096];static int nqueued,defer_queries;
+static void enqueue_query(VkCommandBuffer cb,int kind,VkQueryPool pool,uint32_t q,uint64_t value){
+ assert(nqueued<4096);queued[nqueued++]=(queued_query){cb,kind,pool,q,value};
+}
+static void execute_query_cb(VkCommandBuffer cb){
+ // Queue execution, not recording, makes queries available. Upload reset executes first.
+ for(int i=0;i<nqueued;i++){queued_query *x=&queued[i];if(x->cb!=cb)continue;
+  mock_pool *p=&pools[x->pool];assert(x->pool&&x->q<256);
+  if(x->kind==0){memset(p->reset,1,sizeof p->reset);memset(p->available,0,sizeof p->available);}
+  else if(x->kind==1){assert(p->reset[x->q]&&!p->available[x->q]);p->reset[x->q]=0;p->values[x->q]=0;}
+  else if(x->kind==2){assert(!p->reset[x->q]);p->available[x->q]=1;}
+  else {assert(!p->reset[x->q]&&!p->available[x->q]);p->values[x->q]+=x->value;}
+ }
+}
+static int failure_lines;static char failure_log[4096];
+static void log_ignore(const char *fmt,...){
+ if(!strstr(fmt,"query failure")&&!strstr(fmt,"query part")&&!strstr(fmt,"query draw")&&!strstr(fmt,"query availability"))return;
+ failure_lines++;va_list ap;va_start(ap,fmt);size_t at=strlen(failure_log);
+ vsnprintf(failure_log+at,sizeof failure_log-at,fmt,ap);va_end(ap);
+}
 #define VKLOG(...) log_ignore(__VA_ARGS__)
 static void die(const char *fmt,...){(void)fmt;if(expect_die)longjmp(death,1);abort();}
 #define VKCHK(expr) do { if((expr)!=VK_SUCCESS)die("Vulkan failure"); } while(0)
@@ -72,19 +96,27 @@ static int vkCreateQueryPool(int dev,const VkQueryPoolCreateInfo *ci,const void 
 }
 static void vkCmdResetQueryPool(VkCommandBuffer cb,VkQueryPool pool,uint32_t first,uint32_t count){
  assert(cb==99&&pool&&first==0&&count==256);reset_calls++;
+ if(defer_queries){enqueue_query(cb,0,pool,0,0);return;}
  memset(pools[pool].reset,1,sizeof pools[pool].reset);
  memset(pools[pool].available,0,sizeof pools[pool].available);
 }
 static void vkCmdBeginQuery(VkCommandBuffer cb,VkQueryPool pool,uint32_t q,unsigned flags){
+ if(defer_queries){assert(in_pass&&cb==cur()->main);enqueue_query(cb,1,pool,q,0);begin_calls++;last_flags=(int)flags;return;}
  assert(in_pass&&cb==cur()->main&&q<256&&pools[pool].reset[q]&&!pools[pool].available[q]);
  pools[pool].reset[q]=0;pools[pool].values[q]=0;begin_calls++;last_flags=(int)flags;
 }
 static void vkCmdEndQuery(VkCommandBuffer cb,VkQueryPool pool,uint32_t q){
+ if(defer_queries){assert(in_pass&&cb==cur()->main);enqueue_query(cb,2,pool,q,0);end_calls++;return;}
  assert(in_pass&&cb==cur()->main&&q<256&&!pools[pool].reset[q]);
  pools[pool].available[q]=1;end_calls++;
 }
 static VkResult vkGetQueryPoolResults(int dev,VkQueryPool pool,uint32_t q,uint32_t n,size_t len,void *out,size_t stride,unsigned flags){
- (void)dev;assert(q<256&&n==1&&len==8&&stride==8&&flags==VK_QUERY_RESULT_64_BIT);get_calls++;
+ (void)dev;assert(q<256&&n==1);get_calls++;
+ if(flags==(VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)){
+  assert(len==16&&stride==16);diagnostic_reads++;
+  if(diagnostic_releases)pools[pool].available[q]=1;
+  ((uint64_t*)out)[1]=pools[pool].available[q];
+ }else assert(len==8&&stride==8&&flags==VK_QUERY_RESULT_64_BIT);
  if(!pools[pool].available[q])return 1;
  memcpy(out,&pools[pool].values[q],8);return VK_SUCCESS;
 }
@@ -96,7 +128,7 @@ POST
 HELPERS
 REPORT
 static void complete(vksub_t *s,int submitted_parts){
- struct { int n,rslot,occ_parts; post_op *ops; int slot; } pending={s->npost,(int)(s-g_slot),submitted_parts,s->post,0},*c=&pending;
+ struct { int n,rslot,occ_parts; post_op *ops; int slot; uint64_t frame,fence; } pending={s->npost,(int)(s-g_slot),submitted_parts,s->post,0,123,456},*c=&pending;
  uint64_t now=12345,tend=0;int clock=0;
 COMPLETION
  s->npost=0;
@@ -109,17 +141,20 @@ WAIT
 static void open_pass(void){assert(!in_pass);in_pass=1;}
 static void close_pass(void){vk_occ_end();in_pass=0;}
 static void draw(uint64_t samples){
- vk_occ_draw();if(g_occ_active>=0){int q=g_occ_active;pools[cur()->oq[q/256]].values[q%256]+=samples;}
+ vk_occ_draw();if(g_occ_active>=0){int q=g_occ_active;
+ if(defer_queries)enqueue_query(cur()->main,3,cur()->oq[q/256],(uint32_t)(q%256),samples);
+ else pools[cur()->oq[q/256]].values[q%256]+=samples;}
 }
 static void new_submission(int slot){
  assert(!in_pass&&g_occ_active<0);g_cur=slot;vksub_t *s=cur();
- s->nocc=0;s->npost=0;s->nmain_used=1;s->main=(VkCommandBuffer)(slot+1);
+ s->nocc=0;s->npost=0;s->nmain_used=1;s->main=s->mains[0]=(VkCommandBuffer)(slot+1);
+ s->nmain_sent=0;s->nup_used=1;memset(s->occ,0,sizeof s->occ);
 }
 static void report_to(uint64_t out[2]){mtl_sub_counter((uint64_t)(uintptr_t)out,NVN_COUNTER_TYPE_SAMPLES_PASSED);}
 static void clear_state(void){
  assert(!in_pass);for(int i=0;i<2;i++){free(g_slot[i].oq);free(g_slot[i].post);}memset(g_slot,0,sizeof g_slot);
- memset(pools,0,sizeof pools);creates=begin_calls=end_calls=reset_calls=get_calls=0;
- g_occ_counting=0;g_occ_active=-1;g_occ_completed=0;V.has_occ_precise=1;new_submission(0);
+ memset(pools,0,sizeof pools);creates=begin_calls=end_calls=reset_calls=get_calls=0;nqueued=defer_queries=0;
+ failure_lines=0;failure_log[0]=0;diagnostic_reads=diagnostic_releases=0;g_occ_counting=0;g_occ_active=-1;g_occ_completed=0;V.has_occ_precise=1;new_submission(0);
 }
 int main(void){
  uint64_t a[2]={0},b[2]={0},c[2]={0},d[2]={0};
@@ -130,6 +165,7 @@ int main(void){
  // Reports snapshot cumulative values without resetting. Multiple guest draws share one segment.
  open_pass();draw(3);draw(4);assert(begin_calls==1&&last_flags==VK_QUERY_CONTROL_PRECISE_BIT);
  report_to(a);report_to(b);assert(end_calls==1);
+ assert(cur()->post[0].kind==3&&cur()->post[0].type==2&&cur()->post[0].addr&&(uintptr_t)cur()->post[0].val);
  draw(5);report_to(c);close_pass();complete(cur(),1);
  assert(a[0]==7&&b[0]==7&&c[0]==12&&get_calls==2);
  // Reset inside a pass closes the old segment, then resets in exact CPU-completion order.
@@ -163,16 +199,58 @@ int main(void){
  vk_occ_reset();open_pass();draw(100);close_pass();report_to(a);complete(cur(),1);assert(a[0]==23&&get_calls==1);
  // Dropping the entire submission does not consume stale unavailable queries.
  clear_state();vk_occ_reset();open_pass();draw(100);close_pass();report_to(a);complete(cur(),0);assert(a[0]==0&&!get_calls);
+ // Delayed Vulkan execution: 257 segments recorded across two native parts.
+ // The two block resets are recorded after main-CB recording has started, but execute
+ // on the upload CB before either main. Results must remain unavailable until End executes.
+ clear_state();defer_queries=1;vk_occ_reset();open_pass();
+ for(int i=0;i<256;i++){draw((uint64_t)i+1);vk_occ_end();}close_pass();
+ cur()->nmain_used=2;cur()->main=cur()->mains[1]=3;
+ open_pass();draw(1000);report_to(a);close_pass();
+ assert(cur()->nocc==257&&reset_calls==2&&!pools[cur()->oq[0]].available[35]);
+ assert(cur()->occ[0].begins==256&&cur()->occ[0].ends==256&&cur()->occ[1].begins==1);
+ assert(cur()->occ[0].first_block==0&&cur()->occ[1].first_block==1);
+ execute_query_cb(99);execute_query_cb(1);
+ assert(pools[cur()->oq[0]].available[35]&&!pools[cur()->oq[1]].available[0]);
+ execute_query_cb(3);complete(cur(),2);
+ assert(a[0]==32896+1000&&get_calls==257&&!failure_lines);
+ // If the final part is dropped, its recorded End must not be read and cannot reset
+ // the accumulated counts of the submitted prefix.
+ clear_state();defer_queries=1;vk_occ_reset();open_pass();draw(17);close_pass();
+ cur()->nmain_used=2;cur()->main=cur()->mains[1]=3;
+ vk_occ_reset();open_pass();draw(99);report_to(a);close_pass();
+ execute_query_cb(99);execute_query_cb(1);complete(cur(),1);
+ assert(a[0]==17&&get_calls==1&&!pools[cur()->oq[0]].available[1]&&!failure_lines);
  // Completion must fail loudly instead of publishing fake counts on unavailable results.
  clear_state();vk_occ_reset();open_pass();draw(9);close_pass();
  pools[cur()->oq[0]].available[0]=0;expect_die=1;
  if(!setjmp(death)){complete(cur(),1);abort();}expect_die=0;
+ assert(failure_lines==4&&strstr(failure_log,"frame 123 fence 456 slot 0"));
+ assert(strstr(failure_log,"queries 1 begins 1 ends 1 block resets 1"));
+ assert(strstr(failure_log,"begin/reset/end parts 0/0/0"));
+ assert(g_occ_completed==0&&diagnostic_reads==1); // unavailable diagnostics never become guest results
+ assert(strstr(failure_log,"query draw calls 1")&&strstr(failure_log,"available 0 (failed query)"));
+ // Even a second read that succeeds is evidence only: the original failure remains fatal.
+ failure_lines=0;failure_log[0]=0;diagnostic_releases=1;expect_die=1;
+ if(!setjmp(death)){complete(cur(),1);abort();}expect_die=0;
+ assert(g_occ_completed==0&&strstr(failure_log,"available 1 (failed query)"));
+ diagnostic_releases=0;
+ // A query ending in the wrong native part is identified independently of reset ownership.
+ failure_lines=0;failure_log[0]=0;cur()->nmain_used=2;cur()->mains[1]=3;
+ occ_failure(cur(),&(post_op){.kind=3,.v=1,.q=0},2,9,10,1);
+ assert(failure_lines==5&&strstr(failure_log,"begin/reset/end parts 0/0/1"));
+ // Diagnostic neighbors in a dropped part may never have been reset; do not read them.
+ clear_state();defer_queries=1;vk_occ_reset();open_pass();
+ for(int i=0;i<256;i++){draw(1);vk_occ_end();}close_pass();
+ cur()->nmain_used=2;cur()->main=cur()->mains[1]=3;open_pass();draw(1);close_pass();
+ execute_query_cb(99);execute_query_cb(1);
+ diagnostic_reads=0;occ_failure(cur(),&cur()->post[256],1,9,10,1);
+ assert(diagnostic_reads==3); // only253,254,255; never unsubmitted256
  clear_state();(void)d;
  for(int i=0;i<2;i++){free(g_slot[i].oq);free(g_slot[i].post);}
  return 0;
 }
 '''
-        for marker, value in [('POST', post), ('HELPERS', helpers), ('REPORT', report),
+        for marker, value in [('TRACE_FIELD', trace_field), ('POST', post), ('HELPERS', helpers), ('REPORT', report),
                               ('COMPLETION', completion), ('WAIT', wait)]:
             code = code.replace(marker, value)
         target = ROOT / 'target/tests'
@@ -180,7 +258,7 @@ int main(void){
         with tempfile.TemporaryDirectory(prefix='vk-occlusion-', dir=target) as folder:
             src, exe = Path(folder) / 'check.c', Path(folder) / 'check'
             src.write_text(code)
-            subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
+            subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                             '-Wno-missing-field-initializers', '-fsanitize=address,undefined',
                             str(src), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
@@ -254,7 +332,7 @@ int main(void){
         with tempfile.TemporaryDirectory(prefix='vk-occlusion-dq-', dir=target) as folder:
             src, exe = Path(folder) / 'check.c', Path(folder) / 'check'
             src.write_text(code)
-            subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
+            subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                             str(src), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
 
@@ -265,7 +343,7 @@ int main(void){
         self.assertIn('if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) vk_occ_reset();', runtime)
         self.assertRegex(runtime, r'vk_occ_end\(\);\s*vkCmdDraw\(cb, 3, 1, 0, 0\);')
         guest_calls = re.findall(r'vk_occ_draw\(\);\s*vkCmdDraw\w*\(', runtime)
-        self.assertEqual(len(guest_calls), 7)
+        self.assertEqual(len(guest_calls), 8)  # includes the raster draw of mesh emulation
 
 
 if __name__ == '__main__':

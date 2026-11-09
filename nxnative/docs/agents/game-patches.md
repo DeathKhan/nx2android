@@ -705,20 +705,24 @@ Cuts of Nintendo SDK `sdk` builds ([sdk_patches.py](../../dm/tools/sdk_patches.p
 - **`build` → `sdk`**, address space, blocked: no copy on the drive to compare, judgement: rows of builds not on the game drive (9c73fb73, e01950c5). Likely what the rules give (each names one of their implementations)
 - **`build` → `sdk`**, address space, blocked: one game ships it, judgement: VammManager node area and alignment, SDK 4.4.0 (9de92bad). An older implementation no rule covers (its large regions aligned to 32 MB, not the rules' 2 MB); a rule once a second game ships it
 
-- **sdk** `9de92bad…` ([sdk_patches.py:9](../../dm/tools/sdk_patches.py#L9)): Mario + Rabbids Kingdom Battle 1.9.589692
+- **sdk** `1643a838…` ([sdk_patches.py:8](../../dm/tools/sdk_patches.py#L8)): The Legend of Zelda: Ocarina of Time v131072
+  - cut `+0x16d0e8`: context start: pacia x16,x9 (the entry signed with the IA key) → nop
+  - cut `+0x16d0f8`: context start: pacia x17,x9 (the same, for the compare) → nop
+  - cut `+0x16d40c`: context start: autiasp (the entry authenticated against the stack top; traps with FPAC on Android) → nop
+- **sdk** `9de92bad…` ([sdk_patches.py:18](../../dm/tools/sdk_patches.py#L18)): Mario + Rabbids Kingdom Battle 1.9.589692
   - cut `+0x93dfc`: VammManager node area limit: 1 GB to 64 MB
   - cut `+0x93e8c`: VammManager occupied node area: 1 GB to 64 MB
   - cut `+0x93fe0`: AllocateAddressRegion: align regions of 1 GB and more to 32 MB
-- **sdk** `311deab1…` ([sdk_patches.py:18](../../dm/tools/sdk_patches.py#L18)): Ace Attorney Investigations Collection 1.0.0.2, ROMANCE OF THE THREE KINGDOMS 8 REMAKE 1.1.3
+- **sdk** `311deab1…` ([sdk_patches.py:27](../../dm/tools/sdk_patches.py#L27)): Ace Attorney Investigations Collection 1.0.0.2, ROMANCE OF THE THREE KINGDOMS 8 REMAKE 1.1.3
   - cut `+0x139468`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x1394fc`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `12f16103…` ([sdk_patches.py:26](../../dm/tools/sdk_patches.py#L26)): Brain Memory Training Academy 1.0.0, Unicorn Overlord (Asia) 1.05, Unicorn Overlord 1.05
+- **sdk** `12f16103…` ([sdk_patches.py:35](../../dm/tools/sdk_patches.py#L35)): Brain Memory Training Academy 1.0.0, Unicorn Overlord (Asia) 1.05, Unicorn Overlord 1.05
   - cut `+0x134778`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x13480c`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `9c73fb73…` ([sdk_patches.py:33](../../dm/tools/sdk_patches.py#L33)): Patrick's Parabox 1.0.1
+- **sdk** `9c73fb73…` ([sdk_patches.py:42](../../dm/tools/sdk_patches.py#L42)): Patrick's Parabox 1.0.1
   - cut `+0x37c3b0`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x37c44c`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `e01950c5…` ([sdk_patches.py:41](../../dm/tools/sdk_patches.py#L41)): Hollow Knight: Silksong 1.0.30000
+- **sdk** `e01950c5…` ([sdk_patches.py:50](../../dm/tools/sdk_patches.py#L50)): Hollow Knight: Silksong 1.0.30000
   - cut `+0x145bfc`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x145c68`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
 

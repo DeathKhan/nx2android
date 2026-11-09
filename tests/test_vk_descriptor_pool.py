@@ -18,9 +18,17 @@ class DescriptorPool(unittest.TestCase):
         capacities = source[start:source.index("static nvn_hmap g_dsl_need", start)]
         start = source.index("static VkDescriptorSet descriptor_alloc_set(")
         allocate = source[start:source.index("VkDescriptorSet vk_alloc_set(", start)]
-        start = source.index("static void descriptor_pools_reset(")
+        start = source.index("static int descriptor_large_reuse(")
         reset = source[start:source.index("static void slot_recycle(", start)]
+        lease = source[source.index("uint64_t vk_descriptor_lease("):source.index("// ---------------- submissions: begin, CPU-visible effects, commit")]
+        oversized = "\n".join(line for line in source.splitlines()
+                              if line.startswith("enum { DPX_KEEP") or line.startswith("typedef struct { VkDescriptorPool pool;") or line.startswith("static uint64_t g_descriptor_lease"))
+        # The allocator's eligibility reset is behind the real slot completion wait.
+        recycle = source[source.index("static void slot_recycle("):source.index("static vksub_t *cur(")]
+        self.assertLess(recycle.index("mtl_wait(s->fence"), recycle.index("descriptor_pools_reset(s)"))
+        self.assertLess(recycle.index("wait_fence(s->fence"), recycle.index("descriptor_pools_reset(s)"))
         code = r"""
+#define _POSIX_C_SOURCE 200809L
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
 #include <assert.h>
@@ -37,11 +45,12 @@ static uint64_t kgsl_mapped(void){return 0;}
 static void vklog(const char *f,...){(void)f;}
 #define VKLOG(...) vklog(__VA_ARGS__)
 DECLARATIONS
+OVERSIZED
 CAPACITIES
 typedef struct {
  VkDescriptorPool *dp; int ndp,capdp,dp_cur;
  uint32_t dp_used[DP_TYPES],dp_sets; int dp_counted;
- VkDescriptorPool *dpx; int ndpx,capdpx;
+ dpx_entry *dpx; int ndpx,capdpx;
 } vksub_t;
 static void vkDestroyDescriptorPool(VkDevice device,VkDescriptorPool pool,const VkAllocationCallbacks *cb){(void)device;(void)cb;assert(pool);destroyed++;}
 static int g_dsl_need;
@@ -71,8 +80,11 @@ static VkResult vkAllocateDescriptorSets(VkDevice device,const VkDescriptorSetAl
  for(int t=0;t<DP_TYPES;t++){assert(pools[p].used[t]+needs[l][t]<=pools[p].capacity[t]);pools[p].used[t]+=needs[l][t];}
  pools[p].sets++;*out=H(VkDescriptorSet,++next_set);return VK_SUCCESS;
 }
+static vksub_t *active_slot;
+static vksub_t *cur(void){return active_slot;}
 RESET
 ALLOCATE
+LEASE
 static void fresh(vksub_t *s) {
  free(s->dp);free(s->dpx);memset(s,0,sizeof *s);s->dp_counted=-1;
  memset(needs,0,sizeof needs);memset(pools,0,sizeof pools);
@@ -81,6 +93,7 @@ static void fresh(vksub_t *s) {
 }
 static VkDescriptorSet take(vksub_t *s,uint32_t layout){return descriptor_alloc_set(s,H(VkDescriptorSetLayout,layout));}
 int main(void) {
+ unsetenv("DM_VK_DPX_REUSE");
  vksub_t s={0};fresh(&s);
  needs[1][VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC]=2;needs[1][VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER]=4;
  for(int i=0;i<32;i++)assert((uintptr_t)take(&s,1)==(uintptr_t)i+1);
@@ -116,12 +129,78 @@ int main(void) {
  take(&s,1);take(&s,2);take(&s,2);assert(s.ndpx==2&&s.ndp==1&&pool_count==3&&g_desc_alloc_sets==3&&s.dp_sets==1);
  s.ndp=DP_KEEP+3;s.dp=realloc(s.dp,(size_t)s.ndp*sizeof *s.dp);for(int i=1;i<s.ndp;i++)s.dp[i]=s.dp[0];
  destroyed=0;descriptor_pools_reset(&s);assert(destroyed==5&&s.ndpx==0&&s.ndp==DP_KEEP&&g_dp_freed==3&&s.dp_cur==0);
- free(s.dpx);free(s.dp);
- puts("descriptor pools: all type budgets, maxSets, failures, reset and slot isolation passed");
+ // Oversized sets remain unique throughout an open submission. Completion makes
+ // only exact-layout matches reusable, without resetting/reallocating their pool.
+ fresh(&s);setenv("DM_VK_DPX_REUSE","1",1);
+ needs[2][VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE]=131074;
+ needs[3][VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE]=131074; // same counts, different layout
+ VkDescriptorSet a=take(&s,2),b=take(&s,2);assert(a!=b);
+ assert(pool_count==2&&g_desc_alloc_calls==2);
+ descriptor_pools_reset(&s);assert(s.ndpx==2&&!s.dpx[0].used&&!s.dpx[1].used);
+ assert(take(&s,2)==a&&take(&s,2)==b);
+ VkDescriptorSet c=take(&s,2);assert(c!=a&&c!=b&&pool_count==3);
+ VkDescriptorSet d=take(&s,3);assert(d!=a&&d!=b&&d!=c&&pool_count==4);
+ for(unsigned i=1;i<=pool_count;i++)assert(pools[i].generation==1&&pools[i].sets==1);
+ assert(g_desc_alloc_calls==4&&g_desc_alloc_sets==4); // reused sets are not driver allocations
+ vksub_t independent={.dp_counted=-1};VkDescriptorSet x=take(&independent,2);
+ assert(x!=a&&x!=b&&x!=c&&x!=d);descriptor_pools_reset(&independent);
+ assert(take(&independent,2)==x&&take(&s,2)!=x);free(independent.dpx);independent.dpx=NULL;independent.ndpx=0;
+ // Content leases are exact-slot and one-use. Normal rewrite allocation changes the token.
+ active_slot=&s;uint64_t token=vk_descriptor_lease(a,0);assert(token);
+ assert(!vk_descriptor_claim(a,token)); // still in flight/currently owned
+ descriptor_pools_reset(&s);assert(vk_descriptor_claim(a,token));assert(!vk_descriptor_claim(a,token));
+ assert(vk_descriptor_lease(a,0)==token);
+ uint64_t revised=vk_descriptor_lease(a,1);assert(revised&&revised!=token);
+ descriptor_pools_reset(&s);assert(!vk_descriptor_claim(a,token));assert(vk_descriptor_claim(a,revised));
+ descriptor_pools_reset(&s);assert(take(&s,2)==a);assert(vk_descriptor_lease(a,0)!=revised);
+ active_slot=&independent;assert(!vk_descriptor_claim(a,revised));active_slot=&s;
+ // Retention is bounded even if a loading submission allocates many huge sets.
+ fresh(&s);needs[2][VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE]=131074;
+ for(int i=0;i<DPX_KEEP+7;i++)take(&s,2);
+ destroyed=0;descriptor_pools_reset(&s);
+ assert(s.ndpx==DPX_KEEP&&destroyed==7);
+ for(int i=0;i<DPX_KEEP;i++)assert(!s.dpx[i].used);
+ // Unused retained sets expire at the very next recycle, not after a long idle timeout.
+ destroyed=0;descriptor_pools_reset(&s);assert(!s.ndpx&&destroyed==DPX_KEEP);
+ // The aggregate descriptor budget bounds retention independently of entry count.
+ fresh(&s);needs[2][VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE]=DPX_DESCRIPTORS/2+1;
+ for(int i=0;i<3;i++)take(&s,2);
+ destroyed=0;descriptor_pools_reset(&s);assert(s.ndpx==1&&destroyed==2);
+ assert(take(&s,2)==H(VkDescriptorSet,1)); // the surviving immutable allocation
+ // Only F1-leased contents get bounded idle retention. Eight unused completed-slot
+ // cycles are allowed; the ninth expires it. Original DPX-only expiry remains above.
+ fresh(&s);needs[2][VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE]=131074;active_slot=&s;
+ setenv("DM_VK_POOL_PERSIST","1",1);a=take(&s,2);token=vk_descriptor_lease(a,0);
+ descriptor_pools_reset(&s);
+ for(int idle=1;idle<=8;idle++){descriptor_pools_reset(&s);assert(s.ndpx==1&&s.dpx[0].idle==(unsigned)idle);}
+ assert(vk_descriptor_claim(a,token));descriptor_pools_reset(&s);assert(s.dpx[0].idle==0);
+ for(int idle=0;idle<9;idle++)descriptor_pools_reset(&s);
+ assert(!s.ndpx);
+ // Pool destruction/driver handle reuse cannot revive a stale content token.
+ fresh(&s);needs[2][VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE]=131074;a=take(&s,2);assert(a==H(VkDescriptorSet,1));
+ descriptor_pools_reset(&s);assert(!vk_descriptor_claim(a,token));
+ // F1 idle retention cannot increase either existing cap.
+ fresh(&s);needs[2][VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE]=DPX_DESCRIPTORS/2+1;
+ for(int i=0;i<3;i++){a=take(&s,2);assert(vk_descriptor_lease(a,0));}
+ descriptor_pools_reset(&s);assert(s.ndpx==1);
+ descriptor_pools_reset(&s);assert(s.ndpx==1);
+ unsetenv("DM_VK_POOL_PERSIST");
+ fresh(&s);needs[2][VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE]=DPX_DESCRIPTORS/2+1;
+ take(&s,2);descriptor_pools_reset(&s);assert(take(&s,2)==H(VkDescriptorSet,1));
+ // Disable live: no retained set is handed out, and all old pools disappear safely at recycle.
+ setenv("DM_VK_DPX_REUSE","0",1);VkDescriptorSet z=take(&s,2);
+ assert(z!=H(VkDescriptorSet,1));destroyed=0;descriptor_pools_reset(&s);
+ assert(!s.ndpx&&destroyed==2);
+ // A single layout beyond the entire retention budget is never kept.
+ fresh(&s);setenv("DM_VK_DPX_REUSE","1",1);
+ needs[2][VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE]=DPX_DESCRIPTORS+1;take(&s,2);
+ destroyed=0;descriptor_pools_reset(&s);assert(!s.ndpx&&destroyed==1);
+ unsetenv("DM_VK_DPX_REUSE");free(s.dpx);free(s.dp);
+ puts("descriptor pools: budgets, failure, completed-slot reuse, bounds and layout/slot isolation passed");
 }
 """
-        for name, value in (("DECLARATIONS", declarations), ("CAPACITIES", capacities),
-                            ("RESET", reset), ("ALLOCATE", allocate)):
+        for name, value in (("DECLARATIONS", declarations), ("OVERSIZED", oversized), ("CAPACITIES", capacities),
+                            ("RESET", reset), ("ALLOCATE", allocate), ("LEASE", lease)):
             code = code.replace(name, value)
         target = ROOT / "target/tests"; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="descriptor-pool-", dir=target) as tmp:

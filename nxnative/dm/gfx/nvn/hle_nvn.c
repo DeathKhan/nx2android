@@ -134,17 +134,32 @@ HLE_FORCE("nvnBootstrapLoader", "the NVN graphics API is replaced wholesale with
 
 #include "nvn_obj.h"
 #include "nvn_queue.h"
-// Logical NVN queues (upstream nvn_queue.inc, ea0c98df3: event and sync waits park their queue, a replay worker runs the ready continuations) on Apple. The Android
-// replay keeps its own path: synchronous on the submitting thread, or the DM_NVN_ASYNC replay thread, with physical fences. The scheduler's backend hooks
-// (mtl_completed_fence, mtl_tex_pin, mtl_prog_snapshot, GPU event publishing) are not in the Vulkan replay; OP_WAIT_EVENT / OP_WAIT_SYNC are recorded on both and
-// the Vulkan replay takes them as it took the calls before (no wait)
+// The continuation scheduler is always compiled. Android keeps the established
+// replay by default; the startup-only switch enables a complete queue model for A/B.
 #ifndef NVN_LOGICAL_QUEUES
-#ifdef __ANDROID__
-#define NVN_LOGICAL_QUEUES 0
-#else
 #define NVN_LOGICAL_QUEUES 1
 #endif
+#ifdef __ANDROID__
+static pthread_once_t g_nq_config_once = PTHREAD_ONCE_INIT;
+static int g_nq_enabled;
+static void nq_config_init(void) {
+    const char *e = getenv("DM_NVN_LOGICAL_QUEUES");
+    g_nq_enabled = NVN_LOGICAL_QUEUES && e && !strcmp(e, "1");
+    if (g_nq_enabled) LOG("[nvn] logical queues enabled: event/sync continuations and retained submission resources");
+}
+int nvn_logical_queues_on(void) { pthread_once(&g_nq_config_once, nq_config_init); return g_nq_enabled; }
+#else
+int nvn_logical_queues_on(void) { return NVN_LOGICAL_QUEUES; }
 #endif
+// New resource serialization applies only to the Android opt-in path. Apple's
+// existing scheduler/backend locking stays unchanged.
+static int nvn_logical_android_on(void) {
+#ifdef __ANDROID__
+    return nvn_logical_queues_on();
+#else
+    return 0;
+#endif
+}
 #include "nvn_capture.h"   // DM_NVN_CAPTURE hooks
 
 // ---------- Device ----------
@@ -338,12 +353,16 @@ NVN(nvnTexturePoolInitialize, NVNboolean, NVNtexturePool *tp, const NVNmemoryPoo
 }
 NVN(nvnTexturePoolFinalize, void, NVNtexturePool *tp) { (void)tp; }
 NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) {
+    if (nvn_logical_android_on()) pthread_mutex_lock(&g_sub_mu);
     mtl_reg_tex(dpool_base(g_tpb, g_ntpb, tp) + id, (const tex_t *)t, (const view_t *)v);
+    if (nvn_logical_android_on()) pthread_mutex_unlock(&g_sub_mu);
 }
 // Image descriptors live in the same pool index space as texture descriptors, and image handles are pool indices (nvnDeviceGetImageHandle; BindImages below), so an image
 // registers into the same table. Hyrule Warriors: Age of Calamity registers the images its compute shaders write in the first battle (earlier games registered only textures)
 NVN(nvnTexturePoolRegisterImage, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) {
+    if (nvn_logical_android_on()) pthread_mutex_lock(&g_sub_mu);
     mtl_reg_image(dpool_base(g_tpb, g_ntpb, tp) + id, (const tex_t *)t, (const view_t *)v);
+    if (nvn_logical_android_on()) pthread_mutex_unlock(&g_sub_mu);
 }
 NVN(nvnSamplerPoolInitialize, NVNboolean, NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
     *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n); dpool_add(g_spb, &g_nspb, &g_snext, sp, n, "sampler"); return 1;
@@ -896,19 +915,18 @@ static int seq_on(void) { static uint64_t until; const char *e = getenv("DM_NVN_
 #define SEQ(...) do { if (seq_on()) { char sb_[256]; snprintf(sb_, sizeof sb_, __VA_ARGS__); LOG("[seq] f%llu t%lx %.3f %s", (unsigned long long)g_frame, (unsigned long)(uintptr_t)pthread_self(), now_ns() / 1e6, sb_); } } while (0)
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) {
 #if NVN_LOGICAL_QUEUES
-    (void)c; (void)f; nvn_queue_fence((queue_t *)q, (sync_t *)s); SEQ("fence %p", (void *)s);
-#else
-    (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = nvn_fence_now(); SEQ("fence %p", (void *)s);
+    if (nvn_logical_queues_on()) { (void)c; (void)f; nvn_queue_fence((queue_t *)q, (sync_t *)s); SEQ("fence %p", (void *)s); return; }
 #endif
+    (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = nvn_fence_now(); SEQ("fence %p", (void *)s);
 }
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
 // Queue dependencies capture the current logical receipt; later re-fencing or finalizing the sync cannot retarget work already queued.
+NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
 #if NVN_LOGICAL_QUEUES
-NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { nvn_queue_wait_sync((queue_t *)q,(const sync_t *)s); return 1; }
-#else
-// Android: one replay order (submission order), so commands fenced before are done first; a sync not fenced yet is not waited for (logged once)
-NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; static int once; if (!((const sync_t *)s)->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait"); return 1; }
+    if (nvn_logical_queues_on()) { nvn_queue_wait_sync((queue_t *)q, (const sync_t *)s); return 1; }
 #endif
+    (void)q; static int once; if (!((const sync_t *)s)->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait"); return 1;
+}
 // ZCull data: the host does no ZCull, so there is nothing to save / restore
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
@@ -977,11 +995,12 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
+NVN(nvnQueueFinish, void, NVNqueue *q) {
 #if NVN_LOGICAL_QUEUES
-NVN(nvnQueueFinish, void, NVNqueue *q) { nvn_queue_finish((queue_t *)q); }
-#else
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; uint64_t t0 = now_ns(); nvn_drain(); mtl_finish(); SEQ("finish %.2f ms", (now_ns() - t0) / 1e6); }
+    if (nvn_logical_queues_on()) { nvn_queue_finish((queue_t *)q); return; }
 #endif
+    (void)q; uint64_t t0 = now_ns(); nvn_drain(); mtl_finish(); SEQ("finish %.2f ms", (now_ns() - t0) / 1e6);
+}
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
 #define CB(c) ((cmd_t *)(c))
@@ -1561,10 +1580,11 @@ typedef struct { int kind, n; uint64_t *h; NVNqueue *q; const tex_t *tex; double
 // its replay, and what the GPU still had to do after it (Xenoblade Chronicles 3 waits for each frame's GPU work before submitting the next, so its frame is all four)
 static uint64_t g_tl_enq, g_tl_start, g_tl_end, g_tl_wret, g_tl_sum[4], g_tl_n, g_tl_jobs, g_tl_lastjob;
 static nvn_job *g_jobs; static int g_njob, g_capjob;
+static _Atomic uint64_t g_nq_enqueued; // logical job IDs never depend on execution order
 static uint64_t g_replaying;   // the job being replayed (nvn_replaying_job)
 static uint64_t g_job_enq, g_job_done, g_job_fence[JOB_RING];   // jobs queued and replayed so far; the commit fence each left (by job number)
 static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_job_cv = PTHREAD_COND_INITIALIZER, g_jobdone_cv = PTHREAD_COND_INITIALIZER;
-static int nvn_async(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_ASYNC"); on = !NVN_LOGICAL_QUEUES && e && atoi(e); } return on; }   // (the logical queues replay on their own worker)
+static int nvn_async(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_ASYNC"); on = !nvn_logical_queues_on() && e && atoi(e); } return on; }   // (the logical queues replay on their own worker)
 static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h, uint64_t frame);
 __attribute__((weak)) void dm_perf_replay_work(uint64_t frame, uint64_t begin, uint64_t end) { (void)frame; (void)begin; (void)end; }
 static void *replay_main(void *arg) {
@@ -1587,7 +1607,7 @@ static void *replay_main(void *arg) {
     return NULL;
 }
 // For the backend's texture table (gfx_vk_tex.c mtl_reg_tex / vk_tex_by_id): the jobs queued so far, and the one being replayed (0: none, or no replay thread)
-uint64_t nvn_jobs_queued(void) { return nvn_async() ? __atomic_load_n(&g_job_enq, __ATOMIC_RELAXED) : 0; }
+uint64_t nvn_jobs_queued(void) { if (nvn_logical_queues_on()) return atomic_load(&g_nq_enqueued); return nvn_async() ? __atomic_load_n(&g_job_enq, __ATOMIC_RELAXED) : 0; }
 uint64_t nvn_replaying_job(void) { return __atomic_load_n(&g_replaying, __ATOMIC_RELAXED); }
 static uint64_t job_push(nvn_job j) {   // → the job's number
     static pthread_once_t once = PTHREAD_ONCE_INIT; void replay_start(void); pthread_once(&once, replay_start);
@@ -1626,14 +1646,17 @@ static int nvn_fence_wait(uint64_t f, uint64_t timeout_ns, int kind) {
         if (g_tl_n == 300) { LOG("[timeline] per frame: game gap %.1f ms, queue delay %.1f, replay %.1f, GPU tail %.1f; %.1f jobs", g_tl_sum[0] / 3e8, g_tl_sum[1] / 3e8, g_tl_sum[2] / 3e8, g_tl_sum[3] / 3e8, g_tl_jobs / 300.0); memset(g_tl_sum, 0, sizeof g_tl_sum); g_tl_n = 0; g_tl_jobs = 0; } }
     return r;
 }
-static void nvn_drain(void) {   // every job queued before this guest-thread lifecycle call has replayed
+static void nvn_drain(void) {   // FIFO replay only: finish jobs queued before this lifecycle call.
+    // Logical queues own copied descriptors instead; draining every parked queue
+    // here could block the CPU which must signal its event. Guest backing storage
+    // must remain valid until its queue dependencies complete (as on Apple).
     if (nvn_async()) {
         pthread_mutex_lock(&g_job_mu); uint64_t target = g_job_enq; pthread_mutex_unlock(&g_job_mu);
         job_wait(target, ~0ull);   // no submission/job lock held while the replay worker progresses
     }
 }
-static void replay_lock(void) { if (nvn_async()) pthread_mutex_lock(&g_sub_mu); }
-static void replay_unlock(void) { if (nvn_async()) pthread_mutex_unlock(&g_sub_mu); }
+static void replay_lock(void) { if (nvn_async() || nvn_logical_android_on()) pthread_mutex_lock(&g_sub_mu); }
+static void replay_unlock(void) { if (nvn_async() || nvn_logical_android_on()) pthread_mutex_unlock(&g_sub_mu); }
 // Under asynchronous replay the game may record into its command memory again before the replay thread reaches what it submitted (Unicorn Overlord's skipped
 // scenes: the replay read overwritten records, "unknown record op", and drew nothing while the sound went on). So each submitted handle is copied whole when it
 // is submitted: JUMPs followed, CALLs inlined, and the pointers a record keeps to its own texture snapshots (tex_snap) moved with it. out NULL: only the size (sub_copy)
@@ -1660,12 +1683,14 @@ static uint64_t sub_copy(uint64_t h) {
     size_t at = sub_flat(p, c, 0, n - 8, 0); op_hdr e = {OP_END, 8}; memcpy(c + at, &e, 8);
     g_flat_bytes += n; return (uint64_t)(uintptr_t)c;
 }
-// Upstream's logical NVN queues (nvn_queue.inc, ea0c98df3) on Apple; the Android replay keeps its own path (see NVN_LOGICAL_QUEUES), with these in their place:
+// Builds explicitly excluding the logical scheduler retain these physical-fence hooks:
 // a sync is fenced with a physical (or replay-job) fence, and an event signal from the CPU is a release-ordered store
 #if !NVN_LOGICAL_QUEUES
 void nvn_sync_release(sync_t *s) { (void)s; }
 void nvn_queue_present_release(uint64_t ticket) { (void)ticket; }
 void nvn_queue_forget(queue_t *q) { (void)q; }
+void nvn_queue_gpu_progress(void) {}
+void nvn_event_publish_gpu(volatile uint32_t *word, unsigned mode, uint32_t value, uint64_t fence) { (void)fence; nvn_event_publish(word,mode,value); }
 void nvn_event_publish(volatile uint32_t *word, unsigned mode, uint32_t value) {
     if (mode == NVN_EVENT_SIGNAL_MODE_ADD) atomic_fetch_add_explicit((_Atomic uint32_t *)word, value, memory_order_release);
     else atomic_store_explicit((_Atomic uint32_t *)word, value, memory_order_release);
@@ -1676,8 +1701,8 @@ void nvn_event_publish(volatile uint32_t *word, unsigned mode, uint32_t value) {
 #endif
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
 #if NVN_LOGICAL_QUEUES
-    ((queue_t *)q)->submits++;
-    nvn_queue_submit((queue_t *)q, n, (const uint64_t *)h); return;
+    if (nvn_logical_queues_on()) { ((queue_t *)q)->submits++;
+        nvn_queue_submit((queue_t *)q, n, (const uint64_t *)h); return; }
 #endif
     if (nvn_async()) { uint64_t *c = malloc(sizeof *c * (size_t)(n > 0 ? n : 1)); for (int i = 0; i < n; i++) c[i] = sub_copy(h[i]); ((queue_t *)q)->submits++;
         static uint64_t ns, last; if (++ns % 600 == 0) { LOG("[nvn] submissions copied for the replay thread: %.2f MB each (last 600)", (g_flat_bytes - last) / 600.0 / 1048576); last = g_flat_bytes; }
@@ -1844,19 +1869,21 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     pace_ns += mtl_snap_acquire_wait();   // ring capacity is waited for at acquire, where the game does not hold its present lock
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
-#if NVN_LOGICAL_QUEUES
     uint64_t pq_ns = 0;
+#if NVN_LOGICAL_QUEUES
+    if (nvn_logical_queues_on()) {
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); nvn_queue_present_wait(tk); nvn_queue_present_release(tk); o->ticket[*idx] = 0; pq_ns = now_ns() - w0; }
     g_pq_wait_ns += pq_ns;
     if (s) { nvn_sync_release((sync_t *)s); ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
-#else
+    } else
+#endif
+    {
     // The wait for the present thread (pq_ns) goes to the adaptive frame rate apart from the frame's work: at 40 or 30 fps it is the longer period's own pace
     // (Super Mario Odyssey's title held 30 fps with 1 ms of GPU work a frame and showed 60 when pinned there). The CPU hint still counts it as work: with the
     // replay on its own thread it holds the replay's and the GPU's time too, and without it the hint let the CPU clocks fall to 1 GHz (perf_android.c).
     // With the replay on its own thread the pace can be in the wait for the present's job (the replay thread held by the full present queue); the replay's
     // own time in that wait comes back to the rate as the frame's replay time (dm_perf_frame_cost)
-    uint64_t pq_ns = 0;
     uint64_t tk = *idx < 4 ? __atomic_load_n(&o->ticket[*idx], __ATOMIC_ACQUIRE) : 0;
     if (tk & ASYNC_FENCE) { uint64_t w0 = now_ns(); job_wait(tk & ~ASYNC_FENCE, ~0ull); pq_ns = now_ns() - w0; tk = __atomic_load_n(&o->ticket[*idx], __ATOMIC_ACQUIRE); }   // its present still queued
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); pq_ns += now_ns() - w0; }
@@ -1871,7 +1898,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // here; its work between presenting and acquiring (~13 ms a frame) still overlaps the replay. DM_NVN_ACQ_REPLAYED=0: no wait
     { static int w = -1; if (w < 0) { const char *ar = getenv("DM_NVN_ACQ_REPLAYED"); w = !(ar && !atoi(ar)); } if (w && nvn_async()) job_wait(g_job_enq, ~0ull); }
     if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = acq_now || *idx >= 4 ? nvn_fence_now() : o->done[*idx]; }   // (fenced 2: an acquire sync, waited through mtl_wait_acq for the wait ledger)
-#endif
+    }
     SEQ("acquire %d sync %p", *idx, (void *)s);   // The swapchain texture becomes available once the commits before this point have completed
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; dm_perf_frame_start_id(g_frame, pace_ns, pq_ns); }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
@@ -2472,15 +2499,18 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // enqueue only, return immediately
         const tex_t *t = CTX(o->tex[idx]); int lc[4]; const int *crop = present_crop(o->crop, (int)t->d.width, (int)t->d.height, lc);
 #if NVN_LOGICAL_QUEUES
+        if (nvn_logical_queues_on()) {
         nvn_queue_present_release(o->ticket[idx]);
         o->ticket[idx] = nvn_queue_present((queue_t *)q,t,present_period(o) / 1e9,crop);
-#else
+        } else
+#endif
+        {
         nvn_cap_present(t, crop);   // DM_NVN_CAPTURE (nvn_capture.inc)
         o->done[idx] = nvn_fence_now();
         if (nvn_async()) { nvn_job j = {JOB_PRESENT, 0, NULL, q, t, present_period(o) / 1e9, {0}, &o->ticket[idx]}; memcpy(j.crop, crop, sizeof j.crop);
             o->ticket[idx] = ASYNC_FENCE | (g_job_enq + 1); job_push(j); }   // (the job overwrites the ticket with the present's own when it runs)
         else o->ticket[idx] = mtl_present(t, present_period(o) / 1e9, crop);
-#endif
+        }
     }
     gfx_leave();
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
@@ -2563,13 +2593,11 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     dump_frame();
     { void dm_vi_frame_queued(uint64_t); dm_vi_frame_queued(g_frame); }   // the layer's frame history (hle_vi.c), numbered as GetLatestFrameNumber
     if (g_frame % TWIN == 0) tsummary(g_frame);
-#if NVN_LOGICAL_QUEUES
-    // GPU replay carries the submitted frame, even when a later CPU frame is already queued.
-#else
 #ifdef __ANDROID__
-    if (!nvn_async()) mtl_set_frame(g_frame);   // Queued Android work carries its own frame ID.
+    if (!nvn_async() && !nvn_logical_queues_on()) mtl_set_frame(g_frame);
 #else
-    mtl_set_frame(g_frame);   // Metal also advances capture and A/B state here.
+#if !NVN_LOGICAL_QUEUES
+    mtl_set_frame(g_frame);
 #endif
 #endif
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
@@ -3497,6 +3525,7 @@ int nvn_host_write_texture(const void *nvntex, const void *src, int w, int h, si
 int nvn_host_signal_sync(void *nvnsync) {
     sync_t *o = nvnsync;
     if (!o || o->magic != MAGIC('S', 'Y', 'N', 'C')) return -1;
+    nvn_sync_release(o);   // release a retained logical receipt before replacing it with CPU-complete work
     o->fence = 0; o->fenced = 1; return 0;
 }
 NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }   // unified memory + dirty page tracking: nothing to flush

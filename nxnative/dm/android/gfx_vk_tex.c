@@ -9,6 +9,7 @@
 #include "nvn_tex.h"
 #include "../gfx/tex/nvn_deswizzle.h"
 #include "nvn_hmap.h"
+#include "nvn_queue.h"
 #include "gfx_vk_cpu_storage.h"   // storage the GPU writes, uncompressed textures taken from storage (nvn_mtl.m gws_span / cpu_unc)
 #include <string.h>
 #include <sys/mman.h>
@@ -172,17 +173,24 @@ static VkFormat srgb_twin(VkFormat f) {
 // such a game wants DM_VK_UBWC=2 in its profile
 static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 3; } return v; }
 // A float colour format the device cannot store to from a shader (Adreno: E5B9G9R9 and B10G11R11 have no STORAGE_IMAGE feature) is promoted to R16G16B16A16_SFLOAT when the image needs
-// image stores (the IMAGE flag, or a storage bind's preflight): the image is the host's own copy, never the guest's bytes, so its format is free; the same channels, more precision.
-// Ocarina of Time's compute passes store into its E5B9G9R9 HDR buffers (VkFormat 123), whose stores were dropped before ("storage binding format 123 cannot support image stores")
+// numeric image stores through that same format. A different-format storage view can instead write packed bits (for example R32F over RGB9E5).
+// Defer the choice until storage preflight knows the effective view; the builder IMAGE flag alone cannot distinguish numeric stores from bit reinterpretation.
 static VkFormat storage_promote(const vkfmt_t *f) {
     if (!f || (f->vk != VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && f->vk != VK_FORMAT_B10G11R11_UFLOAT_PACK32)) return VK_FORMAT_UNDEFINED;
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, f->vk, &fp); if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) return VK_FORMAT_UNDEFINED;
     vkGetPhysicalDeviceFormatProperties(V.pd, VK_FORMAT_R16G16B16A16_SFLOAT, &fp); return fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_UNDEFINED;
 }
-static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f, VkImageUsageFlags extra_usage) {
+// Uncompressed colour views of the same texel size are Vulkan-compatible. Decoded/compressed/depth views need separate rules.
+static int storage_view_compatible(const vkfmt_t *base, const vkfmt_t *view) {
+    return base && view && !base->compressed && !view->compressed && !base->dec && !view->dec &&
+        !base->depth && !view->depth && !base->stencil && !view->stencil &&
+        base->bw == 1 && base->bh == 1 && view->bw == 1 && view->bh == 1 && base->bpb && base->bpb == view->bpb;
+}
+static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f, VkImageUsageFlags extra_usage, VkFormat storage_format) {
     vkimg_t *im = calloc(1, sizeof *im);
     const nvn_texdesc *d = &t->d;
-    vkfmt_t pf; VkFormat pv = (extra_usage & VK_IMAGE_USAGE_STORAGE_BIT) || (d->flags & NVN_TEXTURE_FLAGS_IMAGE) ? storage_promote(f) : VK_FORMAT_UNDEFINED;
+    int storage_reinterpret = (extra_usage & VK_IMAGE_USAGE_STORAGE_BIT) && storage_format != VK_FORMAT_UNDEFINED && storage_format != f->vk;
+    vkfmt_t pf; VkFormat pv = (extra_usage & VK_IMAGE_USAGE_STORAGE_BIT) && !storage_reinterpret ? storage_promote(f) : VK_FORMAT_UNDEFINED;
     if (pv) { pf = *f; pf.vk = pv; pf.swz = (VkComponentMapping){0}; f = &pf; im->promoted = 1; extra_usage |= VK_IMAGE_USAGE_STORAGE_BIT;
         static int nl; if (nl++ < 8) VKLOG("image %ux%ux%u nvn format %#x (vk %d) promoted to R16G16B16A16_SFLOAT for image stores (flags %#x, target %d)", d->width, d->height, d->depth, d->format, pv, d->flags, d->target); }
     im->w = d->width ? d->width : 1; im->h = d->target == 0 || d->target == 3 ? 1 : (d->height ? d->height : 1);
@@ -208,7 +216,7 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f, VkImageUsageFlags extr
         {im->w, im->h, im->d}, im->levels, im->layers, (VkSampleCountFlagBits)im->samples, VK_IMAGE_TILING_OPTIMAL, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     if (im->samples > 1) ci.flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     VkFormat fl[2] = {f->vk, srgb_twin(f->vk)}; VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, fl[1] ? 2u : 1u, fl};
-    if (!f->compressed && (ubwc_mode() & (im->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? 1 : 2))) {   // (a depth format has no twin: a list of itself, no MUTABLE_FORMAT)
+    if (!storage_reinterpret && !f->compressed && (ubwc_mode() & (im->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? 1 : 2))) {   // (a depth format has no twin: a list of itself, no MUTABLE_FORMAT)
         im->fixed_fmt = 1; im->fmt2 = fl[1]; ci.pNext = &fli;
         ci.flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_EXTENDED_USAGE_BIT; if (!fl[1]) ci.flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
@@ -325,14 +333,80 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 60 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted, g_img_vkbytes;   // live images and their bytes (guest layout; vkbytes: device memory), images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; g_img_vkbytes -= im->vkbytes; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+extern uint64_t g_tex_gen;
+#include "gfx_vk_texture_diag.h"
+static void img_drop(vkimg_t *im) { if (im->pins) {
+    // The native image survives a finalized pool, but its CPU watches must stop before that
+    // address can be reused. Orphan lookup never reads the former guest storage again.
+    if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len);
+    if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len);
+    im->lin_mem = NULL; im->lin_len = 0; im->pkg_mem = NULL; im->pkg_len = 0; im->pkg_released = 1;
+    im->orphan = 1; alias_unlink(im); g_tex_gen++; vk_tex_diag_native(TEX_DIAG_ORPHAN, NULL, im); return;
+} vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; g_img_vkbytes -= im->vkbytes; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
-        vkimg_t *o = g_by_key.vals[i]; if (!o || o->pool != pool || o->off >= off + size || off >= o->off + o->size || g_tex_frame - o->used < EVICT_KEEP) continue;
+        vkimg_t *o = g_by_key.vals[i]; if (!o || o->pins || o->pool != pool || o->off >= off + size || off >= o->off + o->size || g_tex_frame - o->used < EVICT_KEEP) continue;
         memcpy(&ks[n++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof(akey));
     }
     for (int j = 0; j < n; j++) { vkimg_t *o = nvn_hm_get(&g_by_key, &ks[j]); if (!o) continue; nvn_hm_del(&g_by_key, &ks[j]); img_drop(o); g_img_evicted++; }
+}
+// Snapshot pins are keyed by serial plus the exact storage description. A serial can have
+// aliases with different IMAGE flags; releasing its final pin releases every resolved alias.
+typedef struct tex_pin_image { akey key; vkimg_t *im; struct tex_pin_image *next; } tex_pin_image;
+typedef struct { uint64_t refs; tex_pin_image *images; } tex_pin;
+static nvn_hmap g_tex_pins = {.klen = sizeof(uint64_t)};   // g_img_mu
+static void tex_storage_key(akey *k, const tex_t *t, const vkfmt_t *f) {
+    memset(k, 0, sizeof *k); k->pool = (uint64_t)(uintptr_t)t->pool; k->off = t->off; k->d = t->d;
+    (void)f;
+    // IMAGE is usage intent, not a different storage allocation. Actual storage use upgrades
+    // the shared native image in vk_tex_storage_prepare while preserving its rendered contents.
+    k->d.flags &= NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT;
+}
+static tex_pin *tex_pin_get(uint64_t serial) {
+    tex_pin *p = nvn_hm_get(&g_tex_pins, &serial);
+    if (!p) { p = calloc(1, sizeof *p); if (!p) die("[vk] texture pin allocation failed"); nvn_hm_put(&g_tex_pins, &serial, p); }
+    return p;
+}
+static tex_pin_image *tex_pin_key(tex_pin *p, const akey *key) {
+    for (tex_pin_image *i = p->images; i; i = i->next) if (!memcmp(&i->key, key, sizeof *key)) return i;
+    tex_pin_image *i = calloc(1, sizeof *i); if (!i) die("[vk] texture pin image allocation failed");
+    i->key = *key; i->next = p->images; p->images = i; return i;
+}
+// g_img_mu held. Pinned old pool contents take precedence over a new image reusing its key.
+static vkimg_t *tex_image_find(const tex_t *t, const akey *key, tex_pin_image **pin_out) {
+    tex_pin *pin = nvn_hm_get(&g_tex_pins, &t->serial);
+    tex_pin_image *p = pin ? tex_pin_key(pin, key) : NULL;
+    if (pin_out) *pin_out = p;
+    return p && p->im ? p->im : t->pool ? nvn_hm_get(&g_by_key, key) : nvn_hm_get(&g_by_serial, &t->serial);
+}
+static void tex_image_pin_resolved(tex_pin_image *pin, vkimg_t *im) {
+    if (pin && !pin->im) { pin->im = im; im->pins++; }
+}
+void mtl_tex_snapshot(tex_t *copy, const tex_t *source) {
+    *copy = *source; if (!copy->serial) return;
+    akey key; tex_storage_key(&key, copy, vk_fmt(copy->d.format));
+    pthread_mutex_lock(&g_img_mu); tex_pin *p = tex_pin_get(copy->serial); p->refs++;
+    tex_pin_image *i = tex_pin_key(p, &key);
+    if (!i->im) { i->im = copy->pool ? nvn_hm_get(&g_by_key, &key) : nvn_hm_get(&g_by_serial, &copy->serial); if (i->im) i->im->pins++; }
+    pthread_mutex_unlock(&g_img_mu);
+}
+void mtl_tex_pin(uint64_t serial) {
+    if (!serial) return; pthread_mutex_lock(&g_img_mu);
+    tex_pin_get(serial)->refs++; pthread_mutex_unlock(&g_img_mu);
+}
+void mtl_tex_unpin(uint64_t serial) {
+    if (!serial) return; pthread_mutex_lock(&g_img_mu);
+    tex_pin *p = nvn_hm_get(&g_tex_pins, &serial);
+    if (p && !--p->refs) {
+        nvn_hm_del(&g_tex_pins, &serial);
+        for (tex_pin_image *i = p->images, *next; i; i = next) { next = i->next;
+            if (i->im && !--i->im->pins && i->im->orphan) img_drop(i->im);
+            free(i);
+        }
+        free(p);
+    }
+    pthread_mutex_unlock(&g_img_mu);
 }
 static vkimg_t *vk_tex_(const tex_t *t);
 // The pool tables (gfx_vk_exec.c tbl_set) bind every registered texture ID, so they must not make a texture's first use out of its being registered: Ocarina of Time registers
@@ -351,14 +425,14 @@ static int range_mapped(const uint8_t *mem, size_t len) {
 }
 int vk_tex_pool_ok(const tex_t *t) {
     if (!t || !t->mem || !t->L.size || t->magic != MAGIC('T', 'E', 'X', 0) || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
-    if (!vk_pool_holding((uint64_t)(uintptr_t)t->mem, t->L.size)) return 0;   // its pool is gone (mtl_pool_del); across the pool's chunks is fine for a CPU read
     const vkfmt_t *f = vk_fmt(t->d.format); if (!f) return 0;
-    akey k; memset(&k, 0, sizeof k); k.pool = (uint64_t)(uintptr_t)t->pool; k.off = t->off; k.d = t->d;   // the storage key, as vk_tex makes it
-    k.d.flags &= NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT | (f->depth || f->stencil ? 0 : NVN_TEXTURE_FLAGS_IMAGE);
+    akey k; tex_storage_key(&k, t, f);
     pthread_mutex_lock(&g_img_mu);
-    vkimg_t *im = t->pool ? nvn_hm_get(&g_by_key, &k) : nvn_hm_get(&g_by_serial, &t->serial);
-    int looked = im && __atomic_load_n(&im->looked, __ATOMIC_ACQUIRE), pk = im && im->packaged; uint32_t ck = im ? im->pool_ck : 0;
+    vkimg_t *im = tex_image_find(t, &k, NULL);
+    int looked = im && __atomic_load_n(&im->looked, __ATOMIC_ACQUIRE), pk = im && im->packaged, orphan = im && im->orphan; uint32_t ck = im ? im->pool_ck : 0;
     pthread_mutex_unlock(&g_img_mu);
+    if (orphan) return looked ? 2 : 0;   // a queued snapshot has native contents, not CPU storage
+    if (!vk_pool_holding((uint64_t)(uintptr_t)t->mem, t->L.size)) return 0;   // CPU reads may cross chunks of the live logical pool
     uint32_t g = vk_pool_gen();
     if (looked) {
         if (!pk || ck == g) return 2;
@@ -377,28 +451,27 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     const vkfmt_t *f = vk_fmt(t->d.format);
     if (!f) { VKRED_ONCE(14, "texture format %#x has no Vulkan counterpart here (first case %ux%u target %d)", t->d.format, t->d.width, t->d.height, t->d.target); return NULL; }
     if (t->d.target == NVN_TEXTURE_TARGET_BUFFER) return NULL;   // buffer textures: texel buffer views of the pool (vk_tex_view)
-    akey k; memset(&k, 0, sizeof k); k.pool = (uint64_t)(uintptr_t)t->pool; k.off = t->off; k.d = t->d;
-    // flags that do not change the storage's layout are not part of the key: on the Switch two textures over the same memory that differ only in them see the
-    // same texels. Xenoblade Chronicles 3 renders its shadow maps and depth-stencil buffer through textures with COMPRESSIBLE and samples them through others with
-    // IMAGE added; as separate images those were never written, the shadows were total and the stencil's material tags 0, and its lit scene black. IMAGE stays
-    // in the key for colour formats (it gives the image storage usage), not for depth and stencil, which cannot be storage images
-    k.d.flags &= NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT | (f->depth || f->stencil ? 0 : NVN_TEXTURE_FLAGS_IMAGE);
+    akey k; tex_storage_key(&k, t, f);   // every use of the same storage shares rendered contents
     int keyed = t->pool != NULL;
     pthread_mutex_lock(&g_img_mu);
-    vkimg_t *im = keyed ? nvn_hm_get(&g_by_key, &k) : nvn_hm_get(&g_by_serial, &t->serial);
+    tex_pin_image *pinned = NULL;
+    vkimg_t *im = tex_image_find(t, &k, &pinned);
     if (!im) {
         if (keyed) evict_overlaps(k.pool, t->off, (int64_t)t->L.size);
         if (vk_sub_open()) vk_img_budget_make_room(t->L.size);   // (the texture budget: the least recently drawn go once the GPU is past this submission)
-        im = img_new(t, f, 0); if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
+        im = img_new(t, f, 0, VK_FORMAT_UNDEFINED); if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
         im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = t->d.flags; g_img_n++; g_img_bytes += t->L.size; g_img_vkbytes += im->vkbytes;
         if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);
     }
-    im->used = g_tex_frame;
+    tex_image_pin_resolved(pinned, im);
+    im->used = g_tex_frame; int orphan = im->orphan;
     pthread_mutex_unlock(&g_img_mu);
+    // A finalized pool no longer supplies CPU bytes. A queued snapshot retains its native contents.
+    if (orphan) return im;
     if (!vk_sub_open()) return __atomic_load_n(&im->looked, __ATOMIC_ACQUIRE) ? im : NULL;   // looked up outside a submission (present): nothing can be recorded, a new image has no contents yet
     if (unc_rule()) vcs_unc_drop(cpu_unc_dropped);   // taken uncompressed textures over storage the GPU wrote since: GPU textures from now on (nvn_mtl.m cpu_unc_drop)
     int first = !__atomic_exchange_n(&im->looked, 1, __ATOMIC_ACQ_REL);   // its first use is the first lookup inside a submission, not its creation (which may have been outside one)
-    if (first && !t_pool_fill) g_tex_gen++;   // the pool tables (gfx_vk_exec.c tbl_set) bind only images with contents: a real bind's first use has them built again with this one
+    if (first && !t_pool_fill) { g_tex_gen++; vk_tex_diag_native(TEX_DIAG_FIRST_USE, t, im); }   // the pool tables (gfx_vk_exec.c tbl_set) bind only images with contents: a real bind's first use has them built again with this one
     // a texture's first use: written by the CPU since it was registered (profile tex_dirty_upload), it is CPU-written from now on, as at nvn_mtl.m's first resolution;
     // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
     int nvn_ft_written(const tex_t *);
@@ -436,22 +509,33 @@ static vkimg_t *vk_tex_(const tex_t *t) {
 // Binding as an image establishes storage usage even when the NVN texture builder omitted IMAGE.
 // Keep the storage-key object and all CPU/GPU ownership metadata. Only its native allocation/views change;
 // prior descriptors retain the old handles until the submission fence, and subsequent lookups see the copy.
-int vk_tex_storage_prepare(const tex_t *t) {
-    tex_t snapshot = *t; t = &snapshot;   // registrations are thread-local scratch; ending a pass may perform other lookups
+int vk_tex_storage_prepare(const tex_t *t, const view_t *view) {
+    tex_t snapshot = *t; view_t selected; if (view) { selected = *view; view = &selected; }
+    t = &snapshot;   // registrations are thread-local scratch; ending a pass may perform other lookups
+    const vkfmt_t *f = vk_fmt(t->d.format), *vf = vk_fmt(view && view->set_format ? view->format : t->d.format);
+    if (!f || !vf || (vf->vk != f->vk && !storage_view_compatible(f, vf))) {
+        VKRED_ONCE(174, "storage view format %#x is incompatible with texture format %#x", view && view->set_format ? view->format : t->d.format, t->d.format); return 0;
+    }
     vkimg_t *im = vk_tex(t);
     if (!im) return 0;
-    if (im->usage & VK_IMAGE_USAGE_STORAGE_BIT) return 1;
-    const vkfmt_t *f = vk_fmt(t->d.format); VkFormatProperties fp;
-    vkGetPhysicalDeviceFormatProperties(V.pd, im->fmt, &fp);
-    VkFormat pv = storage_promote(f);   // a format the device cannot store to: the new image takes the promoted one (img_new), the contents blitted over
-    if (!f || (f->vk != im->fmt && !im->promoted) || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
-        (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !pv)) {
-        VKRED_ONCE(161, "storage binding format %d cannot support image stores", im->fmt); return 0;
+    VkFormatProperties vp; vkGetPhysicalDeviceFormatProperties(V.pd, vf->vk, &vp);
+    // A supported compatible view uses the original bits. Only an unsupported numeric base-format view takes the float promotion.
+    VkFormat pv = vf->vk == f->vk ? storage_promote(f) : VK_FORMAT_UNDEFINED;
+    int numeric_promoted = pv && im->promoted && im->fmt == pv;
+    if (!(vp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !pv) {
+        VKRED_ONCE(161, "storage binding view format %d cannot support image stores (base %d)", vf->vk, f->vk); return 0;
     }
+    int native = !im->promoted && im->fmt == f->vk && (!im->fixed_fmt || vf->vk == im->fmt || vf->vk == im->fmt2) &&
+        (vf->vk == im->fmt || (im->cflags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT));
+    if ((im->usage & VK_IMAGE_USAGE_STORAGE_BIT) && (numeric_promoted || (native && (vp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)))) return 1;
+    if (im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (im->fmt != f->vk && !im->promoted)) {
+        VKRED_ONCE(161, "storage binding format %d cannot support requested view %d", im->fmt, vf->vk); return 0;
+    }
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, im->fmt, &fp);
     // Called in a preflight for every stage before any descriptors are collected or a new render pass begins.
     // The main command buffer places the copy after earlier rendering; the upload buffer would copy too soon.
     vk_end_pass_land();
-    vkimg_t *next = img_new(t, f, VK_IMAGE_USAGE_STORAGE_BIT);
+    vkimg_t *next = img_new(t, f, VK_IMAGE_USAGE_STORAGE_BIT, vf->vk);
     if (!next) return 0;
     VkCommandBuffer cb = vk_cmd();
     vk_tex_prepare(cb, im); vk_tex_prepare(cb, next); vk_img_barrier_all(cb);
@@ -487,6 +571,7 @@ uint64_t g_tex_frame;
 typedef struct { uint64_t used; vkimg_t *im; } pkg_age;
 static int pkg_age_cmp(const void *a, const void *b) { uint64_t x = ((const pkg_age *)a)->used, y = ((const pkg_age *)b)->used; return x < y ? -1 : x > y; }
 void vk_tex_sweep(void) {
+    vk_tex_diag_poll();
     if (++g_tex_frame % 300) return;
     uint64_t idle = 0, lru = 0, before = nvn_dirty_released();
     pthread_mutex_lock(&g_img_mu);
@@ -663,7 +748,7 @@ static pthread_mutex_t g_view_mu = PTHREAD_MUTEX_INITIALIZER;
 extern uint64_t g_tex_gen;
 static void vk_tex_view_drop_all(vkimg_t *im) {
     pthread_mutex_lock(&g_view_mu);
-    vview *v = nvn_hm_get(&g_views, &im); g_tex_gen++;
+    vview *v = nvn_hm_get(&g_views, &im); g_tex_gen++; vk_tex_diag_native(TEX_DIAG_VIEW_DROP, NULL, im);
     while (v) { vview *n = v->next; vk_defer_free_view(v->v); free(v); v = n; }
     nvn_hm_del(&g_views, &im);
     pthread_mutex_unlock(&g_view_mu);
@@ -735,6 +820,9 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     VkComponentMapping swz = sample_swizzle(&f->swz,t,vw,as_attachment || storage);
     VkFormat fmt = im->promoted ? im->fmt : f->vk;   // (a promoted image: its own float format, whatever the view asks; the formats' classes differ)
     const vkfmt_t *imf = vk_fmt(im->nvn_format);   // (a BC format decoded on the CPU counts as compressed: its view keeps the decoded image's format)
+    if (im->promoted && (!imf || f->vk != imf->vk)) {
+        VKRED_ONCE(175, "a promoted numeric image cannot supply a bit-reinterpreted view (base %d, requested %d)", imf ? imf->vk : 0, f->vk); return VK_NULL_HANDLE;
+    }
     if ((im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || (f->compressed || f->dec) != (imf->compressed || imf->dec) || (f->dec && f->dbpp != imf->dbpp)) fmt = im->fmt;   // depth views and block-size changes keep the image's format
     if (im->fixed_fmt && fmt != im->fmt && fmt != srgb_twin(im->fmt)) { fmt = im->fmt; static int n; if (n++ < 8) VKLOG("[RED] view format %d of a format-listed image (%d, DM_VK_UBWC): the image's own used", f->vk, im->fmt); }
     pthread_mutex_lock(&g_view_mu);
@@ -746,7 +834,7 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     uci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (storage) { if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(163, "storage view format %d is unsupported", fmt); return VK_NULL_HANDLE; } uci.usage = VK_IMAGE_USAGE_STORAGE_BIT; }
     else if (as_attachment) uci.usage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) | (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
-    else if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) uci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    else if ((im->usage & VK_IMAGE_USAGE_STORAGE_BIT) && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) uci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, im->img, type, fmt, swz, {aspect, lv0, nlv, ly0, nly}};
     VkImageView view; VkResult r = vkCreateImageView(V.dev, &ci, NULL, &view);
     if (r) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(15, "vkCreateImageView failed (%d): type %d format %d levels %u+%u layers %u+%u of image %ux%ux%u", r, type, fmt, lv0, nlv, ly0, nly, im->w, im->h, im->layers); return VK_NULL_HANDLE; }
@@ -765,7 +853,8 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
 // (nvn_jobs_queued / nvn_replaying_job, gfx/nvn/hle_nvn.c); without a replay thread that is always the newest. TREG_OLD older ones per ID, kept for IDs rewritten
 enum { TREG_OLD = 3 };
 typedef struct { tex_t t; view_t v; uint8_t ok, has_v; uint64_t seq; } treg_ver;
-typedef struct { treg_ver cur; treg_ver *old; } treg_t;   // old: TREG_OLD earlier versions, newest first (allocated at the first rewrite)
+typedef struct treg_history { treg_ver v; uint64_t until; struct treg_history *next; } treg_history;
+typedef struct { treg_ver cur; treg_ver *old; treg_history *history; uint32_t history_next; } treg_t;   // old: TREG_OLD earlier versions, newest first (allocated at the first rewrite)
 static treg_t *g_treg; static int g_ntreg, g_tid_max, g_sid_max;   // the registry, and the highest IDs registered (the pool tables' logs, gfx_vk_exec.c tbl_set)
 int vk_tex_id_max(void) { return __atomic_load_n(&g_tid_max, __ATOMIC_RELAXED); }
 int vk_samp_id_max(void) { return __atomic_load_n(&g_sid_max, __ATOMIC_RELAXED); }
@@ -781,17 +870,111 @@ static samp_par *g_sreg; static uint8_t *g_sreg_ok; static VkSampler *g_samp; st
 enum { SREG_OLD = 3 };
 typedef struct { samp_par p; uint64_t seq; } sreg_ver;
 static uint64_t *g_sseq; static sreg_ver *g_sold; static uint64_t g_sregs;   // the current version's count, SREG_OLD older ones per ID (newest first)
+// Logical queues can retain a bind recorded before enqueue, then keep it in a
+// queue after its job finishes. Job IDs cannot bound these registration sequences.
+// Keep immutable CPU parameter history for that opt-in mode until process exit;
+// identical registrations below remain a no-op, and VkSamplers still deduplicate
+// by parameters. Ascending vectors make old saved bindings logarithmic to resolve.
+typedef struct { sreg_ver *v; size_t n, cap; } sreg_history;
+static sreg_history *g_shistory;
+static void samp_history_append(int sid) {   // g_rmu held, current version still installed
+    sreg_history *h = &g_shistory[sid];
+    if (h->n == h->cap) {
+        size_t cap = h->cap ? h->cap * 2 : 4;
+        if (cap < h->cap || cap > SIZE_MAX / sizeof *h->v) die("[vk] sampler history too large");
+        sreg_ver *v = realloc(h->v, cap * sizeof *h->v);
+        if (!v) die("[vk] sampler history allocation failed");
+        h->v = v; h->cap = cap;
+    }
+    h->v[h->n++] = (sreg_ver){g_sreg[sid], g_sseq[sid]};
+}
 uint64_t mtl_samp_seq(void) { return __atomic_load_n(&g_sregs, __ATOMIC_ACQUIRE); }
 static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
 __attribute__((weak)) uint64_t nvn_jobs_queued(void) { return 0; }
 __attribute__((weak)) uint64_t nvn_replaying_job(void) { return 0; }
+// Logical queues can replay out of enqueue order or park for arbitrarily many later jobs.
+// Keep precisely the registration intervals visible to active jobs; never truncate them to TREG_OLD.
+// Job pin/unpin and registration are serialized by the scheduler's submit lock; g_rmu also protects
+// lookup and this retention state. Image pins are nested only g_rmu -> g_img_mu.
+static struct { uint64_t id, refs, sampler_seq, texture_seq; } *g_registry_jobs;
+static uint64_t g_texture_registrations;
+static size_t g_registry_njobs, g_registry_capjobs;
+static int g_registry_logical;
+static uint32_t g_registry_history;   // IDs with retained intervals, encoded as tid+1
+static int registry_interval_needed(uint64_t after, uint64_t through) {
+    for (size_t i = 0; i < g_registry_njobs; i++) if (g_registry_jobs[i].id > after && g_registry_jobs[i].id <= through) return 1;
+    return 0;
+}
+void vk_registry_job_pin(uint64_t id) {
+    if (!id) return; pthread_mutex_lock(&g_rmu); g_registry_logical = 1;
+    for (size_t i = 0; i < g_registry_njobs; i++) if (g_registry_jobs[i].id == id) { g_registry_jobs[i].refs++; pthread_mutex_unlock(&g_rmu); return; }
+    if (g_registry_njobs == g_registry_capjobs) {
+        size_t cap = g_registry_capjobs ? 2 * g_registry_capjobs : 16;
+        void *next = realloc(g_registry_jobs, cap * sizeof *g_registry_jobs); if (!next) die("[vk] registry job retention allocation failed");
+        g_registry_jobs = next; g_registry_capjobs = cap;
+    }
+    g_registry_jobs[g_registry_njobs++] = (__typeof__(*g_registry_jobs)){id, 1, g_sregs, g_texture_registrations}; pthread_mutex_unlock(&g_rmu);
+}
+// Enqueue sequence is not a registration identity: many rewrites can happen between jobs.
+// Unpinned legacy asynchronous jobs have no complete semantic snapshot and cannot reuse tables.
+int vk_registry_snapshot(uint64_t *textures, uint64_t *samplers) {
+    uint64_t job = nvn_replaying_job(); int ok = 0;
+    pthread_mutex_lock(&g_rmu);
+    if (!job) { *textures = g_texture_registrations; *samplers = g_sregs; ok = 1; }
+    else if (g_registry_logical) for (size_t i = 0; i < g_registry_njobs; i++) if (g_registry_jobs[i].id == job) {
+        *textures = g_registry_jobs[i].texture_seq; *samplers = g_registry_jobs[i].sampler_seq; ok = 1; break;
+    }
+    pthread_mutex_unlock(&g_rmu); return ok;
+}
+// g_rmu held. Pool samplers have no per-bind sequence, so use their enclosing job's snapshot.
+// A valid snapshot of zero registrations is distinct from the public API's zero-means-latest.
+static int registry_job_sampler_seq(uint64_t *seq) {
+    uint64_t job = nvn_replaying_job(); if (!g_registry_logical || !job) return 0;
+    for (size_t i = 0; i < g_registry_njobs; i++) if (g_registry_jobs[i].id == job) { *seq = g_registry_jobs[i].sampler_seq; return 1; }
+    *seq = 0; return 1;   // an unpinned logical job must not silently see future registrations
+}
+void vk_registry_job_unpin(uint64_t id) {
+    if (!id) return; pthread_mutex_lock(&g_rmu);
+    for (size_t i = 0; i < g_registry_njobs; i++) if (g_registry_jobs[i].id == id) {
+        if (!--g_registry_jobs[i].refs) g_registry_jobs[i] = g_registry_jobs[--g_registry_njobs];
+        break;
+    }
+    uint32_t *link = &g_registry_history;
+    while (*link) {
+        treg_t *r = &g_treg[*link - 1]; treg_history **p = &r->history;
+        while (*p) { treg_history *h = *p;
+            if (registry_interval_needed(h->v.seq, h->until)) p = &h->next;
+            else { *p = h->next; if (h->v.ok) mtl_tex_unpin(h->v.t.serial); free(h); }
+        }
+        if (r->history) link = &r->history_next;
+        else { *link = r->history_next; r->history_next = 0; }
+    }
+    pthread_mutex_unlock(&g_rmu);
+}
+static void registry_retain(treg_t *r, int tid, uint64_t until) {
+    if (!registry_interval_needed(r->cur.seq, until)) return;
+    treg_history *h = calloc(1, sizeof *h); if (!h) die("[vk] texture registry history allocation failed");
+    h->v = r->cur; h->until = until;
+    if (h->v.ok) mtl_tex_snapshot(&h->v.t, &r->cur.t);
+    if (!r->history) { r->history_next = g_registry_history; g_registry_history = (uint32_t)tid + 1; }
+    h->next = r->history; r->history = h;
+}
 void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     if (tid < 0) return;
     uint64_t seq = nvn_jobs_queued();
     pthread_mutex_lock(&g_rmu);
     if (tid >= g_ntreg) { int n = tid + 1024; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
-    g_tex_gen++; treg_t *r = &g_treg[tid]; if (tid > g_tid_max) g_tid_max = tid;
-    if (r->cur.ok && seq) {   // keep the one replaced for the jobs queued before this registration
+    treg_t *r = &g_treg[tid];
+    // Registering byte-identical texture/view snapshots changes no descriptor. Keep the original
+    // seq too: advancing it or pushing a duplicate would hide meaningful history from queued jobs.
+    // A full comparison is conservative; differing padding only misses this optimization.
+    if (t && r->cur.ok && r->cur.has_v == (v != NULL) && !memcmp(&r->cur.t, t, sizeof *t) && (!v || !memcmp(&r->cur.v, v, sizeof *v))) {
+        pthread_mutex_unlock(&g_rmu); return;
+    }
+    g_tex_gen++; g_texture_registrations++; if (tid > g_tid_max) g_tid_max = tid;
+    vk_tex_diag_registration(tid, r->cur.ok ? &r->cur.t : NULL, r->cur.has_v ? &r->cur.v : NULL, t, v, r->cur.seq, seq, g_texture_registrations);
+    if (g_registry_logical) registry_retain(r, tid, seq);
+    else if (r->cur.ok && seq) {   // keep the one replaced for legacy FIFO jobs queued before this registration
         if (!r->old) r->old = calloc(TREG_OLD, sizeof *r->old);
         if (r->old) { memmove(r->old + 1, r->old, sizeof *r->old * (TREG_OLD - 1)); r->old[0] = r->cur; }
     }
@@ -804,8 +987,15 @@ vkimg_t *vk_tex_by_id(int tid, const view_t **view_out, const tex_t **tex_out) {
     uint64_t job = nvn_replaying_job();
     pthread_mutex_lock(&g_rmu);
     const treg_ver *r = tid > 0 && tid < g_ntreg ? &g_treg[tid].cur : NULL;
-    if (r && job && r->seq >= job && g_treg[tid].old)   // registered after this job was queued: the newest earlier one
-        for (int k = 0; k < TREG_OLD; k++) { const treg_ver *o = &g_treg[tid].old[k]; if (!o->ok) break; r = o; if (o->seq < job) break; }
+    if (r && job && r->seq >= job) {
+        if (g_registry_logical) {
+            r = NULL;
+            for (const treg_history *h = g_treg[tid].history; h; h = h->next) if (h->v.seq < job && job <= h->until) { r = &h->v; break; }
+            // No retained interval means the ID did not exist, or the caller failed to pin its job.
+            // Never substitute a future registration for a parked job.
+        } else if (g_treg[tid].old)
+            for (int k = 0; k < TREG_OLD; k++) { const treg_ver *o = &g_treg[tid].old[k]; if (!o->ok) break; r = o; if (o->seq < job) break; }
+    }
     int ok = r && r->ok; if (ok) t_treg = *r;
     pthread_mutex_unlock(&g_rmu);
     if (!ok) return NULL;
@@ -851,19 +1041,30 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
     if (sid >= g_nsreg) { int n = sid + 256; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, n); g_samp = realloc(g_samp, n * sizeof *g_samp);
         g_sseq = realloc(g_sseq, n * sizeof *g_sseq); g_sold = realloc(g_sold, (size_t)n * SREG_OLD * sizeof *g_sold);
         memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg); memset(g_samp + g_nsreg, 0, (n - g_nsreg) * sizeof *g_samp); memset(g_sseq + g_nsreg, 0, (n - g_nsreg) * sizeof *g_sseq);
-        memset(g_sold + (size_t)g_nsreg * SREG_OLD, 0, (size_t)(n - g_nsreg) * SREG_OLD * sizeof *g_sold); g_nsreg = n; }
+        memset(g_sold + (size_t)g_nsreg * SREG_OLD, 0, (size_t)(n - g_nsreg) * SREG_OLD * sizeof *g_sold);
+        if (nvn_logical_queues_on()) {
+            sreg_history *history = realloc(g_shistory, (size_t)n * sizeof *history);
+            if (!history) die("[vk] sampler history table allocation failed");
+            g_shistory = history; memset(g_shistory + g_nsreg, 0, (size_t)(n - g_nsreg) * sizeof *g_shistory);
+        }
+        g_nsreg = n; }
     if (sid > g_sid_max) g_sid_max = sid;
     if (!g_sreg_ok[sid] || memcmp(&g_sreg[sid], sp, sizeof *sp)) {
         sreg_ver *o = g_sold + (size_t)sid * SREG_OLD;
-        if (g_sreg_ok[sid]) { memmove(o + 1, o, sizeof *o * (SREG_OLD - 1)); o[0] = (sreg_ver){g_sreg[sid], g_sseq[sid]}; }
+        if (g_sreg_ok[sid]) {
+            if (nvn_logical_queues_on()) samp_history_append(sid);
+            memmove(o + 1, o, sizeof *o * (SREG_OLD - 1)); o[0] = (sreg_ver){g_sreg[sid], g_sseq[sid]};
+        }
         g_sreg[sid] = *sp; g_sreg_ok[sid] = 1; g_samp[sid] = VK_NULL_HANDLE; g_sseq[sid] = __atomic_add_fetch(&g_sregs, 1, __ATOMIC_RELEASE); __atomic_fetch_add(&g_samp_gen, 1, __ATOMIC_RELEASE); }   // samplers are cached by parameters below
     pthread_mutex_unlock(&g_rmu);
 }
 static nvn_hmap g_samp_cache = {.klen = sizeof(samp_par)};   // samp_par → VkSampler (VkSamplers are never destroyed: few distinct parameter sets)
 static const samp_par *samp_at(int sid, uint64_t seq);
+static const samp_par *samp_job_at(int sid);
 void vk_samp_describe_at(int sid, uint64_t seq, char *out, size_t n) {   // the registered parameters a bind made after seq registrations sees (traces; 0: the newest)
     pthread_mutex_lock(&g_rmu);
-    if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) { const samp_par *p = samp_at(sid, seq); snprintf(out, n, "sampler %d: wrap %d %d %d min %d mag %d lod %g..%g bias %g aniso %g cmp %d/%d red %d border %g %g %g %g", sid, p->ws, p->wt, p->wr,
+    const samp_par *p = seq ? samp_at(sid, seq) : samp_job_at(sid);
+    if (p) { snprintf(out, n, "sampler %d: wrap %d %d %d min %d mag %d lod %g..%g bias %g aniso %g cmp %d/%d red %d border %g %g %g %g", sid, p->ws, p->wt, p->wr,
         p->minf, p->magf, p->lod_min, p->lod_max, p->lod_bias, p->aniso, p->cmp_mode, p->cmp_func, p->reduction, p->border[0], p->border[1], p->border[2], p->border[3]); }
     else snprintf(out, n, "sampler %d: not registered (dummy)", sid);
     pthread_mutex_unlock(&g_rmu);
@@ -872,9 +1073,22 @@ void vk_samp_describe(int sid, char *out, size_t n) { vk_samp_describe_at(sid, 0
 static const samp_par *samp_at(int sid, uint64_t seq) {   // under g_rmu: the version a bind made after seq registrations sees; NULL when not registered
     if (sid <= 0 || sid >= g_nsreg || !g_sreg_ok[sid]) return NULL;
     if (!seq || g_sseq[sid] <= seq) return &g_sreg[sid];
+    if (nvn_logical_queues_on()) {
+        const sreg_history *h = &g_shistory[sid];
+        size_t lo = 0, hi = h->n;
+        while (lo < hi) { size_t mid = lo + (hi - lo) / 2; if (h->v[mid].seq <= seq) lo = mid + 1; else hi = mid; }
+        return lo ? &h->v[lo - 1].p : NULL;   // this ID was not registered yet
+    }
     const sreg_ver *o = g_sold + (size_t)sid * SREG_OLD;
     for (int k = 0; k < SREG_OLD; k++) if (o[k].seq && o[k].seq <= seq) return &o[k].p;
     return &g_sreg[sid];   // older than what is kept: the newest
+}
+// Implicit and bindless sampler IDs have no explicit bind-time sequence. Resolve
+// them at this logical job's immutable enqueue snapshot, never a later registration.
+static const samp_par *samp_job_at(int sid) {   // g_rmu held
+    uint64_t seq = 0;
+    if (registry_job_sampler_seq(&seq)) return seq ? samp_at(sid, seq) : NULL;
+    return samp_at(sid, 0);
 }
 VkSampler vk_samp_at(int sid, uint64_t seq, int nearest) {   // the sampler a bind made after seq registrations sees (gfx_vk_exec.c samp_for)
     pthread_mutex_lock(&g_rmu);
@@ -887,10 +1101,11 @@ VkSampler vk_samp_at(int sid, uint64_t seq, int nearest) {   // the sampler a bi
 }
 VkSampler vk_samp_by_id(int sid) {
     pthread_mutex_lock(&g_rmu);
-    VkSampler s = VK_NULL_HANDLE;
-    if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) {
-        s = g_samp[sid];
-        if (!s) { s = nvn_hm_get(&g_samp_cache, &g_sreg[sid]); if (!s) { s = make_sampler(&g_sreg[sid]); if (s) nvn_hm_put(&g_samp_cache, &g_sreg[sid], s); } g_samp[sid] = s; }
+    VkSampler s = VK_NULL_HANDLE; const samp_par *p = samp_job_at(sid);
+    if (p) {
+        int current = p == &g_sreg[sid];
+        if (current) s = g_samp[sid];
+        if (!s) { s = nvn_hm_get(&g_samp_cache, p); if (!s) { s = make_sampler(p); if (s) nvn_hm_put(&g_samp_cache, p, s); } if (current) g_samp[sid] = s; }
     }
     pthread_mutex_unlock(&g_rmu);
     return s;
@@ -899,9 +1114,9 @@ VkSampler vk_samp_by_id(int sid) {
 // formats without SAMPLED_IMAGE_FILTER_LINEAR (Pokémon Legends: Arceus samples R8_UINT and R32_UINT views with trilinear samplers; the validation layer named them)
 VkSampler vk_samp_by_id_nearest(int sid) {   // cached by its parameters, as the samplers themselves
     pthread_mutex_lock(&g_rmu);
-    VkSampler s = VK_NULL_HANDLE;
-    if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) {
-        samp_par p = g_sreg[sid]; p.magf = 0; p.minf = p.minf == 1 ? 0 : p.minf == 3 || p.minf == 4 || p.minf == 5 ? 2 : p.minf; p.aniso = 1; p.reduction = 0;
+    VkSampler s = VK_NULL_HANDLE; const samp_par *q = samp_job_at(sid);
+    if (q) {
+        samp_par p = *q; p.magf = 0; p.minf = p.minf == 1 ? 0 : p.minf == 3 || p.minf == 4 || p.minf == 5 ? 2 : p.minf; p.aniso = 1; p.reduction = 0;
         if (!(s = nvn_hm_get(&g_samp_cache, &p)) && (s = make_sampler(&p))) nvn_hm_put(&g_samp_cache, &p, s);
     }
     pthread_mutex_unlock(&g_rmu);
@@ -924,7 +1139,7 @@ VkImageView vk_dummy_view(int dim, int arrayed, int ms, int storage, int is_int)
             t.d.format = is_int ? 0x27 : 0x25; t.d.width = t.d.height = 1; t.d.depth = d == 3 ? 12 : 6; t.d.levels = 1; t.d.samples = ms ? 4 : 0;
             t.d.target = d == 0 ? 3 : d == 2 ? 2 : d == 3 ? 9 : ms ? 6 : 4; t.d.flags = storage ? NVN_TEXTURE_FLAGS_IMAGE : 0;
             if (d == 2) t.d.depth = 1;
-            *pi = img_new(&t, vk_fmt(t.d.format), 0);
+            *pi = img_new(&t, vk_fmt(t.d.format), 0, VK_FORMAT_UNDEFINED);
             VkCommandBuffer cb = vk_upload_cmd(); vk_tex_prepare(cb, *pi);
             VkClearColorValue z = {{0}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
             if (!ms) vkCmdClearColorImage(cb, (*pi)->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
@@ -1013,7 +1228,7 @@ size_t vk_img_list(vk_img_ref **out, size_t *cap) {
     for (int m = 0; m < 2; m++) {
         nvn_hmap *h = m ? &g_by_serial : &g_by_key;
         for (uint32_t i = 0; i < h->cap; i++) {
-            vkimg_t *im = h->vals[i]; if (!im) continue;
+            vkimg_t *im = h->vals[i]; if (!im || im->pins) continue;
             if (n == *cap) { *cap = *cap ? 2 * *cap : 4096; vk_img_ref *nw = realloc(*out, *cap * sizeof **out); if (!nw) return n; *out = nw; }
             (*out)[n++] = (vk_img_ref){h, i, im};
         }
@@ -1021,6 +1236,7 @@ size_t vk_img_list(vk_img_ref **out, size_t *cap) {
     return n;
 }
 void vk_img_evict(const vk_img_ref *r) {   // under g_img_mu, from a list taken under the same hold of the lock (a deletion shifts later entries back: the image is looked for again if its slot changed)
+    if (r->im->pins) return;
     nvn_hmap *h = r->h; uint32_t i = r->i;
     if (i >= h->cap || h->vals[i] != r->im) { for (i = 0; i < h->cap && h->vals[i] != r->im; i++) {} if (i == h->cap) return; }
     uint8_t key[64]; _Static_assert(sizeof(akey) <= 64, "akey"); memcpy(key, h->keys + (size_t)i * h->klen, h->klen);

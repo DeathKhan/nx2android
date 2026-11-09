@@ -19,7 +19,8 @@ class AsyncFrameIdentity(unittest.TestCase):
         submit=function(s,'static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h, uint64_t frame) {')
         self.assertIn('mtl_set_frame(frame);',submit)
         self.assertIn('dm_perf_replay_work(frame, t0, end);',submit)
-        self.assertIn('if (!nvn_async()) mtl_set_frame(g_frame);',s)
+        self.assertTrue('if (!nvn_async() && !nvn_logical_queues_on()) mtl_set_frame(g_frame);' in s,
+                        'both asynchronous replay modes retain their captured frame ID')
         self.assertIn('dm_perf_frame_start_id(g_frame, pace_ns, pq_ns);',s)
         code=r'''
 #define _GNU_SOURCE

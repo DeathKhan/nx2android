@@ -109,11 +109,17 @@ void vk_defer_free_image_sub(VkImage i, void *sub);
 void vk_defer_free_view(VkImageView v);
 void vk_defer_free_bview(VkBufferView v);   // a texel buffer view, destroyed when this submission completes
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l);    // from this submission's descriptor pools
+uint64_t vk_descriptor_lease(VkDescriptorSet set, int rewrite); // current slot's immutable-content token; rewrite invalidates old tokens
+int vk_descriptor_claim(VkDescriptorSet set, uint64_t lease); // exact completed-slot token, once per submission
+int vk_registry_snapshot(uint64_t *textures, uint64_t *samplers); // semantic identity visible to this replay job, or 0 if unproven
+void vk_table_report(void); // per-600-present table build/reuse costs
+
 // Samples-passed is cumulative across passes/submissions until ResetCounter. Only guest draws are counted.
 int vk_occ_counting(void); // a skipped rasterizing draw may change a later samples-passed report
 void vk_occ_draw(void);   // immediately before an actual guest draw, inside its render pass
 void vk_occ_end(void);    // before ending a render pass (also used by reports/resets inside a pass)
 void vk_occ_reset(void);  // NVN samples-passed ResetCounter, preserving command order
+uint64_t vk_reports_fence_done(void);   // report/readback writes landed, before event release
 uint64_t vk_fence_done(void);   // the highest submission fence the GPU has completed
 uint64_t vk_frame_current(void); // frame identity of the job currently replaying
 void vk_perf_frame_seal(uint64_t frame); // after the frame's last submission; no later submission may use this identity
@@ -152,6 +158,7 @@ struct vkimg {
     VkFormat fmt2;   // with fixed_fmt: the other format of its list (its sRGB twin), VK_FORMAT_UNDEFINED when the list is its format alone
     VkImageView full;               // a view of the whole image as created
     VkBufferView tbuf;              // buffer textures: a texel buffer view of the pool
+    uint32_t pins; int orphan;      // queued texture snapshots; a detached image survives until its final pin
     uint64_t last_use;              // submission fence of the last use
     uint64_t pool; int64_t off, size; int flags;   // its storage (pool, offset, layout size) and NVN texture flags: images over the same memory find each other
     struct vkimg *ovl[8]; int novl;   // the other images over some of the same memory (a texture of another description over it: on the Switch it sees these texels)
@@ -160,7 +167,7 @@ struct vkimg {
     uint64_t zc_gen;                  // a texture over a movie picture slot (movie_zc_vk.c zc_tex_refresh): the slot's change count last converted into it
 };
 vkimg_t *vk_tex(const tex_t *t);                                 // the image of a texture object (created, uploaded or refreshed as needed)
-int vk_tex_storage_prepare(const tex_t *t);                    // before descriptor collection/render pass: preserve contents when adding storage usage
+int vk_tex_storage_prepare(const tex_t *t, const view_t *view);                    // before descriptor collection/render pass: preserve contents when adding storage usage
 void vk_lrz_forget(vkimg_t *im);                                 // an image is being dropped: the pass code forgets it (gfx_vk_exec.c)
 int vk_window_bottom_up(void);                                   // the game draws in lower-left origin mode: its window image is stored bottom-up (gfx_vk_exec.c)
 VkImageView vk_tex_view(const tex_t *t, const view_t *v, int dim, int arrayed, int view_kind, vkimg_t **img_out);   // 0 sampled, 1 attachment, 2 storage (identity, one mip)
@@ -247,6 +254,7 @@ VkBuffer vk_zero_buffer(void);
 VkBuffer vk_gmem_log_disabled(void);   // all bits set: the translated log guard skips its atomic; real stores still run
 
 // ---- replay (gfx_vk_exec.c) ----
+void vk_queue_preserve(void);   // logical-queue bindings retained at each submission end
 void vk_exec_reset(void);   // per submission
 void vk_end_pass(void);     // close an open render pass
 

@@ -8,6 +8,7 @@
 //   (event writes, counter reports), as nvn_mtl.m does in its completion handler.
 #define _GNU_SOURCE
 #include "gfx_vk.h"
+#include "nvn_queue.h"
 #include "nvn_hmap.h"
 #include "nvn_dirty.h"
 #include <fcntl.h>
@@ -952,7 +953,16 @@ void mtl_pool_del(const void *mem) {
 __thread const char *vk_pool_tag;
 vkpool_t *vk_pool_holding(uint64_t addr, uint64_t len) {
     vkpool_t *r = NULL;
+    if (len > UINT64_MAX - addr) return NULL;
     pthread_rwlock_rdlock(&g_pool_mu);
+    // CPU reads may span chunks of one pool: containment ends at pool.end, not chunk.hi.
+    // Table fills ask this for every texture; scanning thousands of pools per entry
+    // dominated OoT's replay. Use the same ordered index and lifetime lock as buffer lookups.
+    int lo = 0, hi = g_npool;
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_pool[g_pool_ord[m]].lo <= addr) lo = m + 1; else hi = m; }
+    if (lo > 0) { vkpool_t *p = &g_pool[g_pool_ord[lo - 1]]; if (addr < p->hi && addr + len <= p->end) r = p; }
+    // An overlapping later-starting pool can be too short while an earlier one contains
+    // the range. Preserve that case; no cached pointer survives a mutation without a lock.
     for (int i = 0; i < g_npool && !r; i++) if (addr >= g_pool[i].lo && addr < g_pool[i].hi && addr + len <= g_pool[i].end) r = &g_pool[i];
     pthread_rwlock_unlock(&g_pool_mu);
     return r;
@@ -1067,6 +1077,8 @@ static VkQueryPool g_cq;
 #define SCRATCH_BLOCK (8u << 20)
 enum { SCRATCH_IDLE = 64 };
 static VkDeviceSize scratch_cap(void);
+enum { DPX_KEEP = 4, DPX_DESCRIPTORS = 1 << 20 };   // oversized sets retained per completed slot, with a descriptor-count budget
+typedef struct { VkDescriptorPool pool; VkDescriptorSet set; VkDescriptorSetLayout layout; uint64_t descriptors; int used; uint64_t lease; unsigned cached, idle; } dpx_entry;
 enum { DP_KEEP = 16 };   // descriptor pools kept per slot across recycles (vk_alloc_set, slot_recycle)
 static uint64_t g_dp_made, g_dp_freed;   // descriptor pools made and destroyed
 static uint64_t kgsl_mapped(void);   // recycles of its slot a scratch block may go unused before it is freed (slot_recycle)
@@ -1086,10 +1098,11 @@ struct vksub {
     int cut_diag; uint32_t cut_success, cut_budget_refused, cut_capacity_refused; uint64_t cut_cpu_ns;
     int ncq;          // timestamp counter queries used in this submission (g_cq)
     VkQueryPool *oq; int noq, capoq, nocc;   // occlusion blocks kept until this slot's completion; nocc queries used this submission
+    struct { uint32_t first_q, last_q, begins, ends, first_block, last_block, resets; VkCommandBuffer reset_cb; } occ[MAIN_CBS]; // bounded failure diagnostics, one record per native part
     scratch_blk *blk; int nblk, capblk;
     VkDescriptorPool *dp; int ndp, capdp, dp_cur;
     uint32_t dp_used[DP_TYPES], dp_sets; int dp_counted; int no_ts;   // what pool dp_cur has given out (vk_alloc_set)
-    VkDescriptorPool *dpx; int ndpx, capdpx;   // pools made for one set each (vk_alloc_set: a layout whose needs no shared pool holds), destroyed at the recycle
+    dpx_entry *dpx; int ndpx, capdpx;   // one-set oversized pools; only completed-slot sets may be reused
     dfree_t *df; int ndf, capdf;
     post_op *post; int npost, cappost;
     struct { uint64_t lo, hi; } gw[64]; int ngw, readback_ranges;   // GPU writes into pool memory in this submission (sub_gpu_wrote), for pools_copy_back: nearby ones merged, and once full each joins the nearest
@@ -1211,6 +1224,9 @@ static void slots_init(void) {
         VKCHK(vkAllocateCommandBuffers(V.dev, &ai, cb)); g_slot[i].up = g_slot[i].ups[0] = cb[0]; g_slot[i].main = g_slot[i].mains[0] = cb[1]; g_slot[i].nmain_alloc = 1; g_slot[i].nup_alloc = 1;
     }
 }
+static uint64_t g_reports_done;
+uint64_t vk_reports_fence_done(void) { return __atomic_load_n(&g_reports_done, __ATOMIC_ACQUIRE); }
+uint64_t mtl_completed_fence(void) { return vk_fence_done(); }
 uint64_t vk_fence_done(void) { return __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); }   // written under g_done_mu (for the waiters) with a release store
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
 // Without timeline semaphores only the completion thread waits on the ring's fences, in submission order (a fence tells nothing of the submissions before
@@ -1226,10 +1242,37 @@ static void wait_fence(uint64_t f) {
 // replay ~3,000 draws a frame on a thread that is the frame's limit). The slot is then taken only after the completion thread has passed it (mtl_wait, g_done)
 // rather than as soon as the GPU has. DM_VK_X_NOPRERESET=1 (start-up): reset as they are begun
 static int g_prereset = -1;
-static void descriptor_pools_reset(vksub_t *s) {   // the slot's pools after its submission: DP_KEEP reset and kept, the rest and the one-set pools destroyed (a load's pile of them goes with the load)
+// Live A/B: keep the already allocated one-set pool and set, not its contents. The caller rewrites
+// the descriptors as usual. Only slot_recycle, after its completion wait, clears used; an open
+// submission never receives the same set twice. A load's excess and a previously idle set go away.
+// F1 content-leased sets alone may survive eight idle slot recycles, within the same count/descriptor
+// caps: logical-queue continuation submissions otherwise expire tables before their next draw.
+static uint64_t g_descriptor_lease;
+static int descriptor_large_reuse(void) { const char *e = getenv("DM_VK_DPX_REUSE"); return e && atoi(e) != 0; }
+static VkDescriptorSet descriptor_large_take(vksub_t *s, VkDescriptorSetLayout layout) {
+    if (!descriptor_large_reuse()) return VK_NULL_HANDLE;
+    for (int i = 0; i < s->ndpx && i < DPX_KEEP; i++) {
+        dpx_entry *e = &s->dpx[i];
+        if (!e->used && e->layout == layout) { e->used = 1; e->lease = ++g_descriptor_lease; e->cached = e->idle = 0;
+            static uint64_t n; if (++n <= 4 || !(n & (n - 1))) VKLOG("descriptor oversized sets: %llu completed-slot reuses", (unsigned long long)n);
+            return e->set; }
+    }
+    return VK_NULL_HANDLE;
+}
+static void descriptor_large_recycle(vksub_t *s) {
+    int reuse = descriptor_large_reuse(), kept = 0, freed = 0; uint64_t descriptors = 0;
+    const char *opt = getenv("DM_VK_POOL_PERSIST"); int persistent = opt && atoi(opt) != 0;
+    for (int i = 0; i < s->ndpx; i++) { dpx_entry e = s->dpx[i];
+        if (reuse && (e.used || (persistent && e.cached && e.idle < 8)) && kept < DPX_KEEP && e.descriptors <= DPX_DESCRIPTORS - descriptors) {
+            descriptors += e.descriptors; e.idle = e.used ? 0 : e.idle + 1; e.used = 0; s->dpx[kept++] = e;
+        } else { vkDestroyDescriptorPool(V.dev, e.pool, NULL); freed++; }
+    }
+    s->ndpx = kept;
+    if (freed) { static int nl; if (nl++ < 4) VKLOG("descriptor pools: %d one-set pools of this slot destroyed after its submission (%d retained)", freed, kept); }
+}
+static void descriptor_pools_reset(vksub_t *s) {   // called only after the slot's completion wait
     for (int i = 0; i < s->ndp; i++) { if (i < DP_KEEP) vkResetDescriptorPool(V.dev, s->dp[i], 0); else { vkDestroyDescriptorPool(V.dev, s->dp[i], NULL); g_dp_freed++; } }
-    for (int i = 0; i < s->ndpx; i++) vkDestroyDescriptorPool(V.dev, s->dpx[i], NULL);
-    if (s->ndpx) { static int nl; if (nl++ < 4) VKLOG("descriptor pools: %d one-set pools of this slot destroyed after its submission", s->ndpx); s->ndpx = 0; }
+    descriptor_large_recycle(s);
     if (s->ndp > DP_KEEP) { static int nl; if (nl++ < 8) VKLOG("descriptor pools: %d of this slot's destroyed after its submission (%d kept; %.0f MB of GPU memory mapped now)", s->ndp - DP_KEEP, DP_KEEP, kgsl_mapped() / 1048576.0); s->ndp = DP_KEEP; }
     s->dp_cur = 0; s->dp_counted = -1;
 }
@@ -1262,7 +1305,7 @@ static vksub_t *cur(void) { if (g_cur < 0) die("[vk] no open submission"); retur
 int vk_sub_open(void) { return g_cur >= 0; }
 // A long submission is recorded into several command buffers, submitted together in order: Adreno's driver refuses a command buffer past some size at
 // vkEndCommandBuffer (VK_ERROR_OUT_OF_HOST_MEMORY), which NEO's handheld frames reached at about the 712th draw. The caller has ended the render pass.
-static void part_sent(vksub_t *s) { if (!pass_times_on()) return; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); s->part_ns[s->nmain_used - 1] = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }   // (the chain line's part times)
+static void part_sent(vksub_t *s) { if (!pass_times_on()) return; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); uint64_t ns = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; for (int i = s->nmain_sent; i < s->nmain_used; i++) s->part_ns[i] = ns; }   // (the chain line's part times)
 static int vk_cmd_split_(void);
 static void pools_readback_barrier(VkCommandBuffer cb);
 // DM_VK_CUT_STATS=N: live, bounded to64 submissions;0 disables and rearms.
@@ -1314,9 +1357,11 @@ static int vk_cmd_split_(void) {
     // 700 draws (NEO's handheld frames: VK_ERROR_OUT_OF_HOST_MEMORY at vkEndCommandBuffer whatever the draws were, and in one command buffer or several)
     const char *se = getenv("DM_VK_SUBMIT_SPLIT"); int send = !(se && !atoi(se));   // on unless DM_VK_SUBMIT_SPLIT=0
     if (send && !s->cb_err) {
-        VkCommandBuffer cbs[2]; uint32_t n = 0;
+        // A live 0->1 SUBMIT_SPLIT change can leave older parts unsent. Submit the
+        // entire unsent prefix before advancing its ownership watermark.
+        VkCommandBuffer cbs[1 + MAIN_CBS]; uint32_t n = 0;
         if (s->up_used) { vk_img_barrier_all(s->up); if (vkEndCommandBuffer(s->up) < 0) s->cb_err = 1; cbs[n++] = s->up; }
-        cbs[n++] = s->main;
+        for (int i = s->nmain_sent; i < s->nmain_used; i++) cbs[n++] = s->mains[i];
         if (!s->cb_err) {
             VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, n, cbs, 0, NULL};
             vk_stage_flush();   // (staged uploads before the part that may read them)
@@ -1575,14 +1620,17 @@ void vk_dsl_register(VkDescriptorSetLayout l, const VkDescriptorSetLayoutBinding
 static VkDescriptorSet descriptor_alloc_set(vksub_t *s, VkDescriptorSetLayout l) {
     pthread_mutex_lock(&g_dsl_mu); const uint32_t *need = nvn_hm_get(&g_dsl_need, &l); pthread_mutex_unlock(&g_dsl_mu);
     int huge = 0; if (need) for (int t = 0; t < DP_TYPES; t++) if (need[t] > DP_CAP[t]) huge = 1;
-    if (huge) {   // no shared pool ever holds a set of this layout: before this check the loop below made a new 11.8 MB pool per try, for ever (Nintendo Switch 2 Welcome
+    if (huge) { VkDescriptorSet reused = descriptor_large_take(s, l); if (reused) return reused;
+        // no shared pool ever holds a set of this layout: before this check the loop below made a new 11.8 MB pool per try, for ever (Nintendo Switch 2 Welcome
         // Tour's first scene: 700 pools and 8 GB of GPU memory in 5 s, then the low-memory killer; the game's bindless texture layouts ask for more combined samplers than a pool's capacity)
         VkDescriptorPoolSize sz[DP_TYPES]; uint32_t nz = 0; for (int t = 0; t < DP_TYPES; t++) if (need[t]) sz[nz++] = (VkDescriptorPoolSize){(VkDescriptorType)t, need[t]};
         VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, g_uab ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0, 1, nz, sz};
         if (s->ndpx == s->capdpx) { s->capdpx = s->capdpx ? 2 * s->capdpx : 16; s->dpx = realloc(s->dpx, s->capdpx * sizeof *s->dpx); }
-        VkDescriptorPool dp; VKCHK(vkCreateDescriptorPool(V.dev, &pi, NULL, &dp)); s->dpx[s->ndpx++] = dp;
+        VkDescriptorPool dp; VKCHK(vkCreateDescriptorPool(V.dev, &pi, NULL, &dp));
         VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dp, 1, &l}; VkDescriptorSet set; g_desc_alloc_calls++; VkResult r = vkAllocateDescriptorSets(V.dev, &ai, &set);
         if (r) die("[vk] vkAllocateDescriptorSets (a pool of its own): %d", r);
+        uint64_t descriptors = 0; for (int t = 0; t < DP_TYPES; t++) descriptors += need[t];
+        s->dpx[s->ndpx++] = (dpx_entry){dp, set, l, descriptors, 1, ++g_descriptor_lease, 0, 0};
         g_desc_alloc_sets++;
         static uint64_t n; if (++n <= 4 || !(n & (n - 1))) VKLOG("descriptor set %llu with a pool of its own: layout needs ubo %u / ubo-dyn %u / ssbo %u / ssbo-dyn %u / sampler %u / combined %u / sampled %u / storage-image %u / utb %u / stb %u (a shared pool holds %u combined; %d such pools in this slot)",
             (unsigned long long)n, need[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER], need[VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC], need[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER], need[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC], need[VK_DESCRIPTOR_TYPE_SAMPLER], need[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER], need[VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE], need[VK_DESCRIPTOR_TYPE_STORAGE_IMAGE], need[VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER], need[VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER], DP_CAP[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER], s->ndpx);
@@ -1621,6 +1669,28 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
     return set;
 }
 
+// Immutable-content leases are scoped to the current slot. Normal allocation always changes the
+// lease before its caller rewrites descriptors. A cached handle alone is insufficient: the driver
+// may recycle it after a pool is destroyed. Only completed-slot, unused sets can be claimed.
+uint64_t vk_descriptor_lease(VkDescriptorSet set, int rewrite) {
+    vksub_t *s = cur();
+    for (int i = 0; i < s->ndpx && i < DPX_KEEP; i++) if (s->dpx[i].set == set && s->dpx[i].used) {
+        if (rewrite) { s->dpx[i].lease = ++g_descriptor_lease; s->dpx[i].cached = 0; }
+        else s->dpx[i].cached = 1;
+        return s->dpx[i].lease;
+    }
+    return 0;
+}
+int vk_descriptor_claim(VkDescriptorSet set, uint64_t lease) {
+    if (!lease || !descriptor_large_reuse()) return 0;
+    vksub_t *s = cur();
+    for (int i = 0; i < s->ndpx && i < DPX_KEEP; i++) {
+        dpx_entry *e = &s->dpx[i];
+        if (e->set == set && e->lease == lease && !e->used) { e->used = 1; return 1; }
+    }
+    return 0;
+}
+
 // ---------------- submissions: begin, CPU-visible effects, commit ----------------
 static void post(post_op o) { vksub_t *s = cur(); if (s->npost == s->cappost) { s->cappost = s->cappost ? 2 * s->cappost : 64; s->post = realloc(s->post, s->cappost * sizeof *s->post); } s->post[s->npost++] = o; }
 // Samples-passed on NVN is cumulative on the queue. Vulkan queries are per render pass, so completion replays ordered
@@ -1630,10 +1700,19 @@ static void post(post_op o) { vksub_t *s = cur(); if (s->npost == s->cappost) { 
 enum { OCC_BLOCK = 256 };
 static int g_occ_counting, g_occ_active = -1;   // replay thread, under g_sub_lock; active belongs to the current submission
 static uint64_t g_occ_completed;              // completion thread only, across submissions
+static uintptr_t g_occ_first_site, g_occ_last_site;
+static uint32_t g_occ_draw_calls;              // issued calls, not GPU indirect vertex/index counts
 int vk_occ_counting(void) { return g_occ_counting; }   // query effects outlive each pass and report until the next reset
 void vk_occ_draw(void) {
-    if (!g_occ_counting || g_occ_active >= 0) return;
+    if (!g_occ_counting) return;
+    uintptr_t site = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+    g_occ_last_site = site;
+    if (g_occ_active >= 0) { if (g_occ_draw_calls != UINT32_MAX) g_occ_draw_calls++; return; }
+    g_occ_first_site = site; g_occ_draw_calls = 1;
     vksub_t *s = cur(); int q = s->nocc, block = q / OCC_BLOCK;
+    typeof(s->occ[0]) *trace = &s->occ[s->nmain_used - 1];
+    if (!trace->begins++) trace->first_q = (uint32_t)q;
+    trace->last_q = (uint32_t)q;
     if (!(q % OCC_BLOCK)) {
         if (block == s->noq) {
             if (s->noq == s->capoq) { s->capoq = s->capoq ? 2 * s->capoq : 4; s->oq = realloc(s->oq, (size_t)s->capoq * sizeof *s->oq); if (!s->oq) die("[vk] occlusion pool allocation"); }
@@ -1642,7 +1721,10 @@ void vk_occ_draw(void) {
         }
         // Upload commands execute before this main command buffer. Reset outside the render pass, once per block,
         // including a block first allocated by a draw halfway through a pass or a long submission's later part.
-        vkCmdResetQueryPool(vk_upload_cmd(), s->oq[block], 0, OCC_BLOCK);
+        VkCommandBuffer up = vk_upload_cmd();
+        if (!trace->resets++) trace->first_block = (uint32_t)block;
+        trace->last_block = (uint32_t)block; trace->reset_cb = up;
+        vkCmdResetQueryPool(up, s->oq[block], 0, OCC_BLOCK);
     }
     g_occ_active = s->nocc++;
     vkCmdBeginQuery(s->main, s->oq[block], (uint32_t)(q % OCC_BLOCK), V.has_occ_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
@@ -1651,7 +1733,10 @@ void vk_occ_end(void) {
     if (g_occ_active < 0) return;
     vksub_t *s = cur(); int q = g_occ_active;
     vkCmdEndQuery(s->main, s->oq[q / OCC_BLOCK], (uint32_t)(q % OCC_BLOCK));
-    post((post_op){.kind = 3, .v = (uint32_t)(s->nmain_used - 1), .q = q});
+    s->occ[s->nmain_used - 1].ends++;
+    // The otherwise unused kind-3 fields retain failure-only draw metadata; no allocation or normal-path logging.
+    post((post_op){.kind = 3, .val = (volatile uint32_t *)g_occ_last_site, .v = (uint32_t)(s->nmain_used - 1),
+                   .addr = g_occ_first_site, .type = g_occ_draw_calls, .q = q});
     g_occ_active = -1;
 }
 void vk_occ_reset(void) {
@@ -1662,19 +1747,64 @@ void vk_occ_reset(void) {
 }
 // Run only after the owning submission has completed. One result per segment; no wait or fabricated substitute.
 // The submission slot is held until completion consumes every event. A dropped command-buffer part contributes none.
-static void occ_complete(vksub_t *s, const post_op *o, int submitted_parts) {
+static void occ_failure(vksub_t *s, const post_op *o, int submitted_parts, uint64_t frame, uint64_t fence, VkResult result) {
+    int begin_part = -1, reset_part = -1; uint32_t begins = 0, ends = 0, resets = 0;
+    for (int i = 0; i < s->nmain_used && i < MAIN_CBS; i++) {
+        const typeof(s->occ[0]) *t = &s->occ[i]; begins += t->begins; ends += t->ends; resets += t->resets;
+        if (t->begins && (uint32_t)o->q >= t->first_q && (uint32_t)o->q <= t->last_q) begin_part = i;
+        if (t->resets && (uint32_t)o->q / OCC_BLOCK >= t->first_block && (uint32_t)o->q / OCC_BLOCK <= t->last_block) reset_part = i;
+    }
+    VKLOG("[RED] samples query failure: result %d frame %llu fence %llu slot %d (slot fence %llu), query %d pool %#llx; parts submitted %d recorded %d sent %d, uploads %d; queries %d begins %u ends %u block resets %u; begin/reset/end parts %d/%d/%u",
+          result, (unsigned long long)frame, (unsigned long long)fence, (int)(s - g_slot), (unsigned long long)s->fence,
+          o->q, (unsigned long long)(uintptr_t)s->oq[o->q / OCC_BLOCK], submitted_parts, s->nmain_used, s->nmain_sent, s->nup_used,
+          s->nocc, begins, ends, resets, begin_part, reset_part, o->v);
+    VKLOG("  query draw calls %u, first/last call sites libdmhost.so+%#llx/+%#llx (base %#llx)",
+          o->type, (unsigned long long)(o->addr - (uintptr_t)g_lib_base),
+          (unsigned long long)((uintptr_t)o->val - (uintptr_t)g_lib_base), (unsigned long long)(uintptr_t)g_lib_base);
+    // At most three part lines and five neighboring availability reads. These reads are diagnostic only:
+    // even a now-available result does not replace the failed read or prevent the caller's fatal error.
+    int first = o->q > 2 ? o->q - 2 : 0, last = o->q + 2;
+    if (last >= s->nocc) last = s->nocc - 1;
+    for (int q = first; q <= last; q++) {
+        // A neighbor may belong to a dropped part and even a newly created, never-reset pool.
+        // Vulkan forbids reading uninitialized queries, including for diagnostic availability.
+        int used = 0, reset = 0;
+        for (int i = 0; i < submitted_parts && i < s->nmain_used && i < MAIN_CBS; i++) {
+            const typeof(s->occ[0]) *t = &s->occ[i];
+            if (t->begins && (uint32_t)q >= t->first_q && (uint32_t)q <= t->last_q) used = 1;
+            if (t->resets && (uint32_t)q / OCC_BLOCK >= t->first_block && (uint32_t)q / OCC_BLOCK <= t->last_block) reset = 1;
+        }
+        if (!used || !reset) continue;
+        uint64_t value[2] = {UINT64_MAX, UINT64_MAX};
+        VkResult r = vkGetQueryPoolResults(V.dev, s->oq[q / OCC_BLOCK], (uint32_t)(q % OCC_BLOCK), 1,
+                                           sizeof value, value, sizeof value, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        VKLOG("  query availability %d: result %d samples %llu available %llu%s", q, r,
+              (unsigned long long)value[0], (unsigned long long)value[1], q == o->q ? " (failed query)" : "");
+    }
+    for (int i = 0; i < s->nmain_used && i < MAIN_CBS; i++) if (i == begin_part || i == reset_part || (uint32_t)i == o->v) {
+        const typeof(s->occ[0]) *t = &s->occ[i];
+        VKLOG("  query part %d: main %#llx begins %u [%u..%u] ends %u; resets %u blocks [%u..%u] upload %#llx, %s",
+              i, (unsigned long long)(uintptr_t)s->mains[i], t->begins, t->first_q, t->last_q, t->ends,
+              t->resets, t->first_block, t->last_block, (unsigned long long)(uintptr_t)t->reset_cb, i < submitted_parts ? "submitted" : "dropped");
+    }
+}
+static void occ_complete(vksub_t *s, const post_op *o, int submitted_parts, uint64_t frame, uint64_t fence) {
     if (o->v >= (uint32_t)submitted_parts) return;
     if (o->kind == 4) { g_occ_completed = 0; return; }
     uint64_t samples = 0; int q = o->q;
     VkResult r = vkGetQueryPoolResults(V.dev, s->oq[q / OCC_BLOCK], (uint32_t)(q % OCC_BLOCK), 1, sizeof samples, &samples, sizeof samples, VK_QUERY_RESULT_64_BIT);
-    if (r != VK_SUCCESS) die("[vk] completed samples-passed query unavailable: %d (query %d)", r, q);
+    // A query whose result never became available (a few per submission part on the Odin 3, Ocarina of Time) counts as visible instead of ending the game: the condition
+    // that reads it then draws, as a counter the host does not know does (render_cond). The first failures keep their full diagnostics
+    if (r != VK_SUCCESS) { static unsigned failures; if (failures++ < 3) occ_failure(s, o, submitted_parts, frame, fence, r); else if (!(failures & (failures - 1))) VKLOG("[RED] samples query unavailable at completion: %u so far, counted as visible", failures); samples = 1; }
     g_occ_completed += samples;
 }
 void mtl_init(void) { vk_init(); }
 static int g_shadow_pools;
 static void pools_readback_barrier(VkCommandBuffer cb) {
-    if (!g_shadow_pools) return;
-    // The last part can be dropped after earlier ones were sent; each part must publish its writes for the CPU merge.
+    // Both copied pools and directly mapped AHardwareBuffer pools can contain GPU-written
+    // results the guest reads after a fence/event. A fence wait alone does not make device
+    // writes visible to host accesses, even when no shadow copy-back is needed.
+    // The last part can be dropped after earlier ones were sent; publish every part.
     VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &b, 0, NULL, 0, NULL);
 }
@@ -1687,7 +1817,7 @@ void mtl_sub_begin(void) {
     slot_recycle(s);
     cut_stats_begin(s);
     { const char *e = getenv("DM_VK_DESC_TIMING"); g_desc_timing = e && atoi(e); }
-    s->npost = 0; s->up_used = 0; s->ngw = 0; s->nocc = 0; g_occ_active = -1;
+    s->npost = 0; s->up_used = 0; s->ngw = 0; s->nocc = 0; g_occ_active = -1; memset(s->occ, 0, sizeof s->occ);
     { const char *e = getenv("DM_VK_POOL_READBACK_RANGES"); s->readback_ranges = e && atoi(e); }
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     s->main = s->mains[0]; s->nmain_used = 1; s->cb_err = 0; s->up = s->ups[0]; s->nup_used = 1; s->nmain_sent = 0;
@@ -2004,6 +2134,15 @@ static void chain_maybe(const cpend *c, const uint64_t *t, int np) {
         if (o > (int)sizeof b - 120) { VKLOG("chain passes:%s", b); o = 0; } }
     if (o) VKLOG("chain passes:%s", b);
 }
+// Reports/readbacks precede the release which can wake a CPU writer. Keep this
+// frontier separate from g_done: slot reuse and SyncWait include event publication too.
+static void completion_events_publish(const cpend *c) {
+    __atomic_store_n(&g_reports_done, c->fence, __ATOMIC_RELEASE);
+    for (int i = 0; i < c->n; i++) {
+        const post_op *o = &c->ops[i];
+        if (o->kind == 1) nvn_event_publish_gpu(o->val, o->mode, o->v, c->fence);
+    }
+}
 static void *completion_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "dm-vk-complete");
     for (;;) {
@@ -2044,8 +2183,8 @@ static void *completion_main(void *a) {
         }
         for (int i = 0; i < c->n; i++) {
             post_op *o = &c->ops[i];
-            if (o->kind == 3 || o->kind == 4) { occ_complete(&g_slot[c->rslot], o, c->occ_parts); continue; }
-            if (o->kind == 1) { if (o->mode == 1) *o->val += o->v; else *o->val = o->v; continue; }
+            if (o->kind == 3 || o->kind == 4) { occ_complete(&g_slot[c->rslot], o, c->occ_parts, c->frame, c->fence); continue; }
+            if (o->kind == 1) continue;   // publish after reports and readbacks below
             uint64_t ts = now, tq;
             if (o->q >= 0 && c->slot >= 0 && g_cq && vkGetQueryPoolResults(V.dev, g_cq, (uint32_t)o->q, 1, 8, &tq, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
                 uint64_t host;
@@ -2055,11 +2194,13 @@ static void *completion_main(void *a) {
             // render_cond: a timestamp report's counter field is 0, as on the GPU (gfx_vk_exec.c render_cond evaluates conditions on it)
             uint64_t rec[2] = {o->type == 0 || o->type == 0x10 ? (DM_GAME_RENDER_COND ? 0 : ts) : o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? g_occ_completed : 0, ts}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
         }
+        completion_events_publish(c);
         pthread_mutex_lock(&g_cmu); g_ch = c->next; if (!g_ch) g_ct = NULL; pthread_mutex_unlock(&g_cmu);
         if (g_prereset > 0 && c->rslot >= 0) { vksub_t *s = &g_slot[c->rslot];   // its command buffers reset here (slot_recycle); the slot is not taken before g_done passes this fence
             if (s->fence == c->fence) { for (int i = 0; i < s->nmain_alloc; i++) vkResetCommandBuffer(s->mains[i], 0); for (int i = 0; i < s->nup_alloc; i++) vkResetCommandBuffer(s->ups[i], 0); } }
         perf_frame_complete(c->frame, c->fence, frame_valid, frame_begin, frame_end);
         pthread_mutex_lock(&g_done_mu); if (c->fence > g_done) __atomic_store_n(&g_done, c->fence, __ATOMIC_RELEASE); pthread_cond_broadcast(&g_done_cv); pthread_mutex_unlock(&g_done_mu);
+        nvn_queue_gpu_progress();
         free(c->ops); free(c);
     }
     return NULL;
@@ -2069,6 +2210,7 @@ uint64_t mtl_sub_commit(void) {
     { void vk_prof_end(void); vk_prof_end(); }
     vksub_t *s = cur();
     vk_end_pass_land();
+    vk_queue_preserve();   // retain bindings before a logical job releases its descriptors
     pools_readback_barrier(s->main);
     if (g_tsq) vkCmdWriteTimestamp(s->main, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)g_cur + 1);
     int occ_parts = s->nmain_used;

@@ -37,10 +37,11 @@ class CubicUpscaler(unittest.TestCase):
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <math.h>
 typedef struct { VkImage img;VkFormat fmt;VkImageViewType vtype;uint32_t levels,layers,d,samples,w,h;VkImageUsageFlags usage;int gpu_w; } vkimg_t;
-typedef struct { int set_levels,nlevels,set_layers,nlayers,set_target,target; } view_t;
+typedef struct { int set_levels,nlevels,set_layers,nlayers,set_target,target;uint32_t base_level,min_layer; } view_t;
 enum { NVN_TEXTURE_TARGET_2D=1 };
-typedef struct { vkimg_t *im;int tid,has_view;view_t view;uint32_t level,layer,w,h; } upscaler_image;
+typedef struct { vkimg_t *im;int tid,has_view,allow_promotion,needs_opaque_alpha;view_t view;int tex;uint32_t level,layer,w,h; } upscaler_image;
 typedef struct { uint64_t key; } vkshader_t;
 typedef struct { int x,y,z;uint64_t ind; } p_dispatch;
 static struct { int has_filter_cubic;VkPhysicalDevice pd; } V;
@@ -50,6 +51,16 @@ static VkFilter last_filter;static VkImageBlit last_region;
 static VkFormatFeatureFlags source_features=VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_CUBIC_BIT_EXT;
 static VkFormatFeatureFlags output_features=VK_FORMAT_FEATURE_BLIT_DST_BIT;
 static upscaler_image input,output;
+static int square_enabled,square_ok=1,square_view_ok=1,square_calls;
+static int vk_upscale_square_key(uint64_t key){(void)key;return square_enabled;}
+static VkImageView vk_tex_view(const int *tex,const view_t *v,int dim,int arrayed,int kind,vkimg_t **im){
+ (void)tex;assert(dim==1&&!arrayed&&!kind&&v->set_levels&&v->nlevels==1&&v->set_layers&&v->nlayers==1);
+ assert(v->base_level==input.level&&v->min_layer==input.layer&&v->set_target&&v->target==NVN_TEXTURE_TARGET_2D);
+ *im=input.im;return square_view_ok?(VkImageView)(uintptr_t)42:VK_NULL_HANDLE;
+}
+static int vk_upscale_square(vkimg_t *src,VkImageView view,vkimg_t *dst,const VkImageBlit *r){
+ assert(src==input.im&&dst==output.im&&view&&(r->srcSubresource.mipLevel==input.level));square_calls++;return square_ok;
+}
 static int upscaler_contract(const vkshader_t *cs){(void)cs;return contract_ok;}
 static uint64_t vk_tex_slot_handle(const uint64_t *t,const uint64_t *i,int slot){(void)t;(void)i;assert(slot==0);return 1;}
 static int upscaler_image_at(uint64_t handle,int sampled,upscaler_image *out){(void)handle;*out=sampled?input:output;return image_ok;}
@@ -70,6 +81,8 @@ static void ignore(const char *fmt,...){(void)fmt;}
 CONTRACT
 RECT
 FILTER
+ALPHA
+SQUARE_COORD
 REPLACE
 int main(int argc,char **argv){
  if(argc>1){assert(upscaler_linear_contract(UINT64_C(0x14a8aaf3e0a9edbd))==atoi(argv[1]));return 0;}
@@ -135,11 +148,33 @@ int main(int argc,char **argv){
  contract_ok=0;assert(!upscaler_replace(&cs,&d)&&blits==before);contract_ok=1;
  image_ok=0;assert(!upscaler_replace(&cs,&d)&&blits==before);image_ok=1;
  b.usage=0;assert(!upscaler_replace(&cs,&d)&&blits==before);b.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT;
- S.push[1][2]=UINT32_MAX;assert(!upscaler_replace(&cs,&d)&&blits==before);
+ S.push[1][2]=UINT32_MAX;assert(!upscaler_replace(&cs,&d)&&blits==before);S.push[1][2]=1151;
+ // A promoted RGB source may have arbitrary backing alpha: reject RGBA before recording, allow actual RGB destinations.
+ input.needs_opaque_alpha=1;a.fmt=VK_FORMAT_R16G16B16A16_SFLOAT;b.fmt=VK_FORMAT_R16G16B16A16_SFLOAT;
+ assert(!upscaler_replace(&cs,&d)&&blits==before);
+ b.fmt=VK_FORMAT_B10G11R11_UFLOAT_PACK32;assert(upscaler_replace(&cs,&d)&&last_filter==VK_FILTER_LINEAR&&blits==before+1);
+ // Audited signed-square keys must use their transfer path, including when cubic is live.
+ // Any helper/view failure falls back to native compute, never to the plain blit.
+ before=blits;square_enabled=1;S.push[1][20]=S.push[1][21]=0x3f800000u;
+ float source_recip[2]={1.f/input.w,1.f/input.h},out_recip[2]={1.f/output.w,1.f/output.h};
+ memcpy(&S.push[1][8],source_recip,sizeof source_recip);memcpy(&S.push[1][26],out_recip,sizeof out_recip);
+ S.push[1][24]=output.w;S.push[1][25]=output.h;input.has_view=1;input.view.nlevels=3;input.view.nlayers=2;
+ assert(upscaler_replace(&cs,&d)&&square_calls==1&&blits==before);
+ square_ok=0;assert(!upscaler_replace(&cs,&d)&&square_calls==2&&blits==before);square_ok=1;
+ square_view_ok=0;assert(!upscaler_replace(&cs,&d)&&square_calls==2&&blits==before);square_view_ok=1;
+ S.push[1][20]=0x40000000u;assert(!upscaler_replace(&cs,&d)&&square_calls==2&&blits==before);S.push[1][20]=0x3f800000u;
+ S.push[1][22]=0x3f800000u;assert(!upscaler_replace(&cs,&d)&&square_calls==2&&blits==before);S.push[1][22]=0x80000000u;
+ assert(upscaler_replace(&cs,&d)&&square_calls==3&&blits==before);
+ S.push[1][24]++;assert(!upscaler_replace(&cs,&d)&&square_calls==3&&blits==before);S.push[1][24]--;
+ S.push[1][8]=0x7fc00000u;assert(!upscaler_replace(&cs,&d)&&square_calls==3&&blits==before);
+ source_recip[0]*=1.01f;memcpy(&S.push[1][8],source_recip,sizeof source_recip);
+ assert(!upscaler_replace(&cs,&d)&&square_calls==3&&blits==before);
+ source_recip[0]=1.f/input.w;memcpy(&S.push[1][8],source_recip,sizeof source_recip);
+ S.push[1][8]++;assert(upscaler_replace(&cs,&d)&&square_calls==4&&blits==before);
  return 0;
 }
 """
-        for marker,decl in [('CONTRACT','static int upscaler_linear_contract('),('RECT','static int upscaler_rect('),('FILTER','static VkFilter upscaler_filter('),('REPLACE','static int upscaler_replace(')]:
+        for marker,decl in [('CONTRACT','static int upscaler_linear_contract('),('RECT','static int upscaler_rect('),('FILTER','static VkFilter upscaler_filter('),('ALPHA','static int upscaler_alpha_compatible('),('SQUARE_COORD','static int upscaler_square_coordinates('),('REPLACE','static int upscaler_replace(')]:
             code=code.replace('\n'+marker+'\n','\n'+function(source,decl)+'\n')
         code=code.replace('LINEAR_KEYS',','.join('UINT64_C(0x'+k+')' for k in keys))
         code=code.replace('ENCODED_KEYS',','.join('UINT64_C(0x'+k+')' for k in encoded))

@@ -6,9 +6,10 @@
 #pragma once
 #include <stdint.h>
 struct vkimg;
-// The fill over the whole of out's mip 0 layer 0, recorded in the current submission's main command buffer (gfx_vk.h vk_cmd); 1 recorded (out->gpu_w set);
+// Fill the selected mip/layer, preserving the effective storage-view format. The exact UNORM view over native RGBA8 sRGB uses a raw compatible copy after scaling.
+// Recorded in the current submission's main command buffer; 1 recorded (out->gpu_w set);
 // 0: no picture yet, the pool has no buffer, or the device refuses the blit: the caller goes on with its own replacement
-int vk_movie_fill(struct vkimg *out);
+int vk_movie_fill(struct vkimg *out, uint32_t view_format, uint32_t level, uint32_t layer);
 // DM_VK_MOVIE_FILL_CS=<key>,<key>... (hex shader keys): this shader is named (parsed once; 0 when the variable is unset)
 int vk_movie_fill_kernel(uint64_t key);
 // The first call for a named key (the caller's one-time log line)

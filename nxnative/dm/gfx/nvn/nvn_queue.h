@@ -1,6 +1,7 @@
 // Guest queue completion is distinct from a physical Metal submission fence.
 #pragma once
 #include "nvn_obj.h"
+int nvn_logical_queues_on(void); // startup-only mode; receipts cannot change representation live
 void nvn_queue_submit(queue_t *q, int n, const uint64_t *handles);
 uint64_t nvn_queue_present(queue_t *q,const tex_t *t,double period,const int crop[4]);
 void nvn_queue_present_wait(uint64_t ticket);

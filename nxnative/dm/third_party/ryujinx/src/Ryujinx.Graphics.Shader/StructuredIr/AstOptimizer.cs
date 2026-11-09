@@ -31,7 +31,10 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                         // Pokémon Legends: Z-A's culling compute shaders (66f848f2d65e7b75, e7dd2a9e45c705b9, ec5ebd6d9902a9a1) did each warp's atomic add on a
                         // record's done counter twice; the lane whose rank equals the total then never came, the counters were never reset and grew every frame
                         // (GPU 9 → 70 ms a frame within minutes on both the Adreno driver and Turnip)
-                        if (propVar.Defs.Count == 1 && isWorthPropagating && !UsedByCall(propVar) && !HasSideEffects(assignment.Source))
+                        // A memory read can be removed when unused, but moving its evaluation past a store or helper call changes the value.
+                        // Raw vector helpers overwrite gmem_vec: keep each caller's component snapshots at their original position.
+                        if (propVar.Defs.Count == 1 && isWorthPropagating && !UsedByCall(propVar) &&
+                            !HasSideEffects(assignment.Source) && !ReadsMutableMemory(assignment.Source))
                         {
                             PropagateExpression(propVar, assignment.Source);
                         }
@@ -60,6 +63,31 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                 Instruction.Call or Instruction.ImageAtomic => true,
                 _ => false,
             };
+        }
+
+        private static bool ReadsMutableMemory(IAstNode source)
+        {
+            if (source is not AstOperation operation)
+            {
+                return false;
+            }
+
+            if ((operation.Inst & Instruction.Mask) == Instruction.Load &&
+                operation.StorageKind is not (StorageKind.ConstantBuffer or StorageKind.Input or StorageKind.InputPerPatch))
+            {
+                return true;
+            }
+
+            // Also preserve evaluation order if an earlier pass has already nested a read in an expression.
+            for (int index = 0; index < operation.SourcesCount; index++)
+            {
+                if (ReadsMutableMemory(operation.GetSource(index)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static bool UsedByCall(AstOperand propVar)

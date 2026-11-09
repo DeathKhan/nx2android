@@ -23,11 +23,10 @@ env	DM_ADAPTIVE_FPS=0
 # Movies (2026-11-08, Odin 3): the AV1 movies decode on MediaCodec (c2.qti.av1.decoder; the game reads the pictures on the CPU, so they go through NV12 copies into its linear
 # textures). The NDVE enhancement network the game runs over each decoded picture (Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs, 22 compute shaders of 0.15-1.8 MB of SPIR-V with up to
 # 1,000 subgroup shuffles) does not build on Adreno 830's driver: vkCreateComputePipelines fails on e6be82d835fbe4d3 and throws std::bad_alloc on d15370a382630d4e, which ends the app.
-# Its stages are left out, and the two output stages (ssbo activations + the picture → the enhanced picture) copy the picture through instead: the movies show unenhanced.
-# The game only dispatches the network once per movie here (the frames themselves are drawn from the decoded planes), so the title and the opening look right without it
+# Its stages are left out. The final title output instead receives the decoded picture through the tested movie-fill path below; enhancement is not reproduced.
 env	DM_VK_SKIP_CS=c2fc2ddd604c25e7,4f41ccf24f163e0d,ba079f68ae288dba,a8b4fb48fee0ccf8,e2eebd7ba18fe35f,e6be82d835fbe4d3,9442573ee4ace011,0a56002cdc7e1fce,d15370a382630d4e,7f7ff0f36b54d90f,5a7d69b067a7f011,329e4b0f0b3f2bc6,7653fe5f6ef0b2f2,b6e34b46dea44278,3f18f89630c05813,539ad3b353758de0,d72077c4b6cc264f,ab9a92b55950ec02,c41f451b88a050f6,55ee6dc89a2b64e2,49dff010b9832251,8e98d86c0e4a7b53
 env	DM_VK_PASSTHRU_CS=5a7d69b067a7f011,55ee6dc89a2b64e2,4f41ccf24f163e0d
-# The passthrough copies a skipped layer's output, which is black. Movie fill: the output images of these stages take the decoded NV12 picture itself (the one the CPU path wrote into
-# the game's image pool), converted on the GPU and scaled over the image (dm/android/movie_fill_vk.c; the keys must also be in DM_VK_PASSTHRU_CS). Named for every output stage,
-# since it is not known which one the final draw samples; the first dispatch of each logs "movie fill <key>: the decoded picture → image slot ..."
-env	DM_VK_MOVIE_FILL_CS=5a7d69b067a7f011,55ee6dc89a2b64e2,4f41ccf24f163e0d
+# Device capture identifies 4f41 as the title background producer: its UNORM storage view covers a native SRGB image. The host converts a synchronized NV12 snapshot,
+# scales in UNORM, and copies the encoded bytes into that image. Confirmed animated title background on Odin3; later cutscene outputs remain unverified.
+# Only the observed final producer is filled; this key must also be in DM_VK_PASSTHRU_CS.
+env	DM_VK_MOVIE_FILL_CS=4f41ccf24f163e0d

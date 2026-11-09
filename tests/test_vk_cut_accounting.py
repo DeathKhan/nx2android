@@ -38,14 +38,17 @@ class CutAccounting(unittest.TestCase):
 typedef struct {
  VkCommandPool pool;VkCommandBuffer main,up,mains[MAIN_CBS],ups[MAIN_CBS];
  int nmain_used,nmain_alloc,nmain_sent,nup_used,nup_alloc,cb_err,up_used,cut_diag;
- uint32_t cut_success,cut_budget_refused,cut_capacity_refused;uint64_t cut_cpu_ns;
+ uint32_t cut_success,cut_budget_refused,cut_capacity_refused;uint64_t cut_cpu_ns,part_ns[MAIN_CBS];
 } vksub_t;
 static vksub_t slot;
 static vksub_t *cur(void){return &slot;}
-static void part_sent(vksub_t *s){(void)s;}
+static void part_sent(vksub_t *s);
+static int pass_timing;static int pass_times_on(void){return pass_timing;}
 static struct { VkDevice dev;VkQueue q; } V;
 static int g_prof_on,clock_calls,end_calls,begin_calls,queue_calls,readbacks,lands,log_calls;
 static uint64_t g_prof_ns[8],g_cmd_gen;
+static VkCommandBuffer submitted[2048];static int nsubmitted;
+static unsigned available[2048];
 static pthread_mutex_t g_vk_queue_mu=PTHREAD_MUTEX_INITIALIZER;
 static char log_line[1024];
 static void log_message(const char *f,...){if(strncmp(f,"cut stats",9))return;va_list a;va_start(a,f);vsnprintf(log_line,sizeof log_line,f,a);va_end(a);log_calls++;}
@@ -57,11 +60,19 @@ static void pools_readback_barrier(VkCommandBuffer cb){assert(cb==slot.main);rea
 static void vk_img_barrier_all(VkCommandBuffer cb){assert(cb==slot.up);}
 static VkResult vkEndCommandBuffer(VkCommandBuffer cb){assert(cb);end_calls++;return VK_SUCCESS;}
 static VkResult vkBeginCommandBuffer(VkCommandBuffer cb,const VkCommandBufferBeginInfo *b){assert(cb&&b);begin_calls++;return VK_SUCCESS;}
-static VkResult vkQueueSubmit(VkQueue q,uint32_t n,const VkSubmitInfo *s,VkFence f){(void)q;assert(n==1&&s->commandBufferCount>0&&!f);queue_calls++;return VK_SUCCESS;}
+static VkResult vkQueueSubmit(VkQueue q,uint32_t n,const VkSubmitInfo *s,VkFence f){
+ (void)q;assert(n==1&&s->commandBufferCount>0&&!f);queue_calls++;
+ for(uint32_t i=0;i<s->commandBufferCount;i++){
+  VkCommandBuffer cb=s->pCommandBuffers[i];assert(nsubmitted<2048&&(uintptr_t)cb<2048);
+  submitted[nsubmitted++]=cb;available[(uintptr_t)cb]++;
+ }
+ return VK_SUCCESS;
+}
 static VkResult vkAllocateCommandBuffers(VkDevice d,const VkCommandBufferAllocateInfo *a,VkCommandBuffer *p){(void)d;assert(a->commandBufferCount==1);static uintptr_t next=100;*p=(VkCommandBuffer)next++;return VK_SUCCESS;}
 static int mock_clock(clockid_t c,struct timespec *t){assert(c==CLOCK_MONOTONIC);clock_calls++;*t=(struct timespec){0,clock_calls*100};return 0;}
 #define clock_gettime mock_clock
 static uint64_t g_pipe_kgsl;static uint64_t kgsl_mapped(void){return 0;}static void vk_stage_flush(void){}
+PART_SENT
 HELPERS
 #undef clock_gettime
 static int g_ord_parts,g_cb_draws,g_x_landcut;
@@ -118,12 +129,33 @@ int main(void){
  // Deferred-submit mode still creates a real boundary, with no early queue submission.
  setenv("DM_VK_SUBMIT_SPLIT","0",1);reset_slot();cut_stats_begin(&slot);cuts=0;prior_queue=queue_calls;
  assert(pass_cut(0,&cuts)&&cuts==1&&slot.nmain_used==2&&slot.nmain_sent==0&&queue_calls==prior_queue);
+ // Live off->on must submit every older unsent part, after the shared upload CB.
+ // Availability is changed only by mock queue execution, never by recording/end.
+ VkCommandBuffer first=slot.mains[0],second=slot.mains[1],upload=slot.up;
+ assert(vk_cmd_split());VkCommandBuffer third=slot.mains[2];
+ int base=nsubmitted;unsigned first_before=available[(uintptr_t)first];
+ slot.up_used=1;setenv("DM_VK_SUBMIT_SPLIT","1",1);
+ assert(vk_cmd_split()&&slot.nmain_sent==3&&slot.nmain_used==4);
+ assert(nsubmitted==base+4&&submitted[base]==upload&&submitted[base+1]==first&&submitted[base+2]==second&&submitted[base+3]==third);
+ assert(available[(uintptr_t)first]==first_before+1); // old sender omitted it, leaving its query unavailable
+ // On->off->on must neither resubmit an old part nor omit the new deferred prefix.
+ setenv("DM_VK_SUBMIT_SPLIT","0",1);VkCommandBuffer fourth=slot.main;
+ assert(vk_cmd_split());VkCommandBuffer fifth=slot.main;
+ base=nsubmitted;first_before=available[(uintptr_t)first];
+ setenv("DM_VK_SUBMIT_SPLIT","1",1);assert(vk_cmd_split());
+ assert(nsubmitted==base+2&&submitted[base]==fourth&&submitted[base+1]==fifth);
+ assert(available[(uintptr_t)first]==first_before&&slot.nmain_sent==5);
+ setenv("DM_VK_SUBMIT_SPLIT","0",1);
  // Existing slow-profiler timing works independently when the bounded diagnostic is off.
  g_prof_on=1;assert(vk_cmd_split());assert(g_prof_ns[6]==100&&!slot.cut_cpu_ns);
+ // The real timing helper stamps every newly sent part with the common queue-submit time.
+ g_prof_on=0;reset_slot();slot.nmain_used=4;slot.nmain_sent=1;slot.part_ns[0]=42;
+ pass_timing=1;part_sent(&slot);
+ assert(slot.part_ns[0]==42&&slot.part_ns[1]&&slot.part_ns[1]==slot.part_ns[2]&&slot.part_ns[2]==slot.part_ns[3]);
  return 0;
 }
 """
-        code=code.replace('HELPERS',helpers).replace('PASS_CUT',function(exe,'static int pass_cut('))
+        code=code.replace('PART_SENT',function(core,'static void part_sent(')).replace('HELPERS',helpers).replace('PASS_CUT',function(exe,'static int pass_cut('))
         target=ROOT/'target/tests';target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='cut-accounting-',dir=target) as t:
             src=Path(t)/'test.c';out=Path(t)/'test';src.write_text(code)

@@ -19,6 +19,36 @@
 // spv_size: 0 = the SPIR-V is stored as it is (spv_len bytes; every version 1 entry), else a zstd frame of spv_len bytes that decompresses to spv_size (version 2)
 typedef struct __attribute__((packed)) { uint64_t key; uint32_t stage, spv_off, spv_len, refl_off, refl_len, spv_size; } bent;
 static const uint8_t *g_bundle; static uint32_t g_nent; static const bent *g_ent;
+// Set 0 is shared by every pipeline, including shaders loaded later. Its pool bindings therefore
+// use the union of the entire bundle, never the first program or the currently active stages.
+// Unknown reflection keeps the old full layout; an absent kind retains one compatible descriptor.
+static unsigned g_pool_kinds = (1u << POOL_TEX_SLOTS) - 1;
+static unsigned bundle_pool_kinds(const uint8_t *b, uint64_t size) {
+    const unsigned all = (1u << POOL_TEX_SLOTS) - 1; uint32_t version, count;
+    if (!b || size < 12 || memcmp(b, "DMSV", 4)) return all;
+    memcpy(&version, b + 4, 4); memcpy(&count, b + 8, 4);
+    if (version < 1 || version > 2 || !count || 12 + (uint64_t)count * sizeof(bent) > size) return all;
+    unsigned kinds = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        bent e; memcpy(&e, b + 12 + (uint64_t)i * sizeof(e), sizeof(e));
+        if (e.stage > 7 || (uint64_t)e.spv_off + e.spv_len > size || e.spv_len < 20 ||
+            (uint64_t)e.refl_off + e.refl_len > size || e.refl_len < 20) return all;
+        uint32_t h[5]; memcpy(h, b + e.refl_off, sizeof(h));
+        if (20 + (uint64_t)h[0] * sizeof(dmsv_bind) + h[1] > e.refl_len) return all;
+        for (uint32_t j = 0; j < h[0]; j++) {
+            dmsv_bind r; memcpy(&r, b + e.refl_off + 20 + (uint64_t)j * sizeof(r), sizeof(r));
+            if (r.kind > RK_SAMPP || r.desc > RD_SAMPLER) return all;
+            if (r.kind == RK_SAMPP) { if (r.desc != RD_SAMPLER || r.flags || !r.count) return all; continue; }
+            if (r.kind != RK_TEXP) continue;
+            if (r.desc != RD_IMAGE || (r.flags & ~1u) || !r.count) return all;
+            int slot = r.dim == 1 ? (r.flags & 1) : r.dim == 3 ? 2 : r.dim == 2 ? 3 : -1;
+            if (slot < 0) return all;
+            kinds |= 1u << slot;
+        }
+    }
+    return kinds;
+}
+
 // Every entry is checked against the file's size once here, so a lookup never reads past the mapping (a copy cut short, say a push stopped outside porter, would fault there)
 void vk_shaders_open(const char *path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC); struct stat st;
@@ -35,6 +65,7 @@ void vk_shaders_open(const char *path) {
         bad += (uint64_t)e->spv_off + e->spv_len > sz || (uint64_t)e->refl_off + e->refl_len > sz || e->refl_len < 20;
         raw += e->spv_size ? e->spv_size : e->spv_len; stored += e->spv_len; nz += e->spv_size != 0; }
     if (bad) { VKLOG("[RED] %s: %u of its %u shaders lie past the end of the file (%llu bytes), a partial copy: nothing will be drawn", path, bad, n, (unsigned long long)sz); munmap((void *)b, (size_t)sz); return; }
+    g_pool_kinds = bundle_pool_kinds(b, sz);
     g_bundle = b; g_nent = n; g_ent = t;
     VKLOG("shader bundle %s: version %u, %u shaders (%u zstd-compressed), %.1f MB; SPIR-V %.1f MB stored, %.1f MB decompressed", path, ver, n, nz, sz / 1048576.0, stored / 1048576.0, raw / 1048576.0);
 }
@@ -248,32 +279,38 @@ int vk_tbl_n(void) {   // the texture tables' length (gfx_vk.h): DM_VK_TBL_N, 20
     static int n = -1; if (n < 0) { const char *e = getenv("DM_VK_TBL_N"); n = e ? atoi(e) : 2048; if (n < 0) n = 0; if (n > 65536) n = 65536; }
     return n;
 }
-// The pool tables' lengths (gfx_vk.h): DM_VK_POOL_N textures (4096 unless set; 0 off), 4096 samplers (the whole sampler ID range), each bounded by what the device lets one stage bind
-// beside the texture tables and a stage's own descriptors (the combined image samplers of the tables count as sampled images and as samplers both). Fixed for the process: set 0's layout
-// is shared by every graphics pipeline layout. Logged once; an index past the length reads the last entry (the clamp), and tbl_set notes a registered ID past the length
+// Pool lengths are process-wide, as is set 0. Only image kinds absent from every bundle entry
+// have a one-element binding. Account for those placeholders in the device limit too; do not
+// divide the available descriptor budget by four when only two full arrays can ever be used.
+static int g_pool_nt, g_pool_ns;
+static void pool_lengths_init(void) {
+    bundle_auto();
+    const char *e = getenv("DM_VK_POOL_N"); int n = e ? atoi(e) : 65536; if (n < 0) n = 0; if (n > 65536) n = 65536;
+    int active = __builtin_popcount(g_pool_kinds), spare = POOL_TEX_SLOTS - active;
+    int s = n ? 4096 : 0, tbl = (vk_tbl_n() ? vk_tbl_n() : 1) * TBL_SLOTS;
+    long limi = (long)V.props.limits.maxPerStageDescriptorSampledImages - tbl - 256, lims = (long)V.props.limits.maxPerStageDescriptorSamplers - tbl - 256;
+    if (limi > (long)V.props.limits.maxDescriptorSetSampledImages - tbl - 256) limi = (long)V.props.limits.maxDescriptorSetSampledImages - tbl - 256;
+    if (lims > (long)V.props.limits.maxDescriptorSetSamplers - tbl - 256) lims = (long)V.props.limits.maxDescriptorSetSamplers - tbl - 256;
+    if (n && active && (long)n * active + spare > limi) n = limi > spare ? (int)((limi - spare) / active) & ~255 : 0;
+    if (n && !active && limi < spare) n = 0;
+    if (s && (long)s > lims) s = lims > 0 ? (int)lims & ~255 : 0;
+    if (!n || !s) n = s = 0;
+    VKLOG("texture pool tables: %d textures x %d kinds (bundle mask %#x, %d unused bindings of one), %d samplers (DM_VK_POOL_N %s; the device binds %u sampled images and %u samplers a stage, %u and %u a set)", n, active, g_pool_kinds, spare, s, e ? e : "unset",
+          V.props.limits.maxPerStageDescriptorSampledImages, V.props.limits.maxPerStageDescriptorSamplers, V.props.limits.maxDescriptorSetSampledImages, V.props.limits.maxDescriptorSetSamplers);
+    g_pool_nt = n; g_pool_ns = s;
+}
 static int pool_lengths(int *tex, int *samp) {
-    static int nt = -1, ns; if (nt < 0) {
-        const char *e = getenv("DM_VK_POOL_N"); int n = e ? atoi(e) : 65536; if (n < 0) n = 0; if (n > 65536) n = 65536;   // 65536: Ocarina of Time registers texture IDs past 33,000 in its first scene (tbl_set fills up to the highest registered)
-        int s = n ? 4096 : 0, tbl = vk_tbl_n() * TBL_SLOTS;
-        long limi = (long)V.props.limits.maxPerStageDescriptorSampledImages - tbl - 256, lims = (long)V.props.limits.maxPerStageDescriptorSamplers - tbl - 256;
-        if (limi > (long)V.props.limits.maxDescriptorSetSampledImages - tbl - 256) limi = (long)V.props.limits.maxDescriptorSetSampledImages - tbl - 256;
-        if (lims > (long)V.props.limits.maxDescriptorSetSamplers - tbl - 256) lims = (long)V.props.limits.maxDescriptorSetSamplers - tbl - 256;
-        if (n && (long)n * POOL_TEX_SLOTS > limi) n = limi > 0 ? (int)(limi / POOL_TEX_SLOTS) & ~255 : 0;
-        if (s && (long)s > lims) s = lims > 0 ? (int)lims & ~255 : 0;
-        if (!n || !s) n = s = 0;
-        VKLOG("texture pool tables: %d textures x %d kinds, %d samplers (DM_VK_POOL_N %s; the device binds %u sampled images and %u samplers a stage, %u and %u a set)", n, POOL_TEX_SLOTS, s, e ? e : "unset",
-              V.props.limits.maxPerStageDescriptorSampledImages, V.props.limits.maxPerStageDescriptorSamplers, V.props.limits.maxDescriptorSetSampledImages, V.props.limits.maxDescriptorSetSamplers);
-        ns = s; __atomic_store_n(&nt, n, __ATOMIC_RELEASE); }
-    if (tex) *tex = nt; if (samp) *samp = ns; return nt;
+    static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, pool_lengths_init);
+    if (tex) *tex = g_pool_nt; if (samp) *samp = g_pool_ns; return g_pool_nt;
 }
 int vk_pool_n(void) { int t; pool_lengths(&t, NULL); return t; }
 int vk_pool_samp_n(void) { int s; pool_lengths(NULL, &s); return s; }
-VkDescriptorSetLayout vk_tbl_dsl(void) {   // set 0 of every graphics pipeline layout: TBL_SLOTS arrays of vk_tbl_n() combined image samplers (2D, 2D array, cube), then the pool tables (gfx_vk.h)
+VkDescriptorSetLayout vk_tbl_dsl(void) {   // one common set 0: large bindings only for kinds the whole bundle uses
     static VkDescriptorSetLayout l; VkDescriptorSetLayout r = __atomic_load_n(&l, __ATOMIC_ACQUIRE); if (r) return r;
     pthread_mutex_lock(&g_sh_mu);
     if (!l) { VkDescriptorSetLayoutBinding lb[SET0_BINDINGS]; uint32_t n = (uint32_t)(vk_tbl_n() ? vk_tbl_n() : 1), np = (uint32_t)(vk_pool_n() ? vk_pool_n() : 1), ns = (uint32_t)(vk_pool_samp_n() ? vk_pool_samp_n() : 1);
         for (uint32_t i = 0; i < TBL_SLOTS; i++) lb[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
-        for (uint32_t i = 0; i < POOL_TEX_SLOTS; i++) lb[POOL_B0 + i] = (VkDescriptorSetLayoutBinding){POOL_B0 + i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, np, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
+        for (uint32_t i = 0; i < POOL_TEX_SLOTS; i++) lb[POOL_B0 + i] = (VkDescriptorSetLayoutBinding){POOL_B0 + i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, (g_pool_kinds & (1u << i)) ? np : 1, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
         lb[POOL_SAMP_B] = (VkDescriptorSetLayoutBinding){POOL_SAMP_B, VK_DESCRIPTOR_TYPE_SAMPLER, ns, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
         VkDescriptorSetLayout m = shader_layout(lb, SET0_BINDINGS); __atomic_store_n(&l, m, __ATOMIC_RELEASE); }
     pthread_mutex_unlock(&g_sh_mu);

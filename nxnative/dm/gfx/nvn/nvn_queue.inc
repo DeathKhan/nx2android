@@ -1,8 +1,25 @@
 #include "nvn_capture.h"
 #include "nvn_hmap.h"
 
+#ifdef __ANDROID__
+static void *nq_pool_push(void) { return NULL; }
+static void nq_pool_pop(void *p) { (void)p; }
+void vk_registry_job_pin(uint64_t id);
+void vk_registry_job_unpin(uint64_t id);
+#else
+#define nq_pool_push objc_autoreleasePoolPush
+#define nq_pool_pop objc_autoreleasePoolPop
 void *objc_autoreleasePoolPush(void);
 void objc_autoreleasePoolPop(void *);
+#endif
+
+static void nq_tex_snapshot(tex_t *copy,const tex_t *source) {
+#ifdef __ANDROID__
+    mtl_tex_snapshot(copy,source);
+#else
+    *copy=*source; mtl_tex_pin(copy->serial);
+#endif
+}
 
 // Ready continuations of NVN queues share the renderer's one ordered Metal queue.
 // An unresolved wait parks its queue, never the submitting CPU or another queue.
@@ -15,9 +32,12 @@ typedef struct nq_node {
     tex_t texture; double period; int crop[4];
 } nq_node;
 typedef struct nq_owned { struct nq_owned *next; unsigned kind; uint64_t data[]; } nq_owned;
-typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame; } nq_job;
+typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame, id; } nq_job;
 static void nq_job_free(nq_job *j) {
     for(nq_owned *o=j->owned,*next;o;o=next) { next=o->next; if(o->kind==CAP_K_PROG) mtl_prog_unpin((prog_t *)o->data); else if(o->kind==CAP_K_TEX) mtl_tex_unpin(((tex_t *)o->data)->serial); free(o); }
+#ifdef __ANDROID__
+    if (j->id) vk_registry_job_unpin(j->id);
+#endif
     free(j->objects.keys); free(j->objects.vals); free(j);
 }
 static int nq_snapshot_address(void *ctx,uint64_t *field,uint64_t len,int writable) { (void)ctx;(void)field;(void)len;(void)writable;return 1; }
@@ -28,7 +48,7 @@ static int nq_snapshot_object(void *ctx,int kind,uint64_t *field,uint8_t *payloa
         size_t bytes=kind==CAP_K_PROG?sizeof(prog_t):sizeof(tex_t); o=calloc(1,sizeof *o+bytes); if(!o) die("queue descriptor allocation failed");
         o->kind=kind; o->next=j->owned; j->owned=o;
         if(kind==CAP_K_PROG) mtl_prog_snapshot((prog_t *)o->data,(const prog_t *)(uintptr_t)*field);
-        else { memcpy(o->data,(const void *)(uintptr_t)*field,bytes); mtl_tex_pin(((tex_t *)o->data)->serial); }
+        else nq_tex_snapshot((tex_t *)o->data,(const tex_t *)(uintptr_t)*field);
         nvn_hm_put(&j->objects,key,o);
     }
     *field=(uintptr_t)o->data;return 1;
@@ -57,10 +77,27 @@ static void nq_event_issued(volatile uint32_t *word,uint64_t fence,unsigned mode
 }
 
 enum { NQ_COMMANDS, NQ_EVENT, NQ_SYNC, NQ_FENCE, NQ_PRESENT };
+// Live, bounded replay evidence; set the budget to0 then N to rearm after boot.
+// The default path performs no clocks or logging. A parked queue is never bypassed on timeout.
+static void nq_trace(const char *what,const nq_queue *q,const nq_job *j,const nq_node *n,uint64_t fence) {
+#ifdef __ANDROID__
+    static int previous=-1,left;
+    const char *e=getenv("DM_NVN_QUEUE_DIAG"); int budget=e?atoi(e):0;
+    if(budget<0) budget=0; if(budget>64) budget=64;
+    if(budget!=previous) { previous=budget; left=budget; }
+    if(!left) return; left--;
+    LOG("[nvn queue] %s queue=%llu job=%llu frame=%llu kind=%u event=%p mode=%u target=%u current=%u fence=%llu",
+        what,(unsigned long long)q->serial,(unsigned long long)j->id,(unsigned long long)j->frame,n->kind,(const void *)n->event,n->mode,n->value,
+        n->event?atomic_load_explicit((_Atomic uint32_t *)n->event,memory_order_acquire):0,(unsigned long long)fence);
+#else
+    (void)what;(void)q;(void)j;(void)n;(void)fence;
+#endif
+}
+
 static nq_receipt *nq_new(void) { nq_receipt *r=calloc(1,sizeof *r); if(!r) die("queue receipt allocation failed"); r->refs=1; return r; }
 static void nq_put(nq_receipt *r) { if(r && !--r->refs) free(r); }
 static void nq_set_sync(sync_t *s,nq_receipt *r) { if(s->fenced==3) nq_put((nq_receipt *)(uintptr_t)s->fence); r->refs++; s->fence=(uintptr_t)r; s->fenced=3; }
-void nvn_sync_release(sync_t *s) { pthread_mutex_lock(&nq_mu); if(s->fenced==3) nq_put((nq_receipt *)(uintptr_t)s->fence); s->fenced=0; s->fence=0; pthread_mutex_unlock(&nq_mu); }
+void nvn_sync_release(sync_t *s) { if (!nvn_logical_queues_on()) return; pthread_mutex_lock(&nq_mu); if(s->fenced==3) nq_put((nq_receipt *)(uintptr_t)s->fence); s->fenced=0; s->fence=0; pthread_mutex_unlock(&nq_mu); }
 static nq_queue *nq_get(queue_t *q) {
     nq_queue *p=nq_queues; while(p && p->serial!=q->serial) p=p->next;
     if(!p) { p=calloc(1,sizeof *p); if(!p) die("queue state allocation failed"); p->serial=q->serial; p->origin=q->origin_ll; p->next=nq_queues; nq_queues=p; }
@@ -73,11 +110,17 @@ static int nq_sync_encoded(const sync_t *s,uint64_t *fence) {
     if(!s->fenced) return 0; *fence=s->fence; return 1;
 }
 void nvn_queue_gpu_progress(void) {
+    if (!nvn_logical_queues_on()) return;
     pthread_mutex_lock(&nq_mu); uint64_t done=mtl_completed_fence(); nq_event_write **p=&nq_event_writes;
     while(*p) { nq_event_write *w=*p; if(w->fence<=done) { *p=w->next; free(w); } else p=&w->next; }
     pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
 }
 static void nq_event_publish(volatile uint32_t *word,unsigned mode,uint32_t value,uint64_t gpu_fence) {
+    if (!nvn_logical_queues_on()) {
+        if(mode==1) atomic_fetch_add_explicit((_Atomic uint32_t *)word,value,memory_order_release);
+        else atomic_store_explicit((_Atomic uint32_t *)word,value,memory_order_release);
+        return;
+    }
     pthread_mutex_lock(&nq_mu);
     if(mode==1) atomic_fetch_add_explicit((_Atomic uint32_t *)word,value,memory_order_release);
     else atomic_store_explicit((_Atomic uint32_t *)word,value,memory_order_release);
@@ -109,7 +152,11 @@ static void nq_cost_end(nq_cost c) {
 }
 static void *nq_worker(void *unused) {
     (void)unused; pthread_setname_np("NVN queue replay");
+#ifdef __ANDROID__
+    dm_perf_replay_thread();
+#else
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
+#endif
     uint64_t frame=UINT64_MAX;
     for(;;) {
         pthread_mutex_lock(&nq_mu); nq_queue *q=NULL; nq_node *n=NULL; nq_job *j=NULL;
@@ -120,18 +167,18 @@ static void *nq_worker(void *unused) {
             for(q=nq_queues;q;q=q->next) {
                 j=q->first; if(!j) continue; n=j->first;
                 if(!n) { nq_publish(j->receipt,q->physical); q->first=j->next; if(!q->first) q->last=NULL; nq_put(j->receipt);
-                    pthread_mutex_unlock(&nq_mu); pthread_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush(); nq_job_free(j); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu); pthread_mutex_lock(&nq_mu); goto scan_again; }
+                    pthread_mutex_unlock(&nq_mu); pthread_mutex_lock(&g_sub_mu); void *pool=nq_pool_push(); nq_job_free(j); nq_pool_pop(pool); pthread_mutex_unlock(&g_sub_mu); pthread_mutex_lock(&nq_mu); goto scan_again; }
                 if(n->kind==NQ_EVENT && n->event) {
                     uint64_t predecessor=nq_event_pending(n->event);
                     if(!n->waiting) n->event_predecessor=predecessor;
                     // The queued GPU write satisfies the wait: the GPU runs this continuation after it (nq_event_write). Ocarina of Time waits on about 25 events a frame; each wait
                     // for the writer's completion left the GPU idle while the host encoded the next submission, 2 ms of its 14.5 ms frame, which its dynamic resolution read as work
                     nq_event_write *queued=predecessor>mtl_completed_fence() ? nq_event_write_of(n->event) : NULL;
-                    if(queued && queued->exact && nq_predicate(queued->value,n->mode,n->value)) break;
-                    if(predecessor>mtl_completed_fence() || !nq_predicate(atomic_load_explicit((_Atomic uint32_t *)n->event,memory_order_acquire),n->mode,n->value)) { n->waiting=1; mapped_event_wait=1; continue; }
+                    if(queued && queued->exact && nq_predicate(queued->value,n->mode,n->value)) { n->wait_fence=predecessor; nq_trace("wait-encoded",q,j,n,predecessor); break; }
+                    if(predecessor>mtl_completed_fence() || !nq_predicate(atomic_load_explicit((_Atomic uint32_t *)n->event,memory_order_acquire),n->mode,n->value)) { if(!n->waiting) nq_trace("park",q,j,n,predecessor); n->waiting=1; mapped_event_wait=1; continue; }
                 }
                 if(n->kind==NQ_SYNC) {
-                    if(n->receipt && !n->receipt->published) continue;
+                    if(n->receipt && !n->receipt->published) { if(!n->waiting) nq_trace("park",q,j,n,0); n->waiting=1; continue; }
                     // Targets are immutable snapshots. One Metal queue orders an encoded producer before this continuation. A sync not yet fenced when the wait was submitted
                     // (wait_kind 0) is a snapshot of nothing to wait for, and the wait passes. Sparking! ZERO, on one NVN queue, waits on a sync before that queue's own first
                     // fence of it at its first load, which runs on the console; parked here, the fence behind the wait never published and its SyncWait stalled the game (#1808)
@@ -144,6 +191,7 @@ static void *nq_worker(void *unused) {
             if(mapped_event_wait) { struct timespec tick={0,1000000}; pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&tick); }
             else pthread_cond_wait(&nq_cv,&nq_mu);
         }
+        if(n->waiting) nq_trace("resume",q,j,n,n->receipt?n->receipt->fence:n->wait_fence);
         j->first=n->next; if(!j->first) j->last=NULL;
         // Round-robin ready queues: a continually fed independent producer cannot starve another queue.
         if(q->next) { nq_queue **link=&nq_queues; while(*link!=q) link=&(*link)->next; *link=q->next; nq_queue *tail=nq_queues; while(tail->next) tail=tail->next; tail->next=q; q->next=NULL; }
@@ -152,9 +200,12 @@ static void *nq_worker(void *unused) {
         pthread_mutex_unlock(&nq_mu);
         uint64_t fence=0, present=0;
         if(n->kind==NQ_COMMANDS || n->kind==NQ_PRESENT) {
-            dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush();
+            dm_host_mutex_lock(&g_sub_mu); void *pool=nq_pool_push();
             dm_host_work++; mtl_prepare(); dm_host_work--;
             gfx_enter(); nq_cost cost=nq_cost_begin();
+#ifdef __ANDROID__
+            __atomic_store_n(&g_replaying,j->id,__ATOMIC_RELAXED);
+#endif
             if(frame!=j->frame) { frame=j->frame; mtl_set_frame(frame); }
             mtl_queue_activate(q->serial); mtl_set_queue_origin_lower_left(q->origin);
             if(n->kind==NQ_COMMANDS) {
@@ -166,13 +217,24 @@ static void *nq_worker(void *unused) {
                 nvn_cap_present(&n->texture,n->crop);
                 present=mtl_present(&n->texture,n->period,n->crop); mtl_tex_unpin(n->texture.serial);
             }
-            nq_cost_end(cost); gfx_leave(); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
+#ifdef __ANDROID__
+            if(n->kind==NQ_COMMANDS) dm_perf_replay_work(j->frame,cost.wall,now_ns());
+            __atomic_store_n(&g_replaying,0,__ATOMIC_RELAXED);
+#endif
+            nq_cost_end(cost); gfx_leave(); nq_pool_pop(pool); pthread_mutex_unlock(&g_sub_mu);
         }
-        pthread_mutex_lock(&nq_mu); if(n->kind==NQ_PRESENT) { q->present=present; j->receipt->present=present; } if(fence) { q->physical=fence; if(n->event) nq_event_issued(n->event,fence,n->mode,n->value); } if(n->receipt) nq_put(n->receipt); free(n->bytes); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
+        pthread_mutex_lock(&nq_mu); if(n->kind==NQ_PRESENT) { q->present=present; j->receipt->present=present; } if(fence) { q->physical=fence; if(n->event) { nq_event_issued(n->event,fence,n->mode,n->value); nq_trace("signal-encoded",q,j,n,fence); } } if(n->receipt) nq_put(n->receipt); free(n->bytes); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
     }
     return NULL;
 }
-static void nq_start(void) { pthread_t t; if(pthread_create(&t,NULL,nq_worker,NULL)) die("NVN queue worker failed"); pthread_detach(t); }
+static void nq_start(void) {
+    pthread_t t; pthread_attr_t attr; pthread_attr_init(&attr);
+#ifdef __ANDROID__
+    pthread_attr_setstacksize(&attr,8u<<20);
+#endif
+    if(pthread_create(&t,&attr,nq_worker,NULL)) die("NVN queue worker failed");
+    pthread_attr_destroy(&attr); pthread_detach(t);
+}
 static nq_node *nq_append(nq_job *j,unsigned kind) { nq_node *n=calloc(1,sizeof *n); if(!n) die("queue continuation allocation failed"); n->kind=kind; if(j->last) j->last->next=n; else j->first=n; j->last=n; return n; }
 static void nq_bytes(nq_node *n,const void *bytes,size_t length) { if(n->length+length>n->capacity) { n->capacity=(n->length+length+4095)&~(size_t)4095; n->bytes=realloc(n->bytes,n->capacity); if(!n->bytes) die("queue commands allocation failed"); } memcpy(n->bytes+n->length,bytes,length); n->length+=length; }
 static void nq_end(nq_job *j) { if(j->last && j->last->kind==NQ_COMMANDS && !j->last->closed) { op_hdr end={OP_END,8}; nq_bytes(j->last,&end,8); j->last->closed=1; } }
@@ -201,9 +263,12 @@ void nvn_queue_submit(queue_t *q,int count,const uint64_t *handles) {
     pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue job allocation failed"); j->receipt=nq_new();
     j->objects.klen=16; j->frame=dm_nvn_frame_count();
     // No scheduler lock while copying descriptors or resolving shader libraries.
-    dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
+    dm_host_mutex_lock(&g_sub_mu); void *pool=nq_pool_push(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
+#ifdef __ANDROID__
+    j->id=atomic_fetch_add(&g_nq_enqueued,1)+1; vk_registry_job_pin(j->id);
+#endif
     for(int i=0;i<count;i++) nq_flatten(j,(const uint8_t *)(uintptr_t)handles[i],0); nq_end(j);
-    nq_cost_end(cost); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
+    nq_cost_end(cost); nq_pool_pop(pool); pthread_mutex_unlock(&g_sub_mu);
     int waits=0; for(nq_node *node=j->first;node;node=node->next) waits|=node->kind==NQ_EVENT || node->kind==NQ_SYNC;
     nvn_cap_queue(q->serial,waits);
     pthread_mutex_lock(&nq_mu);
@@ -219,13 +284,21 @@ uint64_t nvn_queue_present(queue_t *q,const tex_t *t,double period,const int cro
     nvn_cap_queue(q->serial,0);
     pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue present allocation failed");
     j->receipt=nq_new(); j->frame=dm_nvn_frame_count(); nq_node *n=nq_append(j,NQ_PRESENT);
-    n->texture=*t; mtl_tex_pin(t->serial); n->period=period; if(crop) memcpy(n->crop,crop,sizeof n->crop);
+#ifdef __ANDROID__
+    dm_host_mutex_lock(&g_sub_mu);
+    j->id=atomic_fetch_add(&g_nq_enqueued,1)+1; vk_registry_job_pin(j->id);
+#endif
+    nq_tex_snapshot(&n->texture,t);
+#ifdef __ANDROID__
+    pthread_mutex_unlock(&g_sub_mu);
+#endif
+    n->period=period; if(crop) memcpy(n->crop,crop,sizeof n->crop);
     pthread_mutex_lock(&nq_mu); j->receipt->refs++; uint64_t ticket=(uintptr_t)j->receipt;
     nq_enqueue(nq_get(q),j); pthread_mutex_unlock(&nq_mu); return ticket;
 }
 void nvn_queue_test_hold(int on) { pthread_mutex_lock(&nq_mu); nq_test_held=on; pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu); }
 void nvn_queue_present_release(uint64_t ticket) {
-    if(!ticket) return; pthread_mutex_lock(&nq_mu); nq_put((nq_receipt *)(uintptr_t)ticket); pthread_mutex_unlock(&nq_mu);
+    if(!nvn_logical_queues_on() || !ticket) return; pthread_mutex_lock(&nq_mu); nq_put((nq_receipt *)(uintptr_t)ticket); pthread_mutex_unlock(&nq_mu);
 }
 void nvn_queue_present_wait(uint64_t ticket) {
     if(!ticket) return; nq_receipt *r=(nq_receipt *)(uintptr_t)ticket;
@@ -256,4 +329,4 @@ void nvn_queue_finish(queue_t *q) { sync_t s={0}; nvn_queue_fence(q,&s); nvn_syn
     pthread_mutex_lock(&nq_mu); uint64_t present=nq_get(q)->present; pthread_mutex_unlock(&nq_mu);
     if(present) mtl_present_wait(present);
 }
-void nvn_queue_forget(queue_t *q) { nvn_queue_finish(q); pthread_mutex_lock(&nq_mu); nq_queue **p=&nq_queues; while(*p && (*p)->serial!=q->serial) p=&(*p)->next; if(*p) { nq_queue *old=*p; *p=old->next; nq_put(old->tail); free(old); } pthread_mutex_unlock(&nq_mu); }
+void nvn_queue_forget(queue_t *q) { if (!nvn_logical_queues_on()) return; nvn_queue_finish(q); pthread_mutex_lock(&nq_mu); nq_queue **p=&nq_queues; while(*p && (*p)->serial!=q->serial) p=&(*p)->next; if(*p) { nq_queue *old=*p; *p=old->next; nq_put(old->tail); free(old); } pthread_mutex_unlock(&nq_mu); }

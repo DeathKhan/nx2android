@@ -127,9 +127,8 @@ static pthread_mutex_t g_last_nv12_mu = PTHREAD_MUTEX_INITIALIZER;
 static void last_nv12_set(const cv_pool *p, const uint8_t *mem, const vpx_image_t *im) {
     // the matrix and range as md_rgba picks them: what the picture declares, undeclared BT.709 from 720 lines up (DM_CODEC_CS_BT709 / DM_CODEC_CS_FULL)
     int cs = (im->cs == VPX_CS_BT_709 || (im->cs == VPX_CS_UNKNOWN && p->h >= 720) ? DM_CODEC_CS_BT709 : 0) | (im->range == VPX_CR_FULL_RANGE ? DM_CODEC_CS_FULL : 0);
-    pthread_mutex_lock(&g_last_nv12_mu);
+    // Caller holds g_last_nv12_mu across the pixel write and this publication, not just the metadata.
     g_last_nv12.addr = (uint64_t)(uintptr_t)mem; g_last_nv12.w = p->w; g_last_nv12.h = p->h; g_last_nv12.cs = cs; g_last_nv12.gen++;
-    pthread_mutex_unlock(&g_last_nv12_mu);
 }
 static void last_nv12_forget(const cv_pool *p) {   // the pool goes: no address into it stays published
     pthread_mutex_lock(&g_last_nv12_mu);
@@ -143,12 +142,29 @@ int dm_codec_last_nv12(uint64_t *addr, uint32_t *w, uint32_t *h, uint64_t *gen, 
     pthread_mutex_unlock(&g_last_nv12_mu);
     return ok;
 }
+// Capture only the exact generation whose dimensions/colour metadata the caller selected. The decoder cannot overwrite
+// its bytes, nor can pool finalization unpublish/free them, while this leaf lock is held. Allocate destination memory before calling.
+int dm_codec_copy_last_nv12(uint64_t expected_gen, void *dst, uint64_t capacity) {
+    if (!dst || !expected_gen) return 0;
+    pthread_mutex_lock(&g_last_nv12_mu);
+    uint64_t size = (uint64_t)g_last_nv12.w * g_last_nv12.h * 3 / 2;
+    int ok = g_last_nv12.addr && g_last_nv12.gen == expected_gen && g_last_nv12.w && g_last_nv12.h &&
+             !(g_last_nv12.w & 1) && !(g_last_nv12.h & 1) && size <= capacity;
+    if (ok) memcpy(dst, (const void *)(uintptr_t)g_last_nv12.addr, (size_t)size);
+    pthread_mutex_unlock(&g_last_nv12_mu);
+    return ok;
+}
 static void pool_native_write(cv_pool *p, uint32_t i, const vpx_image_t *im) {
     if (p->fmt == CV_FMT_NV12 && p->mem && (i + 1) * native_size(p->w, p->h) <= p->size && (uint64_t)p->w * p->h * 3 / 2 <= native_size(p->w, p->h)) {
-        md_nv12(im, p->mem + i * native_size(p->w, p->h), p->w, p->h);
-        last_nv12_set(p, p->mem + i * native_size(p->w, p->h), im);
+        uint8_t *dst = p->mem + i * native_size(p->w, p->h);
+        pthread_mutex_lock(&g_last_nv12_mu);
+        md_nv12(im, dst, p->w, p->h);
+        int native = p->native;
+        if (!native) last_nv12_set(p, dst, im);
+        else if (g_last_nv12.addr == (uint64_t)(uintptr_t)dst) g_last_nv12.addr = 0;   // the native-image path below overwrites this slot with RGBA
+        pthread_mutex_unlock(&g_last_nv12_mu);
         static int once; if (!once++) LOG("[codec] NV12 pool %p: pictures are written into the pool's memory (Y rows then UV at w x h, %ux%u), as the console's decoder does", (void *)p->mem, p->w, p->h);
-        if (!p->native) return;
+        if (!native) return;
     }
     if (!p->native || !p->mem || (i + 1) * native_size(p->w, p->h) > p->size) return;
     uint8_t *dst = p->mem + i * native_size(p->w, p->h);

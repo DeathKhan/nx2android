@@ -44,7 +44,7 @@ int main(void) {
             subprocess.run([os.environ.get('CC','cc'),'-std=c11','-O1','-g','-fsanitize=address,undefined',str(p/'test.c'),'-o',str(p/'test')],check=True)
             r=subprocess.run([str(p/'test')],capture_output=True,text=True)
             self.assertEqual(r.returncode,0,r.stdout+r.stderr);print(r.stdout.strip())
-        self.assertIn('if (!upscaler_native_dispatch(cs->key, &native_trace) && upscaler_replace(cs, d)) return;',text)
+        self.assertIn('if (!upscaler_native_dispatch(cs->key, &native_trace) && upscaler_replace(cs, d)) {',text)
 
 if __name__=='__main__':unittest.main()
 

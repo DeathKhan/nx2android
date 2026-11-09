@@ -67,12 +67,12 @@ int mtl_link_wait_ticks(int ticks, uint64_t timeout_ns) { (void)ticks; (void)tim
 int mtl_snap_on(void) { return 0; }   // DM_PRESENT_SNAP (present snapshots into a ring the display link shows) is Metal-only
 uint64_t mtl_snap_acquire_wait(void) { return 0; }
 int mtl_probe_ramp_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_FSTEP_PROBE_RAMP"); on = e ? atoi(e) != 0 : 1; } return on; }   // as nvn_mtl.m: default on
-// Submission and queue state. The Vulkan replay keeps one set of GPU state across queues (as the Android port did before the upsync), so a queue switch restores nothing;
-// the first submission's prepare step (prewarm, pipeline prebuild) is the Metal backend's: the Vulkan backend builds pipelines at their first draw (gfx_vk_shader.c)
+// Null-backend queue fallbacks; Vulkan supplies state restoration in logical mode.
+// Vulkan builds pipelines at first use instead of the Metal prewarm prepare step.
 void mtl_prepare(void) {}
 uint64_t g_nvn_active_queue;   // the NVN queue whose submission is being replayed (gfx_vk_exec.c: its render-enable state, DM_VK_RC_QUEUE)
-void mtl_queue_activate(uint64_t serial) { g_nvn_active_queue = serial; }
-void mtl_queue_forget(uint64_t serial) { (void)serial; }
+__attribute__((weak)) void mtl_queue_activate(uint64_t serial) { g_nvn_active_queue = serial; }
+__attribute__((weak)) void mtl_queue_forget(uint64_t serial) { (void)serial; }
 void mtl_set_queue_origin_lower_left(int on) { mtl_set_origin_lower_left(on); }   // the raster flip is per queue upstream; here the one flag, set under the submit lock at each submit
 // Memory pools: every pool is resident and reachable by address (vk_pool_of), so no residency hints are needed; a pool's physical storage going away is handled by mtl_pool_del
 void mtl_sp_phys_gone(const void *mem, uint64_t size) { (void)mem; (void)size; }
@@ -82,7 +82,14 @@ void mtl_prog_forget(const prog_t *p) { (void)p; }
 void mtl_prog_prefetch(const prog_t *p) { (void)p; }
 // Textures: image (storage) use comes from the builder's IMAGE flag at creation (gfx_vk_tex.c), and a GPU write is seen through nvn_ft_written before a storage copy.
 // TODO(upsync): a RegisterImage of a texture built without IMAGE needs the image re-created with STORAGE usage. GPU-written storage and mtl_tex_cpu_rewritten: gfx_vk_tex.c / gfx_vk_cpu_storage.c
-void mtl_reg_image(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
+// RegisterImage uses the texture descriptor index space and explicitly declares
+// image usage. Preserve that intent in our snapshot; storage preflight adds native
+// usage and compatible integer views while retaining any existing GPU contents.
+void mtl_reg_image(int id, const tex_t *t, const view_t *v) {
+    if (!t) { mtl_reg_tex(id, NULL, v); return; }
+    tex_t image = *t; image.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;
+    mtl_reg_tex(id, &image, v);
+}
 // Acquire syncs (WindowAcquireTexture's sync, fenced 2) wait like any fence; the wait ledger that tells them apart is nvn_mtl.m's
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, timeout_ns); }
 // The picture's shape (a sized vi layer, a taller screen): the swapchain presenter letterboxes to the window texture's own size. TODO(upsync): honour these as present_shape does
@@ -91,3 +98,23 @@ void mtl_present_screen(uint32_t w, uint32_t h) { (void)w; (void)h; }
 // DM_NVN_CAPTURE (nvn_capture.inc, included by nvn_mtl.m: it reads that backend's registries and pools). TODO(upsync): the same over the Vulkan backend's tables
 void nvn_cap_submit(int n, const uint64_t *handles) { (void)n; (void)handles; static int said; if (!said++ && getenv("DM_NVN_CAPTURE")) LOG("[RED] DM_NVN_CAPTURE: frame captures are not available on Android yet"); }
 void nvn_cap_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
+
+// Android shader modules and serial→key records live for the process. A queued
+// bind owns descriptor bytes, and materializes keys before the guest can reuse
+// its program object/control section. No compiled library reference is borrowed.
+void mtl_prog_snapshot(prog_t *copy, const prog_t *source) {
+    *copy = *source;
+    if (!copy->serial) copy->serial = nvn_new_serial();
+    for (unsigned i=0; i<copy->nstage && i<6; i++) { uint8_t key[8]; prog_key(copy,i,key); }
+}
+void mtl_prog_unpin(prog_t *p) { (void)p; }
+void nvn_cap_queue(uint64_t serial, int waits) { (void)serial; (void)waits; }
+
+// Null backend fallbacks; Vulkan retains registry versions/native images.
+__attribute__((weak)) void vk_registry_job_pin(uint64_t id) { (void)id; }
+__attribute__((weak)) void vk_registry_job_unpin(uint64_t id) { (void)id; }
+__attribute__((weak)) void mtl_tex_pin(uint64_t serial) { (void)serial; }
+__attribute__((weak)) void mtl_tex_unpin(uint64_t serial) { (void)serial; }
+__attribute__((weak)) void mtl_tex_snapshot(tex_t *copy, const tex_t *source) { *copy=*source; mtl_tex_pin(copy->serial); }
+
+__attribute__((weak)) uint64_t mtl_completed_fence(void) { return mtl_last_fence(); }

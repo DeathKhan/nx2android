@@ -25,7 +25,7 @@ class StorageImage(unittest.TestCase):
         header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text()
         runtime = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text()
         image_type = re.search(r'typedef struct vkimg vkimg_t;\nstruct vkimg \{.*?\n\};', header, re.S).group()
-        helper = function(runtime, 'int vk_tex_storage_prepare(')
+        helper = '\n'.join(function(runtime, n) for n in ['static VkFormat storage_promote(', 'static int storage_view_compatible(', 'int vk_tex_storage_prepare('])
         code = r'''
 #define VK_NO_PROTOTYPES
 #define VK_USE_64_BIT_PTR_DEFINES 0
@@ -37,11 +37,13 @@ class StorageImage(unittest.TestCase):
 #include <stdarg.h>
 #include <assert.h>
 IMAGE_TYPE
-typedef struct { struct { int format, flags; } d; } tex_t;
-typedef struct { VkFormat vk; } vkfmt_t;
+typedef struct { struct { int format, flags; } d; uint64_t serial; } tex_t;
+typedef struct { int set_format,format; } view_t;
+typedef struct { VkFormat vk; int compressed,dec,depth,stencil,bw,bh,bpb; } vkfmt_t;
 static struct { VkPhysicalDevice pd; } V;
 static vkimg_t image;
-static vkfmt_t format={VK_FORMAT_B10G11R11_UFLOAT_PACK32};
+static vkfmt_t format={.vk=VK_FORMAT_B10G11R11_UFLOAT_PACK32,.bw=1,.bh=1,.bpb=4},raw={.vk=VK_FORMAT_R32_UINT,.bw=1,.bh=1,.bpb=4},wrong={.vk=VK_FORMAT_R16_SFLOAT,.bw=1,.bh=1,.bpb=2};
+static int promotion_supported,raw_supported=1,blits;
 static int supported=1,alloc_fail,pass_open,ended,copies,barriers,prepared,view_drops,deferred_images,deferred_views,allocations;
 static uint64_t g_img_vkbytes,tex_gen=1;
 static VkImageCopy regions[32];
@@ -51,16 +53,19 @@ static void log_ignore(const char *fmt,...){(void)fmt;}
 #define VKLOG(...) log_ignore(__VA_ARGS__)
 #define VKRED_ONCE(id,...) log_ignore(__VA_ARGS__)
 static vkimg_t *vk_tex(const tex_t *t){assert(t->d.format==63);return &image;}
-static const vkfmt_t *vk_fmt(int f){assert(f==63);return &format;}
+static const vkfmt_t *vk_fmt(int f){return f==63?&format:f==10?&raw:f==11?&wrong:NULL;}
 static void vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice pd,VkFormat f,VkFormatProperties *p){
- (void)pd;assert(f==image.fmt);memset(p,0,sizeof *p);p->optimalTilingFeatures=supported?VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT:0;
+ (void)pd;memset(p,0,sizeof *p);int ok=f==VK_FORMAT_R16G16B16A16_SFLOAT?promotion_supported:f==raw.vk?raw_supported:supported;
+ p->optimalTilingFeatures=VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT|(ok?VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT:0);
 }
 static void vk_end_pass_land(void){pass_open=0;ended++;}
-static vkimg_t *img_new(const tex_t *t,const vkfmt_t *f,VkImageUsageFlags extra){
+static vkimg_t *img_new(const tex_t *t,const vkfmt_t *f,VkImageUsageFlags extra,VkFormat storage_format){
  assert(!pass_open&&t->d.format==63&&t->d.flags==0&&f==&format&&extra==VK_IMAGE_USAGE_STORAGE_BIT);allocations++;
  if(alloc_fail)return NULL;
  vkimg_t *n=calloc(1,sizeof *n);*n=image;n->img=200;n->mem=300;n->sub=(void *)(uintptr_t)400;
- n->usage=image.usage|extra;n->cflags=image.cflags;n->vkbytes=512;n->layout=VK_IMAGE_LAYOUT_UNDEFINED;
+ n->usage=image.usage|extra;n->cflags=VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT|VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;n->vkbytes=512;n->layout=VK_IMAGE_LAYOUT_UNDEFINED;
+ n->fmt=f->vk;n->promoted=0;n->fixed_fmt=0;
+ if(storage_format==f->vk&&!supported&&promotion_supported){n->fmt=VK_FORMAT_R16G16B16A16_SFLOAT;n->promoted=1;}
  return n;
 }
 static VkCommandBuffer vk_cmd(void){assert(!pass_open);return (VkCommandBuffer)(uintptr_t)5;}
@@ -73,6 +78,10 @@ static void vkCmdCopyImage(VkCommandBuffer cb,VkImage src,VkImageLayout sl,VkIma
  assert(!r->srcSubresource.baseArrayLayer&&!r->dstSubresource.baseArrayLayer);
  regions[copies++]=*r;
  for(uint32_t l=0;l<r->srcSubresource.layerCount;l++)new_pixels[r->srcSubresource.mipLevel][l]=old_pixels[r->srcSubresource.mipLevel][l];
+}
+static void vkCmdBlitImage(VkCommandBuffer cb,VkImage src,VkImageLayout sl,VkImage dst,VkImageLayout dl,uint32_t n,const VkImageBlit *r,VkFilter filter){
+ assert(cb==(VkCommandBuffer)(uintptr_t)5&&!pass_open&&src==100&&dst==200&&sl==VK_IMAGE_LAYOUT_GENERAL&&dl==VK_IMAGE_LAYOUT_GENERAL&&n==1&&filter==VK_FILTER_NEAREST);
+ assert(r->srcSubresource.layerCount==r->dstSubresource.layerCount);blits++;
 }
 static void vk_tex_view_drop_all(vkimg_t *im){assert(im==&image&&!pass_open&&barriers==2);view_drops++;tex_gen++;}
 static void vk_defer_free_view(VkImageView view){assert(view==80&&view_drops==1);deferred_views++;}
@@ -89,12 +98,12 @@ static void setup(uint32_t w,uint32_t h,uint32_t d,uint32_t layers,uint32_t leve
  pass_open=1;copies=barriers=prepared=ended=view_drops=deferred_images=deferred_views=allocations=defer_sub=0;
  memset(regions,0,sizeof regions);memset(new_pixels,0,sizeof new_pixels);
  for(int m=0;m<32;m++)for(int l=0;l<8;l++)old_pixels[m][l]=(uint32_t)(100*m+l+1);
- g_img_vkbytes=1024;supported=1;alloc_fail=0;
+ g_img_vkbytes=1024;supported=1;alloc_fail=0;promotion_supported=0;raw_supported=1;blits=0;
 }
 int main(void){
- tex_t t={{63,0}};
+ tex_t t={.d={63,0}};
  setup(16,8,1,3,5);vkimg_t before=image;uint64_t generation=tex_gen;
- assert(vk_tex_storage_prepare(&t));assert(ended==1&&allocations==1&&copies==5&&barriers==2&&prepared==2);
+ assert(vk_tex_storage_prepare(&t,NULL));assert(ended==1&&allocations==1&&copies==5&&barriers==2&&prepared==2);
  assert(image.img==200&&image.mem==300&&image.sub==(void *)(uintptr_t)400&&image.usage==0x1f);
  assert(g_img_vkbytes==1280&&tex_gen==generation+1&&deferred_images==1&&deferred_views==1&&!defer_sub&&!image.full);
  // Restore only the native fields in a copy: everything else must remain byte-for-byte unchanged.
@@ -103,16 +112,34 @@ int main(void){
  assert(!memcmp(&tracked,&before,sizeof before));
  for(int m=0;m<5;m++){assert(regions[m].extent.width==(16u>>m?16u>>m:1)&&regions[m].extent.height==(8u>>m?8u>>m:1)&&regions[m].extent.depth==1);
   for(int l=0;l<3;l++)assert(new_pixels[m][l]==old_pixels[m][l]);}
- assert(vk_tex_storage_prepare(&t));assert(allocations==1&&copies==5); // Subsequent storage binds do nothing.
+ assert(vk_tex_storage_prepare(&t,NULL));assert(allocations==1&&copies==5); // Subsequent storage binds do nothing.
  setup(8,4,4,1,4);image.sub=(void *)(uintptr_t)102;
- assert(vk_tex_storage_prepare(&t));assert(copies==4&&defer_sub==1);
+ assert(vk_tex_storage_prepare(&t,NULL));assert(copies==4&&defer_sub==1);
  assert(regions[0].extent.depth==4&&regions[1].extent.depth==2&&regions[2].extent.depth==1&&regions[3].extent.depth==1);
  for(int m=0;m<4;m++)assert(regions[m].srcSubresource.layerCount==1);
  // Unsupported base format and allocation failure preserve the original allocation and data.
- setup(8,4,1,1,1);supported=0;before=image;assert(!vk_tex_storage_prepare(&t));
+ setup(8,4,1,1,1);supported=0;before=image;assert(!vk_tex_storage_prepare(&t,NULL));
  assert(!memcmp(&before,&image,sizeof image)&&!ended&&!allocations&&!copies&&!deferred_images);
- setup(8,4,1,1,1);alloc_fail=1;before=image;assert(!vk_tex_storage_prepare(&t));
+ setup(8,4,1,1,1);alloc_fail=1;before=image;assert(!vk_tex_storage_prepare(&t,NULL));
  assert(!memcmp(&before,&image,sizeof image)&&ended==1&&allocations==1&&!copies&&!deferred_images);
+ // Packed R32_UINT writes preserve the original 32-bit backing even when its numeric format cannot support storage.
+ view_t r32={1,10};setup(8,4,1,1,1);supported=0;promotion_supported=1;
+ assert(vk_tex_storage_prepare(&t,&r32));assert(image.fmt==format.vk&&!image.promoted&&copies==1&&!blits);
+ int saved_alloc=allocations;assert(vk_tex_storage_prepare(&t,&r32)&&allocations==saved_alloc);
+ // A numeric store still takes the established RGBA16F conversion path.
+ setup(8,4,1,1,1);supported=0;promotion_supported=1;
+ assert(vk_tex_storage_prepare(&t,NULL));assert(image.fmt==VK_FORMAT_R16G16B16A16_SFLOAT&&image.promoted&&blits==1&&!copies);
+ assert(vk_tex_storage_prepare(&t,NULL)&&allocations==1);
+ // An existing promoted allocation must not bypass effective-view selection.
+ setup(8,4,1,1,1);supported=0;promotion_supported=1;image.fmt=VK_FORMAT_R16G16B16A16_SFLOAT;image.promoted=1;image.usage|=VK_IMAGE_USAGE_STORAGE_BIT;
+ assert(vk_tex_storage_prepare(&t,&r32));assert(image.fmt==format.vk&&!image.promoted&&blits==1);
+ // A format-listed allocation with STORAGE still needs remaking before a different-format view.
+ setup(8,4,1,1,1);image.usage|=VK_IMAGE_USAGE_STORAGE_BIT;image.fixed_fmt=1;
+ assert(vk_tex_storage_prepare(&t,&r32)&&allocations==1&&!image.fixed_fmt);
+ setup(8,4,1,1,1);view_t bad={1,11};before=image;
+ assert(!vk_tex_storage_prepare(&t,&bad)&&!memcmp(&before,&image,sizeof image)&&!allocations);
+ setup(8,4,1,1,1);raw_supported=0;before=image;
+ assert(!vk_tex_storage_prepare(&t,&r32)&&!memcmp(&before,&image,sizeof image)&&!allocations);
  return 0;
 }
 '''
@@ -156,7 +183,7 @@ VIEW_TYPE
 enum { NVN_TEXTURE_FLAGS_IMAGE=4 };
 static struct { VkPhysicalDevice pd; VkDevice dev; } V;
 static vkimg_t image;
-static vkfmt_t fmt={.vk=VK_FORMAT_B10G11R11_UFLOAT_PACK32};
+static vkfmt_t fmt={.vk=VK_FORMAT_B10G11R11_UFLOAT_PACK32},rawfmt={.vk=VK_FORMAT_R32_UINT};
 static pthread_mutex_t g_view_mu=PTHREAD_MUTEX_INITIALIZER;
 static int g_views,creates,support=1;
 static uint64_t g_wseq;
@@ -172,13 +199,13 @@ static vkimg_t *vk_tex(const tex_t *t){(void)t;return &image;}
 static void alias_check(vkimg_t *im){(void)im;}
 static void vk_watch(const vkimg_t *im,const char *why){(void)im;(void)why;}
 static void vk_texdump_note(vkimg_t *im){(void)im;}
-static const vkfmt_t *vk_fmt(int f){(void)f;return &fmt;}
+static const vkfmt_t *vk_fmt(int f){return f==11?&rawfmt:&fmt;}
 static VkImageViewType vtype_of(int target){return target==4?VK_IMAGE_VIEW_TYPE_2D_ARRAY:VK_IMAGE_VIEW_TYPE_2D;}
 static VkFormat srgb_twin(VkFormat f){(void)f;return VK_FORMAT_UNDEFINED;}
 static vview *nvn_hm_get(int *map,const vkimg_t **key){(void)map;assert(*key==&image);return head;}
 static void nvn_hm_put(int *map,const vkimg_t **key,vview *v){(void)map;assert(*key==&image);head=v;}
 static void vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice pd,VkFormat f,VkFormatProperties *p){
- (void)pd;assert(f==fmt.vk);memset(p,0,sizeof *p);p->optimalTilingFeatures=support?VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT|VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT:0;
+ (void)pd;assert(f==fmt.vk||f==rawfmt.vk||f==VK_FORMAT_R16G16B16A16_SFLOAT);memset(p,0,sizeof *p);p->optimalTilingFeatures=support?VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT|VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT:0;
 }
 static VkResult vkCreateImageView(VkDevice d,const VkImageViewCreateInfo *ci,const void *a,VkImageView *out){
  (void)d;(void)a;last=*ci;last_usage=((const VkImageViewUsageCreateInfo *)ci->pNext)->usage;*out=(VkImageView)++creates;return VK_SUCCESS;
@@ -200,8 +227,23 @@ int main(void){
               .set_swizzle=1,.swz={4,3,2,0}};
  assert(vk_tex_view(&tex,&view,1,0,2,&got));assert(last.subresourceRange.baseMipLevel==2&&last.subresourceRange.levelCount==1);
  assert(last.subresourceRange.baseArrayLayer==1&&last.subresourceRange.layerCount==1&&!last.components.r&&!last.components.a);
- // An old allocation without storage usage is refused rather than bound invalidly.
- image.usage=0x17;assert(!vk_tex_view(&tex,NULL,1,0,2,&got));image.usage=0x1f;
+ // A raw integer storage view keeps the same backing and its integer type; no numeric promotion is allowed to disguise it.
+ view_t raw_view={.set_format=1,.format=11};
+ assert(vk_tex_view(&tex,&raw_view,1,0,2,&got));assert(last.format==VK_FORMAT_R32_UINT&&got==&image&&last_usage==VK_IMAGE_USAGE_STORAGE_BIT);
+ image.promoted=1;image.fmt=VK_FORMAT_R16G16B16A16_SFLOAT;
+ assert(!vk_tex_view(&tex,&raw_view,1,0,2,&got));
+ assert(vk_tex_view(&tex,NULL,1,1,2,&got));assert(last.format==VK_FORMAT_R16G16B16A16_SFLOAT);
+ image.promoted=0;image.fmt=fmt.vk;
+ // RegisterImage adds usage intent to the snapshot, not to an already allocated image.
+ // Sampling that shared old backing must not request unsupported STORAGE view usage.
+ tex.d.flags=NVN_TEXTURE_FLAGS_IMAGE;image.usage=0x17;
+ view.base_level=1;view.nlevels=1;assert(vk_tex_view(&tex,&view,1,0,0,&got));
+ assert(!(last_usage&VK_IMAGE_USAGE_STORAGE_BIT));
+ // Storage itself still requires successful preflight; after upgrade a new sampled view
+ // may include STORAGE only because the real allocation now supports it.
+ assert(!vk_tex_view(&tex,NULL,1,0,2,&got));image.usage=0x1f;
+ view.base_level=2;assert(vk_tex_view(&tex,&view,1,0,0,&got));
+ assert(last_usage&VK_IMAGE_USAGE_STORAGE_BIT);
  // An unsupported view format is refused even when the allocation supports storage.
  support=0;view.base_level=3;assert(!vk_tex_view(&tex,&view,1,0,2,&got));
  while(head){vview *next=head->next;free(head);head=next;}
