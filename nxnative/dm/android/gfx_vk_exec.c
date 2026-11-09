@@ -1514,18 +1514,26 @@ static void mrt_after_draw(int64_t base_vertex,uint32_t base_instance,uint64_t i
     vk_end_pass();mrt_copy(g_mrt_color,0,1);mrt_copy(&g_mrt_image,1,1);
     g_mrt_done++;mrt_detach();
 }
+// Flat observer: an observed draw whose debug output holds no covered fragment (Ocarina of Time: most of the pair's mesh draws are culled to nothing on the GPU,
+// the first ones of a frame among them) is dropped unwritten and the observer re-arms for a later present, up to 240 attempts
+static unsigned g_mrt_attempts;
 static void mrt_poll(uint64_t done_fence) {
     if(!g_mrt_ndump)return;
     unsigned pending=0;
+    for(unsigned i=0;i<g_mrt_ndump;i++){pdump_t *d=&g_mrt_dumps[i];if(d->b&&d->fence>done_fence)pending++;}
+    if(pending)return;
+    int hit=!g_mrt_observer;
     for(unsigned i=0;i<g_mrt_ndump;i++){pdump_t *d=&g_mrt_dumps[i];if(!d->b)continue;
-        if(d->fence>done_fence){pending++;continue;}
-        VkMappedMemoryRange r={VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,NULL,d->m,0,VK_WHOLE_SIZE};
-        VkResult ok=vkInvalidateMappedMemoryRanges(V.dev,1,&r);
-        if(!ok)pass_dump_raw_native_named(d,(int)i,getenv("DM_ROOT"),g_mrt_observer?"flat-observer":"mrt");
-        else VKLOG("MRT diagnostic: invalidate failed %d index%u",ok,i);
+        VkMappedMemoryRange r={VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,NULL,d->m,0,VK_WHOLE_SIZE};vkInvalidateMappedMemoryRanges(V.dev,1,&r);
+        if(g_mrt_observer&&d->binding==1){const uint32_t *w=d->p;for(uint64_t k=3;k<d->raw_bytes/4;k+=4)if(w[k]==0x43415252u){hit=1;break;}}}
+    int retry=g_mrt_observer&&!hit&&g_mrt_done&&!g_mrt_failed&&g_mrt_attempts<240;
+    if(g_mrt_observer)VKLOG("Flat observer: attempt %u at present %llu %s",g_mrt_attempts+1,(unsigned long long)g_mrt_dumps[0].present,hit?"covered fragments: written":retry?"covered nothing: re-armed":"covered nothing: giving up");
+    for(unsigned i=0;i<g_mrt_ndump;i++){pdump_t *d=&g_mrt_dumps[i];if(!d->b)continue;
+        if(!retry)pass_dump_raw_native_named(d,(int)i,getenv("DM_ROOT"),g_mrt_observer?"flat-observer":"mrt");
         vkDestroyBuffer(V.dev,d->b,NULL);vkFreeMemory(V.dev,d->m,NULL);d->b=VK_NULL_HANDLE;
     }
-    if(!pending&&!g_mrt_active&&(g_mrt_done==(g_mrt_fixed_mode?1u:MRT_MODES)||g_mrt_failed)&&g_mrt_image.img){
+    if(retry){g_mrt_attempts++;g_mrt_ndump=0;g_mrt_done=0;g_mrt_qualifying=0;g_mrt_skip=0;return;}
+    if(!g_mrt_active&&(g_mrt_done==(g_mrt_fixed_mode?1u:MRT_MODES)||g_mrt_failed)&&g_mrt_image.img){
         vkDestroyImageView(V.dev,g_mrt_view,NULL);vkDestroyImage(V.dev,g_mrt_image.img,NULL);vkFreeMemory(V.dev,g_mrt_image.mem,NULL);
         memset(&g_mrt_image,0,sizeof g_mrt_image);g_mrt_view=VK_NULL_HANDLE;
     }
