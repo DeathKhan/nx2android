@@ -316,7 +316,7 @@ def classify(stage, b, res):
     if m:
         idx = int(m.group(1)); sb = sorted(res.get('sbufs', []), key=lambda x: x['binding'])
         s = sb[idx] if idx < len(sb) else None; off = s['cb_offset'] * 4 if s and s['cb_slot'] == 0 else None; base = SSBO.get(stage)
-        e.update(kind='sbuf', rw=bool(s and s['flags'] & 2))
+        e.update(kind='sbuf', rw=bool(s and s['flags'] & 1))   # Ryujinx BufferUsageFlags.Write = 1 << 0 (upstream nx2android #182; was & 2: every game storage buffer read-only)
         if s and s['cb_slot'] == GMEM_MAP_CB_SLOT:   # not a game buffer: the host's pool table for addresses traced to no storage buffer (offset 0), or the write log of those stores (dmsh_build.py does the same)
             if s['cb_offset'] == GMEM_LOG_CB_OFFSET: e.update(kind='gmem_log', rw=True)
             else: e.update(kind='gmem_map', rw=any(re.search(r'operation "(Store|Atomic\w*)" traced to no storage buffer', n) for n in res.get('notes', ())))   # rw: one of those accesses writes
