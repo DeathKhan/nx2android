@@ -342,25 +342,31 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             }
         }
 
+        // The type of a copy or select destination, from what its value is used as (through further copies). Upstream takes the first use; here a value any use reads as
+        // an integer is an integer variable, even when an earlier use reads it as a float: its float uses get a bitcast, which is exact. A float variable carries integer
+        // bits as a float, and a GPU that flushes denormals (Adreno: shaderDenormPreserveFloat32 = 0) turns every small integer (below 2^23: a denormal's bits) into 0
+        // at a float move or select. Ocarina of Time's lightmap layer (2 = 0x1p-148) read layer 0 and lit the scene 100 times too bright that way
         private static AggregateType GetVarTypeFromUses(Operand dest, ShaderProperties properties)
         {
             HashSet<Operand> visited = [];
 
             Queue<Operand> pending = new();
 
-            bool Enqueue(Operand operand)
+            AggregateType? first = null;
+            AggregateType? integer = null;
+
+            void Note(AggregateType type)
             {
-                if (visited.Add(operand))
+                first ??= type;
+
+                if (integer == null && (type == AggregateType.S32 || type == AggregateType.U32))
                 {
-                    pending.Enqueue(operand);
-
-                    return true;
+                    integer = type;
                 }
-
-                return false;
             }
 
-            Enqueue(dest);
+            visited.Add(dest);
+            pending.Enqueue(dest);
 
             while (pending.TryDequeue(out Operand operand))
             {
@@ -375,14 +381,14 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                     {
                         if (operation.Dest.Type == OperandType.LocalVariable)
                         {
-                            if (Enqueue(operation.Dest))
+                            if (visited.Add(operation.Dest))
                             {
-                                break;
+                                pending.Enqueue(operation.Dest);
                             }
                         }
                         else
                         {
-                            return OperandInfo.GetVarType(operation.Dest.Type);
+                            Note(OperandInfo.GetVarType(operation.Dest.Type));
                         }
                     }
                     else
@@ -391,14 +397,19 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                         {
                             if (operation.GetSource(index) == operand)
                             {
-                                return GetSourceVarType(operation, index, properties);
+                                Note(GetSourceVarType(operation, index, properties));
                             }
                         }
                     }
                 }
             }
 
-            return AggregateType.S32;
+            if (first == AggregateType.FP32 && integer != null)
+            {
+                return integer.Value;
+            }
+
+            return first ?? AggregateType.S32;
         }
 
         private static AggregateType GetSourceVarType(Operation operation, int index, ShaderProperties properties)
