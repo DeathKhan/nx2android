@@ -239,9 +239,9 @@ static uint32_t *spv_add_outputs(const uint32_t *w, uint32_t nw, uint32_t mask, 
     for (uint32_t i = 5; i < fn;) { if ((w[i] & 0xffff) == 23 && w[i + 2] == f32 && w[i + 3] == 4) v4 = w[i + 1]; i += w[i] >> 16; }
     if (v4) for (uint32_t i = 5; i < fn;) { if ((w[i] & 0xffff) == 32 && w[i + 2] == 3 && w[i + 3] == v4) pv4 = w[i + 1]; i += w[i] >> 16; }
     int k = __builtin_popcount(mask); uint32_t ids[32], nid = 0;
-    uint32_t *o = malloc(((size_t)nw + 16 * k + 16) * 4), no = 5; memcpy(o, w, 20);
+    uint32_t *o = malloc(((size_t)nw + 16 * k + 48) * 4), no = 5; memcpy(o, w, 20);
     for (int l = 0; l < 32; l++) if (mask >> l & 1) ids[nid++] = bound++;
-    uint32_t tv4 = v4 ? v4 : bound++, tpv4 = pv4 ? pv4 : bound++;
+    uint32_t tv4 = v4 ? v4 : bound++, tpv4 = pv4 ? pv4 : bound++, c0 = bound++, c1 = bound++, cv = bound++;   // (0, 0, 0, 1): what an input no stage wrote reads on the console
     for (uint32_t i = 5; i < fn;) { uint32_t n = w[i] >> 16;
         if (i == ep) { o[no++] = (n + nid) << 16 | 15; memcpy(&o[no], &w[i + 1], (n - 1) * 4); no += n - 1; memcpy(&o[no], ids, nid * 4); no += nid; }   // the entry point lists them
         else { memcpy(&o[no], &w[i], n * 4); no += n; }
@@ -250,7 +250,12 @@ static uint32_t *spv_add_outputs(const uint32_t *w, uint32_t nw, uint32_t mask, 
     }
     if (!v4) { o[no++] = 4u << 16 | 23; o[no++] = tv4; o[no++] = f32; o[no++] = 4; }
     if (!pv4) { o[no++] = 4u << 16 | 32; o[no++] = tpv4; o[no++] = 3; o[no++] = tv4; }
-    for (uint32_t q = 0; q < nid; q++) { o[no++] = 4u << 16 | 59; o[no++] = tpv4; o[no++] = ids[q]; o[no++] = 3; }   // OpVariable Output
+    o[no++] = 4u << 16 | 43; o[no++] = f32; o[no++] = c0; o[no++] = 0; o[no++] = 4u << 16 | 43; o[no++] = f32; o[no++] = c1; o[no++] = 0x3f800000;   // OpConstant 0.0, 1.0
+    o[no++] = 7u << 16 | 44; o[no++] = tv4; o[no++] = cv; o[no++] = c0; o[no++] = c0; o[no++] = c0; o[no++] = c1;   // OpConstantComposite (0, 0, 0, 1)
+    // OpVariable Output with that initializer. Declared only, the outputs were undefined, and Adreno handed the fragment shader whatever its registers held: Ocarina of Time's
+    // mesh-drawn room geometry (the pass-through vertex shaders of shader_meshwrap.py) reads locations its mesh shaders never write, and lit through them the probe cube and the
+    // scene came out thousands of times too bright. Upstream pads such inputs to (0, 0, 0, 1) for the same reason (docs/reference/shaders.md, pixel shader inputs the mesh shader does not write)
+    for (uint32_t q = 0; q < nid; q++) { o[no++] = 5u << 16 | 59; o[no++] = tpv4; o[no++] = ids[q]; o[no++] = 3; o[no++] = cv; }
     memcpy(&o[no], &w[fn], (nw - fn) * 4); no += nw - fn;
     o[3] = bound; *onw = no; return o;
 }
@@ -430,6 +435,7 @@ vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo) {
     v->xfb = gs->xfb; memcpy(v->xfb_stride, gs->xfb_stride, sizeof v->xfb_stride);
     return v;
 }
+static void spv_runtime_dump(vkshader_t *s, const uint32_t *w, uint32_t nw);
 static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     bundle_auto();
     struct { uint64_t key; uint64_t stage; } hk = {key, (uint64_t)stage};
@@ -587,6 +593,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
     VkResult vr = vkCreateShaderModule(V.dev, &ci, NULL, &s->mod); s->spv = w; s->nspv = nw;
     if (vr) { VKLOG("[RED] shader %016llx: vkCreateShaderModule %d", (unsigned long long)key, vr); free(w); if (s->gs_claim_invocations) free((void *)s->b); free(s); nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); return NULL; }
+    spv_runtime_dump(s, w, nw); // opt-in diagnostic, after every base-module rewrite
     // descriptor set layout: one entry per binding
     // The game's constant buffers and the driver segment are dynamic uniform buffers: their offset is given when the set is bound, so a set matches any draw's
     // with the same buffers (Unity updates a constant buffer before nearly every draw, and each update is a shadow at a new offset: NEO made a new set for
@@ -795,15 +802,304 @@ static uint32_t *spv_alpha_test(const uint32_t *w, uint32_t nw, uint32_t *onw) {
         memcpy(&o[no], &w[i], n * 4); no += n; i += n; }
     o[3] = c.bound; *onw = no; free(c.nt); return o;
 }
+// Runtime-normalized ALT probes must retain the exact existing resource/type preamble.
+// Only fresh declarations needed by the offline intermediate-output tool may be added.
+// This is intentionally stricter than structural type equivalence: these diagnostics
+// preserve original IDs. A bundle module with unshrunk/remapped pools is rejected.
+// A configured list is all-or-nothing: a malformed suffix must not retain an
+// earlier matching key. Empty preserves the explicit-directory, bounded dump mode.
+static int spv_runtime_dump_match(const char *list, uint64_t wanted) {
+    if (!list || !*list) return 1;
+    const char *p = list; unsigned count = 0; int matched = 0;
+    for (;;) {
+        if (++count > 32) return 0;
+        uint64_t key = 0;
+        for (unsigned i = 0; i < 16; i++) {
+            unsigned c = (unsigned char)*p, v;
+            if (c >= '0' && c <= '9') v = c - '0';
+            else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+            else return 0;
+            key = key << 4 | v; p++;
+        }
+        matched |= key == wanted;
+        if (!*p) return matched;
+        if (*p++ != ',' || !*p) return 0;
+    }
+}
+static int spv_runtime_extra(const uint32_t *w, uint32_t n, uint32_t oldbound, uint32_t bound) {
+    uint32_t op = w[0] & 0xffff, id = 0;
+    if ((op == 21 && n == 4) || (op == 22 && n == 3) || (op == 23 && n == 4)) id = w[1];
+    else if (op == 32 && n == 4 && (w[2] == 1 || w[2] == 6)) id = w[1]; // Input/Private pointer type only
+    else if ((op == 43 && n >= 4) || (op == 44 && n >= 4)) id = w[2];
+    else if (op == 59 && (n == 4 || n == 5) && w[3] == 6) id = w[2]; // Private variable, no descriptor
+    else return 0;
+    return id >= oldbound && id < bound;
+}
+static int spv_runtime_private(const uint32_t *w, uint32_t nw, uint32_t id, uint32_t oldbound) {
+    if (id < oldbound || id >= w[3]) return 0;
+    for (uint32_t i = 5; i < nw;) {
+        uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (!n || n > nw - i || op == 54) break;
+        if (op == 59 && n >= 4 && w[i + 2] == id) return w[i + 3] == 6;
+        i += n;
+    }
+    return 0;
+}
+// Trusted diagnostics may add exactly one float4 colour at location1, matching
+// the existing location0 type. No other interface/resource change is permitted.
+static uint32_t spv_runtime_mrt(const uint32_t *base, uint32_t bn, const uint32_t *alt, uint32_t an) {
+    uint32_t out = 0, pointer = 0, vector = 0, scalar = 0, added = 0;
+    unsigned outputs = 0, entries = 0, locations = 0, declarations = 0;
+    for (uint32_t i = 5; i < bn;) {
+        uint32_t n = base[i] >> 16, op = base[i] & 0xffff;
+        if (!n || n > bn - i) return 0;
+        if (op == 54) break;
+        if (op == 15) { if (n < 4 || base[i + 1] != 4) return 0; entries++; }
+        if (op == 59 && n >= 4 && base[i + 3] == 3) { outputs++; out = base[i + 2]; pointer = base[i + 1]; }
+        i += n;
+    }
+    if (entries != 1 || outputs != 1) return 0;
+    int location0 = 0;
+    for (uint32_t i = 5; i < bn;) {
+        uint32_t n = base[i] >> 16, op = base[i] & 0xffff;
+        if (!n || n > bn - i) return 0;
+        if (op == 54) break;
+        if (op == 71 && n >= 4 && base[i + 1] == out) {
+            if (base[i + 2] == 30 && base[i + 3] == 0) location0++;
+            else return 0; // no Index/component/other output contract
+        }
+        if (op == 32 && n == 4 && base[i + 1] == pointer && base[i + 2] == 3) vector = base[i + 3];
+        i += n;
+    }
+    if (location0 != 1 || !vector) return 0;
+    for (uint32_t i = 5; i < bn;) {
+        uint32_t n = base[i] >> 16, op = base[i] & 0xffff;
+        if (op == 54) break;
+        if (op == 23 && n == 4 && base[i + 1] == vector && base[i + 3] == 4) scalar = base[i + 2];
+        i += n;
+    }
+    int float32 = 0;
+    for (uint32_t i = 5; i < bn;) {
+        uint32_t n = base[i] >> 16, op = base[i] & 0xffff;
+        if (op == 54) break;
+        if (op == 22 && n == 3 && base[i + 1] == scalar && base[i + 2] == 32) float32 = 1;
+        i += n;
+    }
+    if (!float32) return 0;
+    for (uint32_t i = 5; i < an;) {
+        uint32_t n = alt[i] >> 16, op = alt[i] & 0xffff;
+        if (!n || n > an - i) return 0;
+        if (op == 54) break;
+        if (op == 59 && n >= 4 && alt[i + 3] == 3 && alt[i + 2] >= base[3]) {
+            if (++declarations != 1 || n != 4 || alt[i + 1] != pointer || alt[i + 2] >= alt[3]) return 0;
+            added = alt[i + 2];
+        }
+        i += n;
+    }
+    if (!added) return 0;
+    for (uint32_t i = 5; i < an;) {
+        uint32_t n = alt[i] >> 16, op = alt[i] & 0xffff;
+        if (op == 54) break;
+        if (op == 71 && n >= 2 && alt[i + 1] == added) {
+            if (n != 4 || alt[i + 2] != 30 || alt[i + 3] != 1) return 0;
+            locations++;
+        }
+        i += n;
+    }
+    return locations == 1 ? added : 0;
+}
+
+static int spv_runtime_contract(const uint32_t *base, uint32_t bn, const uint32_t *alt, uint32_t an) {
+    if (!base || !alt || bn < 5 || an < 5 || base[0] != 0x07230203u || alt[0] != base[0] ||
+        alt[1] != base[1] || alt[2] != base[2] || alt[4] != base[4] || alt[3] < base[3]) return 0;
+    // Validate every instruction boundary, including the function section.
+    int in_function = 0, functions = 0;
+    for (uint32_t i = 5; i < an;) { uint32_t n = alt[i] >> 16, op = alt[i] & 0xffff;
+        if (!n || n > an - i) return 0;
+        if (op == 54) { if (n != 5 || in_function) return 0; in_function = 1; functions++; }
+        if (op == 56) { if (n != 1 || !in_function) return 0; in_function = 0; }
+        i += n; }
+    if (in_function || !functions) return 0;
+    uint32_t mrt = spv_runtime_mrt(base, bn, alt, an), mrt_seen = 0;
+    uint32_t b = 5, a = 5;
+    while (a < an) {
+        uint32_t na = alt[a] >> 16, oa = alt[a] & 0xffff;
+        if (b >= bn) return 0;
+        uint32_t nb = base[b] >> 16, ob = base[b] & 0xffff;
+        if (!nb || nb > bn - b) return 0;
+        if (oa == 54) return ob == 54 && (!mrt || mrt_seen == 7); // original declarations and complete optional MRT
+        if (na == nb && !memcmp(alt + a, base + b, (size_t)nb * 4)) { a += na; b += nb; continue; }
+        // A diagnostic MRT is an Output interface in every version; Private
+        // globals are interface operands only in SPIR-V1.4 and later.
+        if (oa == 15 && ob == 15 && na > nb &&
+            !memcmp(alt + a + 1, base + b + 1, (size_t)(nb - 1) * 4)) {
+            for (uint32_t j = nb; j < na; j++) {
+                if (mrt && alt[a + j] == mrt) { if (mrt_seen & 1) return 0; mrt_seen |= 1; }
+                else if (base[1] < 0x00010400u || !spv_runtime_private(alt, an, alt[a + j], base[3])) return 0;
+            }
+            a += na; b += nb; continue;
+        }
+        if (mrt && oa == 71 && na == 4 && alt[a + 1] == mrt && alt[a + 2] == 30 && alt[a + 3] == 1) {
+            if (mrt_seen & 2) return 0;
+            mrt_seen |= 2; a += na; continue;
+        }
+        if (mrt && oa == 59 && na == 4 && alt[a + 2] == mrt && alt[a + 3] == 3) {
+            if (mrt_seen & 4) return 0;
+            mrt_seen |= 4; a += na; continue;
+        }
+        if (!spv_runtime_extra(alt + a, na, base[3], alt[3])) return 0;
+        a += na;
+    }
+    return 0;
+}
+// Separate, opt-in paired observer contract. Preserve every original declaration;
+// only Flat uint location12 and (fragment only) uvec4 colour1 may extend the IO.
+static const uint32_t *spv_observer_decl(const uint32_t *w, uint32_t nw, uint32_t id, unsigned opcode) {
+    for (uint32_t i=5;i<nw;) { uint32_t n=w[i]>>16, op=w[i]&0xffff;
+        if (!n || n>nw-i || op==54) return NULL;
+        if (op==opcode && n>=3 && w[i+1]==id) return w+i;
+        i+=n;
+    }
+    return NULL;
+}
+static int spv_observer_uint(const uint32_t *w,uint32_t nw,uint32_t id,int vector) {
+    if(vector){const uint32_t *v=spv_observer_decl(w,nw,id,23);
+        if(!v || v[0]>>16!=4 || v[3]!=4)return 0;id=v[2];}
+    const uint32_t *t=spv_observer_decl(w,nw,id,21);
+    return t && t[0]>>16==4 && t[2]==32 && t[3]==0;
+}
+static int spv_observer_contract(const uint32_t *base,uint32_t bn,const uint32_t *alt,uint32_t an,int fragment) {
+    if(!base||!alt||bn<5||an<5||alt[3]<base[3])return 0;
+    uint32_t ids[2]={0},ptr[2]={0},seen[2]={0};unsigned nids=fragment?2:1,entries=0;
+    for(uint32_t i=5;i<bn;){uint32_t n=base[i]>>16,op=base[i]&0xffff;
+        if(!n||n>bn-i)return 0;if(op==54)break;
+        if(op==15){if(n<4||base[i+1]!=(fragment?4u:0u))return 0;entries++;}
+        if(op==71&&n==4&&base[i+2]==30){
+            if(base[i+3]==12)return 0;
+            if(fragment&&base[i+3]==1)for(uint32_t j=5;j<bn;){uint32_t m=base[j]>>16;
+                if(!m||m>bn-j)return 0;if((base[j]&0xffff)==54)break;
+                if((base[j]&0xffff)==59&&m>=4&&base[j+2]==base[i+1]&&base[j+3]==3)return 0;
+                j+=m;}
+        }
+        i+=n;
+    }
+    if(entries!=1)return 0;
+    for(uint32_t i=5;i<an;){uint32_t n=alt[i]>>16,op=alt[i]&0xffff;
+        if(!n||n>an-i)return 0;if(op==54)break;
+        if(op==59&&n>=4&&alt[i+2]>=base[3]&&(alt[i+3]==1||alt[i+3]==3)){
+            unsigned slot=fragment&&alt[i+3]==3?1:0;
+            if(n!=4||slot>=nids||ids[slot]||alt[i+2]>=alt[3]||
+                alt[i+3]!=(slot?3u:fragment?1u:3u))return 0;
+            const uint32_t *t=spv_observer_decl(alt,an,alt[i+1],32);
+            if(!t||t[0]>>16!=4||t[2]!=alt[i+3]||!spv_observer_uint(alt,an,t[3],slot==1))return 0;
+            ids[slot]=alt[i+2];ptr[slot]=alt[i+1];
+        }i+=n;
+    }
+    if(!ids[0]||(fragment&&!ids[1]))return 0;
+    uint32_t *clean=malloc((size_t)an*4);if(!clean)return 0;
+    memcpy(clean,alt,20);uint32_t out=5;int ok=1;
+    for(uint32_t i=5;i<an&&ok;){uint32_t n=alt[i]>>16,op=alt[i]&0xffff;int strip=0;
+        if(!n||n>an-i){ok=0;break;}
+        if(op==54){memcpy(clean+out,alt+i,(size_t)(an-i)*4);out+=an-i;break;}
+        for(unsigned k=0;k<nids;k++){
+            if(op==71&&n>=3&&alt[i+1]==ids[k]){
+                unsigned bit=0;
+                if(n==4&&alt[i+2]==30&&alt[i+3]==(k?1u:12u))bit=1;
+                if(!k&&n==3&&alt[i+2]==14)bit=2; // Flat
+                if(!bit||(seen[k]&bit)){ok=0;break;}seen[k]|=bit;strip=1;
+            }
+            if(op==59&&n==4&&alt[i+2]==ids[k])strip=1;
+            if(op==32&&n==4&&alt[i+1]==ptr[k]&&ptr[k]>=base[3])strip=1;
+        }
+        if(op==15){
+            uint32_t start=out;clean[out++]=alt[i]; // retain original entry operands and only omit the added IO IDs
+            uint32_t interface=3;while(interface<n){uint32_t word=alt[i+interface++];
+                if(!(word&0xffu)||!(word&0xff00u)||!(word&0xff0000u)||!(word&0xff000000u))break;}
+            for(uint32_t j=1;j<n;j++){int added=0;for(unsigned k=0;k<nids;k++)if(j>=interface&&alt[i+j]==ids[k]){
+                if(seen[k]&4){ok=0;break;}seen[k]|=4;added=1;}
+                if(!added)clean[out++]=alt[i+j];
+            }
+            clean[start]=(out-start)<<16|15;
+        }else if(!strip){memcpy(clean+out,alt+i,(size_t)n*4);out+=n;}
+        i+=n;
+    }
+    for(unsigned k=0;k<nids;k++)if(seen[k]!=(k?5u:7u))ok=0;
+    if(ok)ok=spv_runtime_contract(base,bn,clean,out);
+    free(clean);return ok;
+}
+// The pair has one immutable process-lifetime identity (pkey.alt=2). Neither half
+// enters the generic per-shader ALT cache, and a partial failure publishes neither.
+int vk_shader_observer_pair(vkshader_t *vs,vkshader_t *fs,VkShaderModule modules[2]) {
+    static int tried,ready;static vkshader_t *bases[2];static VkShaderModule pair[2];
+    if(!vs||!fs||vs->key!=0xc8ab0e758c17df4aull||fs->key!=0x96dbc0392691b437ull)return 0;
+    const char *enable=getenv("DM_VK_FLAT_OBSERVER"),*dir=getenv("DM_VK_FLAT_OBSERVER_DIR");
+    if(!enable||strcmp(enable,"1")||!dir||!*dir)return 0;
+    pthread_mutex_lock(&g_sh_mu);
+    if(!tried){
+        tried=1;uint32_t *w[2]={0},nw[2]={0};vkshader_t *s[2]={vs,fs};VkShaderModule made[2]={0};int ok=1;
+        for(unsigned i=0;i<2&&ok;i++){
+            char path[768];if(snprintf(path,sizeof path,"%s/%016llx.spv",dir,(unsigned long long)s[i]->key)>=(int)sizeof path){ok=0;break;}
+            FILE *f=fopen(path,"rb");if(!f){ok=0;break;}
+            if(fseek(f,0,SEEK_END)){fclose(f);ok=0;break;}long n=ftell(f);rewind(f);
+            if(n<=20||n>(16L<<20)||(n&3)){fclose(f);ok=0;break;}
+            w[i]=malloc((size_t)n);nw[i]=(uint32_t)(n/4);
+            ok=w[i]&&fread(w[i],1,(size_t)n,f)==(size_t)n;fclose(f);
+            if(ok)ok=spv_observer_contract(s[i]->spv,s[i]->nspv,w[i],nw[i],i==1);
+        }
+        for(unsigned i=0;i<2&&ok;i++){VkShaderModuleCreateInfo ci={VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,NULL,0,(size_t)nw[i]*4,w[i]};
+            ok=vkCreateShaderModule(V.dev,&ci,NULL,&made[i])==VK_SUCCESS;
+        }
+        if(ok){for(unsigned i=0;i<2;i++){pair[i]=made[i];bases[i]=s[i];unsigned char hash[CC_SHA256_DIGEST_LENGTH];char hex[65];
+                CC_SHA256(w[i],(CC_LONG)nw[i]*4,hash);for(unsigned j=0;j<sizeof hash;j++)snprintf(hex+2*j,3,"%02x",hash[j]);
+                VKLOG("Flat observer paired module: key=%016llx sha256=%s words=%u identity=2",(unsigned long long)s[i]->key,hex,nw[i]);}ready=1;
+        }else{for(unsigned i=0;i<2;i++)if(made[i])vkDestroyShaderModule(V.dev,made[i],NULL);
+            VKLOG("Flat observer: pair refused; both original modules retained");}
+        free(w[0]);free(w[1]);
+    }
+    int ok=ready&&bases[0]==vs&&bases[1]==fs;
+    if(ok&&modules){modules[0]=pair[0];modules[1]=pair[1];}
+    pthread_mutex_unlock(&g_sh_mu);return ok;
+}
+static void spv_runtime_dump(vkshader_t *s, const uint32_t *w, uint32_t nw) {
+    const char *dir = getenv("DM_VK_SPV_DUMP_DIR");
+    static unsigned count;
+    if (!dir || !*dir) return; // normal path: no key lookup, parsing or file work
+    const char *key = getenv("DM_VK_SPV_DUMP_KEY");
+    if (count >= (key && *key ? 32u : 16u) || !spv_runtime_dump_match(key, s->key)) return;
+    count++;
+    char path[768], part[800], meta[800];
+    if (snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)s->key) >= (int)sizeof path) return;
+    snprintf(part, sizeof part, "%s.part", path);
+    FILE *f = fopen(part, "wb");
+    if (!f) { VKLOG("[RED] runtime SPIR-V dump could not open %s", part); return; }
+    int ok = fwrite(w, 4, nw, f) == nw;
+    if (fclose(f)) ok = 0;
+    if (!ok || rename(part, path)) { VKLOG("[RED] runtime SPIR-V dump incomplete: %s", part); return; }
+    snprintf(meta, sizeof meta, "%s.json", path);
+    f = fopen(meta, "w");
+    if (f) { fprintf(f, "{\n  \"schema\": \"vk-runtime-spv-v1\",\n  \"key\": \"%016llx\",\n  \"stage\": %d,\n  \"set\": %d,\n  \"word_count\": %u,\n  \"pool_arrays\": %d,\n  \"pool_textures\": %d,\n  \"pool_samplers\": %d,\n  \"requires_alt_runtime\": true\n}\n",
+        (unsigned long long)s->key, s->stage, s->set, nw, s->npool, vk_pool_n(), vk_pool_samp_n()); fclose(f); }
+    VKLOG("runtime SPIR-V dumped: %s (%u words, stage %d, set %d); ALT requires DM_VK_SPV_RUNTIME=1", path, nw, s->stage, s->set);
+}
+
 // DM_VK_SPV_DIR=<dir> with DM_VK_SPV_ALT=1 (live, debugging): pipelines made while it is on use <dir>/<key>.spv in place of the bundle's code where the file
 // exists (same bindings), so two compilations of a shader can be compared in one run: the translator's module through spirv-opt, its GLSL through glslc...
 static VkShaderModule alt_module(vkshader_t *s) {
+    const char *observer=getenv("DM_VK_FLAT_OBSERVER");
+    if(observer&&!strcmp(observer,"1")&&(s->key==0xc8ab0e758c17df4aull||s->key==0x96dbc0392691b437ull))
+        return s->mod; // the observer pair can never enter the independent generic ALT path
     const char *dir = getenv("DM_VK_SPV_DIR"); char path[512]; if (!dir) return s->mod;
     snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)s->key); FILE *f = fopen(path, "rb"); if (!f) return s->mod;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); uint32_t *w = n > 20 && !(n & 3) ? malloc((size_t)n) : NULL; VkShaderModule m = s->mod;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET); uint32_t *w = n > 20 && n <= (64L << 20) && !(n & 3) ? malloc((size_t)n) : NULL; VkShaderModule m = s->mod;
     if (w && fread(w, 1, (size_t)n, f) == (size_t)n) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)n, w};
-        for (uint32_t i = 5, nw = (uint32_t)(n / 4); i < nw;) { uint32_t k = w[i] >> 16; if (!k) break; if ((w[i] & 0xffff) == 71 && k >= 4 && w[i + 2] == 34) w[i + 3] = (uint32_t)s->set; i += k; }   // the stage's set, as at load
-        if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) m = s->mod; else VKLOG("shader %016llx: alternative code from %s", (unsigned long long)s->key, path); }
+        const char *r = getenv("DM_VK_SPV_RUNTIME"); int runtime = r && atoi(r);
+        if (runtime && !spv_runtime_contract(s->spv, s->nspv, w, (uint32_t)(n / 4))) {
+            VKLOG("[RED] shader %016llx: runtime alternative rejected (preamble differs from current module): %s", (unsigned long long)s->key, path);
+        } else {
+            if (!runtime) for (uint32_t i = 5, nw = (uint32_t)(n / 4); i < nw;) { uint32_t k = w[i] >> 16; if (!k || k > nw - i) break; if ((w[i] & 0xffff) == 71 && k >= 4 && w[i + 2] == 34) w[i + 3] = (uint32_t)s->set; i += k; }
+            if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) m = s->mod; else VKLOG("shader %016llx: alternative code from %s%s", (unsigned long long)s->key, path, runtime ? " (verified runtime layout)" : "");
+        } }
     free(w); fclose(f); return m;
 }
 // A fragment shader's dual-source variant (gfx_vk_exec.c pkey dual): its output at location 1 becomes location 0, index 1, the second source of target 0's blend.
@@ -858,6 +1154,10 @@ static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im,
     return m;
 }
 // Process-lifetime buffers: Ryujinx support values, 64 KB of zeros, and the immutable all-set raw-global write bitmap (Android does not consume the write log).
+void vk_support_values(void *p) {
+    memset(p, 0, VK_SUPPORT_BYTES);
+    for (int i = 0; i < 73; i++) *(float *)((uint8_t *)p + 192 + 16 * i) = 1.0f; // render_scale[i].x (SupportBuffer.cs)
+}
 static VkBuffer static_buf(int which) {
     static VkBuffer b[3]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     { VkBuffer r = __atomic_load_n(&b[which], __ATOMIC_ACQUIRE); if (r) return r; }   // made already: no lock (every draw binds them)
@@ -868,8 +1168,8 @@ static VkBuffer static_buf(int which) {
         VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &nb)); VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, nb, &req);
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
         VkDeviceMemory m; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, nb, m, 0));
-        void *p; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p)); memset(p, which == 2 ? 0xff : 0, size);
-        if (which == 0) for (int i = 0; i < 73; i++) *(float *)((uint8_t *)p + 192 + 16 * i) = 1.0f;   // render_scale[i].x (SupportBuffer.cs layout)
+        void *p; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p));
+        if (which == 0) vk_support_values(p); else memset(p, which == 2 ? 0xff : 0, size);
         __atomic_store_n(&b[which], nb, __ATOMIC_RELEASE);   // published once filled
     }
     pthread_mutex_unlock(&mu);

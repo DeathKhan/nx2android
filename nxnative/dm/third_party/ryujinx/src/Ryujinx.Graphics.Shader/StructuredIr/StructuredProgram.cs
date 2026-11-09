@@ -258,7 +258,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
                 if (isCondSel || isCopy)
                 {
-                    AggregateType type = GetVarTypeFromUses(operation.Dest);
+                    AggregateType type = GetVarTypeFromUses(operation.Dest, context.ResourceManager.Properties);
 
                     if (isCondSel && type == AggregateType.FP32)
                     {
@@ -342,7 +342,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             }
         }
 
-        private static AggregateType GetVarTypeFromUses(Operand dest)
+        private static AggregateType GetVarTypeFromUses(Operand dest, ShaderProperties properties)
         {
             HashSet<Operand> visited = [];
 
@@ -391,7 +391,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                         {
                             if (operation.GetSource(index) == operand)
                             {
-                                return InstructionInfo.GetSrcVarType(operation.Inst, index);
+                                return GetSourceVarType(operation, index, properties);
                             }
                         }
                     }
@@ -399,6 +399,33 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             }
 
             return AggregateType.S32;
+        }
+
+        private static AggregateType GetSourceVarType(Operation operation, int index, ShaderProperties properties)
+        {
+            if (operation is TextureOperation texture &&
+                texture.Inst == Instruction.TextureSample &&
+                (texture.Type & SamplerType.Array) != 0)
+            {
+                // Sampling coordinates are floats, but the guest array layer is an integer.
+                // Match the resource-index prefix consumed by GenerateSampledImageLoad before
+                // locating that layer. Keeping copy/select locals integer avoids representing
+                // MOV 1/2 as floating-point denormals only to bitcast them back at the sample.
+                int coordinateStart = properties.Textures[new SetBindingPair(texture.Set, texture.Binding)].ArrayLength != 1 ? 1 : 0;
+
+                if (texture.SamplerBinding >= 0 &&
+                    properties.Textures[new SetBindingPair(texture.SamplerSet, texture.SamplerBinding)].ArrayLength != 1)
+                {
+                    coordinateStart++;
+                }
+
+                if (index == coordinateStart + texture.Type.Dimensions)
+                {
+                    return AggregateType.S32;
+                }
+            }
+
+            return InstructionInfo.GetSrcVarType(operation.Inst, index);
         }
 
         private static bool AreAllSourceTypesEqual(IAstNode[] sources, AggregateType type)

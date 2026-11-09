@@ -781,6 +781,41 @@ static VkComponentMapping sample_swizzle(const VkComponentMapping *format, const
         apply(swz_comp(sw[2]),format,VK_COMPONENT_SWIZZLE_B),
         apply(swz_comp(sw[3]),format,VK_COMPONENT_SWIZZLE_A)};
 }
+// Passive diagnostic: first sixteen distinct normally selected views of one native size.
+// Called with g_view_mu held; it neither resolves resources nor changes cache behavior.
+static int view_log_size_parse(const char *s, uint32_t *w, uint32_t *h) {
+    uint32_t v[2]={0};
+    if(!s||!*s)return 0;
+    for(int i=0;i<2;i++){
+        if(*s<'0'||*s>'9')return 0;
+        while(*s>='0'&&*s<='9'){
+            unsigned d=(unsigned)(*s++-'0');
+            if(v[i]>(UINT32_MAX-d)/10u)return 0;
+            v[i]=v[i]*10u+d;
+        }
+        if(!v[i])return 0;
+        if(i==0&&*s++!='x')return 0;
+    }
+    if(*s)return 0;
+    *w=v[0];*h=v[1];return 1;
+}
+static void view_log_selected(const tex_t *t,const view_t *v,const vkimg_t *im,
+                              int dim,int arrayed,int kind,const vview *native,int cached) {
+    static int init;static uint32_t width,height;
+    static VkImageView seen[16];static unsigned nseen;
+    if(!init){init=1;view_log_size_parse(getenv("DM_VK_VIEW_LOG_SIZE"),&width,&height);}
+    if(!width||nseen>=16||im->w!=width||im->h!=height)return;
+    for(unsigned i=0;i<nseen;i++)if(seen[i]==native->v)return;
+    seen[nseen++]=native->v;
+    unsigned flags=v?((unsigned)!!v->set_format|((unsigned)!!v->set_target<<1)|((unsigned)!!v->set_levels<<2)|
+        ((unsigned)!!v->set_layers<<3)|((unsigned)!!v->set_swizzle<<4)|((unsigned)!!v->set_dsmode<<5)):0;
+    VKLOG("view selected: cached=%d serial=%llu pool=%p off=%#llx texture_target=%d image=%p extent=%ux%ux%u native_format=%u native_type=%u native_target=%d native_layers=%u native_levels=%u samples=%u request_dim=%d request_arrayed=%d view_kind=%d view=%p type=%u format=%u mip=%u+%u layers=%u+%u aspect=%#x view_flags=%#x requested_target=%d requested_format=%d requested_mip=%u+%u requested_layers=%u+%u",
+        cached,(unsigned long long)t->serial,(void*)t->pool,(unsigned long long)t->off,t->d.target,
+        (void*)im->img,im->w,im->h,im->d,(unsigned)im->fmt,(unsigned)im->vtype,im->target,im->layers,im->levels,im->samples,
+        dim,arrayed,kind,(void*)native->v,(unsigned)native->type,(unsigned)native->fmt,
+        native->lv0,native->nlv,native->ly0,native->nly,(unsigned)native->aspect,flags,
+        v?v->target:0,v?v->format:0,v?v->base_level:0,v?v->nlevels:0,v?v->min_layer:0,v?v->nlayers:0);
+}
 __thread VkFormat vk_view_fmt; __thread uint32_t vk_view_layers;
 VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, int view_kind, vkimg_t **img_out) {
     int as_attachment = view_kind == 1, storage = view_kind == 2;
@@ -828,7 +863,7 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     pthread_mutex_lock(&g_view_mu);
     vview *head = nvn_hm_get(&g_views, &im);
     for (vview *v = head; v; v = v->next)
-        if (v->type == type && v->fmt == fmt && v->lv0 == lv0 && v->nlv == nlv && v->ly0 == ly0 && v->nly == nly && v->aspect == aspect && v->attach == view_kind && !memcmp(&v->swz, &swz, sizeof swz)) { pthread_mutex_unlock(&g_view_mu); vk_view_fmt = fmt; vk_view_layers = nly; return v->v; }
+        if (v->type == type && v->fmt == fmt && v->lv0 == lv0 && v->nlv == nlv && v->ly0 == ly0 && v->nly == nly && v->aspect == aspect && v->attach == view_kind && !memcmp(&v->swz, &swz, sizeof swz)) { view_log_selected(t,vw,im,dim,arrayed,view_kind,v,1); pthread_mutex_unlock(&g_view_mu); vk_view_fmt = fmt; vk_view_layers = nly; return v->v; }
     VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, 0};
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, fmt, &fp);
     uci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -840,6 +875,7 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     if (r) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(15, "vkCreateImageView failed (%d): type %d format %d levels %u+%u layers %u+%u of image %ux%ux%u", r, type, fmt, lv0, nlv, ly0, nly, im->w, im->h, im->layers); return VK_NULL_HANDLE; }
     vview *nv = calloc(1, sizeof *nv); *nv = (vview){view, type, fmt, lv0, nlv, ly0, nly, swz, aspect, view_kind, head};
     nvn_hm_put(&g_views, &im, nv);
+    view_log_selected(t,vw,im,dim,arrayed,view_kind,nv,0);
     pthread_mutex_unlock(&g_view_mu);
     vk_view_fmt = fmt; vk_view_layers = nly;
     return view;
@@ -890,6 +926,41 @@ static void samp_history_append(int sid) {   // g_rmu held, current version stil
 }
 uint64_t mtl_samp_seq(void) { return __atomic_load_n(&g_sregs, __ATOMIC_ACQUIRE); }
 static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
+// DM_CTL texlist: copy current CPU registration metadata only. The control thread must
+// not create native views, resolve replay history, or touch texture storage/GPU work.
+void vk_registry_texlist(int target) {
+    enum { LIMIT = 256 };
+    struct record { int tid; treg_ver value; };
+    if (target < NVN_TEXTURE_TARGET_1D || target > NVN_TEXTURE_TARGET_BUFFER) {
+        VKLOG("[texlist] unsupported NVN target %d", target); return;
+    }
+    struct record *records = calloc(LIMIT, sizeof *records);
+    if (!records) { VKLOG("[texlist] snapshot allocation failed"); return; }
+    unsigned n = 0; int truncated = 0;
+    pthread_mutex_lock(&g_rmu);
+    for (int tid = 1; tid < g_ntreg; tid++) {
+        const treg_ver *v = &g_treg[tid].cur;
+        if (!v->ok || v->t.d.target != target) continue;
+        if (n == LIMIT) { truncated = 1; break; }
+        records[n++] = (struct record){tid, *v};
+    }
+    pthread_mutex_unlock(&g_rmu);
+    VKLOG("[texlist] current registry target %d: %u entries%s (CPU metadata snapshot; no native image lookup)",
+        target, n, truncated ? ", truncated at 256" : "");
+    for (unsigned i = 0; i < n; i++) {
+        const treg_ver *r = &records[i].value; const tex_t *t = &r->t; const view_t *v = &r->v;
+        VKLOG("[texlist] tid=%d ser=%llu seq=%llu target %d %ux%ux%u format %#x levels %u layers %u flags %#x pool %p+%#llx storage %p size %#llx layer_size %#llx block height/depth log2 %u/%u swizzle %d/%#x stencil %d",
+            records[i].tid, (unsigned long long)t->serial, (unsigned long long)r->seq, t->d.target,
+            t->d.width, t->d.height, t->d.depth, t->d.format, t->d.levels, t->L.layers, t->d.flags,
+            (void *)t->pool, (unsigned long long)t->off, (void *)t->mem, (unsigned long long)t->L.size,
+            (unsigned long long)t->L.layer_size, t->L.tileH, t->L.tileD, t->set_swz, t->swz, t->stencil);
+        if (r->has_v) VKLOG("[texlist] tid=%d view target %d/%u format %d/%#x levels %d/%u+%u layers %d/%u+%u swizzle %d/%u,%u,%u,%u depth-stencil %d/%u",
+            records[i].tid, v->set_target, v->target, v->set_format, v->format,
+            v->set_levels, v->base_level, v->nlevels, v->set_layers, v->min_layer, v->nlayers,
+            v->set_swizzle, v->swz[0], v->swz[1], v->swz[2], v->swz[3], v->set_dsmode, v->dsmode);
+    }
+    free(records);
+}
 __attribute__((weak)) uint64_t nvn_jobs_queued(void) { return 0; }
 __attribute__((weak)) uint64_t nvn_replaying_job(void) { return 0; }
 // Logical queues can replay out of enqueue order or park for arbitrarily many later jobs.

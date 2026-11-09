@@ -1,0 +1,10 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform sampler2DArray image_source;
+layout(std430, set = 0, binding = 1) readonly buffer Points { vec4 points[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Samples { vec4 samples[]; };
+layout(push_constant) uniform Parameters { uint count; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < count) samples[i] = textureLod(image_source, points[i].xyz, 0.0);
+}

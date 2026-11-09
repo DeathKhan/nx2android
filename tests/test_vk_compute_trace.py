@@ -64,13 +64,14 @@ typedef struct {int set_levels,set_layers,set_format,format,set_target,target;ui
 typedef struct {VkFormat vk;} vkfmt_t;
 DECL_PD
 DECL_CI
-enum {CS_TRACE_KEYS=16,CS_TRACE_DISPATCHES=32,CS_TRACE_IMAGES=8,CS_TRACE_COPIES=16,PD_MAX=96};
+enum {CS_TRACE_KEYS=16,CS_TRACE_DISPATCHES=32,CS_TRACE_IMAGES=8,CS_TRACE_COPIES=16,PD_MAX=96,PD_DRAW_MAX=256};
 static uint64_t g_cs_trace_keys[CS_TRACE_KEYS],g_cs_trace_bytes;
 static unsigned g_cs_trace_n,g_cs_trace_seen,g_cs_trace_copies,g_cs_trace_wait,g_cs_trace_found,g_cs_buffer_copies,g_cs_images_n,g_cs_images_copies;
 static int g_cs_trace_dump,g_cs_trace_collect,g_cs_trace_buffers;
 static unsigned g_cs_trace_frames;static uint64_t g_cs_trace_start_present;
 static cs_trace_image g_cs_images[CS_TRACE_IMAGES];
-static pdump_t g_pd[PD_MAX];static int g_npd,g_pd_state,g_sub_pass=37;
+static pdump_t g_pd[PD_DRAW_MAX];static int g_npd,g_pd_state,g_sub_pass=37,g_pd_draw_mode,g_draw_i=91;
+static int g_fs_image_collect;static unsigned g_fs_image_copies;static uint64_t g_fs_image_bytes;
 static uint64_t g_tex_frame=419;
 #define NVN_TEXTURE_TARGET_3D 3
 static uint64_t vk_frame_current(void){return 501;}
@@ -98,7 +99,7 @@ void vkCmdPipelineBarrier(VkCommandBuffer c,VkPipelineStageFlags src,VkPipelineS
 }
 
 FUNCTIONS
-static void reset_capture(void){g_cs_images_n=g_cs_images_copies=g_cs_trace_copies=0;g_cs_trace_bytes=0;g_npd=0;g_pd_state=1;g_cs_trace_collect=1;}
+static void reset_capture(void){g_fs_image_collect=g_pd_draw_mode=0;g_fs_image_copies=0;g_fs_image_bytes=0;g_cs_images_n=g_cs_images_copies=g_cs_trace_copies=0;g_cs_trace_bytes=0;g_npd=0;g_pd_state=1;g_cs_trace_collect=1;}
 int main(void){
  cs_trace_poll();assert(!g_cs_trace_n&&!cs_trace_match(1));
  setenv("DM_VK_TRACE_CS","abc",1);cs_trace_poll();assert(g_cs_trace_n==1&&g_cs_trace_wait==600);
@@ -173,6 +174,24 @@ int main(void){
   .aspect=VK_IMAGE_ASPECT_COLOR_BIT,.vtype=VK_IMAGE_VIEW_TYPE_2D,.samples=1,.d=1,.levels=1,.layers=1,.w=256,.h=256};
  v=(view_t){0};bind.flags=0;t.d.format=im.fmt;cs_trace_image_note(&bind,&ii,&im,&t,NULL,0);assert(g_cs_images_n==1&&!g_cs_images[0].raw);
  cs_trace_images_copy(VK_NULL_HANDLE,0x21d9,0);assert(!g_pd[0].raw_bytes&&g_pd[0].depth==1);
+ // Exact selected-FS path uses the same native-copy helper, preserves RGBA bytes,
+ // and coexists with236 draw checkpoints without the old96-copy ceiling.
+ reset_capture();g_cs_trace_collect=0;g_fs_image_collect=1;g_pd_draw_mode=1;g_npd=236;
+ im=(vkimg_t){.img=(VkImage)(uintptr_t)9,.fmt=VK_FORMAT_R8G8B8A8_UNORM,.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+ .aspect=VK_IMAGE_ASPECT_COLOR_BIT,.vtype=VK_IMAGE_VIEW_TYPE_2D,.samples=1,.d=1,.levels=1,.layers=1,.w=4,.h=4};
+ t.d.format=im.fmt;bind.binding=1;bind.flags=0;
+ cs_trace_image_note(&bind,&ii,&im,&t,NULL,0);
+ assert(g_cs_images_n==1&&g_fs_image_copies==1&&g_fs_image_bytes==64&&!g_cs_trace_copies);
+ assert(g_cs_images[0].graphics&&g_cs_images[0].raw&&g_cs_images[0].bytes==64);
+ cs_trace_images_copy(VK_NULL_HANDLE,0xcca,0);
+ assert(g_npd==237&&g_pd[236].raw_bytes==64&&g_pd[236].fence==702&&g_pd[236].dispatch==91&&g_pd[236].pass==-3091);
+ assert(last_copy.imageSubresource.mipLevel==0&&last_copy.imageSubresource.baseArrayLayer==0&&last_copy.imageExtent.width==4);
+ g_cs_images_n=g_cs_images_copies=0;cs_trace_image_note(&bind,&ii,&im,&t,NULL,0);cs_trace_images_copy(VK_NULL_HANDLE,0xcca,0);
+ assert(g_npd==238&&g_fs_image_copies==2&&g_fs_image_bytes==128);
+ g_cs_images_n=g_cs_images_copies=0;cs_trace_image_note(&bind,&ii,&im,&t,NULL,0);assert(!g_cs_images_n);
+ g_fs_image_copies=0;g_fs_image_bytes=0;g_npd=256;cs_trace_image_note(&bind,&ii,&im,&t,NULL,0);assert(!g_cs_images_n);
+ g_npd=0;g_pd_state=2;cs_trace_image_note(&bind,&ii,&im,&t,NULL,0);assert(!g_cs_images_n);
+ g_pd_state=1;g_fs_image_collect=0;cs_trace_image_note(&bind,&ii,&im,&t,NULL,0);assert(!g_cs_images_n);
 
  return 0;
 }
@@ -227,7 +246,7 @@ int main(int argc,char **argv){
         self.assertLess(poll.index("done_fence <"),poll.index("vkInvalidateMappedMemoryRanges"))
         self.assertLess(poll.index("vkInvalidateMappedMemoryRanges"),poll.index("pass_dump_raw_native("))
         self.assertLess(poll.index("pass_dump_raw_native("),poll.index('fopen(path, "wb")'))
-        self.assertIn("memset(g_pd, 0, sizeof g_pd)",poll)
+        self.assertIn("memset(g_pd, 0, sizeof g_pd)",extract(src,"static void pass_dump_arm("))
 
     def test_dispatch_and_completion_order(self):
         src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()

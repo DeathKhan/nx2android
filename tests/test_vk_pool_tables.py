@@ -18,7 +18,8 @@ def fixture(source):
     header = (ROOT / "nxnative/dm/android/gfx_vk.h").read_text()
     defs = header[header.index("enum { RK_SUPPORT"):header.index("_Static_assert(sizeof(dmsv_bind)")]
     start = source.index("static struct { uint64_t h, epoch, tex, samp;")
-    cache = source[start:source.index("static VkDescriptorSet tbl_set", start)]
+    cache = source[start:source.index("// ---------------- the pool tables' ring", start)]
+    cache += "\nstatic VkDescriptorSet tbl_ring(int st,unsigned mask){(void)st;(void)mask;return VK_NULL_HANDLE;}\n"
     kinds = function(source, "static unsigned tbl_kinds(") if "static unsigned tbl_kinds(" in source else ""
     draw = function(source, "static int prepare_draw(")
     start = draw.index("    vkshader_t *ts = NULL;")
@@ -41,18 +42,22 @@ static void mock_log(const char *format, ...){if(strstr(format,"  table set "))t
 typedef struct { uint64_t addr,size; } p_bind_buf;
 typedef struct { uint64_t end; } vkpool_t;
 typedef struct { int set_target,target; } view_t;
-typedef struct { struct { int target,width,height,depth; } d; struct {uint64_t size;} L; } tex_t;
+typedef struct { struct { int target,width,height,depth,format; } d; struct {uint64_t size;} L; } tex_t;
 typedef struct {uint64_t last_use;} vkimg_t;
 typedef struct {uint64_t key;int ntbl,npool,tbl_reg,tbl_off,nbind,set;uint8_t tbl[96];const dmsv_bind*b;} vkshader_t;
 static struct { p_bind_buf ubo[6][16]; vkshader_t *sh[6]; } S;
 static struct {VkDevice dev;} V;
 static uint64_t g_set_epoch=1,g_tex_gen=1,g_samp_gen=1,clock_,allocs;
-static int g_tracing,g_x_nosetc,g_pool_tex_base,g_pool_samp_base,g_var_now;
+static int g_tracing,g_x_nosetc,g_pool_tex_base,g_pool_samp_base,g_var_now,g_fs_buffer_collect;
+static uint64_t g_ring_full,g_ring_patch,g_ring_ids,g_ring_hits,g_ring_none,g_ring_ns;
+static int g_pool_strict,g_pdum_lo=-1,g_pdum_hi,g_pdum_nf;
+static unsigned g_pdum_kinds,g_pdum_f[16];
+uint64_t g_tex_gen_why[4];
 static uint64_t g_num_um,g_num_im;
 static uint32_t pool_generation=1, writes[256], resolves[4], sampler_resolves;
 static VkDescriptorImageInfo captured[256][8][8];
 static uint32_t input_words[16]={1,0,2,0};
-static tex_t texture={.d={1,16,16,1},.L={4}};
+static tex_t texture={.d={1,16,16,1,122},.L={4}};
 static uint64_t current_texture_seq=1,current_sampler_seq=1,refreshes,dirty_uploads;
 static int snapshot_valid=1,content_dirty,refresh_change,refresh_fail,pool_ok=2,current_slot;
 static uint64_t leases[256],lease_clock;static int owners[256],used[256];
@@ -263,6 +268,146 @@ int main(int argc,char **argv){
         function(source, "static VkDescriptorSet tbl_set(")))).replace("SELECTION", selection).replace("HAS_KINDS", str(int(bool(kinds))))
 
 
+def ring_fixture(source):
+    """Execute the real ring, registry snapshot and implicit sampler-version selector."""
+    tex = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text()
+    header = (ROOT / "nxnative/dm/android/gfx_vk.h").read_text()
+    defs = header[header.index("enum { RK_SUPPORT"):header.index("_Static_assert(sizeof(dmsv_bind)")]
+    start = source.index("// ---------------- the pool tables' ring")
+    ring = source[start:source.index("static VkDescriptorSet tbl_set", start)]
+    return r"""
+#include <vulkan/vulkan_core.h>
+#include <assert.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+DEFS
+enum {TBL_SLOTS=3,POOL_TEX_SLOTS=4,POOL_B0=3,POOL_SAMP_B=7};
+#define H(t,n) ((t)(uintptr_t)(n))
+#define VKLOG(...) ((void)0)
+typedef struct {int set_target,target;} view_t;
+typedef struct {struct {int target,width,height,depth,format;} d;struct {uint64_t size;} L;} tex_t;
+typedef struct {uint64_t last_use;} vkimg_t;
+static struct {VkDevice dev;} V;
+static int g_pool_tex_base,g_pool_samp_base,g_pool_strict,g_pdum_lo=-1,g_pdum_hi,g_pdum_nf;
+static unsigned g_pdum_kinds,g_pdum_f[16];
+uint64_t g_tex_gen_why[4],g_samp_gen=2;
+static uint64_t g_ring_full,g_ring_patch,g_ring_ids,g_ring_hits,g_ring_none,g_ring_ns;
+static uint64_t job=1,last_fence=10,done=10,clock_,set_fence[7];
+uint64_t nvn_replaying_job(void){return job;}
+static uint64_t tick(void){return ++clock_;}
+static uint64_t mtl_last_fence(void){return last_fence;}
+static uint64_t vk_fence_done(void){return done;}
+static uint32_t vk_pool_gen(void){return 1;}
+static int vk_pool_n(void){return 4;}
+static int vk_pool_samp_n(void){return 4;}
+unsigned vk_pool_kinds(void){return 1;}
+static VkDescriptorSetLayout vk_tbl_dsl(void){return H(VkDescriptorSetLayout,1);}
+int vk_alloc_sets_owned(VkDescriptorSetLayout l,int n,VkDescriptorSet *sets){
+ (void)l;assert(n==6);for(int i=0;i<n;i++)sets[i]=H(VkDescriptorSet,i+1);return 1;
+}
+uint64_t vk_reglog_visible_end(uint64_t before){(void)before;return 5;}
+uint64_t vk_reglog_head(void){return 5;}
+int vk_reglog_pending(uint64_t p,uint64_t before){(void)p;(void)before;return 0;}
+uint64_t vk_reglog_take(uint64_t from,uint64_t before,int *ids,int max,int *n){
+ (void)before;(void)ids;(void)max;*n=0;return from;
+}
+static pthread_mutex_t g_rmu=PTHREAD_MUTEX_INITIALIZER;
+static int g_registry_logical=1;
+static uint64_t g_sregs=2,g_texture_registrations=2;
+static struct {uint64_t id;int refs;uint64_t sampler_seq,texture_seq;} g_registry_jobs[]={
+ {1,1,1,1},{2,1,2,2},{3,1,0,0},{4,1,1,1}};
+static size_t g_registry_njobs=4;
+SNAPSHOT
+JOBSEQ
+typedef struct {uint64_t native;} samp_par;
+static samp_par params[3]={{0},{1001},{2001}};
+static const samp_par *samp_at(int sid,uint64_t seq){
+ (void)sid;assert(seq<=2);return &params[seq?seq:g_sregs];
+}
+JOBLOOKUP
+static VkSampler vk_samp_by_id(int id){
+ const samp_par*p=samp_job_at(id);return p?H(VkSampler,p->native+(uint64_t)id):VK_NULL_HANDLE;
+}
+static VkSampler vk_dummy_sampler(void){return H(VkSampler,999);}
+static VkImageView vk_dummy_view(int a,int b,int c,int d,int e){
+ (void)a;(void)b;(void)c;(void)d;(void)e;return H(VkImageView,999);
+}
+static int vk_samp_id_max(void){return 3;}
+static int vk_tex_id_max(void){return 3;}
+static tex_t texture={.d={1,16,16,1,122},.L={4}};
+static vkimg_t image,*g_desc_im=&image;
+static int vk_tex_by_id(int id,const view_t **view,const tex_t **t){(void)id;*view=NULL;*t=&texture;return 1;}
+static int view_num(const tex_t*t,const view_t*v){(void)t;(void)v;return 0;}
+static int vk_tex_pool_ok(const tex_t*t){(void)t;return 2;}
+static void vk_tex_pool_fill(int on){(void)on;}
+MEMHANDLE
+static void tex_desc_for(int st,const dmsv_bind*b,uint64_t h,VkDescriptorImageInfo*d,int x){
+ (void)st;(void)b;(void)x;uint64_t t,s;assert(vk_registry_snapshot(&t,&s));
+ *d=(VkDescriptorImageInfo){0,H(VkImageView,10000+t*100+(h&0xfffff)),VK_IMAGE_LAYOUT_GENERAL};
+}
+static VkDescriptorImageInfo captured[7][8][4];
+static unsigned updates,sampler_updates,image_updates;
+static void mock_update(VkDevice dev,uint32_t n,const VkWriteDescriptorSet*w,uint32_t nc,const VkCopyDescriptorSet*c){
+ (void)dev;(void)nc;(void)c;updates++;
+ for(unsigned i=0;i<n;i++){
+  uintptr_t id=(uintptr_t)w[i].dstSet;assert(id>0&&id<=6);
+  assert(set_fence[id]<=done); // Never mutate a pending or recording draw's set.
+  assert(w[i].dstBinding<8&&w[i].dstArrayElement+w[i].descriptorCount<=4);
+  memcpy(&captured[id][w[i].dstBinding][w[i].dstArrayElement],w[i].pImageInfo,w[i].descriptorCount*sizeof(VkDescriptorImageInfo));
+  if(w[i].dstBinding==7)sampler_updates++;else image_updates++;
+ }
+}
+#define vkUpdateDescriptorSets mock_update
+RING
+static VkDescriptorSet take(void){VkDescriptorSet s=tbl_ring(0,17);if(s)set_fence[(uintptr_t)s]=last_fence+1;return s;}
+static uintptr_t sampler(VkDescriptorSet s){return(uintptr_t)captured[(uintptr_t)s][7][1].sampler;}
+static uintptr_t img(VkDescriptorSet s){return(uintptr_t)captured[(uintptr_t)s][3][1].imageView;}
+static void next(uint64_t nextjob){done=++last_fence;job=nextjob;}
+int main(int argc,char **argv){
+ assert(argc==2);int mode=atoi(argv[1]);
+ if(mode==0){
+  // Both registrations already exist globally before the older job replays.
+  // Its set is then selected again after completion for the newer job.
+  VkDescriptorSet a=take();assert(sampler(a)==1002&&g_samp_gen==2);
+  next(2);VkDescriptorSet b=take();assert(a==b&&sampler(b)==2002);
+  assert(sampler_updates==2&&g_ring_full==1&&g_ring_patch==1);
+ }else if(mode==1){
+  VkDescriptorSet a=take();unsigned n=updates;assert(take()==a&&updates==n);
+  // A distinct snapshot cannot fast-hit or mutate the still-recording set.
+  job=2;VkDescriptorSet b=take();assert(a!=b&&sampler(a)==1002&&sampler(b)==2002);
+ }else if(mode==2){
+  job=2;VkDescriptorSet a=take();assert(img(a)==10201);
+  next(1);assert(take()==a&&img(a)==10101&&sampler(a)==1002&&g_ring_full==2);
+ }else if(mode==3){
+  VkDescriptorSet a=take();next(3);assert(take()==a&&sampler(a)==999);
+ }else if(mode==4){
+  job=99;assert(!take()&&!updates); // Missing snapshot falls back, never assumes latest.
+ }else if(mode==5){
+  // Six pending sets exhaust the ring, then only the completed first slot is eligible.
+  VkDescriptorSet a=take();for(int i=0;i<5;i++){last_fence++;assert(take());}
+  last_fence++;assert(!take());done=11;assert(take()==a);
+ }else if(mode==6){
+  job=0;VkDescriptorSet a=take();assert(img(a)==10201);
+  next(1);assert(take()==a&&img(a)==10101&&g_ring_full==2);
+ }else if(mode==7){
+  VkDescriptorSet a=take();g_samp_gen++;next(1);
+  assert(take()==a&&sampler(a)==1002&&sampler_updates==2);
+ }else if(mode==8){
+  VkDescriptorSet a=take();next(4);assert(take()==a&&sampler(a)==1002);
+  assert(sampler_updates==1&&g_ring_patch==1);
+ }
+ for(int i=0;i<RING_N;i++){free(g_ring[i].img);free(g_ring[i].pend);}
+ return 0;
+}
+""".replace("DEFS", defs).replace("SNAPSHOT", function(tex, "int vk_registry_snapshot(")).replace(
+        "JOBSEQ", function(tex, "static int registry_job_sampler_seq(")).replace(
+        "JOBLOOKUP", function(tex, "static const samp_par *samp_job_at(int sid) {")).replace(
+        "MEMHANDLE", function(source, "static uint64_t mem_handle(")).replace("\nRING\n", "\n" + ring + "\n")
+
+
 class PoolTables(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
     def test_real_table_construction_and_previous_regressions(self):
@@ -275,7 +420,7 @@ class PoolTables(unittest.TestCase):
                 c, exe = folder / (name + ".c"), folder / name
                 c.write_text(fixture(text))
                 subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
-                                "-fsanitize=address,undefined",
+                                "-Wno-misleading-indentation", "-fsanitize=address,undefined",
                                 "-I" + str(ROOT / "nxnative/dm/third_party/vulkan-headers/include"),
                                 "-I" + str(ROOT / "nxnative/dm/gfx/nvn"),
                                 str(c), "-o", str(exe)], check=True)
@@ -292,6 +437,36 @@ class PoolTables(unittest.TestCase):
             exe = compile_one(unshared, "per-set-payloads")
             result = subprocess.run([str(exe), "13"], capture_output=True, timeout=15)
             self.assertNotEqual(result.returncode, 0)
+
+    @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
+    def test_ring_historical_snapshots_and_completed_set_ownership(self):
+        source = (ROOT / SOURCE).read_text()
+        target = ROOT / "target/tests"
+        target.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="pool-ring-", dir=target) as folder:
+            folder = Path(folder)
+            def compile_one(text, name):
+                c, exe = folder / (name + ".c"), folder / name
+                c.write_text(ring_fixture(text))
+                subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                                "-Wno-misleading-indentation", "-pthread",
+                                "-fsanitize=address,undefined",
+                                "-I" + str(ROOT / "nxnative/dm/third_party/vulkan-headers/include"),
+                                str(c), "-o", str(exe)], check=True)
+                return exe
+            exe = compile_one(source, "candidate")
+            for mode in range(9):
+                subprocess.run([str(exe), str(mode)], check=True, timeout=15)
+            # Recreate the previous global-generation-only hit/update predicates.
+            previous = source.replace(" && r->sampseq == sampseq", "").replace(
+                " || r->sampseq != sampseq", "")
+            self.assertNotEqual(previous, source)
+            old = compile_one(previous, "global-generation-only")
+            self.assertNotEqual(subprocess.run([str(old), "0"], capture_output=True, timeout=15).returncode, 0)
+            previous = source.replace("r->jobpos = jp;", "r->jobpos = jp == UINT64_MAX ? r->jobpos : jp;")
+            self.assertNotEqual(previous, source)
+            old = compile_one(previous, "latest-position-not-recorded")
+            self.assertNotEqual(subprocess.run([str(old), "6"], capture_output=True, timeout=15).returncode, 0)
 
     def test_all_active_raster_stages_and_mesh_contract(self):
         source = (ROOT / SOURCE).read_text()

@@ -23,7 +23,13 @@ class ComputeBuffers(unittest.TestCase):
 #include <stdlib.h>
 #include <string.h>
 typedef struct {int kind,reg;uint32_t binding;} dmsv_bind;
-enum {RK_SBUF=1,RK_CBUF=2,RK_DRV=3,RK_C1=4};
+enum {RK_SBUF=1,RK_CBUF=2,RK_DRV=3,RK_C1=4,RK_SBUF_UBO=5,SB_ALIGN=256};
+typedef struct { unsigned stage, reg; uint64_t offset, bytes; } fs_buffer_window;
+static fs_buffer_window g_fs_buffer_windows[8];
+static unsigned g_fs_buffer_windows_n,g_fs_buffer_copies;
+enum {FS_BUFFER_BYTE_BUDGET=48<<20};
+static uint32_t g_fs_buffer_sbuf_max=65536;static uint64_t g_fs_buffer_bytes;
+static int g_fs_buffer_collect,g_draw_i=42,g_sub_pass=7;
 static struct {struct {uint64_t addr;} ssbo[6][16],ubo[6][16];} S;
 static struct {VkDevice dev;} V;
 static uint64_t g_tex_frame=99;
@@ -74,8 +80,8 @@ int main(int argc,char **argv){
  mock_buffer buffer={source,sizeof source};VkDescriptorBufferInfo bi={(VkBuffer)&buffer,256,192};
  S.ssbo[5][0].addr=0x12340100;S.ubo[5][2].addr=0x887700;
  dmsv_bind storage={RK_SBUF,0,4},uniform={RK_CBUF,2,7},immutable={RK_C1,0,9};
- cs_trace_buffer_note(&immutable,&bi);assert(!g_cs_buffers_n);
- cs_trace_buffer_note(&storage,&bi);cs_trace_buffer_note(&uniform,&bi);
+ cs_trace_buffer_note(5,0x21d9,&immutable,&bi);assert(!g_cs_buffers_n);
+ cs_trace_buffer_note(5,0x21d9,&storage,&bi);cs_trace_buffer_note(5,0x21d9,&uniform,&bi);
  assert(g_cs_buffers_n==2&&g_cs_buffer_copies==3&&g_cs_buffers[0].guest==0x12340100);
  cs_trace_buffers_copy(VK_NULL_HANDLE,0x21d9,0);assert(copies==2&&g_cs_buffer_dump[0].source_offset==256);
  cs_trace_buffers_copy(VK_NULL_HANDLE,0x21d9,1);assert(copies==3&&barriers==6&&host_barriers==3);
@@ -85,20 +91,69 @@ int main(int argc,char **argv){
  char path[1024];snprintf(path,sizeof path,"%s/csbuf_0001_00000000000021d9_b4_before.bin",argv[1]);
  FILE *f=fopen(path,"rb");assert(f);uint8_t got[192];assert(fread(got,1,sizeof got,f)==sizeof got&&!memcmp(got,source+256,sizeof got));assert(fgetc(f)==EOF);fclose(f);
  for(unsigned i=0;i<CS_BUFFER_DUMPS;i++)assert(!g_cs_buffer_dump[i].b);
- reset_notes();g_cs_buffer_collect=0;cs_trace_buffer_note(&storage,&bi);assert(!g_cs_buffers_n);g_cs_buffer_collect=1;
- bi.buffer=vk_zero_buffer();cs_trace_buffer_note(&storage,&bi);assert(!g_cs_buffers_n);bi.buffer=(VkBuffer)&buffer;
- bi.offset=1;cs_trace_buffer_note(&storage,&bi);assert(!g_cs_buffers_n);bi.offset=256;
- bi.range=3;cs_trace_buffer_note(&storage,&bi);assert(!g_cs_buffers_n);bi.range=VK_WHOLE_SIZE;cs_trace_buffer_note(&storage,&bi);assert(!g_cs_buffers_n);
- bi.range=192;g_cs_buffer_copies=63;cs_trace_buffer_note(&storage,&bi);assert(!g_cs_buffers_n);cs_trace_buffer_note(&uniform,&bi);assert(g_cs_buffers_n==1&&g_cs_buffer_copies==64);
+ reset_notes();g_cs_buffer_collect=0;cs_trace_buffer_note(5,0x21d9,&storage,&bi);assert(!g_cs_buffers_n);g_cs_buffer_collect=1;
+ bi.buffer=vk_zero_buffer();cs_trace_buffer_note(5,0x21d9,&storage,&bi);assert(!g_cs_buffers_n);bi.buffer=(VkBuffer)&buffer;
+ bi.offset=1;cs_trace_buffer_note(5,0x21d9,&storage,&bi);assert(!g_cs_buffers_n);bi.offset=256;
+ bi.range=3;cs_trace_buffer_note(5,0x21d9,&storage,&bi);assert(!g_cs_buffers_n);bi.range=VK_WHOLE_SIZE;cs_trace_buffer_note(5,0x21d9,&storage,&bi);assert(!g_cs_buffers_n);
+ bi.range=192;g_cs_buffer_copies=63;cs_trace_buffer_note(5,0x21d9,&storage,&bi);assert(!g_cs_buffers_n);cs_trace_buffer_note(5,0x21d9,&uniform,&bi);assert(g_cs_buffers_n==1&&g_cs_buffer_copies==64);
  reset_notes();for(unsigned i=0;i<63;i++)g_cs_buffer_dump[i].b=(VkBuffer)(uintptr_t)1;
- cs_trace_buffer_note(&storage,&bi);assert(!g_cs_buffers_n);cs_trace_buffer_note(&uniform,&bi);assert(g_cs_buffers_n==1);memset(g_cs_buffer_dump,0,sizeof g_cs_buffer_dump);
- reset_notes();bi.offset=0;bi.range=70000;cs_trace_buffer_note(&uniform,&bi);complete=0;
+ cs_trace_buffer_note(5,0x21d9,&storage,&bi);assert(!g_cs_buffers_n);cs_trace_buffer_note(5,0x21d9,&uniform,&bi);assert(g_cs_buffers_n==1);memset(g_cs_buffer_dump,0,sizeof g_cs_buffer_dump);
+ reset_notes();bi.offset=0;bi.range=70000;cs_trace_buffer_note(5,0x21d9,&uniform,&bi);complete=0;
  cs_trace_buffers_copy(VK_NULL_HANDLE,0x9e6,0);assert(g_cs_buffer_dump[0].bytes==65536&&g_cs_buffer_dump[0].source_range==70000);
  gpu_complete();cs_trace_buffers_poll(7);
- reset_notes();bi.range=192;cs_trace_buffer_note(&storage,&bi);unsigned old=copies,old_d=destroys,old_f=frees;
+ reset_notes();bi.range=192;cs_trace_buffer_note(5,0x21d9,&storage,&bi);unsigned old=copies,old_d=destroys,old_f=frees;
  fail_alloc=1;cs_trace_buffers_copy(VK_NULL_HANDLE,1,0);assert(copies==old&&destroys==old_d+1&&frees==old_f);fail_alloc=0;
  fail_map=1;cs_trace_buffers_copy(VK_NULL_HANDLE,1,0);assert(copies==old&&destroys==old_d+2&&frees==old_f+1);fail_map=0;
+
  for(unsigned i=0;i<CS_BUFFER_DUMPS;i++)assert(!g_cs_buffer_dump[i].b);
+ reset_notes();g_cs_buffer_collect=0;g_fs_buffer_collect=1;
+ S.ssbo[1][0].addr=0x80000120;S.ssbo[0][0].addr=0x90000120;
+ bi.offset=256;bi.range=66000;g_fs_buffer_windows_n=3;
+ g_fs_buffer_windows[0]=(fs_buffer_window){1,0,0x10000,16};
+ g_fs_buffer_windows[1]=(fs_buffer_window){1,0,UINT64_MAX-3,16}; // overflow refuses
+ g_fs_buffer_windows[2]=(fs_buffer_window){1,0,65960,32}; // crosses actual descriptor end
+ unsigned before=copies;
+ cs_trace_buffer_note(1,0xabc,&storage,&bi);
+ assert(g_cs_buffers_n==2&&g_fs_buffer_copies==2);
+ assert(g_cs_buffers[0].guest==0x80000100&&g_cs_buffers[1].guest==0x80010120);
+ assert(g_cs_buffers[1].source.offset==256+32+65536&&g_cs_buffers[1].source.range==16);
+ assert(g_cs_buffers[1].descriptor_offset==256&&g_cs_buffers[1].descriptor_range==66000);
+ assert(g_cs_buffers[1].window_offset==65568&&g_cs_buffers[1].stage==1);
+ complete=0;cs_trace_buffers_copy(VK_NULL_HANDLE,0xdeadbeef,0);cs_trace_buffers_copy(VK_NULL_HANDLE,0xdeadbeef,1);
+ assert(copies==before+2&&g_cs_buffer_dump[1].draw==42&&g_cs_buffer_dump[1].pass==7);
+ uint64_t id=g_cs_buffer_dump[1].id;
+ cs_trace_buffers_poll(6);assert(g_cs_buffer_dump[1].b);gpu_complete();cs_trace_buffers_poll(7);
+ snprintf(path,sizeof path,"%s/fsbuf_%04llu_00000000deadbeef_s1_b4_draw42_before.bin",argv[1],(unsigned long long)id);
+ f=fopen(path,"rb");assert(f);assert(fread(got,1,16,f)==16&&!memcmp(got,source+256+32+65536,16));assert(fgetc(f)==EOF);fclose(f);
+ char meta[1100],json[2048];snprintf(meta,sizeof meta,"%s.json",path);f=fopen(meta,"rb");assert(f);size_t j=fread(json,1,sizeof json-1,f);json[j]=0;fclose(f);
+ assert(strstr(json,"\"stage\":1")&&strstr(json,"\"shader_key\":\"0000000000000abc\"")&&strstr(json,"\"window_offset\":65568")&&strstr(json,"\"fence\":7"));
+ reset_notes();g_fs_buffer_windows_n=0;bi.range=192;g_trace_sbuf_guest=0x66660000;
+ dmsv_bind derived={RK_SBUF_UBO,3,11};cs_trace_buffer_note(0,0xa,&derived,&bi);cs_trace_buffer_note(0,0xa,&storage,&bi);
+ assert(g_cs_buffers_n==2&&g_cs_buffers[0].guest==0x66660000&&g_cs_buffers[1].guest==0x90000100);
+ // Extended graphics storage captures preserve the actual finite offset/range and remain fenced.
+ reset_notes();g_fs_buffer_copies=0;g_fs_buffer_bytes=0;g_fs_buffer_sbuf_max=8u<<20;
+ uint8_t *large=malloc((8u<<20)+256);assert(large);
+ for(unsigned i=0;i<(8u<<20)+256;i++)large[i]=(uint8_t)(i*13+7);
+ mock_buffer big={large,(8u<<20)+256};bi=(VkDescriptorBufferInfo){(VkBuffer)&big,256,5767200};
+ cs_trace_buffer_note(1,0x396,&storage,&bi);assert(g_cs_buffers_n==1&&g_cs_buffers[0].bytes==5767200);
+ complete=0;cs_trace_buffers_copy(VK_NULL_HANDLE,0x396,0);assert(g_cs_buffer_dump[0].bytes==5767200);
+ cs_trace_buffers_poll(6);assert(g_cs_buffer_dump[0].b);gpu_complete();
+ assert(!memcmp(g_cs_buffer_dump[0].p,large+256,5767200));cs_trace_buffers_poll(7);
+ reset_notes();g_fs_buffer_copies=0;g_fs_buffer_bytes=0;
+ cs_trace_buffer_note(1,0x396,&uniform,&bi);assert(g_cs_buffers[0].bytes==65536); // only SBUF gets the larger cap
+ reset_notes();g_fs_buffer_collect=0;g_cs_buffer_collect=1;
+ cs_trace_buffer_note(5,0x396,&storage,&bi);assert(g_cs_buffers[0].bytes==65536); // compute unchanged
+ reset_notes();g_fs_buffer_collect=1;g_fs_buffer_copies=0;g_fs_buffer_bytes=0;bi.range=8u<<20;
+ for(int i=0;i<6;i++)cs_trace_buffer_note(1,0x396,&storage,&bi);
+ assert(g_cs_buffers_n==6&&g_fs_buffer_bytes==48u<<20);
+ cs_trace_buffer_note(1,0x396,&storage,&bi);assert(g_cs_buffers_n==6); // request cap
+ reset_notes();g_fs_buffer_copies=0;g_fs_buffer_bytes=0;
+ for(int i=0;i<6;i++){g_cs_buffer_dump[i].b=(VkBuffer)(uintptr_t)1;g_cs_buffer_dump[i].graphics=1;g_cs_buffer_dump[i].bytes=8u<<20;}
+ cs_trace_buffer_note(1,0x396,&storage,&bi);assert(!g_cs_buffers_n); // rearming cannot bypass in-flight cap
+ memset(g_cs_buffer_dump,0,sizeof g_cs_buffer_dump);
+ bi.range=VK_WHOLE_SIZE;cs_trace_buffer_note(1,0x396,&storage,&bi);assert(!g_cs_buffers_n);
+ bi.range=8u<<20;bi.offset=UINT64_MAX-3;cs_trace_buffer_note(1,0x396,&storage,&bi);assert(!g_cs_buffers_n);
+ free(large);
  return 0;
 }
 """
@@ -116,7 +171,7 @@ int main(int argc,char **argv){
         self.assertLess(dispatch.index("cs_trace_buffers_copy(cb, cs->key, 0)"),dispatch.index("vkCmdDispatch(cb"))
         self.assertGreater(dispatch.index("cs_trace_buffers_copy(cb, cs->key, 1)"),dispatch.index("vkCmdDispatch(cb"))
         stage=extract(s,"static VkDescriptorSet stage_set(")
-        self.assertLess(stage.index("cs_trace_buffer_note(b, &bi[nw])"),stage.index("if (s->dyn[i])"))
+        self.assertLess(stage.index("cs_trace_buffer_note(st, s->key, b, &bi[nw])"),stage.index("if (s->dyn[i])"))
         poll=extract(s,"void vk_pass_dump_poll(")
         self.assertLess(poll.index("cs_trace_buffers_poll(done_fence)"),poll.index("if (g_pd_state"))
 if __name__=="__main__":unittest.main()

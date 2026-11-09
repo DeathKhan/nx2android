@@ -1,0 +1,4 @@
+#!/bin/sh
+: "${CODEX_ADB_CONTROL_PATH:?task-owned launcher required}"
+exec /usr/bin/ssh -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
+  -o ControlMaster=auto -o ControlPersist=300 -o "ControlPath=$CODEX_ADB_CONTROL_PATH" "$@"

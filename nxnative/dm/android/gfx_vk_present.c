@@ -1175,6 +1175,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     r = vkQueuePresentKHR(V.q, &pi);
     if (V.has_dtiming && r >= 0) present_time_map(ptm.presentID, ticket);
     pthread_mutex_unlock(&g_vk_queue_mu);
+    { void dm_renderdoc_poll(void); dm_renderdoc_poll(); }   // inactive unless DM_CTL requested a RenderDoc capture
     if (r == VK_ERROR_OUT_OF_DATE_KHR) swap_destroy();
     else if (r == VK_SUBOPTIMAL_KHR && g_pre != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {   // the device turned over (ROTATE_90 <-> ROTATE_270): a swapchain for the new turn
         VkSurfaceCapabilitiesKHR c; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, g_surf, &c);

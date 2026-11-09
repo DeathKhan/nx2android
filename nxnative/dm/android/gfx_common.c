@@ -41,7 +41,8 @@ void mtl_use_stats(uint64_t *c, uint64_t *s) { *c = *s = 0; }
 void dm_gfx_passdump_next(long n) { (void)n; }
 void dm_gfx_shot_at(long k, const char *path) { (void)k; (void)path; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
-void dm_gfx_texlist(int target) { (void)target; }
+void vk_registry_texlist(int target) __attribute__((weak));   // Vulkan metadata-only listing; absent for the null backend
+void dm_gfx_texlist(int target) { if (vk_registry_texlist) vk_registry_texlist(target); }
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
 
 // ---------------- upsync 2026-11-07: hooks the host gained from nxnative (Metal backend) that both Android backends answer the same way ----------------

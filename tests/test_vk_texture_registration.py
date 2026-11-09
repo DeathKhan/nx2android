@@ -20,6 +20,67 @@ def function(source, declaration):
 
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class TextureRegistration(unittest.TestCase):
+    def test_registry_listing_is_bounded_metadata_copy(self):
+        source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text()
+        common = (ROOT / "nxnative/dm/android/gfx_common.c").read_text()
+        actual = function(source, "void vk_registry_texlist(")
+        route = function(common, "void dm_gfx_texlist(")
+        code = r"""
+#define _POSIX_C_SOURCE 200809L
+#include <assert.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "nvn_obj.h"
+typedef struct {tex_t t;view_t v;uint8_t ok,has_v;uint64_t seq;} treg_ver;
+typedef struct {treg_ver cur;} treg_t;
+static treg_t *g_treg;static int g_ntreg;
+static pthread_mutex_t g_rmu=PTHREAD_MUTEX_INITIALIZER;
+static char logs[300000];static size_t used;static int mutate;
+static void logger(const char *format,...){
+ assert(pthread_mutex_trylock(&g_rmu)==0); // no logging under the registry mutex
+ if(mutate){mutate=0;for(int i=1;i<g_ntreg;i++)g_treg[i].cur.t.serial=999999;}
+ pthread_mutex_unlock(&g_rmu);
+ va_list a;va_start(a,format);int n=vsnprintf(logs+used,sizeof logs-used,format,a);va_end(a);
+ assert(n>=0&&(size_t)n<sizeof logs-used);used+=(size_t)n;logs[used++]='\n';logs[used]=0;
+}
+#define VKLOG(...) logger(__VA_ARGS__)
+ACTUAL
+ROUTE
+int main(void){
+ g_ntreg=400;g_treg=calloc((size_t)g_ntreg,sizeof *g_treg);assert(g_treg);
+ g_treg[1].cur.ok=1;g_treg[1].cur.t.d.target=1;g_treg[1].cur.t.serial=11;
+ treg_ver *v=&g_treg[2].cur;v->ok=v->has_v=1;v->seq=123;v->t.serial=22;
+ v->t.d.target=4;v->t.d.width=80;v->t.d.height=40;v->t.d.depth=3;v->t.d.levels=2;v->t.d.format=0x32;
+ v->t.L.layers=3;v->t.L.size=4096;v->t.L.layer_size=1024;v->t.off=0x2400;
+ v->t.pool=(pool_t *)(uintptr_t)0x12340000;v->t.mem=(uint8_t *)(uintptr_t)0x23450000; // invalid to dereference: metadata only
+ v->v.set_layers=1;v->v.min_layer=1;v->v.nlayers=2;v->v.set_format=1;v->v.format=0x33;
+ g_treg[3].cur.t.d.target=4;g_treg[3].cur.t.serial=33; // unregistered excluded
+ mutate=1;dm_gfx_texlist(4);
+ assert(strstr(logs,"target 4: 1 entries")&&strstr(logs,"tid=2 ser=22 seq=123")&&!strstr(logs,"ser=999999")&&!strstr(logs,"tid=1")&&!strstr(logs,"tid=3"));
+ assert(strstr(logs,"80x40x3 format 0x32 levels 2 layers 3")&&strstr(logs,"pool 0x12340000+0x2400"));
+ assert(strstr(logs,"view target 0/0 format 1/0x33")&&strstr(logs,"layers 1/1+2"));
+ used=0;logs[0]=0;
+ for(int i=1;i<g_ntreg;i++){g_treg[i].cur.ok=1;g_treg[i].cur.has_v=0;g_treg[i].cur.t.d.target=4;g_treg[i].cur.t.serial=(uint64_t)i;}
+ dm_gfx_texlist(4);assert(strstr(logs,"256 entries, truncated at 256")&&strstr(logs,"tid=256 ")&&!strstr(logs,"tid=257 "));
+ used=0;logs[0]=0;dm_gfx_texlist(2);assert(strstr(logs,"target 2: 0 entries"));
+ used=0;logs[0]=0;dm_gfx_texlist(-1);assert(strstr(logs,"unsupported NVN target -1"));
+ free(g_treg);return 0;
+}
+"""
+        code = code.replace("ACTUAL", actual).replace("ROUTE", route)
+        target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="texture-list-",dir=target) as tmp:
+            c,exe=Path(tmp)/"test.c",Path(tmp)/"test";c.write_text(code)
+            subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror","-Wno-address",
+                            "-fsanitize=address,undefined","-pthread",
+                            "-I"+str(ROOT/"nxnative/dm/gfx/nvn"),"-I"+str(ROOT/"nxnative/dm/gfx/nvn/include"),
+                            str(c),"-o",str(exe)],check=True)
+            subprocess.run([str(exe)],check=True,timeout=10)
+
     def test_identical_registration_preserves_generation_and_history(self):
         source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text()
         start = source.index("enum { TREG_OLD")
@@ -38,6 +99,7 @@ class TextureRegistration(unittest.TestCase):
 typedef struct {int unused;} vkimg_t;
 DECLARATIONS
 static uint64_t g_tex_gen=1,queued,job,g_sregs;
+uint64_t g_tex_gen_why[4];
 static pthread_mutex_t g_rmu=PTHREAD_MUTEX_INITIALIZER;
 static __thread treg_ver t_treg;
 static uint64_t nvn_jobs_queued(void){return queued;}

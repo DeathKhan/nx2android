@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/bin/scp -S "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/ssh" "$@"
