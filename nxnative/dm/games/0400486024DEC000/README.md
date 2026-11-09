@@ -203,3 +203,6 @@ Android also still excluded the [logical queue scheduler](../../../docs/referenc
 - [Movie output through a UNORM view of an sRGB image](../../../docs/reference/rendering.md#movie-output-through-a-unorm-view-of-an-srgb-image): resolved on Android: the moving title landscape renders at 58–60 FPS.
 
 - [Packed image stores retain their integer views](../../../docs/reference/rendering.md#packed-image-stores-retain-their-integer-views): resolved on Android: the checker is gone; the following native upscaler's colour error remains separate.
+- [AV1 movies stop an M1 iPad with SIGILL in dav1d](../../../docs/reference/movies.md#av1-movies-stop-an-m1-ipad-with-sigill-in-dav1d): the title movie on an M1 iPad Pro.
+- [`devicectl` copies a large RomFS image through the Mac's memory](../../../docs/reference/packing.md#devicectl-copies-a-large-romfs-image-through-the-macs-memory): the 26.2 GB image's pushes to an iPad filled a 16 GB Mac's swap and failed; now sent over AFC.
+- [`devicectl`'s `--remove-existing-content` empties the app's whole container](../../../docs/reference/packing.md#devicectls---remove-existing-content-empties-the-apps-whole-container): the first complete copy of the image, deleted by the DLC step after it.
