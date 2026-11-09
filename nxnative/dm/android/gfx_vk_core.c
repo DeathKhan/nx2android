@@ -1662,6 +1662,18 @@ static VkDescriptorSet descriptor_alloc_set(vksub_t *s, VkDescriptorSetLayout l)
         s->dp_cur++;
     }
 }
+// n sets of layout l in a descriptor pool of their own, never reset or freed (gfx_vk_exec.c's ring of pool tables: they outlive submissions). 0 when the layout is unknown or the pool fails
+int vk_alloc_sets_owned(VkDescriptorSetLayout l, int n, VkDescriptorSet *out) {
+    pthread_mutex_lock(&g_dsl_mu); const uint32_t *need = nvn_hm_get(&g_dsl_need, &l); pthread_mutex_unlock(&g_dsl_mu);
+    if (!need || n <= 0 || n > 16) return 0;
+    VkDescriptorPoolSize sz[DP_TYPES]; uint32_t nz = 0; for (int t = 0; t < DP_TYPES; t++) if (need[t]) sz[nz++] = (VkDescriptorPoolSize){(VkDescriptorType)t, need[t] * (uint32_t)n};
+    VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, g_uab ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0, (uint32_t)n, nz, sz};
+    VkDescriptorPool dp; if (vkCreateDescriptorPool(V.dev, &pi, NULL, &dp)) return 0;
+    VkDescriptorSetLayout ls[16]; for (int i = 0; i < n; i++) ls[i] = l;
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dp, (uint32_t)n, ls};
+    if (vkAllocateDescriptorSets(V.dev, &ai, out)) { vkDestroyDescriptorPool(V.dev, dp, NULL); return 0; }
+    return 1;
+}
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
     if (!g_desc_timing) return descriptor_alloc_set(cur(), l);
     uint64_t start = mem_diag_ns(); VkDescriptorSet set = descriptor_alloc_set(cur(), l);

@@ -184,7 +184,10 @@ static long long g_watch_off = -1; static int g_watch_n; extern uint64_t g_tex_f
 static uint64_t g_ubolog_key; static int g_ubolog_n;
 static void ubo_log(const vkshader_t *s, int st, int reg, uint64_t a, uint64_t n) {
     if (!g_ubolog_key || s->key != g_ubolog_key || g_ubolog_n <= 0) return;
-    g_ubolog_n--; uint8_t buf[4096]; if (n > sizeof buf) n = sizeof buf; void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst); vk_ubd_read(a, n, buf);
+    g_ubolog_n--; static uint8_t buf[65536]; if (n > sizeof buf) n = sizeof buf; void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst); vk_ubd_read(a, n, buf);
+    { const char *dd = getenv("DM_VK_UBO_DUMP"); if (dd && atoi(dd)) {   // DM_VK_UBO_DUMP=1 (live, with UBO_LOG): the whole buffer as DM_ROOT/ubo_<present>_p<pass>_st<stage>_c<reg>.bin (compare with the Mac's DM_NVN_CBDUMP)
+        char path[1024]; const char *root = getenv("DM_ROOT"); snprintf(path, sizeof path, "%s/ubo_%llu_p%d_st%d_c%d.bin", root ? root : ".", (unsigned long long)g_tex_frame, g_sub_pass - 1, st, reg);
+        FILE *df = fopen(path, "wb"); if (df) { fwrite(buf, 1, (size_t)n, df); fclose(df); } } }
     uint64_t h = 1469598103934665603ull; for (uint64_t i = 0; i < n; i++) h = (h ^ buf[i]) * 1099511628211ull; float f[16] = {0}; memcpy(f, buf, n < 64 ? n : 64);
     // every word of 512 bytes, as floats: from byte 0, or from DM_VK_UBO_LOG_FROM=<byte offset> (live, a multiple of 16) for fields further in
     const char *fe = getenv("DM_VK_UBO_LOG_FROM"); uint32_t from = fe ? (uint32_t)atoi(fe) & ~15u : 0; if (from >= n) from = 0;
@@ -211,7 +214,15 @@ void vk_watch(const vkimg_t *im, const char *what) {
                        (unsigned long long)im->pool, (unsigned long long)im->off, (const void *)im, im->flags, im->novl);
 }
 static void set_profile_poll(void);
+static int g_pdum_lo = -1, g_pdum_hi, g_pdum_nf; static unsigned g_pdum_kinds; static uint32_t g_pdum_f[16];   // + DM_VK_POOL_DUMMY_KINDS=mask, DM_VK_POOL_DUMMY_FMT=hex nvn formats
+//   // DM_VK_POOL_DUMMY=lo-hi (live, diagnostic): those texture IDs read the dummy in the pool tables, to bisect which bindless read is wrong
+static int g_pool_strict;
+static uint64_t g_ring_full, g_ring_patch, g_ring_ids, g_ring_hits, g_ring_none, g_ring_ns;   // the pool tables ring (tbl_ring)
 static void x_read(void) { original_index_read(); set_profile_poll(); cs_trace_poll();
+    { const char *e = getenv("DM_VK_POOL_STRICT"); g_pool_strict = e && atoi(e); }
+    { const char *e = getenv("DM_VK_POOL_DUMMY"); int lo, hi; if (e && sscanf(e, "%d-%d", &lo, &hi) == 2) g_pdum_lo = lo, g_pdum_hi = hi; else g_pdum_lo = -1; }
+    { const char *e = getenv("DM_VK_POOL_DUMMY_KINDS"); g_pdum_kinds = e ? (unsigned)strtoul(e, NULL, 0) : 0;   // bits 0-3: 2D, 2D array, cube, 3D tables
+      g_pdum_nf = 0; for (const char *q = getenv("DM_VK_POOL_DUMMY_FMT"); q && *q && g_pdum_nf < 16;) { char *n; unsigned long v = strtoul(q, &n, 16); if (n == q) break; g_pdum_f[g_pdum_nf++] = (uint32_t)v; q = *n ? n + 1 : n; } }
     { const char *e = getenv("DM_VK_UPSCALER_DIAG"); int n = e ? atoi(e) : 0; if (n < 0) n = 0; if (n > 256) n = 256;
       if (!n) g_up_diag_left = 0; else if (n != g_up_diag_request) g_up_diag_left = n;
       g_up_diag_request = n; }
@@ -527,6 +538,17 @@ static void pass_dump(void) {
 }
 static void texdump_flush(void) {   // DM_VK_TEXDUMP: outside a render pass (pass_dump runs after its end)
     vkimg_t *im = g_td_im; if (!im || g_pd_state != 1) return; g_td_im = NULL; g_td_done = 1;
+    { const char *rw = getenv("DM_VK_TEXDUMP_RAW"); if (rw && atoi(rw) > 0) {   // DM_VK_TEXDUMP_RAW=<bytes per 4x4 block> (8 or 16; compressed formats): level 0 of each layer as the image holds it, not decoded (pass_NN.raw)
+        uint32_t bb = (uint32_t)atoi(rw), bw = (im->w + 3) / 4, bh = (im->h + 3) / 4; VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
+        for (uint32_t ly = 0; ly < im->layers && ly < 6 && g_npd < PD_MAX; ly++) {
+            pdump_t *d = &g_pd[g_npd++]; memset(d, 0, sizeof *d); d->w = im->w; d->h = im->h; d->depth = 1; d->f = im->fmt; d->view_format = im->fmt; d->layer = ly; d->pass = -100 - (int)ly; d->present = g_tex_frame; d->raw_bytes = (uint64_t)bw * bh * bb;
+            VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, d->raw_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+            VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &d->b)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, d->b, &rq);
+            VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0)};
+            VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &d->m)); VKCHK(vkBindBufferMemory(V.dev, d->b, d->m, 0)); VKCHK(vkMapMemory(V.dev, d->m, 0, VK_WHOLE_SIZE, 0, &d->p));
+            VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, ly, 1}, {0, 0, 0}, {im->w, im->h, 1}};
+            vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, d->b, 1, &c); }
+        vk_img_barrier_all(cb); VKLOG("texdump raw: %ux%u fmt %d layers %u at pool %#llx+%#llx", im->w, im->h, im->fmt, im->layers, (unsigned long long)im->pool, (unsigned long long)im->off); return; } }
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, im->fmt, &fp);
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) { VKLOG("texdump: format %d cannot be blitted", im->fmt); return; }
     const char *tl = getenv("DM_VK_TEXDUMP_LEVEL"); uint32_t lv = tl && *tl ? (uint32_t)atoi(tl) : 0; if (lv >= im->levels) lv = im->levels - 1;   // =n: that mip level instead of level 0
@@ -1636,20 +1658,22 @@ static void up_native_texture_trace(const dmsv_bind *b, uint64_t h, const VkDesc
         v ? v->set_format : 0, v ? v->format : 0, v ? v->set_target : 0, v ? v->target : 0, v ? v->set_levels : 0, v ? v->base_level : 0, v ? v->nlevels : 0,
         v ? v->set_layers : 0, v ? v->min_layer : 0, v ? v->nlayers : 0, v ? v->set_swizzle : 0, v ? v->swz[0] : 0, v ? v->swz[1] : 0, v ? v->swz[2] : 0, v ? v->swz[3] : 0);
 }
+static vkimg_t *g_desc_im;   // the image tex_desc_for's last view is of (NULL: the dummy), for the ring of pool tables
 static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImageInfo *ii, int storage) {   // the view's view_num
+    g_desc_im = NULL;
     int tid = (int)(h & 0xfffff); const view_t *v = NULL; const tex_t *t = NULL;
     ii->imageLayout = VK_IMAGE_LAYOUT_GENERAL; ii->sampler = storage ? VK_NULL_HANDLE : samp_for(st, b, h, 0); ii->imageView = VK_NULL_HANDLE;
     unsigned ck = ((unsigned)tid * 2654435761u ^ (unsigned)b->dim * 97u ^ (unsigned)(b->flags & 1) ^ (unsigned)storage * 17u) % TVC;
     int logfs = g_x_logfs && S.sh[1] && S.sh[1]->key == g_x_logfs && st == 1; static int nlogfs; if (logfs && nlogfs >= 60) logfs = 0;
     if (tid && g_var_now != 3 && !g_tracing && !logfs && g_tvc[ck].epoch == g_set_epoch && g_tvc[ck].gen == g_tex_gen && g_tvc[ck].tid == tid && g_tvc[ck].dim == b->dim && g_tvc[ck].arr == (b->flags & 1) && g_tvc[ck].storage == storage) {
-        ii->imageView = g_tvc[ck].v; if (g_tvc[ck].im) { g_tvc[ck].im->last_use = mtl_last_fence() + 1; if (storage) g_tvc[ck].im->gpu_w = 1; } vk_texdump_note(g_tvc[ck].im);
+        ii->imageView = g_tvc[ck].v; g_desc_im = g_tvc[ck].im; if (g_tvc[ck].im) { g_tvc[ck].im->last_use = mtl_last_fence() + 1; if (storage) g_tvc[ck].im->gpu_w = 1; } vk_texdump_note(g_tvc[ck].im);
         if (g_tvc[ck].num && !storage) ii->sampler = samp_for(st, b, h, 1);
         if (g_up_native_trace) up_native_texture_trace(b, h, ii, g_tvc[ck].im, storage, 1);
         return g_tvc[ck].num;
     }
     int num = 0;
     if (tid && g_var_now != 3 && vk_tex_by_id(tid, &v, &t) && t) {
-        vkimg_t *im = NULL; ii->imageView = vk_tex_view(t, v, b->dim, b->flags & 1, storage ? 2 : 0, &im); if (storage && im) im->gpu_w = 1;
+        vkimg_t *im = NULL; ii->imageView = vk_tex_view(t, v, b->dim, b->flags & 1, storage ? 2 : 0, &im); if (storage && im) im->gpu_w = 1; g_desc_im = im;
         if (logfs) nlogfs++;
         if (g_tracing || logfs) VKLOG("  %stexture binding %d handle %#llx id %d: %ux%u nvn format %#x target %d serial %llu pool %p+%#llx size %#llx → image %p (%ux%u fmt %d layers %u levels %u, gpu-written %d) view %p", logfs ? "logfs " : "", b->binding, (unsigned long long)h, tid, t->d.width, t->d.height, t->d.format, t->d.target,
                              (unsigned long long)t->serial, (const void *)t->pool, (unsigned long long)t->off, (unsigned long long)t->L.size, (void *)im, im ? im->w : 0, im ? im->h : 0, im ? im->fmt : 0, im ? im->layers : 0, im ? im->levels : 0, im ? (int)im->gpu_w : -1, (void *)ii->imageView);
@@ -2235,6 +2259,8 @@ void vk_table_report(void) {
     }
     prev = g_tblpd;
     static uint64_t builds, hits, persistent, all_ns, full_ns, refresh_ns, refresh_n, fallback;
+    { extern uint64_t g_tex_gen_why[4]; VKLOG("texture generation bumps (cumulative): orphan %llu, first use %llu, view drop %llu, registration %llu", (unsigned long long)g_tex_gen_why[0], (unsigned long long)g_tex_gen_why[1], (unsigned long long)g_tex_gen_why[2], (unsigned long long)g_tex_gen_why[3]); }
+    VKLOG("pool table ring (cumulative): %llu whole writes, %llu patches (%llu IDs), %llu reuses, %llu times no free set; %.1f ms in all", (unsigned long long)g_ring_full, (unsigned long long)g_ring_patch, (unsigned long long)g_ring_ids, (unsigned long long)g_ring_hits, (unsigned long long)g_ring_none, g_ring_ns / 1e6);
     VKLOG("texture tables per frame (last 600): %.2f full builds, %.1f submission hits, %.2f persistent hits; total %.3f ms, build %.3f ms, refresh %.3f ms (%.1f sources), %.2f refresh fallbacks; metadata %.2f MB",
         (g_tbl_builds - builds) / 600.0, (g_tbl_hits - hits) / 600.0, (g_tblp_hits - persistent) / 600.0,
         (g_ns_tbl - all_ns) / 6e8, (g_tbl_full_ns - full_ns) / 6e8, (g_tblp_refresh_ns - refresh_ns) / 6e8,
@@ -2252,10 +2278,118 @@ static void tbl_trace(unsigned c, int st, const vkshader_t *s, int reused) {
           (unsigned long long)t->h, t->tex_base, t->samp_base, (unsigned long long)t->epoch,
           (unsigned long long)t->tex, (unsigned long long)t->samp, t->pool);
 }
+
+// ---------------- the pool tables' ring (DM_VK_POOL_RING=0: off) ----------------
+// The Mac patches its pool tables (nvn_mtl.m pool_gpu): a change takes only the IDs registered since the table was built. Here a table is one descriptor set of 4 x 65,536 images
+// and 4,096 samplers, and tbl_set wrote it whole on every texture registration: Ocarina of Time's Kokiri Forest registers about 130 changed textures a frame, so 2-3 whole tables
+// (50-60 ms) a frame, and a fresh 68 MB descriptor pool for each. Instead RING_N sets live for the whole run, each with every pool kind and the samplers: a set the GPU is done
+// with (its last submission's fence completed, and not bound in the one being recorded) is brought up to date by rewriting only the IDs the registration log names after its
+// position (gfx_vk_tex.c vk_reglog_take, the entries visible to the replaying job), and written whole only when an image went or an ID got contents (the view drop, orphan and
+// first-use generations), pool memory changed (vk_pool_gen), the pool bases changed, the log wrapped or the replay went back to an earlier job. IDs that read the dummy for lack of
+// contents or of first-use budget are retried by later patches, RING_RETRY at a time. Each take marks the images the set holds as used by the submission (eviction waits for it)
+enum { RING_N = 6, RING_TIDS = 2048, RING_RETRY = 256 };
+typedef struct { VkDescriptorSet set; uint64_t fence, logpos, fullgen, sampgen, jobpos; uint32_t poolgen; int tex_base, samp_base, valid; vkimg_t **img; size_t nimg, capimg; int *pend; size_t npend, cappend, pcur; } ring_slot;
+static ring_slot g_ring[RING_N]; static int g_ring_on = -1, g_ring_cur = -1;
+uint64_t vk_reglog_visible_end(uint64_t before); uint64_t vk_reglog_head(void); int vk_reglog_pending(uint64_t p, uint64_t before); uint64_t vk_reglog_take(uint64_t from, uint64_t before, int *tids, int max, int *n);
+int vk_alloc_sets_owned(VkDescriptorSetLayout l, int n, VkDescriptorSet *out); unsigned vk_pool_kinds(void); uint64_t nvn_replaying_job(void);
+extern uint64_t g_tex_gen_why[4], g_samp_gen;
+static uint64_t ring_fullgen(void) { return g_tex_gen_why[0] + g_tex_gen_why[1] + g_tex_gen_why[2]; }
+static void ring_img(ring_slot *r, vkimg_t *im) {
+    if (!im) return;
+    if (r->nimg && r->img[r->nimg - 1] == im) return;   // (the same texture through each kind)
+    if (r->nimg == r->capimg) { r->capimg = r->capimg ? 2 * r->capimg : 4096; r->img = realloc(r->img, r->capimg * sizeof *r->img); }
+    r->img[r->nimg++] = im;
+}
+static void ring_pend(ring_slot *r, int tid) {
+    if (r->npend == r->cappend) { r->cappend = r->cappend ? 2 * r->cappend : 1024; r->pend = realloc(r->pend, r->cappend * sizeof *r->pend); }
+    r->pend[r->npend++] = tid;
+}
+// One entry of kind ps for pool index k (the ID minus the bound pool's base), as tbl_set's fill decides it; 1 when it should be tried again later (no contents yet, or no budget)
+static int ring_entry(int st, ring_slot *r, int ps, int k, VkDescriptorImageInfo *d, int *lazy_n, uint64_t *lazy_b) {
+    dmsv_bind vb = {.kind = RK_TEXP, .desc = RD_IMAGE, .dim = (uint8_t)(ps == 2 ? 3 : ps == 3 ? 2 : 1), .flags = (uint8_t)(ps == 1 ? 1 : 0), .samp = RS_NONE, .reg = -1, .off = -1};
+    VkDescriptorImageInfo dummy = {VK_NULL_HANDLE, vk_dummy_view(vb.dim, vb.flags & 1, 0, 0, 0), VK_IMAGE_LAYOUT_GENERAL}; *d = dummy;
+    uint64_t hh = mem_handle((uint64_t)k); const view_t *v = NULL; const tex_t *t = NULL;
+    if (!vk_tex_by_id((int)(hh & 0xfffff), &v, &t) || !t) return 0;
+    int target = v && v->set_target ? v->target : t->d.target;
+    int fits = ps == 2 ? (t->d.width == t->d.height && (target == 8 || target == 9 || (target == 4 && t->d.depth >= 6))) : ps == 3 ? target == 2 : (target == 1 || target == 4 || target == 8 || target == 9);
+    if (g_pool_strict && fits) fits = ps == 0 ? target == 1 : ps == 1 ? target == 4 : ps == 2 ? target == 8 : 1;
+    if (fits && view_num(t, v)) fits = 0;
+    if (fits) { int id_ = (int)(hh & 0xfffff), any = g_pdum_lo >= 0 || g_pdum_kinds || g_pdum_nf, hit = any;   // the bisection switches, as tbl_set's fill
+        if (g_pdum_lo >= 0 && (id_ < g_pdum_lo || id_ > g_pdum_hi)) hit = 0;
+        if (g_pdum_kinds && !(g_pdum_kinds & (1u << ps))) hit = 0;
+        if (g_pdum_nf) { int f = 0; for (int q = 0; q < g_pdum_nf; q++) if ((uint32_t)t->d.format == g_pdum_f[q]) f = 1; if (!f) hit = 0; }
+        if (hit) fits = 0; }
+    if (!fits) return 0;
+    int ok = vk_tex_pool_ok(t);
+    if (ok == 1) { if (*lazy_n < 64 && *lazy_b < (64u << 20)) { (*lazy_n)++; *lazy_b += t->L.size; } else return 1; }
+    if (!ok) return 1;
+    tex_desc_for(st, &vb, hh, d, 0); d->sampler = VK_NULL_HANDLE;
+    if (!d->imageView) { *d = dummy; return 0; }
+    ring_img(r, g_desc_im); return 0;
+}
+static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
+    if (g_ring_on < 0) { const char *e = getenv("DM_VK_POOL_RING"); g_ring_on = !e || atoi(e);
+        if (g_ring_on) { VkDescriptorSet sets[RING_N]; if (!vk_alloc_sets_owned(vk_tbl_dsl(), RING_N, sets)) { g_ring_on = 0; VKLOG("[RED] pool table ring: its descriptor pool could not be made; tables are built as before"); }
+            else { for (int i = 0; i < RING_N; i++) g_ring[i].set = sets[i]; VKLOG("pool table ring: %d persistent sets (DM_VK_POOL_RING=0 builds tables as before)", RING_N); } } }
+    if (!g_ring_on || !(poolmask & ((1u << POOL_TEX_SLOTS) - 1))) return VK_NULL_HANDLE;
+    uint64_t t0 = tick(), f = mtl_last_fence() + 1, job = nvn_replaying_job(), jp = job ? job : UINT64_MAX, fg = ring_fullgen(), sg = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE); uint32_t pg = vk_pool_gen();
+    if (g_ring_cur >= 0) { ring_slot *r = &g_ring[g_ring_cur];
+        if (r->valid && r->fence == f && r->fullgen == fg && r->sampgen == sg && r->poolgen == pg && r->tex_base == g_pool_tex_base && r->samp_base == g_pool_samp_base && r->jobpos <= jp && !vk_reglog_pending(r->logpos, jp)) {
+            g_ring_hits++; g_ring_ns += tick() - t0; return r->set; } }
+    // a set the GPU is done with and the recording command buffer does not hold: the most recently written one (fewest IDs to take again)
+    uint64_t done = vk_fence_done(); int pick = -1;
+    for (int i = 0; i < RING_N; i++) { ring_slot *r = &g_ring[i]; if (r->fence > done || r->fence == f) continue;
+        if (pick < 0 || (r->valid && (!g_ring[pick].valid || r->logpos > g_ring[pick].logpos))) pick = i; }
+    if (pick < 0) { g_ring_none++; return VK_NULL_HANDLE; }
+    ring_slot *r = &g_ring[pick]; const int NP = vk_pool_n(), NS = vk_pool_samp_n(); const unsigned kinds = vk_pool_kinds();
+    static VkDescriptorImageInfo *dd; static VkWriteDescriptorSet *ww; static int *tids;
+    if (!dd) { dd = calloc((size_t)POOL_TEX_SLOTS * NP + NS + (size_t)(RING_TIDS + RING_RETRY) * POOL_TEX_SLOTS, sizeof *dd); ww = calloc((size_t)(RING_TIDS + RING_RETRY) * POOL_TEX_SLOTS + 8, sizeof *ww); tids = calloc(RING_TIDS, sizeof *tids); }
+    int full = !r->valid || r->fullgen != fg || r->poolgen != pg || r->tex_base != g_pool_tex_base || r->samp_base != g_pool_samp_base || r->jobpos > jp || r->nimg > 8u * (size_t)NP;
+    int lazy_n = 0; uint64_t lazy_b = 0; uint32_t nw = 0; uint64_t head = vk_reglog_head(), pos = r->logpos; int ntid = 0;
+    if (!full) { pos = vk_reglog_take(r->logpos, jp, tids, RING_TIDS, &ntid); if (pos == UINT64_MAX || (ntid == RING_TIDS && vk_reglog_pending(pos, jp))) full = 1; }
+    vk_tex_pool_fill(1);
+    if (full) {   // every entry, as tbl_set's fill
+        r->nimg = 0; r->npend = 0; r->pcur = 0; pos = vk_reglog_visible_end(jp); (void)head;   // later jobs' registrations stay in the log for the next patch
+        static uint8_t *again; if (!again) again = calloc((size_t)NP, 1); else memset(again, 0, (size_t)NP);
+        VkDescriptorImageInfo *d = dd; int hw = vk_tex_id_max() - g_pool_tex_base + 1; if (hw > NP) hw = NP;
+        for (int ps = 0; ps < POOL_TEX_SLOTS; ps++) {
+            int len = (kinds & (1u << ps)) ? NP : 1;
+            for (int k = 0; k < len; k++) { if (k == 0 || k >= hw) { dmsv_bind vb = {.dim = (uint8_t)(ps == 2 ? 3 : ps == 3 ? 2 : 1), .flags = (uint8_t)(ps == 1 ? 1 : 0)};
+                    d[k] = (VkDescriptorImageInfo){VK_NULL_HANDLE, vk_dummy_view(vb.dim, vb.flags & 1, 0, 0, 0), VK_IMAGE_LAYOUT_GENERAL}; continue; }
+                if (ring_entry(st, r, ps, k, &d[k], &lazy_n, &lazy_b)) again[k] = 1; }
+            ww[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, r->set, (uint32_t)(POOL_B0 + ps), 0, (uint32_t)len, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, d, NULL, NULL}; d += len; }
+        for (int k = 1; k < NP; k++) if (again[k]) ring_pend(r, k + g_pool_tex_base);
+        g_ring_full++;
+    } else {   // the IDs logged since, and some of those left the dummy
+        VkDescriptorImageInfo *d = dd; int nret = 0;
+        if (r->npend && ntid < RING_TIDS) { size_t room = (size_t)(RING_TIDS - ntid), take = r->npend < RING_RETRY ? r->npend : RING_RETRY; if (take > room) take = room;   // retried: removed from the list, added again by ring_entry's answer below
+            for (size_t i = 0; i < take && ntid < RING_TIDS + RING_RETRY; i++) { size_t j = (r->pcur + i) % r->npend; if (ntid < RING_TIDS) tids[ntid++] = r->pend[j]; nret++; }
+            if (take == r->npend) r->npend = 0; else { size_t keep = 0; int *np_ = malloc(r->npend * sizeof *np_);   // the ones not taken this time, in order after the cursor
+                for (size_t i = take; i < r->npend; i++) np_[keep++] = r->pend[(r->pcur + i) % r->npend]; memcpy(r->pend, np_, keep * sizeof *np_); free(np_); r->npend = keep; r->pcur = 0; } }
+        for (int i = 0; i < ntid; i++) { int k = tids[i] - g_pool_tex_base; if (k < 1 || k >= NP) continue; int again = 0;
+            for (int ps = 0; ps < POOL_TEX_SLOTS; ps++) { if (!(kinds & (1u << ps))) continue;
+                again |= ring_entry(st, r, ps, k, d, &lazy_n, &lazy_b);
+                ww[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, r->set, (uint32_t)(POOL_B0 + ps), (uint32_t)k, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, d, NULL, NULL}; d++; }
+            if (again) ring_pend(r, tids[i]); }
+        g_ring_patch++; g_ring_ids += (uint64_t)ntid; (void)nret;
+    }
+    vk_tex_pool_fill(0);
+    if (full || r->sampgen != sg || r->samp_base != g_pool_samp_base) {   // the samplers, whole (4,096)
+        VkDescriptorImageInfo *d = dd + (size_t)POOL_TEX_SLOTS * NP; d[0] = (VkDescriptorImageInfo){vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+        int hw = vk_samp_id_max() - g_pool_samp_base + 1; if (hw > NS) hw = NS;
+        for (int k = 1; k < NS; k++) { VkSampler sm = k < hw && !(g_pdum_kinds & 16) ? vk_samp_by_id(g_pool_samp_base + k) : VK_NULL_HANDLE; d[k] = (VkDescriptorImageInfo){sm ? sm : vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; }
+        ww[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, r->set, POOL_SAMP_B, 0, (uint32_t)NS, VK_DESCRIPTOR_TYPE_SAMPLER, d, NULL, NULL}; }
+    if (nw) vkUpdateDescriptorSets(V.dev, nw, ww, 0, NULL);
+    r->valid = 1; r->fullgen = fg; r->sampgen = sg; r->poolgen = pg; r->tex_base = g_pool_tex_base; r->samp_base = g_pool_samp_base; r->jobpos = jp == UINT64_MAX ? r->jobpos : jp; r->logpos = pos; r->fence = f;
+    for (size_t i = 0; i < r->nimg; i++) r->img[i]->last_use = f;   // (full rewrites drop the list; a view drop or orphan forces one before a freed image could be reached)
+    g_ring_cur = pick; g_ring_ns += tick() - t0;
+    return r->set;
+}
 static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // poolmask: kinds used by ALL active raster stages, bit 0..3 images and bit 4 samplers
     uint64_t t0 = tick(); const int N = vk_tbl_n(), NP = vk_pool_n(), NS = vk_pool_samp_n(); const int ntbl = s && s->ntbl;
     static uint32_t words[2 * 65536 / 8]; static VkDescriptorImageInfo *ii;   // the handles read (8 bytes each), and TBL_SLOTS x N + POOL_TEX_SLOTS x NP + NS descriptors
     const p_bind_buf *u = ntbl && s->tbl_reg >= 0 && s->tbl_reg < 16 ? &S.ubo[st][s->tbl_reg] : NULL; uint32_t n = 0;
+    if (!ntbl && poolmask && !g_x_nosetc && !g_var_now) { VkDescriptorSet rs = tbl_ring(st, poolmask); if (rs) { g_ns_tbl += tick() - t0; g_tbl_binds++; return rs; } }
     if (u && u->addr && s->tbl_off >= 0) { uint64_t a = u->addr + (uint64_t)s->tbl_off, size = u->size ? u->size : 65536; if (size > 65536) size = 65536;
         vkpool_t *p = vk_pool_peek(a, 8);
         if (p && size > (uint64_t)s->tbl_off) { uint64_t bytes = size - (uint64_t)s->tbl_off; if (a + bytes > p->end) bytes = p->end > a ? p->end - a : 0;
@@ -2308,7 +2442,14 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
                 uint64_t hh = mem_handle((uint64_t)k); const view_t *v = NULL; const tex_t *t = NULL; int fits = 0;
                 if (vk_tex_by_id((int)(hh & 0xfffff), &v, &t) && t) { int target = v && v->set_target ? v->target : t->d.target;
                     fits = ps == 2 ? (t->d.width == t->d.height && (target == 8 || target == 9 || (target == 4 && t->d.depth >= 6))) : ps == 3 ? target == 2 : (target == 1 || target == 4 || target == 8 || target == 9);
+                    if (g_pool_strict && fits) fits = ps == 0 ? target == 1 : ps == 1 ? target == 4 : ps == 2 ? target == 8 : 1;   // DM_VK_POOL_STRICT (x_read, test): as the Mac's pool_entry, each table holds only textures of its own type
                     if (fits && view_num(t, v)) fits = 0;   // (the arrays declare floating-point texels)
+                    {   // DM_VK_POOL_DUMMY / _KINDS / _FMT (x_read): the conditions given must all hold
+                        int id_ = (int)(hh & 0xfffff), any = g_pdum_lo >= 0 || g_pdum_kinds || g_pdum_nf, hit = any;
+                        if (g_pdum_lo >= 0 && (id_ < g_pdum_lo || id_ > g_pdum_hi)) hit = 0;
+                        if (g_pdum_kinds && !(g_pdum_kinds & (1u << ps))) hit = 0;
+                        if (g_pdum_nf) { int f = 0; for (int q = 0; q < g_pdum_nf; q++) if ((uint32_t)t->d.format == g_pdum_f[q]) f = 1; if (!f) hit = 0; }
+                        if (hit) fits = 0; }
                     if (fits) { int ok = vk_tex_pool_ok(t);
                         if (ok == 1) { if (lazy_n < POOL_LAZY_N && lazy_b < POOL_LAZY_B) { lazy_n++; lazy_b += t->L.size; } else { ok = 0; deferred++; } }
                         if (!ok) { fits = 0; skipped++; } } }
@@ -2331,7 +2472,8 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
             d[0] = (VkDescriptorImageInfo){vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
             int hw = vk_samp_id_max() - g_pool_samp_base + 1; if (hw > NS) hw = NS;
             // The registry ID includes the pool base; only the guest-local ID is 12 bits.
-            for (int k = 1; k < NS; k++) { VkSampler sm = k < hw ? vk_samp_by_id(g_pool_samp_base + k) : VK_NULL_HANDLE; if (sm) filled[POOL_TEX_SLOTS]++; d[k] = (VkDescriptorImageInfo){sm ? sm : vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; }
+            for (int k = 1; k < NS; k++) { VkSampler sm = k < hw && !(g_pdum_kinds & 16) ? vk_samp_by_id(g_pool_samp_base + k) : VK_NULL_HANDLE;   // DM_VK_POOL_DUMMY_KINDS bit 4: the dummy sampler throughout (diagnostic)
+                if (sm) filled[POOL_TEX_SLOTS]++; d[k] = (VkDescriptorImageInfo){sm ? sm : vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; }
             w[nwr++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, POOL_SAMP_B, 0, (uint32_t)NS, VK_DESCRIPTOR_TYPE_SAMPLER, d, NULL, NULL};
         }
         g_pool_builds++;

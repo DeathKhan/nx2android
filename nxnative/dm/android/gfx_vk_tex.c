@@ -341,7 +341,7 @@ static void img_drop(vkimg_t *im) { if (im->pins) {
     if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len);
     if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len);
     im->lin_mem = NULL; im->lin_len = 0; im->pkg_mem = NULL; im->pkg_len = 0; im->pkg_released = 1;
-    im->orphan = 1; alias_unlink(im); g_tex_gen++; vk_tex_diag_native(TEX_DIAG_ORPHAN, NULL, im); return;
+    im->orphan = 1; alias_unlink(im); g_tex_gen++; { extern uint64_t g_tex_gen_why[4]; g_tex_gen_why[0]++; } vk_tex_diag_native(TEX_DIAG_ORPHAN, NULL, im); return;
 } vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; g_img_vkbytes -= im->vkbytes; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
@@ -471,7 +471,7 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     if (!vk_sub_open()) return __atomic_load_n(&im->looked, __ATOMIC_ACQUIRE) ? im : NULL;   // looked up outside a submission (present): nothing can be recorded, a new image has no contents yet
     if (unc_rule()) vcs_unc_drop(cpu_unc_dropped);   // taken uncompressed textures over storage the GPU wrote since: GPU textures from now on (nvn_mtl.m cpu_unc_drop)
     int first = !__atomic_exchange_n(&im->looked, 1, __ATOMIC_ACQ_REL);   // its first use is the first lookup inside a submission, not its creation (which may have been outside one)
-    if (first && !t_pool_fill) { g_tex_gen++; vk_tex_diag_native(TEX_DIAG_FIRST_USE, t, im); }   // the pool tables (gfx_vk_exec.c tbl_set) bind only images with contents: a real bind's first use has them built again with this one
+    if (first && !t_pool_fill) { g_tex_gen++; { extern uint64_t g_tex_gen_why[4]; g_tex_gen_why[1]++; } vk_tex_diag_native(TEX_DIAG_FIRST_USE, t, im); }   // the pool tables (gfx_vk_exec.c tbl_set) bind only images with contents: a real bind's first use has them built again with this one
     // a texture's first use: written by the CPU since it was registered (profile tex_dirty_upload), it is CPU-written from now on, as at nvn_mtl.m's first resolution;
     // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
     int nvn_ft_written(const tex_t *);
@@ -748,7 +748,7 @@ static pthread_mutex_t g_view_mu = PTHREAD_MUTEX_INITIALIZER;
 extern uint64_t g_tex_gen;
 static void vk_tex_view_drop_all(vkimg_t *im) {
     pthread_mutex_lock(&g_view_mu);
-    vview *v = nvn_hm_get(&g_views, &im); g_tex_gen++; vk_tex_diag_native(TEX_DIAG_VIEW_DROP, NULL, im);
+    vview *v = nvn_hm_get(&g_views, &im); g_tex_gen++; { extern uint64_t g_tex_gen_why[4]; g_tex_gen_why[2]++; } vk_tex_diag_native(TEX_DIAG_VIEW_DROP, NULL, im);
     while (v) { vview *n = v->next; vk_defer_free_view(v->v); free(v); v = n; }
     nvn_hm_del(&g_views, &im);
     pthread_mutex_unlock(&g_view_mu);
@@ -858,7 +858,7 @@ typedef struct { treg_ver cur; treg_ver *old; treg_history *history; uint32_t hi
 static treg_t *g_treg; static int g_ntreg, g_tid_max, g_sid_max;   // the registry, and the highest IDs registered (the pool tables' logs, gfx_vk_exec.c tbl_set)
 int vk_tex_id_max(void) { return __atomic_load_n(&g_tid_max, __ATOMIC_RELAXED); }
 int vk_samp_id_max(void) { return __atomic_load_n(&g_sid_max, __ATOMIC_RELAXED); }
-uint64_t g_tex_gen = 1;   // changes whenever a texture ID is registered again or views go (gfx_vk_exec.c's per-submission view cache)
+uint64_t g_tex_gen = 1; uint64_t g_tex_gen_why[4];   // bumps by cause: orphan, first use, view drop, registration (logged with the texture table stats)   // changes whenever a texture ID is registered again or views go (gfx_vk_exec.c's per-submission view cache)
 uint64_t g_samp_gen = 1;  // changes whenever a sampler ID is registered with other parameters (gfx_vk_exec.c samp_cached and the descriptor set memo)
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static VkSampler *g_samp; static int g_nsreg;
 // Samplers as a bind saw them. Super Mario Odyssey hands out sampler IDs from a cache of slots and registers a slot again with other parameters while a command
@@ -959,6 +959,26 @@ static void registry_retain(treg_t *r, int tid, uint64_t until) {
     if (!r->history) { r->history_next = g_registry_history; g_registry_history = (uint32_t)tid + 1; }
     h->next = r->history; r->history = h;
 }
+// The IDs whose registration changed, in order, with the job sequence each was queued at (the replay sees a registration from the jobs after it): gfx_vk_exec.c's ring of
+// pool tables rewrites only these in a table that was up to date before them. Written under g_rmu
+enum { RLOG_N = 1 << 15 };
+static struct { int tid; uint64_t seq; } g_rlog[RLOG_N]; static uint64_t g_rlog_head;
+uint64_t vk_reglog_head(void) { pthread_mutex_lock(&g_rmu); uint64_t h = g_rlog_head; pthread_mutex_unlock(&g_rmu); return h; }
+// Whether an entry after position p is visible to a job (its sequence below `before`)
+int vk_reglog_pending(uint64_t p, uint64_t before) { pthread_mutex_lock(&g_rmu); int r = p < g_rlog_head && (g_rlog_head - p > RLOG_N || g_rlog[p % RLOG_N].seq < before); pthread_mutex_unlock(&g_rmu); return r; }
+// The IDs of the entries after `from` visible to a job (sequence below `before`), at most max: the position reached, or UINT64_MAX when the log no longer holds `from`
+// The position up to which every entry is visible to a job (sequence below `before`): entries are in sequence order, so the first one that is not ends them
+uint64_t vk_reglog_visible_end(uint64_t before) {
+    pthread_mutex_lock(&g_rmu); uint64_t lo = g_rlog_head > RLOG_N ? g_rlog_head - RLOG_N : 0, p = g_rlog_head;
+    while (p > lo && g_rlog[(p - 1) % RLOG_N].seq >= before) p--;
+    pthread_mutex_unlock(&g_rmu); return p;
+}
+uint64_t vk_reglog_take(uint64_t from, uint64_t before, int *tids, int max, int *n) {
+    pthread_mutex_lock(&g_rmu); *n = 0;
+    if (g_rlog_head - from > RLOG_N) { pthread_mutex_unlock(&g_rmu); return UINT64_MAX; }
+    uint64_t p = from; while (p < g_rlog_head && *n < max && g_rlog[p % RLOG_N].seq < before) tids[(*n)++] = g_rlog[p++ % RLOG_N].tid;
+    pthread_mutex_unlock(&g_rmu); return p;
+}
 void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     if (tid < 0) return;
     uint64_t seq = nvn_jobs_queued();
@@ -971,7 +991,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     if (t && r->cur.ok && r->cur.has_v == (v != NULL) && !memcmp(&r->cur.t, t, sizeof *t) && (!v || !memcmp(&r->cur.v, v, sizeof *v))) {
         pthread_mutex_unlock(&g_rmu); return;
     }
-    g_tex_gen++; g_texture_registrations++; if (tid > g_tid_max) g_tid_max = tid;
+    g_tex_gen++; { extern uint64_t g_tex_gen_why[4]; g_tex_gen_why[3]++; } g_texture_registrations++; if (tid > g_tid_max) g_tid_max = tid;
     vk_tex_diag_registration(tid, r->cur.ok ? &r->cur.t : NULL, r->cur.has_v ? &r->cur.v : NULL, t, v, r->cur.seq, seq, g_texture_registrations);
     if (g_registry_logical) registry_retain(r, tid, seq);
     else if (r->cur.ok && seq) {   // keep the one replaced for legacy FIFO jobs queued before this registration
@@ -979,6 +999,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
         if (r->old) { memmove(r->old + 1, r->old, sizeof *r->old * (TREG_OLD - 1)); r->old[0] = r->cur; }
     }
     r->cur.ok = t != NULL; if (t) r->cur.t = *t; r->cur.has_v = v != NULL; if (v) r->cur.v = *v; r->cur.seq = seq;
+    g_rlog[g_rlog_head % RLOG_N].tid = tid; g_rlog[g_rlog_head % RLOG_N].seq = seq; g_rlog_head++;
     pthread_mutex_unlock(&g_rmu);
 }
 void mtl_set_tex_pool_n(int n) { (void)n; }

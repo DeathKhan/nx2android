@@ -305,6 +305,7 @@ static int pool_lengths(int *tex, int *samp) {
 }
 int vk_pool_n(void) { int t; pool_lengths(&t, NULL); return t; }
 int vk_pool_samp_n(void) { int s; pool_lengths(NULL, &s); return s; }
+unsigned vk_pool_kinds(void) { return g_pool_kinds; }   // the pool kinds set 0 declares at full length (the others have one element)
 VkDescriptorSetLayout vk_tbl_dsl(void) {   // one common set 0: large bindings only for kinds the whole bundle uses
     static VkDescriptorSetLayout l; VkDescriptorSetLayout r = __atomic_load_n(&l, __ATOMIC_ACQUIRE); if (r) return r;
     pthread_mutex_lock(&g_sh_mu);
@@ -369,6 +370,34 @@ static int spv_tbl_shrink(uint32_t *w, uint32_t nw, const uint32_t *tv, int ntv,
             i += n; } }
     free(ptr_of); free(pointee); free(arr_len); free(cval); free(ctype);
     return ok;
+}
+// Pool arrays are indexed by a handle each fragment reads from the material records (a varying), so the index can differ between the invocations of one draw. Vulkan requires such
+// an index's resource to be decorated NonUniform (SPV_EXT_descriptor_indexing, shaderSampledImageArrayNonUniformIndexing); undecorated, the result is undefined and Adreno takes one
+// invocation's descriptor for a whole wave. Metal's argument buffers have no such rule, which is why the Mac renders the same SPIR-V correctly. Decorates the access chains into
+// the pool arrays, their indices, the loaded descriptors and the sampled images made from them; adds the capabilities and the extension. *pw may be reallocated. Returns the decorations added
+static int spv_nonuniform(uint32_t **pw, uint32_t *pnw, const uint32_t *vars, int nvars) {
+    uint32_t *w = *pw, nw = *pnw, bound = w[3]; if (!bound || bound > (1u << 22) || !nvars) return 0;
+    uint8_t *mark = calloc(bound, 1); uint32_t ncap = 0, cap_end = 5, ann_end = 0, first_fn = nw; int has_ext = 0;
+    for (int k = 0; k < nvars; k++) if (vars[k] < bound) mark[vars[k]] = 1;   // 1: a pool array variable
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { free(mark); return 0; }
+        if (op == 17) { cap_end = i + n; ncap++; }
+        if (op == 10 && n >= 2 && !memcmp(w + i + 1, "SPV_EXT_descriptor_indexing", 27)) has_ext = 1;
+        if (op == 71 || op == 72 || op == 73 || op == 74 || op == 75 || op == 332 || op == 5632 || op == 5633) ann_end = i + n;
+        if (op == 54 && first_fn == nw) first_fn = i;
+        if ((op == 65 || op == 66) && n >= 5 && w[i + 3] < bound && mark[w[i + 3]] == 1) { if (w[i + 2] < bound) mark[w[i + 2]] = 2; if (w[i + 4] < bound && !mark[w[i + 4]]) mark[w[i + 4]] = 3; }
+        else if (op == 61 && n >= 4 && w[i + 3] < bound && mark[w[i + 3]] == 2 && w[i + 2] < bound) mark[w[i + 2]] = 4;
+        else if (op == 86 && n >= 5 && ((w[i + 3] < bound && mark[w[i + 3]] == 4) || (w[i + 4] < bound && mark[w[i + 4]] == 4)) && w[i + 2] < bound) mark[w[i + 2]] = 5;
+        i += n; }
+    uint32_t nd = 0; for (uint32_t id = 1; id < bound; id++) nd += mark[id] >= 2;
+    if (!nd || !ann_end || ann_end > first_fn || cap_end > ann_end) { free(mark); return 0; }
+    uint32_t add = 2 * 2 + (has_ext ? 0 : 8) + 3 * nd, *o = malloc((size_t)(nw + add) * 4), k = 0;
+    memcpy(o, w, (size_t)cap_end * 4); k = cap_end;
+    o[k++] = 2u << 16 | 17; o[k++] = 5301; o[k++] = 2u << 16 | 17; o[k++] = 5307;   // ShaderNonUniform, SampledImageArrayNonUniformIndexing
+    if (!has_ext) { o[k++] = 8u << 16 | 10; memset(o + k, 0, 28); memcpy(o + k, "SPV_EXT_descriptor_indexing", 27); k += 7; }
+    memcpy(o + k, w + cap_end, (size_t)(ann_end - cap_end) * 4); k += ann_end - cap_end;
+    for (uint32_t id = 1; id < bound; id++) if (mark[id] >= 2) { o[k++] = 3u << 16 | 71; o[k++] = id; o[k++] = 5300; }
+    memcpy(o + k, w + ann_end, (size_t)(nw - ann_end) * 4); k += nw - ann_end;
+    free(mark); free(w); *pw = o; *pnw = k; return (int)nd;
 }
 // A pipeline currently combines vertex, fragment and geometry sets. Reserve at most one third of the total dynamic-storage limit per stage.
 // Only directly bound single storage buffers participate; arrays, UBO-derived pointers, compute and unsupported alignment keep their static descriptor.
@@ -460,6 +489,9 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
         if (npv < s->npool) pfail = "an array variable was not found";
         if (!pfail && ntv && !spv_tbl_shrink(w, nw, tv, ntv, (uint32_t)vk_pool_n())) pfail = "its texture arrays could not be cut to the table's length";
         if (!pfail && nsv && !spv_tbl_shrink(w, nw, sv, nsv, (uint32_t)vk_pool_samp_n())) pfail = "its sampler array could not be cut to the table's length";
+        { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NONUNIFORM"); on = e && atoi(e); }   // DM_VK_NONUNIFORM=1 (start-up, opt-in): decorate them (measured on Ocarina of Time 2026-11-09: no visible change, so not by default)
+          if (!pfail && on) { uint32_t all[192]; int na = 0; for (int k = 0; k < ntv; k++) all[na++] = tv[k]; for (int k = 0; k < nsv; k++) all[na++] = sv[k];
+              int nd = spv_nonuniform(&w, &nw, all, na); static int nl; if (nl++ < 4) VKLOG("shader %016llx: %d pool array accesses decorated NonUniform", (unsigned long long)key, nd); } }
     }
     if (pfail) { static int nl; if (nl++ < 16) VKLOG("[RED] shader %016llx (stage %d): %s; not drawn (its texture pool arrays can be bound only from the pool tables)", (unsigned long long)key, stage, pfail);
         nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); free(w); free(s); return NULL; }
