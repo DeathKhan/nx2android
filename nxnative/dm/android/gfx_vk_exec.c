@@ -541,6 +541,7 @@ void vk_exec_reset(void) {   // a new submission: NVN state does not carry over 
         if (cur) { unsigned i = 0; while (i < nq && q[i].serial != cur) i++; if (i == nq && nq < RCQ) q[nq++].serial = cur; if (i < nq) q[i].skip = g_rc_skip; }
         cur = g_nvn_active_queue; g_rc_skip = 0; for (unsigned i = 0; i < nq; i++) if (q[i].serial == cur) g_rc_skip = q[i].skip;
     } else g_rc_skip = 0;
+    { void vk_tex_release_drain(void); vk_tex_release_drain(); }   // Finalized textures' CPU-written marks that no queued job needs any more (gfx_vk_tex.c)
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_cb_draws = 0; g_ord_parts = 0; g_psplit_now = 0; g_set_epoch++; x_read();
     g_sub_hist[g_sub_hn++ % 8] = g_vkst.draws - g_sub_d0; g_sub_d0 = g_vkst.draws;   // (part_pace: the submission just ended)
     if (g_prof_on) { extern uint64_t g_pkg_ns, g_pkg_n; memset(g_prof_ns, 0, sizeof g_prof_ns); g_prof_t0 = tick(); g_prof_pkg0 = g_pkg_ns; g_prof_npkg0 = g_pkg_n; g_prof_pipes0 = g_vkst.pipes_built; }
@@ -1797,7 +1798,10 @@ enum { APQ = 256 };
 static pkey g_apq[APQ]; static int g_apq_h, g_apq_t, g_apq_on;   // queued keys (a draw left out counts as skipped for no pipeline)
 static pthread_mutex_t g_apq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_apq_cv = PTHREAD_COND_INITIALIZER;
 static void async_pipe_complete(const pkey *k, VkPipeline p) {
-    pthread_mutex_lock(&g_pipe_mu); nvn_hm_put(&g_pipes, k, p); if (p != (void *)1) pipe_record(k);
+    pthread_mutex_lock(&g_pipe_mu);
+    VkPipeline had = nvn_hm_get(&g_pipes, k);   // a prewarm thread made it meanwhile (as graphics_pipeline does: the one in the table may be bound already, the new one goes)
+    if (had && had != PIPE_PENDING) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); }
+    else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1) pipe_record(k); }
     pthread_cond_broadcast(&g_pipe_ready); pthread_mutex_unlock(&g_pipe_mu);   // wake counted draws waiting on either success or failure
 }
 static void *async_pipe_thread(void *arg) {

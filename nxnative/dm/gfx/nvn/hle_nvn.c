@@ -300,6 +300,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     return 1;
 }
 static void fl_add(const uint8_t *a, uint64_t n); static void fl_drop(const uint8_t *a, uint64_t n);   // flushed ranges, see nvn_flushed
+static void ft_drop(const uint8_t *a, uint64_t n);   // first-touch textures over a pool that goes, see ft_add
 // Under asynchronous replay the submissions queued before it are replayed first: they may still read the pool (Unicorn Overlord's skipped scenes freed theirs
 // right after submitting, and the replay then found its index buffers outside every pool and the command memory overwritten: a black screen, the sound going on)
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
@@ -308,7 +309,7 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     replay_lock(); mtl_alias_drop_pool(p); replay_unlock(); ((pool_t *)p)->magic = 0;
     if (((pool_t *)p)->flags & 0x200 && ((pool_t *)p)->vp) vpool_release((pool_t *)p);
     if (((pool_t *)p)->mem && !(((pool_t *)p)->flags & 0x200)) {   // A virtual pool's storage is borrowed from a physical pool; do not unregister it
- nvn_dirty_remove_range(((pool_t *)p)->mem); replay_lock(); mtl_pool_del(((pool_t *)p)->mem); mtl_sp_phys_gone(((pool_t *)p)->mem, ((pool_t *)p)->size); replay_unlock(); fl_drop(((pool_t *)p)->mem, ((pool_t *)p)->size);
+ nvn_dirty_remove_range(((pool_t *)p)->mem); replay_lock(); mtl_pool_del(((pool_t *)p)->mem); mtl_sp_phys_gone(((pool_t *)p)->mem, ((pool_t *)p)->size); replay_unlock(); fl_drop(((pool_t *)p)->mem, ((pool_t *)p)->size); ft_drop(((pool_t *)p)->mem, ((pool_t *)p)->size);
  dm_device_share(((pool_t *)p)->mem, ((pool_t *)p)->size, 0); } }
 static void ft_flush(const uint8_t *a, uint64_t n);
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {   // see ft_add and nvn_flushed
@@ -492,10 +493,33 @@ static void ft_add(const tex_t *t) {
     g_ft[g_nft++] = f;
     pthread_mutex_unlock(&g_ft_mu);
 }
+// Under asynchronous replay a texture Finalized (or initialized again) between submit and replay is still drawn by that submission, and its first use there (nvn_ft_written) needs
+// the entry: the deletion waits for the replay of the first job queued after it (ft_del_drain, submit_now); without a replay thread it is at once
+uint64_t nvn_jobs_queued(void); uint64_t nvn_replaying_job(void);
+typedef struct { uint64_t serial, seq; } ft_rel;
+static ft_rel *g_ftrel; static size_t g_nftrel, g_cftrel;   // under g_ft_mu
+static void ft_del_now(uint64_t serial) {   // g_ft_mu held
+    for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; break; }
+}
 static void ft_del(uint64_t serial) {
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return;
+    uint64_t seq = nvn_jobs_queued();
     pthread_mutex_lock(&g_ft_mu);
-    for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; break; }
+    if (!seq) ft_del_now(serial);
+    else { if (g_nftrel == g_cftrel && !(g_ftrel = realloc(g_ftrel, (g_cftrel = g_cftrel ? 2 * g_cftrel : 256) * sizeof *g_ftrel))) die("flush_tex allocation failed"); g_ftrel[g_nftrel++] = (ft_rel){serial, seq}; }
+    pthread_mutex_unlock(&g_ft_mu);
+}
+static void ft_del_drain(void) {   // the replay thread, at each submission
+    uint64_t job = nvn_replaying_job(); if (!job) return;
+    pthread_mutex_lock(&g_ft_mu);
+    size_t o = 0; for (size_t i = 0; i < g_nftrel; i++) { if (g_ftrel[i].seq < job) ft_del_now(g_ftrel[i].serial); else g_ftrel[o++] = g_ftrel[i]; }
+    g_nftrel = o;
+    pthread_mutex_unlock(&g_ft_mu);
+}
+static void ft_drop(const uint8_t *a, uint64_t n) {   // a pool goes: the textures over it that were never Finalized leave the list (their entries pointed at dead memory and stayed for good)
+    if (!DM_GAME_TEX_FLUSH_UPLOAD || !a || !n) return;
+    pthread_mutex_lock(&g_ft_mu);
+    for (size_t i = 0; i < g_nft;) if (g_ft[i].mem >= a && g_ft[i].mem < a + n) g_ft[i] = g_ft[--g_nft]; else i++;
     pthread_mutex_unlock(&g_ft_mu);
 }
 // Profile tex_dirty_upload: Tears of the Kingdom fills some textures from the CPU after creating them and publishes them with no NVN flush at all (os::FlushDataCache runs
@@ -631,7 +655,8 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
     // Re-initializing a texture object that is still live (without a Finalize first): release the host texture of the old serial first. SMBW re-initializes its transient render targets on the same object every frame and never Finalizes them;
     //   previously every init created a new private MTLTexture and the old one stayed in the serial table forever, so GPU memory grew about 13 MB per frame (killed by the memory watchdog at 24 GB)
-    if (o->magic == MAGIC('T', 'E', 'X', 0) && o->serial) { static uint64_t n; if (!n++) LOG("[nvn] TextureInitialize on a texture object that is still live (no Finalize): releasing the old host texture (first case ser=%llu)", (unsigned long long)o->serial); mtl_tex_release(o); }
+    //   The old serial also leaves the first-touch list (ft_del, as Finalize does): kept, every such re-initialization added an entry that only a write to its pages removed, and the per-submission poll walked them all
+    if (o->magic == MAGIC('T', 'E', 'X', 0) && o->serial) { static uint64_t n; if (!n++) LOG("[nvn] TextureInitialize on a texture object that is still live (no Finalize): releasing the old host texture (first case ser=%llu)", (unsigned long long)o->serial); ft_del(o->serial); mtl_tex_release(o); }
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8); o->set_swz = s->set_swz; o->stencil = s->stencil; o->swz = s->swz;
@@ -857,7 +882,9 @@ static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
 int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
     if (st >= p->nstage) return 0;
     if (!p->serial) return keys_hash(&p->sd[st], 0, key), 1;   // not set by SetShaders (the game wrote the struct itself): no record to keep the key in
-    prog_keys_t *k = pk_get(p->serial);
+    // a program already Finalized (replayed after its Finalize under asynchronous replay, or submitted after it) gets no entry: pk_drop has run, nothing would drop one
+    // made now (its keys are hashed again at each of its binds in that one submission; cheaper than an entry kept for good; upstream nx2android e69473622)
+    prog_keys_t tmp = {0}, *k = p->magic == MAGIC('P', 'R', 'O', 'G') ? pk_get(p->serial) : &tmp;
     if (!(k->ok >> st & 1)) { keys_hash(&p->sd[st], 0, k->key[st]); k->ok |= (uint8_t)(1u << st); }
     memcpy(key, k->key[st], 8);
     return 1;
@@ -1722,7 +1749,7 @@ static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h, uint64_t f
     mtl_queue_activate(((const queue_t *)q)->serial);
     mtl_set_queue_origin_lower_left(((const queue_t *)q)->origin_ll);
     nvn_cap_submit(n, (const uint64_t *)h);   // DM_NVN_CAPTURE (nvn_capture.inc)
-    mtl_sub_begin();
+    mtl_sub_begin(); ft_del_drain();
     nvn_ft_poll();
     mtl_sub_index((const uint64_t *)h, n);
     for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }

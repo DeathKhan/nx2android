@@ -14,6 +14,9 @@ typedef struct { void (*fn)(void *); void *arg; } spawn_arg;
 typedef struct { _Alignas(16) uint8_t tt[0x200]; void *stack_alloc; } host_thread;
 void dm_thread_mark_host(void);
 static void spawn_tramp(void *p) { spawn_arg a = *(spawn_arg *)p; free(p); dm_thread_mark_host(); a.fn(a.arg); }
+// What one spawn makes: the ThreadType first (its address is the handle the caller keeps), then its stack. A joined thread's go to a free list for the next spawn of that stack size
+// rather than to free(): the thread exits on that stack (hle_thread.c thread_exit, pthread_exit after WaitThread can return), and reuse only happens at a later spawn. Freed never,
+// every OpenAudioRenderer after a CloseAudioRenderer (hle_audren.c: the render thread) left a ThreadType and a 64 KB stack behind
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size) {
     spawn_arg *sa = malloc(sizeof *sa); if (!sa) die("host guest thread: allocation failed"); sa->fn = fn; sa->arg = arg; fn = spawn_tramp; arg = sa;
     stack_size = (stack_size + 0xfff) & ~(size_t)0xfff;
