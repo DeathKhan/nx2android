@@ -80,6 +80,7 @@ For a developer-only shader rebuild, `devtools/build_shader_bundle.py` uses that
 
 `--hmma-shuffle 1` is an Android shader-build experiment: warp-local packed register exchanges replace the software HMMA helper's shared-memory transport while retaining its FP32 fused operations and final half packing. It is off by default, and does not change the Mac helper selected for Metal matrix lowering. Target-device equivalence and performance must be checked before using it for a bundle.
 
+`--vulkan-driver <lib.so>` packs a Vulkan driver (Mesa's Turnip) in the APK under a `lib*.so` name, beside libadrenotools and its hook libraries, and the data pack's `env.txt` names it (`DM_VK_DRIVER`; `gfx_vk_core.c` loads it through adrenotools, and falls back to the device's driver when it does not load). `python -m porter driver <lib.so> [--package …]` changes the driver of a port already on the device without the game's files (`porter/driver.py`): the installed APK is pulled, written again by `dm/android/apk/apkdriver.py` with the new library in place of the old (every other entry kept, page-aligned and signed again with the player's key by `apksign.py`, the ZIP writer and v2 signer `mkapk.py` uses), installed over the app (its saves stay), and `env.txt`'s `DM_VK_DRIVER` row names it; `--system` drops the library and the row (the device's driver). An APK ported without `--vulkan-driver` has no libadrenotools and is refused: it needs one port with a driver first.
 
 ## Saves
 
