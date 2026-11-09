@@ -10,6 +10,9 @@ void nvn_dirty_hold(const void *addr, size_t len);                 // Make the c
 void nvn_dirty_unhold(void);
 void nvn_dirty_freeze(const void *addr, size_t len);               // Until nvn_dirty_unfreeze: a game write into [addr, addr+len) waits in the fault handler, a host write waits before it starts (gfx_vk_core.c: a pool backed late, read-only while its bytes are copied and its new mapping placed). One range at a time
 void nvn_dirty_unfreeze(void);
+void nvn_dirty_open(const void *addr, size_t len);                 // Make the covered protected pages writable, not counted as written, and hold off protection until nvn_dirty_close: around making a zero-copy buffer the GPU writes through
+void nvn_dirty_close(void);                                        // Protect them again; those whose bytes changed meanwhile count as written
+void nvn_dirty_open_stats(uint64_t *opened, uint64_t *changed);    // Cumulative: pages nvn_dirty_open opened, and those of them that changed while open
 int nvn_dirty_tracked(const void *addr, size_t len);
 void nvn_dirty_protect(const void *addr, size_t len);              // Set the covered pages read-only
 void nvn_dirty_release(const void *addr, size_t len);              // Make the covered pages writable again and stamp them as written (a span no longer watched)
