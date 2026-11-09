@@ -4609,11 +4609,11 @@ static mesh_buf mesh_alloc(VkDeviceSize n) {   // GPU-only memory for this draw:
     if (g_mesh_arena.b && !g_mesh_arena.noted++) VKLOG("mesh emulation: the arena (%llu MB) is full this submission; the rest of its mesh draws use scratch memory (DM_VK_MESH_ARENA_MB)", (unsigned long long)(g_mesh_arena.size >> 20));
     vk_scratch(n, 256, &r.b, &r.off); r.len = n; return r;
 }
-static int mesh_kernels(void) {   // meshlaunch.comp and meshprep.comp: three storage buffers, 16 bytes of push constants
+static int mesh_kernels(void) {   // meshlaunch.comp and meshprep.comp: three storage buffers, 32 bytes of push constants
     if (g_mesh_k.launch || g_mesh_k.bad) return !g_mesh_k.bad;
     VkDescriptorSetLayoutBinding lb[3] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
     VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 3, lb};
-    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
     g_mesh_k.bad = 1;
     if (vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_mesh_k.dl)) return 0;
     void vk_dsl_register(VkDescriptorSetLayout l, const VkDescriptorSetLayoutBinding *b, uint32_t n); vk_dsl_register(g_mesh_k.dl, lb, 3);   // (vk_alloc_set counts its pool needs)
@@ -4629,12 +4629,12 @@ static int mesh_kernels(void) {   // meshlaunch.comp and meshprep.comp: three st
     }
     g_mesh_k.bad = 0; return 1;
 }
-static void mesh_helper(VkCommandBuffer cb, VkPipeline p, const mesh_buf b[3], const uint32_t pc[4]) {   // one dispatch of a helper kernel over three buffers
+static void mesh_helper(VkCommandBuffer cb, VkPipeline p, const mesh_buf b[3], const uint32_t pc[8]) {   // one dispatch of a helper kernel over three buffers
     VkDescriptorSet set = vk_alloc_set(g_mesh_k.dl); VkDescriptorBufferInfo bi[3]; VkWriteDescriptorSet w[3];
     for (int i = 0; i < 3; i++) { bi[i] = (VkDescriptorBufferInfo){b[i].b, b[i].off, b[i].len}; w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[i], NULL}; }
     vkUpdateDescriptorSets(V.dev, 3, w, 0, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p); vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_mesh_k.pl, 0, 1, &set, 0, NULL);
-    vkCmdPushConstants(cb, g_mesh_k.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, pc); vkCmdDispatch(cb, 1, 1, 1); vk_img_barrier_all(cb);
+    vkCmdPushConstants(cb, g_mesh_k.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 32, pc); vkCmdDispatch(cb, 1, 1, 1); vk_img_barrier_all(cb);
 }
 static VkPipeline mesh_cpipe(vkshader_t *k) {   // the kernel's compute pipeline, from the dispatch cache (compute_build; (VkPipeline)1 when it failed)
     uint64_t ck[3] = {k->key, g_num_um, g_num_im};
@@ -4651,7 +4651,18 @@ static int mesh_kernel(VkCommandBuffer cb, int st, vkshader_t *k, const mesh_buf
     if (ind) vkCmdDispatchIndirect(cb, ind->b, ind->off + ind_at); else vkCmdDispatch(cb, groups, 1, 1);
     vk_img_barrier_all(cb); return 1;
 }
+// A task-less indirect mesh draw's count is written by the GPU and has no bound here: its workgroups were capped at DM_VK_MESH_MAX (2048) and the rest dropped
+// without a word (Ocarina of Time's grass carpet in Link's house: the ground under it never drawn, the clear colour showing through as white). It is drawn as
+// DM_VK_MESH_BATCHES (start-up, default 4) slices of up to DM_VK_MESH_MAX workgroups each, meshprep.comp giving each slice its part of the count (an empty one
+// dispatches and draws nothing)
+static void mesh_draw_one(const p_draw *d, uint32_t batch);
 static void mesh_draw(const p_draw *d) {
+    static uint32_t batches; if (!batches) { const char *e = getenv("DM_VK_MESH_BATCHES"); batches = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 4; if (batches > 64) batches = 64; }
+    vkshader_t *ts = S.sh[3]; int taskless = !(ts && ts->mesh_kind == 1 && S.sh[4] && S.sh[4]->mesh_task);
+    uint32_t n = d->ind && taskless ? batches : 1;
+    for (uint32_t b = 0; b < n; b++) mesh_draw_one(d, b);
+}
+static void mesh_draw_one(const p_draw *d, uint32_t batch) {
     vkshader_t *ts = S.sh[3], *ms = S.sh[4];
     if (!mesh_emu_on()) { g_mesh_skipped++; VKRED_ONCE(160, "task / mesh draw skipped (DM_VK_MESH_EMU=0)"); return; }
     if (ts && ts->mesh_kind != 1) ts = NULL;
@@ -4674,7 +4685,7 @@ static void mesh_draw(const p_draw *d) {
     mesh_buf vtx = mesh_alloc((VkDeviceSize)nmesh * ms->mesh_max_v * (ms->mesh_ncomp ? ms->mesh_ncomp : 1) * 4), idx = mesh_alloc((VkDeviceSize)nmesh * ipw * 4);
     if (d->ind) {   // {count, first} at a game address: meshprep.comp copies it into ctl and the header's dispatch arguments
         VkBuffer rb; VkDeviceSize ro; if (!vk_buf_at(d->ind, 8, &rb, &ro)) { g_mesh_skipped++; VKRED_ONCE(165, "DrawMeshTasksIndirect record outside the memory pools: skipped"); return; }
-        mesh_buf rec = {rb, ro & ~255ull, (ro & 255) + 8}; uint32_t pc[4] = {(uint32_t)(ro & 255) / 4, ts ? cap_t : cap_m, ts != NULL, ipw};
+        mesh_buf rec = {rb, ro & ~255ull, (ro & 255) + 8}; uint32_t pc[8] = {(uint32_t)(ro & 255) / 4, ts ? cap_t : cap_m, ts != NULL, ipw, ts ? 0 : batch};
         mesh_helper(cb, g_mesh_k.prep, (mesh_buf[3]){rec, ctl, launch}, pc);
     } else if (!ts) {   // no task: the header is known here
         uint32_t hdr[MESH_HDR] = {nmesh, 1, 1, 0, nmesh * ipw, 1, 0, 0, 0, 0, 0, 0, nmesh, 1, 1, 0}; vkCmdUpdateBuffer(cb, launch.b, launch.off, sizeof hdr, hdr); vk_img_barrier_all(cb);
@@ -4682,7 +4693,7 @@ static void mesh_draw(const p_draw *d) {
     g_mesh.ctl = ctl; g_mesh.taskout = taskout; g_mesh.launch = launch; g_mesh.vtx = vtx; g_mesh.idx = idx;
     if (ts) {
         if (!mesh_kernel(cb, 3, ts, d->ind ? &launch : NULL, 12 * 4, ntask)) { g_mesh_skipped++; return; }
-        uint32_t pc[4] = {pay, nmesh, ipw, 0}; mesh_helper(cb, g_mesh_k.launch, (mesh_buf[3]){ctl, taskout, launch}, pc);
+        uint32_t pc[8] = {pay, nmesh, ipw, 0}; mesh_helper(cb, g_mesh_k.launch, (mesh_buf[3]){ctl, taskout, launch}, pc);
     }
     if (!mesh_kernel(cb, 4, ms, ts || d->ind ? &launch : NULL, 0, nmesh)) { g_mesh_skipped++; return; }
     S.bound_pipe = VK_NULL_HANDLE;
