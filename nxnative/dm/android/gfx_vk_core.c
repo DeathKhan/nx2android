@@ -845,6 +845,7 @@ static int zc_over(uint64_t size) { static uint64_t m = 1; if (m == 1) { const c
 void mtl_pool_add(const void *mem, uint64_t size) {
     vk_init();
     if (!size) return;
+    { void vk_cap_pool_note(const void *, uint64_t, int); vk_cap_pool_note(mem, size, 1); }   // DM_NVN_CAPTURE (gfx_vk_capture.inc): the pools as given
     uint64_t a = (uint64_t)(uintptr_t)mem, c = ((a | size) & 0xfff) || zc_over(size) ? size : ZC_CHUNK;
     for (uint64_t o = 0; o < size; o += c) pool_add_one((const uint8_t *)mem + o, size - o < c ? size - o : c, a, a + size);
     if (size > c) VKLOG("memory pool %p +%#llx: %llu chunks of at most %#llx", mem, (unsigned long long)size, (unsigned long long)((size + c - 1) / c), c);
@@ -937,6 +938,7 @@ static void pools_back_addressed(void) {   // raw global memory in use: every ad
     static int nl; if (n && nl++ < 8) VKLOG("raw global memory: %d addressed memory pool chunks backed (%.1f MB)", n, bytes / 1048576.0);
 }
 void mtl_pool_del(const void *mem) {
+    { void vk_cap_pool_note(const void *, uint64_t, int); vk_cap_pool_note(mem, 0, 0); }
     for (;;) {   // every chunk of the pool
         pthread_rwlock_wrlock(&g_pool_mu);
         int i = 0; while (i < g_npool && g_pool[i].base != (uint64_t)(uintptr_t)mem) i++;

@@ -1335,3 +1335,5 @@ void vk_img_evict(const vk_img_ref *r) {   // under g_img_mu, from a list taken 
     nvn_hm_del(h, key); img_drop(r->im); g_img_evicted++;
 }
 uint64_t vk_img_vkbytes(void) { return g_img_vkbytes; }
+
+#include "gfx_vk_capture.inc"   // DM_NVN_CAPTURE: frame captures over this backend's registries and images (dm/android/tools/nvn_replay_vk.c replays them)

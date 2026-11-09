@@ -96,9 +96,7 @@ int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns) { return mtl_wait(fence, t
 // The picture's shape (a sized vi layer, a taller screen): the swapchain presenter letterboxes to the window texture's own size. TODO(upsync): honour these as present_shape does
 void mtl_present_layer(uint32_t w, uint32_t h) { (void)w; (void)h; }
 void mtl_present_screen(uint32_t w, uint32_t h) { (void)w; (void)h; }
-// DM_NVN_CAPTURE (nvn_capture.inc, included by nvn_mtl.m: it reads that backend's registries and pools). TODO(upsync): the same over the Vulkan backend's tables
-void nvn_cap_submit(int n, const uint64_t *handles) { (void)n; (void)handles; static int said; if (!said++ && getenv("DM_NVN_CAPTURE")) LOG("[RED] DM_NVN_CAPTURE: frame captures are not available on Android yet"); }
-void nvn_cap_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
+// DM_NVN_CAPTURE: gfx_vk_capture.inc (included by gfx_vk_tex.c)
 
 // Android shader modules and serial→key records live for the process. A queued
 // bind owns descriptor bytes, and materializes keys before the guest can reuse
@@ -109,7 +107,6 @@ void mtl_prog_snapshot(prog_t *copy, const prog_t *source) {
     for (unsigned i=0; i<copy->nstage && i<6; i++) { uint8_t key[8]; prog_key(copy,i,key); }
 }
 void mtl_prog_unpin(prog_t *p) { (void)p; }
-void nvn_cap_queue(uint64_t serial, int waits) { (void)serial; (void)waits; }
 
 // Null backend fallbacks; Vulkan retains registry versions/native images.
 __attribute__((weak)) void vk_registry_job_pin(uint64_t id) { (void)id; }

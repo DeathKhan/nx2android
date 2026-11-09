@@ -43,6 +43,7 @@ static p_tf_bind g_tf[4]; static uint64_t g_tf_off[4]; static int g_tf_on, g_tf_
 static int g_depth_zero = 1, g_lower_left;
 void mtl_set_depth_zero(int on) { g_depth_zero = on; }
 void mtl_set_origin_lower_left(int on) { g_lower_left = on; }
+int vk_cap_origin_ll(void) { return g_lower_left; } int vk_cap_depth_zero(void) { return g_depth_zero; }   // DM_NVN_CAPTURE (gfx_vk_capture.inc): the state it records
 // NVN's upper-left mode has clip space y up (as Metal and D3D): it is drawn with a flipped viewport over the same top-left rectangle, lower-left mode without
 // one; the scissor is then never flipped and the winding follows nvn_mtl.m's. Drawn the other way, every blit flipped the picture (NEO docked: upside down)
 // and the winding had to be inverted. DM_VK_FLIPY=0 brings the old way back

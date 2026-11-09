@@ -135,3 +135,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 }
 
 void mtl_present_progress(uint64_t *queued, uint64_t *done) { *queued = *done = 0; }
+// DM_NVN_CAPTURE: the Vulkan backend captures (gfx_vk_capture.inc); the null device has nothing to capture
+void nvn_cap_submit(int n, const uint64_t *handles) { (void)n; (void)handles; }
+void nvn_cap_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
+void nvn_cap_queue(uint64_t serial, int waits) { (void)serial; (void)waits; }

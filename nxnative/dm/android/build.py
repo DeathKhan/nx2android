@@ -16,6 +16,7 @@ ap.add_argument('--out')
 ap.add_argument('--api', default='31')
 ap.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
 ap.add_argument('--exe', action='store_true'); ap.add_argument('--lib', action='store_true')
+ap.add_argument('--replay', action='store_true', help='also nvn_replay_vk, the frame replayer of DM_NVN_CAPTURE captures (android/tools/nvn_replay_vk.c), run on the device')
 ap.add_argument('--only-compile', action='store_true', help='compile every source and report errors, no link')
 ap.add_argument('--keep-going', action='store_true')
 ap.add_argument('-O', default='2')
@@ -23,7 +24,7 @@ ap.add_argument('--gfx', default='vk', choices=('vk', 'null'), help='graphics ba
 ap.add_argument('--release', action='store_true', help='a build to keep installed: no debug information, stripped, no DM_CTL')
 ap.add_argument('--adrenotools', action='store_true', help='also libadrenotools.so and its hooks (third_party/libadrenotools), which the APK carries with a custom Vulkan driver')
 a = ap.parse_args()
-if not (a.exe or a.lib): a.exe = a.lib = True
+if not (a.exe or a.lib or a.replay): a.exe = a.lib = True
 
 host = 'windows-x86_64' if os.name == 'nt' else 'linux-x86_64' if sys.platform.startswith('linux') else 'darwin-x86_64'
 bin_ = Path(a.ndk) / 'toolchains/llvm/prebuilt' / host / 'bin'
@@ -126,6 +127,16 @@ if a.lib:
     if a.release:   # the static symbol table goes too (the dynamic one stays: ANativeActivity_onCreate)
         subprocess.run([str(bin_ / ('llvm-strip.exe' if os.name == 'nt' else 'llvm-strip')), '--strip-unneeded', str(out / 'libdmhost.so')], check=True)
         print(f'stripped {out / "libdmhost.so"}: {(out / "libdmhost.so").stat().st_size // 1024} KB')
+
+if a.replay:   # the replayer includes hle_nvn.c (its side tables), so that object stays out; the host's main is renamed out of its way
+    robjs, rfailed = build([DM / 'android/tools/nvn_replay_vk.c'])
+    if rfailed: sys.exit(1)
+    mr = obj / 'host_main.replay.o'
+    subprocess.run([str(bin_ / 'llvm-objcopy'), '--redefine-sym', 'main=dm_host_main_unused', str(obj / 'host_main.c.o'), str(mr)], check=True)
+    keep = [o for o in objs if o.name not in ('gfx_nvn_hle_nvn.c.o', 'host_main.c.o')]
+    r = subprocess.run([CC] + LDFLAGS + ['-pie', '-o', str(out / 'nvn_replay_vk')] + [str(o) for o in keep + [mr] + robjs + vobjs] + LIBS, capture_output=True, text=True, errors='replace')
+    print(r.stderr.strip() if r.returncode else f'linked {out / "nvn_replay_vk"}', file=sys.stderr if r.returncode else sys.stdout)
+    if r.returncode: sys.exit(1)
 
 # --adrenotools: libadrenotools.so (gfx_vk_core.c vk_init loads a custom Vulkan driver through it, DM_VK_DRIVER) and the hooks it loads from the APK's library folder,
 # as its CMake files build them: linkernsbypass inside libadrenotools and libhook_impl, the three small hooks over libhook_impl with -z global
