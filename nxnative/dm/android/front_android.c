@@ -73,6 +73,7 @@ void dm_focus_set(int st); void dm_audio_suspend(int on); void guest_clock_freez
 // ---- settings (the pause menu's), kept in the files folder as KEY=VALUE lines ----
 static char g_root[512];
 static char g_title[128];   // the app's name (on_create: app_label), the menu's header
+static _Atomic int g_set_temps = -1;   // Show temperatures (settings.txt temps=): -1 until the player chooses, then they follow Show FPS, as before the switch
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
@@ -99,6 +100,7 @@ static void settings_load(void) {
     g_set_extra[0] = 0;
     while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_padlabel, v != 0); else if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
+        else if (sscanf(line, "temps=%d", &v) == 1) atomic_store(&g_set_temps, v != 0);
         else if (sscanf(line, "docked=%d", &v) == 1) { setenv("DM_OPMODE", v ? "1" : "0", 1); atomic_store(&g_set_res, v ? DM_RES_MAX : DM_RES_BALANCED); }   // over env.txt's: the host reads it once, at its first query
         else if (!strncmp(line, "res=", 4)) { for (int k = 0; k < DM_RES_N; k++) if (!strncmp(line + 4, RES_KEYS[k], strlen(RES_KEYS[k]))) { atomic_store(&g_set_res, k); setenv("DM_OPMODE", k == DM_RES_MAX ? "1" : "0", 1); } }   // (after docked=)
         else if (sscanf(line, "fpscap=%d", &v) == 1) atomic_store(&g_set_cap, cap_index(v));
@@ -127,6 +129,7 @@ static void settings_save(void) {
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\nfpscap=%d\nres=%s\naccent=%06X\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0,
             atomic_load(&g_set_fps), atomic_load(&g_set_opacity), atomic_load(&g_set_grid), OVM_CAPS[atomic_load(&g_set_cap)], RES_KEYS[atomic_load(&g_set_res)],
             atomic_load(&g_set_accent) & 0xffffff);
+    if (atomic_load(&g_set_temps) >= 0) fprintf(f, "temps=%d\n", atomic_load(&g_set_temps));   // (only once chosen)
     fprintf(f, "fpspos=%s\n", OVM_FPSPOS_KEYS[atomic_load(&g_set_fpspos) & 3]);
     if (atomic_load(&g_set_padlabel) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_padlabel));   // (only once chosen: until then env.txt decides)
     fputs(g_set_extra, f);   // the lines settings_load did not know
@@ -476,12 +479,13 @@ static _Atomic int g_tx_ver;   // the text entry's edit count: the panel is draw
 static _Atomic int g_ed_st;    // the layout editor's state for dm_menu_state (overlay_layout.h OVE_ST)
 static _Atomic int g_sp_on, g_sp_hi = -1, g_sp_ver;   // the save picker (below): open, its highlighted row, its edit count
 static _Atomic int g_sv_st, g_sv_n;                   // Export save: its outcome (overlay_layout.h OVX_*), the exports made
+static int temps_on(void) { int v = atomic_load(&g_set_temps); return v < 0 ? atomic_load(&g_set_fps) : v; }   // Show temperatures (unset: as Show FPS)
 int dm_menu_state(void) {
     if (atomic_load(&g_tx_on)) return 1 << 16 | (atomic_load(&g_tx_ver) & 0xffff);   // the text entry's panel (gfx_vk_present.c ov_text_panel)
     if (!atomic_load(&g_menu)) return -1;
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
-    return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
+    return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | temps_on() << 11 | (atomic_load(&g_menu_hi) + 1) << 4 |
            atomic_load(&g_menu_tab) << 8 | (atomic_load(&g_menu_down) ? OVM_PRESSED : 0) | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24;
 }
 static int accent_index(unsigned c) { for (int i = 0; i < OVM_ACCENTS_N; i++) if (OVM_ACCENTS[i] == c) return i; return -1; }
@@ -490,6 +494,7 @@ int dm_menu_value(int item) {
     case OVM_OVERLAY: return atomic_load(&g_set_overlay);
     case OVM_RUMBLE: return atomic_load(&g_set_rumble);
     case OVM_FPS: return atomic_load(&g_set_fps);
+    case OVM_TEMPS: return temps_on();
     case OVM_OPACITY: return atomic_load(&g_set_opacity);
     case OVM_MODE: return atomic_load(&g_set_res);
     case OVM_ACCENT: return accent_index(atomic_load(&g_set_accent));
@@ -513,7 +518,8 @@ int dm_game_title(char *out, int cap) { if (cap > 0) snprintf(out, (size_t)cap, 
 static void menu_set(int item, int v) {   // a row's new value (a switch, a choice's index, the slider's percent), saved
     if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, v != 0); atomic_store(&g_overlay, 1); }
     else if (item == OVM_RUMBLE) { atomic_store(&g_set_rumble, v != 0); dm_haptics_android_set(v != 0); }
-    else if (item == OVM_FPS) atomic_store(&g_set_fps, v != 0);
+    else if (item == OVM_FPS) { if (atomic_load(&g_set_temps) < 0) atomic_store(&g_set_temps, atomic_load(&g_set_fps)); atomic_store(&g_set_fps, v != 0); }   // (the temperatures stay as they were shown)
+    else if (item == OVM_TEMPS) atomic_store(&g_set_temps, v != 0);
     else if (item == OVM_MODE && v >= 0 && v < DM_RES_N) {   // Resolution: the mode reaches the game as the notification it takes when the menu closes, the GPU target at its next frame
         atomic_store(&g_set_res, v); dm_set_opmode(v == DM_RES_MAX); dm_res_set(v);
         LOG("[menu] resolution %s (%s; the game takes the mode as it goes on)", RES_KEYS[v], v == DM_RES_MAX ? "docked" : "handheld");
@@ -529,7 +535,8 @@ static void menu_set(int item, int v) {   // a row's new value (a switch, a choi
     else return;
     settings_save();
 }
-int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_menu); }   // gfx_vk_present.c draws the counter (not while the menu holds the game)
+int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_menu); }
+int dm_overlay_temps(void) { return temps_on() && !atomic_load(&g_menu); }   // gfx_vk_present.c draws the temperatures in the counter's box (Show temperatures)   // gfx_vk_present.c draws the counter (not while the menu holds the game)
 static void menu_open(int hi) {
     if (!atomic_load(&g_running) || atomic_exchange(&g_menu, 1)) return;
     if (hi >= 0) hi = g_menu_last >= 0 && g_menu_last < OVM_ROWS && ov_menu_item(atomic_load(&g_menu_tab), g_menu_last) >= 0 ? g_menu_last : 1;   // a controller opened it: the last row used

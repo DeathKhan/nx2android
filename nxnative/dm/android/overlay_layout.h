@@ -112,7 +112,7 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
 // rows (OVM_TAB_ITEMS). front_android.c keeps each row's value (dm_menu_value) and changes it (menu_set); gfx_vk_present.c draws a row by its kind.
 // A new choice row (one that cycles through values with left and right, "< value >"): an OVM_* item, its OVM_ROW entry, its place in a tab, and its value
 // in front_android.c dm_menu_value and menu_set ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_ACCENT, OVM_FRAMECAP, OVM_FPSPOS, OVM_PADLABEL, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_ACCENT, OVM_FRAMECAP, OVM_FPSPOS, OVM_PADLABEL, OVM_TEMPS, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
             // OVM_EDIT: the layout editor; OVM_MODE: Resolution, the level (host/dm.h DM_RES_*: Max is docked, the others handheld; a game without its own
             // dynamic-resolution settings has two, Balanced = handheld and Max = docked); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
             // OVM_ACCENT: the menu's highlight colour (OVM_ACCENTS); OVM_FRAMECAP: the frame cap (Off, 60, 30 fps: OVM_CAPS; host/hle_framecap.c);
@@ -144,11 +144,12 @@ static const ov_mrow OVM_ROW[OVM_N] = {
     [OVM_EDIT]    = {OVR_ACTION, "Edit layout", "Move and resize the touch controls", NULL, 0, "Edit"},
     [OVM_RUMBLE]  = {OVR_TOGGLE, "Rumble", "Vibration and tap feedback"},
     [OVM_FPS]     = {OVR_TOGGLE, "Show FPS", "Frame rate in the corner"},
+    [OVM_TEMPS]   = {OVR_TOGGLE, "Show temperatures", "Chip and battery, beside the FPS"},
     [OVM_MODE]    = {OVR_CHOICE, "Resolution", "Render size; Max renders as docked", OVM_RES_NAMES, 4},
     [OVM_EXPORT]  = {OVR_ACTION, "Export save", "Copy the save to the files folder", NULL, 0, "Export"},
     [OVM_IMPORT]  = {OVR_ACTION, "Import save", "Replace the save with an exported one", NULL, 0, "Import"},
     [OVM_ACCENT]  = {OVR_CHOICE, "Highlight colour", NULL, OVM_ACCENT_NAMES, OVM_ACCENTS_N, NULL, OVM_ACCENTS},
-    [OVM_FPSPOS]  = {OVR_CHOICE, "FPS position", "Corner of the frame rate counter", OVM_FPSPOS_NAMES, 4},
+    [OVM_FPSPOS]  = {OVR_CHOICE, "FPS position", "Corner of the FPS and temperatures", OVM_FPSPOS_NAMES, 4},
     [OVM_PADLABEL] = {OVR_CHOICE, "Face buttons", "A, B, X and Y by place or by their letters", OVM_PADLABEL_NAMES, 2},
     [OVM_FRAMECAP] = {OVR_CHOICE, "Frame cap", "Hold the game to a steady rate", OVM_CAP_NAMES, OVM_NCAPS, NULL, NULL, "Not for this game"},
     [OVM_RESUME]  = {OVR_RESUME, "Resume"},
@@ -156,7 +157,7 @@ static const ov_mrow OVM_ROW[OVM_N] = {
 };
 #define OVM_TABS 3
 #define OVM_PER_TAB 5   // the most rows a tab has (every tab's panel is as tall); -1: no row there (up and down skip it)
-static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_FPS, OVM_FRAMECAP, OVM_MODE, -1, -1}, {OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PADLABEL},
+static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_FPS, OVM_TEMPS, OVM_FRAMECAP, OVM_MODE, -1}, {OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PADLABEL},
                                                          {OVM_ACCENT, OVM_FPSPOS, OVM_EXPORT, OVM_IMPORT, -1}};
 static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Game", "Controls", "System"};
 #define OVM_ROWS (OVM_PER_TAB + 2)   // the tabs, a tab's rows, Resume

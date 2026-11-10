@@ -71,6 +71,7 @@ __attribute__((weak)) void dm_overlay_knob(int stick, float *dx, float *dy) { (v
 __attribute__((weak)) int64_t dm_overlay_pressed(int ctl, uint64_t bit) { (void)ctl; (void)bit; return 0; }
 __attribute__((weak)) int dm_menu_state(void) { return -1; }
 __attribute__((weak)) int dm_overlay_fps(void) { return 0; }
+__attribute__((weak)) int dm_overlay_temps(void) { return 0; }   // (front_android.c: Show temperatures)
 __attribute__((weak)) int dm_overlay_fps_pos(void) { return 0; }   // front_android.c: the counter's corner (bit 0 right, bit 1 bottom)   // front_android.c: the pause menu's Show FPS
 __attribute__((weak)) int dm_save_note(char *out, int cap) { if (cap > 0) out[0] = 0; return OVX_IDLE; }   // front_android.c: the save manager's rows
 __attribute__((weak)) int dm_save_rows(ov_srow rows[OVM_ROWS]) { (void)rows; return 0; }
@@ -802,7 +803,7 @@ static float ov_glow(int64_t t, int64_t now) {   // a held button's glow: bright
     if (!t) return 0;
     float f = (float)(now - t) / OV_FLASH_NS; return f >= 1 ? 0.22f : 0.22f + 0.48f * (1 - f) * (1 - f);
 }
-// The frame rate counter: the game's frames shown per second, measured over half a second, in the corner the player chose on a dark box. Its characters
+// The counter (ov_fps below): the frame rate and the temperatures in one box, in the corner the player chose. Its characters
 // (OV_FPS_CHARS) are rasterized at the window's resolution into the rows under the panel, one cell each (the digits white, the letters the accent's, then red copies);
 // the counter is put together from them on every present, so a changing number needs no upload
 static float ov_fps_cell(void) {   // a character cell's width in texels: TrueType's, else the pixel font's widest advance of OV_FPS_CHARS (8 columns: A, O, T), a clear texel each side
@@ -822,36 +823,39 @@ static void ov_fps_glyphs(void) {   // the characters into the rows under the pa
     }
 }
 __attribute__((weak)) void dm_android_temps(int *soc, int *bat) { *soc = *bat = -1000; }   // (front_android.c temp_watch; absent in other builds)
-// One row of the counter at y0: its box and its characters, in the corner the player chose (dm_overlay_fps_pos); on the right a box is placed as wide as "999 FPS", so it stays
-// put as the number changes (the bottom corners are clear of the gesture bar in the middle, the right ones of the system handle half way down the right edge). hot: the red copies
-static void ov_fps_row(VkCommandBuffer cb, const char *s, int hot, float y0) {
-    float cw = ov_fps_cell() * (ovf_ready() ? 0.80f : 1), ch = (float)g_ov.gh, m = (float)g_sext.height * 0.02f, r = ch / 2, x = m + r * 0.9f, gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
-    float bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1], x1 = x + (strlen(s) - (strchr(s, ' ') ? 0.55f : 0)) * cw + r * 0.1f;
-    int pos = dm_overlay_fps_pos() & 3; float bw = (7 - 0.55f) * cw + 1.9f * r, dx = pos & 1 ? (float)g_sext.width - 2 * m - bw : 0;
-    x += dx; x1 += dx;
-    ov_rect(cb, m + dx, y0, x1 + r * 0.9f, y0 + ch, bx - 2, by - 2, bx + 2, by + 2, 0.50f);   // the box: square-cornered, as much room each side
-    size_t nc = strlen(OV_FPS_CHARS);
-    for (int i = 0; s[i]; x += s[i] == ' ' ? cw * 0.45f : cw, i++) {   // (a narrower space)
-        const char *c = strchr(OV_FPS_CHARS, s[i]); if (!c || s[i] == ' ') continue;
-        float u = (float)((size_t)(c - OV_FPS_CHARS) + (hot ? nc : 0)) * ov_fps_cell(), o = (ov_fps_cell() - cw) / 2;
-        ov_rect(cb, x - o, y0, x - o + ov_fps_cell(), y0 + ch, u, gy, u + ov_fps_cell(), gy + ch, 1);
+static float ov_fps_w(const char *s, float cw) { float w = 0; for (; *s; s++) w += *s == ' ' ? cw * 0.45f : cw; return w; }   // a part's width (a narrower space)
+static void ov_fps_text(VkCommandBuffer cb, const char *s, int hot, float x, float y0, float cw) {   // a part's characters from the glyph rows; hot: the red copies
+    float ch = (float)g_ov.gh, gy = (float)(g_ov.h + g_ov.sh + g_ov.ph), cell = ov_fps_cell(), o = (cell - cw) / 2; size_t nc = strlen(OV_FPS_CHARS);
+    for (; *s; x += *s == ' ' ? cw * 0.45f : cw, s++) {
+        const char *c = strchr(OV_FPS_CHARS, *s); if (!c || *s == ' ') continue;
+        float u = (float)((size_t)(c - OV_FPS_CHARS) + (hot ? nc : 0)) * cell;
+        ov_rect(cb, x - o, y0, x - o + cell, y0 + ch, u, gy, u + cell, gy + ch, 1);
     }
 }
-// The counter: the frame rate, then the chip's and the battery's temperature where the device gives them (front_android.c dm_android_temps, upstream nx2android #150), one box
-// a row; in a bottom corner the rows grow upwards and the frame rate stays on top. Red from where it is dangerously hot: the chip at 80 C (phones throttle hard in the high 80s),
-// the battery at 45 C (Android's warnings and charging limits)
-static void ov_fps(VkCommandBuffer cb, int64_t now) {
+// The counter: one dark box in the corner the player chose (dm_overlay_fps_pos), its parts side by side: the frame rate (Show FPS: the game's frames shown per second, measured over
+// half a second) and the chip's and the battery's temperature where the device gives them (Show temperatures: front_android.c dm_android_temps, upstream nx2android #150).
+// what: bit 0 the frame rate, bit 1 the temperatures. Each part keeps the width of its widest text ("99 FPS", "SOC 99C"), so the box stays put as the numbers change; a part
+// is red from where it is dangerously hot: the chip at 80 C (phones throttle hard in the high 80s), the battery at 45 C (Android's warnings and charging limits)
+static void ov_fps(VkCommandBuffer cb, int64_t now, int what) {
     static uint64_t n0; static int64_t t0; static int fps = -1;
     uint64_t n = atomic_load(&g_fps_frames);
     if (!t0 || now - t0 > 2000000000ll) { t0 = now; n0 = n; fps = -1; }   // the first frame, or after a pause in the presents (the menu, the background): measure anew
     else if (now - t0 >= 500000000ll) { fps = (int)((double)(n - n0) * 1e9 / (double)(now - t0) + 0.5); t0 = now; n0 = n; }
-    char rows[3][16]; int nr = 0, hot[3] = {0};
-    if (fps < 0) snprintf(rows[nr++], 16, "-- FPS"); else snprintf(rows[nr++], 16, "%d FPS", fps > 999 ? 999 : fps);
-    int soc = -1000, bat = -1000; dm_android_temps(&soc, &bat);   // whole degrees C, -1000 when not known
-    if (soc > -100 && soc < 1000) { hot[nr] = soc >= 80; snprintf(rows[nr++], 16, "SOC %dC", soc); }
-    if (bat > -100 && bat < 1000) { hot[nr] = bat >= 45; snprintf(rows[nr++], 16, "BAT %dC", bat); }
-    float ch = (float)g_ov.gh, m = (float)g_sext.height * 0.02f, gap = ch * 0.15f; int bottom = (dm_overlay_fps_pos() & 2) != 0;
-    for (int i = 0; i < nr; i++) ov_fps_row(cb, rows[i], hot[i], bottom ? (float)g_sext.height - m - ch - (float)(nr - 1 - i) * (ch + gap) : m + (float)i * (ch + gap));
+    struct { char s[16]; const char *widest; int hot; } part[3]; int np = 0;
+    if (what & 1) { if (fps < 0) snprintf(part[np].s, 16, "-- FPS"); else snprintf(part[np].s, 16, "%d FPS", fps > 999 ? 999 : fps); part[np].widest = fps >= 100 ? "999 FPS" : "99 FPS"; part[np++].hot = 0; }   // (two digits unless the game runs past 99)
+    if (what & 2) {
+        int soc = -1000, bat = -1000; dm_android_temps(&soc, &bat);   // whole degrees C, -1000 when not known
+        if (soc > -100 && soc < 1000) { snprintf(part[np].s, 16, "SOC %dC", soc); part[np].widest = soc >= 100 ? part[np].s : "SOC 99C"; part[np++].hot = soc >= 80; }
+        if (bat > -100 && bat < 1000) { snprintf(part[np].s, 16, "BAT %dC", bat); part[np].widest = bat >= 100 ? part[np].s : "BAT 99C"; part[np++].hot = bat >= 45; }
+    }
+    if (!np) return;   // (Show temperatures alone on a device that gives none)
+    float cw = ov_fps_cell() * (ovf_ready() ? 0.80f : 1), ch = (float)g_ov.gh, m = (float)g_sext.height * 0.02f, r = ch / 2, pad = r * 0.9f, sep = cw * 1.1f;
+    float w = 2 * pad + (float)(np - 1) * sep; for (int i = 0; i < np; i++) w += ov_fps_w(part[i].widest, cw);
+    int pos = dm_overlay_fps_pos() & 3;   // (the bottom corners are clear of the gesture bar in the middle, the right ones of the system handle half way down the right edge)
+    float x0 = pos & 1 ? (float)g_sext.width - m - w : m, y0 = pos & 2 ? (float)g_sext.height - m - ch : m, bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1];
+    ov_rect(cb, x0, y0, x0 + w, y0 + ch, bx - 2, by - 2, bx + 2, by + 2, 0.50f);   // the box: square-cornered, as much room each side
+    float x = x0 + pad;
+    for (int i = 0; i < np; i++) { ov_fps_text(cb, part[i].s, part[i].hot, x, y0, cw); x += ov_fps_w(part[i].widest, cw) + sep; }
 }
 static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) {   // (alpha: the player's opacity; each control at its own size factor)
     float W = (float)g_sext.width, H = (float)g_sext.height, k = H / t->dh * dm_overlay_scale(), b[4]; const ov_ctl *L = OV_LAYOUTS[t->layout];
@@ -936,7 +940,7 @@ static void ov_render(VkCommandBuffer cb, int mode, int menu, int fps) {
             ov_rect(cb, p[0], p[1], p[0] + p[2], p[1] + p[3], pr[0], y0 + pr[1], pr[0] + pr[2], y0 + pr[1] + pr[3], 1);
         }
     }
-    if (fps && menu < 0) ov_fps(cb, now);
+    if (fps && menu < 0) ov_fps(cb, now, fps);
 }
 // the theme's atlas for a layout into its texture, once (overlay_theme.c reads it at the first present that shows the gamepad in that layout): copied in this
 // present's command buffer; its staging buffer goes at a later present, once the copy has run (its slot's fence signalled, or the slot came round again)
@@ -1146,7 +1150,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     VkImageLayout lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     int external = dm_external_active();
-    int ovm = external ? 0 : dm_overlay_visible(), menu = external ? -1 : dm_menu_state(), fps = dm_overlay_fps();
+    int ovm = external ? 0 : dm_overlay_visible(), menu = external ? -1 : dm_menu_state(), fps = dm_overlay_fps() | dm_overlay_temps() << 1;   // (the counter's parts: ov_fps)
     if ((ovm || menu >= 0 || fps) && overlay_ready(cb, k, menu) && (V.has_dynrender || ov_fb(idx))) {   // without dynamic rendering, only with the image's framebuffer
         barrier(cb, tgt, lay, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); lay = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, tview, lay, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE};
