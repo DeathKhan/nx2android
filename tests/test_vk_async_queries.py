@@ -44,7 +44,7 @@ typedef int VkPipelineLayout;
 enum { RD_SSBO=1, RD_STORAGE=2, RD_STORAGE_TBUF=3, NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET=4, APQ=256 };
 typedef struct { int flags,desc; } dmsv_bind;
 typedef struct { int xfb,nbind; dmsv_bind *b; } vkshader_t;
-typedef struct { uint64_t key[3]; int raster_discard; } pkey;
+typedef struct { uint64_t key[3]; uint32_t alt; int raster_discard; } pkey;
 typedef struct { uint64_t rt_frames; int w,h,nvn_format; } vkimg_t;
 typedef struct { VkPipeline values[32]; } nvn_hmap;
 static nvn_hmap g_pipes;

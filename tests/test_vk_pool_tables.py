@@ -23,7 +23,9 @@ def fixture(source):
     kinds = function(source, "static unsigned tbl_kinds(") if "static unsigned tbl_kinds(" in source else ""
     draw = function(source, "static int prepare_draw(")
     start = draw.index("    vkshader_t *ts = NULL;")
-    selection = draw[start:draw.index("    uint64_t tdesc =", start)]
+    # the stage loop and the table set; it ends at the pass-order check that follows them (g_order_check), where there is one
+    end = draw.index("    if (g_order_check)", start) if "    if (g_order_check)" in draw else draw.index("    uint64_t tdesc =", start)
+    selection = draw[start:end]
     return r"""
 #include <vulkan/vulkan_core.h>
 #include <stdint.h>
@@ -48,7 +50,7 @@ typedef struct {uint64_t key;int ntbl,npool,tbl_reg,tbl_off,nbind,set;uint8_t tb
 static struct { p_bind_buf ubo[6][16]; vkshader_t *sh[6]; } S;
 static struct {VkDevice dev;} V;
 static uint64_t g_set_epoch=1,g_tex_gen=1,g_samp_gen=1,clock_,allocs;
-static int g_tracing,g_x_nosetc,g_pool_tex_base,g_pool_samp_base,g_var_now,g_fs_buffer_collect;
+static int g_tracing,g_x_nosetc,g_x_nosetc_bits,g_pool_tex_base,g_pool_samp_base,g_var_now,g_fs_buffer_collect;
 static uint64_t g_ring_full,g_ring_patch,g_ring_ids,g_ring_hits,g_ring_none,g_ring_ns;
 static int g_pool_strict,g_pdum_lo=-1,g_pdum_hi,g_pdum_nf;
 static unsigned g_pdum_kinds,g_pdum_f[16];
@@ -110,7 +112,8 @@ static void mock_update(VkDevice dev,uint32_t n,const VkWriteDescriptorSet *w,ui
 }
 #define vkUpdateDescriptorSets mock_update
 HELPERS
-static VkDescriptorSet stage_set(int st,vkshader_t *shader,uint32_t *offsets){(void)st;(void)shader;(void)offsets;return VK_NULL_HANDLE;}
+static uint64_t g_set_memo;static int g_stn[3],g_coll_st=-1; // the stage loop's image collection (vk_watch), idle here
+static VkDescriptorSet stage_set(int st,vkshader_t *shader,uint32_t *offsets,VkDescriptorBufferInfo *indirect){(void)st;(void)shader;(void)offsets;(void)indirect;return VK_NULL_HANDLE;}
 static __attribute__((unused)) VkDescriptorSet draw_tables(int discard) {
     struct {int raster_discard;uint64_t um[3],im[3];} k={.raster_discard=discard};
     VkDescriptorSet sets[6]={0},tbl=VK_NULL_HANDLE;uint32_t dofs[6][96];
@@ -343,6 +346,11 @@ static int vk_tex_by_id(int id,const view_t **view,const tex_t **t){(void)id;*vi
 static int view_num(const tex_t*t,const view_t*v){(void)t;(void)v;return 0;}
 static int vk_tex_pool_ok(const tex_t*t){(void)t;return 2;}
 static void vk_tex_pool_fill(int on){(void)on;}
+static pthread_mutex_t g_view_mu=PTHREAD_MUTEX_INITIALIZER;
+DROPLOG
+static void drop(const void *im){ // as vk_tex_view_drop_all logs an image whose views went
+ pthread_mutex_lock(&g_view_mu);g_droplog[g_droplog_seq%DROPLOG_N]=im;__atomic_store_n(&g_droplog_seq,g_droplog_seq+1,__ATOMIC_RELEASE);pthread_mutex_unlock(&g_view_mu);
+}
 MEMHANDLE
 static void tex_desc_for(int st,const dmsv_bind*b,uint64_t h,VkDescriptorImageInfo*d,int x){
  (void)st;(void)b;(void)x;uint64_t t,s;assert(vk_registry_snapshot(&t,&s));
@@ -395,6 +403,15 @@ int main(int argc,char **argv){
  }else if(mode==7){
   VkDescriptorSet a=take();g_samp_gen++;next(1);
   assert(take()==a&&sampler(a)==1002&&sampler_updates==2);
+ }else if(mode==9){
+  // An image whose views went: the set that holds it is not reused as it is; its IDs are written again (a patch),
+  // and more drops than the log holds rewrite the set whole.
+  VkDescriptorSet a=take();unsigned fulls=g_ring_full,patches=g_ring_patch,iu=image_updates,u=updates;
+  assert(take()==a&&updates==u); // unchanged: a fast hit
+  next(1);assert(take()==a&&image_updates==iu&&g_ring_patch==patches+1);patches=g_ring_patch;
+  drop(&image);next(1);assert(take()==a&&g_ring_full==fulls&&g_ring_patch==patches+1&&image_updates>iu);
+  for(int i=0;i<=DROPLOG_N;i++)drop(&image);
+  next(1);assert(take()==a&&g_ring_full==fulls+1);
  }else if(mode==8){
   VkDescriptorSet a=take();next(4);assert(take()==a&&sampler(a)==1002);
   assert(sampler_updates==1&&g_ring_patch==1);
@@ -405,7 +422,8 @@ int main(int argc,char **argv){
 """.replace("DEFS", defs).replace("SNAPSHOT", function(tex, "int vk_registry_snapshot(")).replace(
         "JOBSEQ", function(tex, "static int registry_job_sampler_seq(")).replace(
         "JOBLOOKUP", function(tex, "static const samp_par *samp_job_at(int sid) {")).replace(
-        "MEMHANDLE", function(source, "static uint64_t mem_handle(")).replace("\nRING\n", "\n" + ring + "\n")
+        "MEMHANDLE", function(source, "static uint64_t mem_handle(")).replace("\nRING\n", "\n" + ring + "\n").replace(
+        "\nDROPLOG\n", "\n" + tex[tex.index("enum { DROPLOG_N"):tex.index("static void vk_tex_view_drop_all(", tex.index("enum { DROPLOG_N"))] + "\n")
 
 
 class PoolTables(unittest.TestCase):
@@ -455,7 +473,7 @@ class PoolTables(unittest.TestCase):
                                 str(c), "-o", str(exe)], check=True)
                 return exe
             exe = compile_one(source, "candidate")
-            for mode in range(9):
+            for mode in range(10):
                 subprocess.run([str(exe), str(mode)], check=True, timeout=15)
             # Recreate the previous global-generation-only hit/update predicates.
             previous = source.replace(" && r->sampseq == sampseq", "").replace(
@@ -475,8 +493,9 @@ class PoolTables(unittest.TestCase):
         self.assertIn("st < 3", draw)
         self.assertIn("!(st == 1 && k.raster_discard)", draw)
         self.assertIn("tbl_set(ts ? tst : 0, ts, poolmask)", draw)
-        mesh = function(source, "static void mesh_draw(const p_draw *d) {")
-        self.assertIn("prepare_draw(prim, 1)", mesh)
+        mesh = function(source, "static void mesh_draw(const p_draw *d) {")   # the batches of a draw: each prepares its draw like any other
+        self.assertIn("mesh_draw_one(d, b)", mesh)
+        self.assertIn("prepare_draw(prim, 1)", function(source, "static void mesh_draw_one(const p_draw *d, uint32_t batch) {"))
         shader = (ROOT / "nxnative/dm/android/gfx_vk_shader.c").read_text(encoding='utf-8')
         self.assertIn('stage > 4) pfail = "a compute kernel has no pool table set"', shader)
 

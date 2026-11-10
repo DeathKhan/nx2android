@@ -71,6 +71,8 @@ int main(void) {
         # pool_zero_copy takes a slab slot and, failing that, a kept buffer of the same size (the zcf cache): both, beside the logging
         helpers += src[src.index('typedef struct { AHardwareBuffer *ahb; VkBuffer buf; VkDeviceMemory mem; uint64_t size, fence; } zcfree_t;'):src.index('// Small pools take a slot of a slab')]
         helpers += src[src.index('#define SLAB_POOL_MAX'):src.index('// Zero copy: the pages of')]
+        # the device-address chain and address every backing takes (zero for a device without the feature), and the copy into a fresh buffer's pages
+        helpers = src[src.index('#define BDA_ALLOC_FLAGS'):src.index('static VkResult pool_copied_alloc(')] + src[src.index('static uint64_t g_zc_copied'):src.index('// Freed zero-copy pools')] + helpers
         start = src.index('static int pool_zero_copy(')
         function = src[start:src.index('\n}\n', start) + 3]
         harness = r'''
@@ -81,6 +83,7 @@ struct ANativeWindow;
 #include <vulkan/vulkan_android.h>
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -100,8 +103,10 @@ typedef struct { uint32_t width, height, layers, format; uint64_t usage; uint32_
 #define AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER 16777216
 #define POOL_USAGE VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
 struct slab_t;   // SLABS below defines it
-typedef struct { VkBuffer buf; VkDeviceMemory mem; AHardwareBuffer *ahb; int zero_copy; uint64_t boff; struct slab_t *slab; uint32_t slot; } vkpool_t;
-static struct { VkDevice dev; } V;
+typedef struct { VkBuffer buf; VkDeviceMemory mem; AHardwareBuffer *ahb; int zero_copy; uint64_t boff, gpu; struct slab_t *slab; uint32_t slot; } vkpool_t;
+static struct { VkDevice dev; int has_bda; } V;
+static PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress;   // (V.has_bda 0: no device addresses)
+static const char *vk_mem_tag;
 static uint64_t vk_fence_done(void) { return 0; }
 uint64_t mtl_last_fence(void) { return 0; }
 static int failure, released, closed, destroyed, messages;
@@ -175,9 +180,10 @@ int main(void) {
             if (enabled) assert(strstr(last, names[failure]));
         }
     }
-    failure = -1; released = closed = destroyed = 0; vkpool_t p = {0};
+    failure = -1; released = closed = destroyed = 0; vkpool_t p = {0}; uint64_t moved = g_zc_copied + g_zc_skipped;
     assert(pool_zero_copy(&p, memory, 64) == 0 && p.zero_copy && p.ahb);
     assert(closed == 3 && released == 0 && destroyed == 0 && memcmp(memory, temporary, 64) == 0);
+    assert(!p.gpu && !vk_mem_tag && g_zc_copied + g_zc_skipped - moved == 64);   // (the tag is cleared after the import's allocation; the pool's 64 bytes are all accounted)
     uint64_t t = mem_diag_ns(); mem_diag_note(1, t, 1048576);
     assert(strstr(last, "cpu-to-gpu: last 1.00 ms / 1.00 MiB, mean 1.00 ms / 1.00 MiB (1 calls)"));
     assert(strstr(last, "fault-released-pages=7 prep-pages=3"));
@@ -198,7 +204,7 @@ int main(void) {
     assert(strstr(last,"mean total 14.00 ms, invalidate 6.40 ms (45.7%, 1.60 MiB), 5 submissions"));
     return 0;
 }
-'''.replace('HELPERS', helpers).replace('FUNCTION', function)
+'''.replace('\nHELPERS\nFUNCTION\n', '\n' + helpers + function + '\n')
         with tempfile.TemporaryDirectory(prefix='nx2a-memdiag-test-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
             c.write_text(harness, encoding='utf-8')

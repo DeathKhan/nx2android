@@ -129,7 +129,7 @@ COMPLETION
             return src[start:src.index('\n}\n', start)+3]
         usage = src[src.index('static const VkBufferUsageFlags POOL_USAGE0'):src.index('static VkResult pool_copied_alloc(')]
         start = src.index('        const char *e = getenv("DM_VK_POOL_CACHED")')
-        select = src[start:src.index('\n    }\n    pthread_rwlock_wrlock(&g_pool_mu);', start)]
+        select = src[start:src.index('\n    }\n    p->backed = 1;', start)]   # pool_back_locked's copied-pool choice (the block ends where the chunk is marked backed)
         harness = r'''
 #define _GNU_SOURCE
 #define VK_NO_PROTOTYPES
@@ -138,8 +138,10 @@ COMPLETION
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
-static struct { VkDevice dev; VkPhysicalDeviceMemoryProperties mem; VkPhysicalDeviceProperties props; int has_xfb; } V;
-typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *shadow; int noncoherent; uint64_t lo, hi; } vkpool_t;
+static struct { VkDevice dev; VkPhysicalDeviceMemoryProperties mem; VkPhysicalDeviceProperties props; int has_xfb, has_bda; } V;
+typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *shadow; int noncoherent; uint64_t lo, hi, gpu; } vkpool_t;
+static PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress;   // (no device addresses here: V.has_bda 0)
+static const char *vk_mem_tag;
 static int failure, buffers, memories, mapped, creates, allocs, types[8];
 static uint32_t allowed=3;
 static VkResult failure_result=VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -215,6 +217,7 @@ int main(int argc, char **argv) {
         allocs=creates=0;
     }
     create(&p,65); assert(types[0]==1 && p.noncoherent);
+    assert(!p.gpu && !vk_mem_tag);
     p.hi=65; pool_cache_sync(&p,0,0,65); pool_cache_sync(&p,1,0,65); assert(cache_calls==2);
     drop(&p); allocs=creates=0;
     for (int i=1;i<=4;i++) {
@@ -233,7 +236,7 @@ int main(int argc, char **argv) {
     unsetenv("DM_VK_POOL_CACHED"); p=(vkpool_t){0}; create(&p,65);
     assert(types[0]==0 && creates==1 && !p.noncoherent); drop(&p);
 }
-'''.replace('MEM_TYPE', function('uint32_t vk_mem_type(')).replace('USAGE', usage).replace('ALLOCATE', function('static VkResult pool_copied_alloc(')).replace('\nCACHE\n', '\n' + function('static void pool_cache_sync(') + '\n').replace('SELECT', select)
+'''.replace('\nMEM_TYPE\nUSAGE\nALLOCATE\nCACHE\n', '\n' + function('uint32_t vk_mem_type(') + usage + function('static VkResult pool_copied_alloc(') + function('static void pool_cache_sync(') + '\n').replace('\nSELECT\n', '\n' + select + '\n')
         with tempfile.TemporaryDirectory(prefix='nx2a-cached-pool-') as tmp:
             c, exe = Path(tmp)/'check.c', Path(tmp)/'check'
             c.write_text(harness, encoding='utf-8')

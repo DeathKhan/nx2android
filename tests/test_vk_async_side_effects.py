@@ -32,7 +32,7 @@ class AsyncSideEffects(unittest.TestCase):
 #include <stddef.h>
 DECLARATIONS
 typedef struct { int xfb, nbind; const dmsv_bind *b; } vkshader_t;
-typedef struct { int raster_discard; } pkey;
+typedef struct { int alt, raster_discard; } pkey;
 static int g_async_pipe = 1, counting;
 static int vk_occ_counting(void) { return counting; }
 static struct { vkshader_t *sh[5]; } S;
@@ -49,6 +49,8 @@ int main(void) {
     counting=1; assert(!otherwise_eligible(&k)); counting=0;
     g_async_pipe = 0; assert(!otherwise_eligible(&k)); g_async_pipe = 1;
     k.raster_discard = 1; assert(!otherwise_eligible(&k)); k.raster_discard = 0;
+    // The validated observer pair (pkey.alt 2) is built at once; a generic alternate-code key (alt 1) is not held back.
+    k.alt = 2; assert(!otherwise_eligible(&k)); k.alt = 1; assert(otherwise_eligible(&k)); k.alt = 0;
 
     // Reflection values from shipped Bananza terrain GS 5d537f7630ec3671:
     // both storage bindings have flags=0 despite OpAtomicIAdd and

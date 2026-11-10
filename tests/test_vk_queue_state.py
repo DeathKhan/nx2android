@@ -118,7 +118,8 @@ static void nvn_event_publish_gpu(volatile uint32_t *word,unsigned mode,uint32_t
 HELPER
 static struct {uint64_t addr,fence;int kind;} g_rc_pend[4];
 static int g_rc_npend;
-static int rc_occ_has(uint64_t a){(void)a;return 0;}
+static uint64_t occ_addr,occ_fence; // the occlusion-report table (g_rc_occ): an address and the submission of its latest report
+static uint64_t rc_occ_fence(uint64_t a){return a==occ_addr?occ_fence:0;}
 VALUE
 int main(void){
  volatile uint32_t event=0;post_op ops[]={{.kind=1,.val=&event,.mode=0,.v=3},{.kind=2},{.kind=1,.val=&event,.mode=1,.v=4}};
@@ -130,6 +131,9 @@ int main(void){
  g_rc_pend[0].kind=1;__atomic_store_n(&g_reports_done,9,__ATOMIC_RELEASE);
  bytes=456;assert(rc_value((uintptr_t)&bytes,&v)&&v==456); // completed report, then CPU rewrite
  g_rc_pend[0].kind=2;assert(rc_value((uintptr_t)&bytes,&v)&&v==456); // completed unknown GPU writer is now readable
+ g_rc_npend=0;occ_addr=(uintptr_t)&bytes;occ_fence=10;bytes=789;
+ assert(!rc_value((uintptr_t)&bytes,&v)); // an occlusion counter whose latest report has not landed stays unknown, even out of the pending list
+ __atomic_store_n(&g_reports_done,10,__ATOMIC_RELEASE);assert(rc_value((uintptr_t)&bytes,&v)&&v==789); // then reads what the GPU wrote
  return 0;
 }
 """.replace("HELPER", helper).replace("VALUE", value)
