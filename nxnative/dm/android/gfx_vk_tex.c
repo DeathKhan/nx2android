@@ -252,6 +252,10 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f, VkImageUsageFlags extr
         ci.usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; im->usage = ci.usage; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
     if (r) { VKRED_ONCE(10, "vkCreateImage failed (%d): %ux%ux%u format %#x (vk %d) target %d levels %u layers %u samples %u", r, im->w, im->h, im->d, d->format, f->vk, d->target, im->levels, im->layers, im->samples); free(im); return NULL; }
     VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im->img, &req);
+    // Probe (logging only): an image of 256 MB or more, with whether its pool is VIRTUAL (sparse on the Switch, where only its touched pages have memory; here it is made
+    // whole). Before a size cap such as droidplay-core 6ab2640b4's: whether any game makes one at all
+    if (req.size >= (256ull << 20)) { static int n; if (n++ < 8) VKLOG("[probe] image of %.0f MB: %ux%ux%u, %u levels, %u layers, nvn format %#x (vk %d), texture flags %#x, pool flags %#x%s",
+        req.size / 1048576.0, im->w, im->h, im->d, im->levels, im->layers, d->format, f->vk, d->flags, t->pool ? t->pool->flags : 0, t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? " (VIRTUAL: sparse on the Switch)" : ""); }
     if ((ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) && im->w >= 256) { static int n; if (n++ < 16)   // UBWC check: a compressed target takes room for its metadata
         VKLOG("target %ux%u format %d%s: %llu bytes", im->w, im->h, f->vk, im->fixed_fmt ? " (format-listed)" : "", (unsigned long long)req.size); }
     VkDeviceSize moff;
@@ -733,8 +737,21 @@ static int tex_storage_ok(const tex_t *t, const vkfmt_t *f, int unc) {
              || ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(f && f->compressed)));
 }
 static void cpu_unc_take(const tex_t *t) { vcs_unc_take(t->serial, (uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size); }
+// Probe (logging only), where unc_rule is off: an uncompressed 2D texture whose storage the CPU flushed (nvnMemoryPoolFlushMappedRange, hle_nvn.c nvn_flushed) or that lies
+// in a CPU_UNCACHED pool, with data in it at its first use, starts as zeros here. droidplay-core 4a9f4ec6b fills such a texture once from its storage (Breath of the Wild's sky
+// table); whether any of our games has one, the first 8 say (DM_NVN_STORAGE_UNC=1 takes them from storage). At most 4096 textures are looked at
+static void unc_fill_probe(const tex_t *t, const vkfmt_t *f) {
+    static int checked, logged; int nvn_flushed(const void *p, uint64_t n);
+    if (logged >= 8 || checked >= 4096 || !tex_storage_ok(t, f, 1)) return;
+    if (!(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) && !nvn_flushed(t->mem, t->L.size)) return;
+    checked++;
+    if (vcs_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size) || !mem_any(t->mem, t->L.size)) return;
+    logged++; VKLOG("[probe] texture %ux%u nvn format %#x at %p (pool flags %#x): its storage %s and holds data at its first use, but it starts as zeros (no fill from storage: DM_NVN_STORAGE_UNC=1 takes it)",
+                    t->d.width, t->d.height, t->d.format, (const void *)t->mem, t->pool->flags, t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED ? "is CPU_UNCACHED" : "was flushed by the CPU");
+}
 static int cpu_content_unc(const tex_t *t, const vkfmt_t *f) {   // first use, uncompressed 2D (above)
-    if (!unc_rule() || !tex_storage_ok(t, f, 1)) return 0;
+    if (!unc_rule()) { unc_fill_probe(t, f); return 0; }
+    if (!tex_storage_ok(t, f, 1)) return 0;
     if (vcs_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size) || !mem_any(t->mem, t->L.size)) return 0;
     static int n; if (n++ < 8) VKLOG("texture %ux%u nvn format %#x at %p (pool flags %#x): uncompressed, written by the CPU before its first use in storage the GPU has not written: uploaded from its storage",
                                      t->d.width, t->d.height, t->d.format, (const void *)t->mem, t->pool->flags);
