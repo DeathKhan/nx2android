@@ -5,6 +5,7 @@ libasan or libubsan, so harnesses that mprotect pools, call setenv or run under 
 are skipped there (each test's skip says which); macOS and Linux run them.
 """
 import functools
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -25,14 +26,16 @@ int main(void) {
 '''
 
 
-def _builds(code, *flags):
+def _builds(code, *flags, env=None):
     if not shutil.which('cc'):
         return False
     with tempfile.TemporaryDirectory() as d:
         c = Path(d) / 'probe.c'
         c.write_text(code, encoding='utf-8')
         try:
-            return subprocess.run(['cc', *flags, str(c), '-o', str(Path(d) / 'probe')], capture_output=True, timeout=60).returncode == 0
+            if subprocess.run(['cc', *flags, str(c), '-o', str(Path(d) / 'probe')], capture_output=True, timeout=60).returncode:
+                return False
+            return env is None or subprocess.run([str(Path(d) / 'probe')], capture_output=True, timeout=60, env=env).returncode == 0
         except (OSError, subprocess.SubprocessError):
             return False
 
@@ -53,3 +56,9 @@ def ubsan():
 def sanitizers():
     """cc links -fsanitize=address,undefined (the harnesses built under both sanitizers; MinGW has no libasan or libubsan)."""
     return _builds('int main(void) { return 0; }\n', '-std=c11', '-fsanitize=address,undefined')
+
+
+@functools.lru_cache(maxsize=None)
+def leaks():
+    """An ASan program runs with detect_leaks=1 (LeakSanitizer: Linux has it, macOS on arm64 does not)."""
+    return _builds('int main(void) { return 0; }\n', '-fsanitize=address', env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=1'})

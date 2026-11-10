@@ -53,7 +53,7 @@ static uint8_t memory[4096];static tex_t texture={.serial=7};static int log_coun
 static void mock_log(const char *f,...){(void)f;log_count++;}
 #define VKLOG(...) mock_log(__VA_ARGS__)
 static void *vk_pool_peek(uint64_t a,uint64_t n){return a>=0x1000&&a<=0x2000&&n<=0x2000-a?memory:NULL;}
-static void vk_ubd_read(uint64_t a,uint64_t n,uint8_t *p){assert(vk_pool_peek(a,n));memcpy(p,memory+a-0x1000,n);}
+static void vk_ubd_read(uint64_t a,uint64_t n,uint8_t *p){assert(vk_pool_peek(a,n));memcpy(p,memory+(a-0x1000),n);}
 static int vk_tex_by_id(int id,const view_t **v,const tex_t **t){*v=NULL;*t=&texture;return id==42;}
 HELPER
 static const dmsv_bind vb[]={{.kind=RK_SUPPORT},{.kind=RK_CBUF,.reg=0,.count=1},{.kind=RK_TEX,.desc=RD_SAMPLED,.reg=0,.count=1,.samp=RS_TEX,.dim=1}};

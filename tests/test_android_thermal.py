@@ -21,6 +21,9 @@ HARNESS = r'''
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__   // macOS names only the calling thread (pthread_setname_np(name)); Android and Linux name any thread
+#define pthread_setname_np(thread, name) ((void)(thread), (void)(name), 0)
+#endif
 static int logs, opens, acquires, statuses, status = 3; static pthread_t main_thread, status_thread; static char last[512];
 #define LOG(...) do { snprintf(last, sizeof last, __VA_ARGS__); __atomic_fetch_add(&logs, 1, __ATOMIC_RELAXED); } while (0)
 static int fake_manager;

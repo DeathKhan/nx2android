@@ -30,11 +30,11 @@ class RenderDocCapture(unittest.TestCase):
 #include <string.h>
 #include <sys/stat.h>
 static RENDERDOC_API_1_6_0 api;
-static unsigned mode, opens, closes, resolves, gets, triggers, num, queried, pathmode, written;
+static unsigned mode, opens, closes, resolves, api_gets, triggers, num, queried, pathmode, written;
 static char last_log[2048], templ[1024];
 static void mock_log(const char *fmt, ...) { va_list a; va_start(a,fmt); vsnprintf(last_log,sizeof last_log,fmt,a); va_end(a); }
 #define LOG(...) mock_log(__VA_ARGS__)
-static int getapi(RENDERDOC_Version v, void **out) { gets++; assert(v==eRENDERDOC_API_Version_1_6_0); *out=&api; return mode!=4; }
+static int getapi(RENDERDOC_Version v, void **out) { api_gets++; assert(v==eRENDERDOC_API_Version_1_6_0); *out=&api; return mode!=4; }
 static void *mock_dlsym(void *h, const char *name) {
     resolves++; assert(!strcmp(name,"RENDERDOC_GetAPI"));
     return (mode==1 || (h==(void *)0x123 && mode!=3)) ? (void *)getapi : NULL;
@@ -65,7 +65,7 @@ static uint32_t getcapture(uint32_t idx, char *p, uint32_t *n, uint64_t *t) {
 """ + src + r"""
 #undef stat
 static void reset(unsigned m) {
-    mode=m;opens=closes=resolves=gets=triggers=num=queried=pathmode=written=0;last_log[0]=templ[0]=0;
+    mode=m;opens=closes=resolves=api_gets=triggers=num=queried=pathmode=written=0;last_log[0]=templ[0]=0;
     g_rdoc=NULL;g_rdoc_handle=NULL;atomic_store(&g_rdoc_pending,0);g_rdoc_before=0;
     memset(&api,0,sizeof api);api.SetCaptureFilePathTemplate=setpath;api.GetNumCaptures=getnum;api.GetCapture=getcapture;api.TriggerCapture=trigger;
     setenv("DM_ROOT","/app/files",1);
@@ -88,7 +88,7 @@ int main(void) {
     num=4;pathmode=1;dm_renderdoc_poll();assert(atomic_load(&g_rdoc_pending));
     pathmode=0;written=1;dm_renderdoc_poll();assert(!atomic_load(&g_rdoc_pending)&&queried==3);
     assert(strstr(last_log,"capture completed")&&strstr(last_log,"bytes 12345"));
-    dm_renderdoc_poll();assert(triggers==1);dm_renderdoc_capture();assert(triggers==2&&gets==1);
+    dm_renderdoc_poll();assert(triggers==1);dm_renderdoc_capture();assert(triggers==2&&api_gets==1);
     num=5;written=0;dm_renderdoc_poll();assert(!atomic_load(&g_rdoc_pending));
     assert(strstr(last_log,"file not accessible")&&!strstr(last_log,"capture completed"));
     reset(2);dm_renderdoc_capture();assert(opens==1&&!closes&&g_rdoc_handle==(void *)0x123);
@@ -96,12 +96,12 @@ int main(void) {
     assert(strstr(last_log,"invalid path length"));
     reset(2);dm_renderdoc_capture();num=1;pathmode=3;dm_renderdoc_poll();assert(!atomic_load(&g_rdoc_pending));
     reset(2);pthread_t th[12];for(unsigned i=0;i<12;i++)assert(!pthread_create(&th[i],NULL,request_thread,NULL));
-    for(unsigned i=0;i<12;i++)pthread_join(th[i],NULL);assert(triggers==1&&gets==1&&opens==1);
+    for(unsigned i=0;i<12;i++)pthread_join(th[i],NULL);assert(triggers==1&&api_gets==1&&opens==1);
     puts("RenderDoc actual module: all cases passed");return 0;
 }
 #else
 int main(void) { reset(1);dm_renderdoc_capture();dm_renderdoc_poll();dm_renderdoc_status();
-    assert(!resolves&&!opens&&!gets&&!triggers&&!atomic_load(&g_rdoc_pending));return 0; }
+    assert(!resolves&&!opens&&!api_gets&&!triggers&&!atomic_load(&g_rdoc_pending));return 0; }
 #endif
 """
         tdroot = ROOT / "target/tests"

@@ -35,6 +35,9 @@ class AsyncFrameIdentity(unittest.TestCase):
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
+#ifdef __APPLE__   // macOS names only the calling thread (pthread_setname_np(name)); Android and Linux name any thread
+#define pthread_setname_np(thread, name) ((void)(thread), (void)(name), 0)
+#endif
 typedef int NVNqueue;
 typedef int tex_t;
 typedef uint64_t NVNcommandHandle;

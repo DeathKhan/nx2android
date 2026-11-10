@@ -30,7 +30,8 @@ int main(void){
   assert(rgb[0]==(float)ldexp((double)m,(int)e-24));
   assert(rgb[1]==(float)ldexp((double)g,(int)e-24)&&rgb[2]==(float)ldexp((double)b,(int)e-24));
   assert(isfinite(rgb[0])&&isfinite(rgb[1])&&isfinite(rgb[2]));
- }return 0;
+ }
+ return 0;
 }
 """
         self.assertIn("case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:",extract(src,"static uint32_t cs_trace_bpp("))

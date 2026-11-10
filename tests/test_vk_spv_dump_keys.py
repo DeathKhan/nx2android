@@ -93,7 +93,7 @@ int main(int argc,char **argv) {
         for p in output.glob("*.spv*"):
             p.unlink()
         subprocess.run([str(self.exe), mode, str(output)], check=True,
-                       env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1"})
+                       env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1" if host_cc.leaks() else "detect_leaks=0"})   # macOS on arm64 has no LeakSanitizer
 
     def test_strict_parser_all_or_nothing_and_bounds(self):
         self.run_case("parser")

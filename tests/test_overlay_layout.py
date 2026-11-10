@@ -129,7 +129,7 @@ int main(void) {
             (tmp / 'android_profile.h').write_text(android_profile.header(None), encoding='utf-8')
             c, exe = tmp / 'check.c', tmp / 'check'
             c.write_text(harness, encoding='utf-8')
-            result = subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', f'-I{tmp}',
+            result = subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers', f'-I{tmp}',   # (clang: the menu rows leave trailing fields 0)
                                      f'-I{DM / "android"}', f'-I{DM / "host"}', str(c), '-lm', '-o', str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             result = subprocess.run([str(exe)], capture_output=True, text=True)

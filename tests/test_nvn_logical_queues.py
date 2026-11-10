@@ -38,7 +38,9 @@ static uint64_t replay_ids[128], seen_prog, seen_tex, present_tex;
 static int nids;
 static uint8_t active_ids[128];
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000+t.tv_nsec; }
+#ifndef __APPLE__   // macOS has it (<time.h>)
 static uint64_t clock_gettime_nsec_np(clockid_t c) { struct timespec t; clock_gettime(c,&t); return (uint64_t)t.tv_sec*1000000000+t.tv_nsec; }
+#endif
 static int relative_wait(pthread_cond_t *cv,pthread_mutex_t *mu,const struct timespec *r) {
  struct timespec t; clock_gettime(CLOCK_REALTIME,&t); t.tv_sec+=r->tv_sec;t.tv_nsec+=r->tv_nsec;if(t.tv_nsec>=1000000000){t.tv_sec++;t.tv_nsec-=1000000000;}
  return pthread_cond_timedwait(cv,mu,&t);
