@@ -11,12 +11,20 @@ This is the Android port of [nxnative](https://github.com/seedds/nxnative), whic
 
 ## This fork: Nintendo Switch 2 games
 
-This fork adds Nintendo Switch 2 games to the porter, tuned on an AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver). It also carries a re-sync of the vendored nxnative with upstream.
+This fork adds Nintendo Switch 2 games to the porter, tuned on an AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver). It also keeps the vendored nxnative trued up with upstream: nx2android's and nxnative's commits are taken one by one onto the fork's own work, with nxnative's Metal fixes ported to the Vulkan backend where they apply.
+
+Screenshots from the Odin 3 (the game's own picture, overlay off); frame rates as measured there.
+
+| | |
+|:---:|:---:|
+| ![Donkey Kong Bananza](docs/images/donkey-kong-bananza.jpg)<br>Donkey Kong Bananza<br><sub>this fork · update v458752 with DLC · 60 fps in caves and indoors, 30 outdoors</sub> | ![Nintendo Switch 2 Welcome Tour](docs/images/nintendo-switch-2-welcome-tour.jpg)<br>Nintendo Switch 2 Welcome Tour<br><sub>this fork · update 1.0.4 · 60 fps in the intro and expo hall (with the app's frame cap at 30 here: GPU 4-22 ms a frame)</sub> |
+| ![The Legend of Zelda: Ocarina of Time](docs/images/the-legend-of-zelda-ocarina-of-time.jpg)<br>The Legend of Zelda: Ocarina of Time<br><sub>this fork · update v131072 · 20-30 fps (30 outdoors in Kokiri Forest) · **work in progress**: plays from a save; lit surfaces bloom too bright, the title movie's enhancement network is skipped</sub> | |
 
 | Game | State on the Odin 3 |
 |---|---|
 | Donkey Kong Bananza (with its DLC) | Plays. 60 fps in caves and indoors, 30 outdoors (GPU work being cut); handheld mode by default |
-| Nintendo Switch 2 Welcome Tour | Plays. Intro video and expo hall at 60 fps; mouse exhibits need a Joy-Con 2 mouse, which the host does not provide yet |
+| Nintendo Switch 2 Welcome Tour | Plays. Intro video and expo hall at 60 fps; mouse exhibits open with `DM_MOUSE=1` (the right stick or the touchscreen is the Joy-Con 2 mouse, R / ZR its buttons) |
+| The Legend of Zelda: Ocarina of Time | Work in progress. Loads a save and plays in Kokiri Forest at 20-30 fps (GPU about 20 ms a frame outdoors, mesh shaders run as compute); lit surfaces bloom too bright (open) |
 
 What the Switch 2 support adds, in short:
 
@@ -24,6 +32,8 @@ What the Switch 2 support adds, in short:
 - **Shaders:** NVN2 control sections, Ampere (sm86) jobs, push constants in bank 24, raw global memory through a pool table and buffer device addresses, per-vertex fragment inputs through a generated geometry shader on drivers without fragment-shader barycentrics, and task / mesh shaders run as compute plus an indirect draw on drivers without mesh shaders.
 - **Host:** the Switch 2 additions to vi, hid, oe and time; 614.4 MHz NVN timestamps; acceleration-structure size queries; zero-copy H.264 video (MediaCodec into Vulkan); memory pools backed on first GPU use and an image budget, so games with large pools fit in 16 GB; texture handle tables in one shared descriptor set.
 - **Bananza fixes:** the NDSR neural upscaler replaced by a cubic blit for its linear-output variants, real occlusion queries (the pink skin), geometry-shader side effects run once per primitive on Adreno (terrain gaps), the game's present-interval controller kept on its own pacing.
+
+- **Ocarina of Time fixes:** texture handles read from material tables bound as texture and sampler pools in the shared descriptor set (a ring of persistent sets patched from the registrations), task and mesh kernels with initialised locals and no fused multiply-adds (the white flashes and grass specks), the driver segment hashed through the mesh-stage tables, AV1 movies through MediaCodec, an SDK cut for the 8 Elite's pointer authentication, and the mesh scratch and stale render targets no longer growing until the system kills the game.
 
 Only your own dumps can be ported: this repository holds no game files, keys or built apps.
 
