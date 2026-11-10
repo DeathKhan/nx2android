@@ -3028,7 +3028,7 @@ static void tbl_trace(unsigned c, int st, const vkshader_t *s, int reused) {
 // (50-60 ms) a frame, and a fresh 68 MB descriptor pool for each. Instead RING_N sets live for the whole run, each with every pool kind and the samplers: a set the GPU is done
 // with (its last submission's fence completed, and not bound in the one being recorded) is brought up to date by rewriting only the IDs the registration log names after its
 // position (gfx_vk_tex.c vk_reglog_take, the entries visible to the replaying job), and written whole only when an image went or an ID got contents (the view drop, orphan and
-// first-use generations), pool memory changed (vk_pool_gen), the pool bases changed, the log wrapped or the replay went back to an earlier job. An image whose views went
+// first-use generations), the pool bases changed, the log wrapped or the replay went back to an earlier job. An image whose views went
 // (eviction; gfx_vk_tex.c's drop log) has only the IDs that held it written again: Ocarina of Time places each frame's render targets at new offsets of one pool, so images
 // go nearly every frame, and every one had the set after it written whole (21 ms on the Odin 3, 4 x 65,536 entries). IDs that read the dummy for lack of
 // contents or of first-use budget are retried by later patches, RING_RETRY at a time. Each take marks the images the set holds as used by the submission (eviction waits for it)
@@ -3095,7 +3095,7 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
     ring_slot *r = &g_ring[pick]; const int NP = vk_pool_n(), NS = vk_pool_samp_n(); const unsigned kinds = vk_pool_kinds();
     static VkDescriptorImageInfo *dd; static VkWriteDescriptorSet *ww; static int *tids;
     if (!dd) { dd = calloc((size_t)POOL_TEX_SLOTS * NP + NS + (size_t)(RING_TIDS + RING_RETRY) * POOL_TEX_SLOTS, sizeof *dd); ww = calloc((size_t)(RING_TIDS + RING_RETRY + RING_DROPS) * POOL_TEX_SLOTS + 8, sizeof *ww); tids = calloc(RING_TIDS + RING_DROPS, sizeof *tids); }
-    int full = !r->valid || r->fullgen != fg || r->poolgen != pg || r->tex_base != g_pool_tex_base || r->samp_base != g_pool_samp_base || r->jobpos > jp || r->nimg > 8u * (size_t)NP;
+    int full = !r->valid || r->fullgen != fg || r->tex_base != g_pool_tex_base || r->samp_base != g_pool_samp_base || r->jobpos > jp || r->nimg > 8u * (size_t)NP;
     int lazy_n = 0; uint64_t lazy_b = 0; uint32_t nw = 0; uint64_t head = vk_reglog_head(), pos = r->logpos; int ntid = 0;
     if (!full) { pos = vk_reglog_take(r->logpos, jp, tids, RING_TIDS, &ntid); if (pos == UINT64_MAX || (ntid == RING_TIDS && vk_reglog_pending(pos, jp))) full = 1; }
     // the images that went since this set was written: their IDs again, and out of the list before anything reads it (taken before the entries are written: one that
@@ -3105,7 +3105,10 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
         if (!hit) { i++; continue; }
         if (ntid == RING_TIDS + RING_DROPS) { full = 1; break; }
         tids[ntid++] = r->itid[i]; r->nimg--; r->img[i] = r->img[r->nimg]; r->itid[i] = r->itid[r->nimg]; }
-    // an image got its contents at a real bind since (a first use): every ID that waits on the dummy is tried again now, not RING_RETRY of them
+    // an image got its contents at a real bind since (a first use): every ID that waits on the dummy is tried again now, not RING_RETRY of them.
+    // Pool memory that came or went (vk_pool_gen) takes a patch and no more: an entry already written holds a live image, which only the logs above take back, and what a pool
+    // changes is vk_tex_pool_ok's answer for an ID without contents (its memory inside a live pool), which waits in the retry list. Writing the set whole for it was 23 ms,
+    // 237 times in 900 frames of Ocarina of Time's Kokiri Forest (the game makes and frees pools as it streams)
     uint64_t fu = g_tex_gen_why[1]; int all = !full && r->firstgen != fu; if (all && r->npend > (size_t)(RING_TIDS + RING_DROPS - ntid)) full = 1;
     vk_tex_pool_fill(1);
     if (full) {   // every entry, as tbl_set's fill
