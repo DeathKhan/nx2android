@@ -2,6 +2,8 @@
 from pathlib import Path
 import shutil,subprocess,tempfile,unittest
 from test_vk_compute_trace import extract
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 ROOT=Path(__file__).resolve().parents[1]
 SRC=ROOT/'nxnative/dm/android/gfx_vk_exec.c'
 HEADER=r"""
@@ -33,6 +35,7 @@ class MRT(unittest.TestCase):
    c,e=Path(tmp)/'t.c',Path(tmp)/'t';c.write_text(body, encoding='utf-8')
    subprocess.run(['cc','-std=gnu11','-O1','-g','-Wall','-Wextra','-Werror','-Wno-unused-variable','-Wno-missing-field-initializers','-fsanitize=address,undefined','-I'+str(ROOT/'nxnative/dm/third_party/vulkan-headers/include'),str(c),'-o',str(e)],check=True)
    subprocess.run([str(e)],check=True,timeout=10)
+ @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
  def test_selection_attachment_support(self):
   src=SRC.read_text(encoding='utf-8')
   actual='\n'.join(extract(src,'static '+sig+('(void) {' if sig=='void mrt_attach' else '(')) for sig in ['uint32_t mrt_active_slots','int mrt_match','int mrt_choose','void mrt_attach','void mrt_detach','void mrt_support'])
@@ -101,6 +104,7 @@ int main(void){
  mrt_detach();assert(!g_mrt_active&&S.ncol==1&&S.cfmt[0]==122);return 0;
 }
 """)
+ @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
  def test_fenced_native_copy_and_completion(self):
   src=SRC.read_text(encoding='utf-8')
   attempts='static unsigned g_mrt_attempts;\n'   # the observer's re-arm count, declared beside mrt_poll
@@ -171,6 +175,7 @@ int main(void){
  return 0;
 }
 """)
+ @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
  def test_observer_opt_in_exact_gate_skip_and_pair_refusal(self):
   src=SRC.read_text(encoding='utf-8')
   functions=['static int fs_buffer_number(', 'static int pass_dump_fs_parse(', 'static uint32_t mrt_active_slots(', 'static int mrt_match(', 'static int mrt_choose(', 'static int mrt_observer_match(', 'static int mrt_prepare(']

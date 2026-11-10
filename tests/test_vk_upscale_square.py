@@ -5,11 +5,14 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
 class SquareUpscaler(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "host compiler required")
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_commands_contract_lifetime(self):
         source = (ROOT / "nxnative/dm/android/upscale_square_vk.c").read_text(encoding='utf-8')
         source = source[source.index("typedef struct { uint32_t w, h; }"):]

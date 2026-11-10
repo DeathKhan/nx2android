@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,6 +22,7 @@ def function(source, declaration):
 
 class PoolHolding(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_actual_indexed_lookup_against_linear_oracle(self):
         source = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         helpers = '\n'.join(function(source, declaration) for declaration in (

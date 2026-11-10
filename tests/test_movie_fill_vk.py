@@ -4,12 +4,15 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class MovieFill(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host compiler is required")
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_actual_movie_commands_and_lifetimes(self):
         source = (ROOT / "nxnative/dm/android/movie_fill_vk.c").read_text(encoding='utf-8')
         source = source[source.index("typedef struct { uint32_t w, h, word0, flags; }"):

@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,6 +23,7 @@ def function(source, declaration):
 
 class OcclusionCounter(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_real_query_lifetime_and_ordered_reports(self):
         runtime = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         start = runtime.index('enum { OCC_BLOCK')
@@ -267,6 +270,7 @@ int main(void){
             subprocess.run([str(exe)], check=True, timeout=15)
 
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_deferred_query_commands_preserve_draw_order(self):
         runtime = (ROOT / 'nxnative/dm/android/gfx_vk_dq.c').read_text(encoding='utf-8')
         commands = runtime[runtime.index('#define DQ_CMDS'):runtime.index('#define DQ_SYNC')]

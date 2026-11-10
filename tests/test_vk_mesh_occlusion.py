@@ -4,12 +4,15 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class MeshOcclusion(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "C compiler required")
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_actual_final_draw_query_order(self):
         source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         start = source.index("    if (ok) { cb = vk_cmd();", source.index("static void mesh_draw_one(const p_draw *d, uint32_t batch) {"))

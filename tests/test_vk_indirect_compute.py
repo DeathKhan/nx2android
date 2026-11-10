@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DM = ROOT / 'nxnative/dm'
@@ -62,6 +64,7 @@ def production():
 
 
 @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
+@unittest.skipUnless(host_cc.posix(), 'a POSIX host C compiler is required (MinGW has no setenv)')
 class IndirectCompute(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

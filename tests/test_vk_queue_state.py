@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "nxnative/dm/android/gfx_vk_core.c"
@@ -33,6 +35,7 @@ def run_c(code):
 
 @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
 class VulkanQueue(unittest.TestCase):
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_actual_queue_state_and_target_lifetime(self):
         source = EXEC.read_text(encoding='utf-8')
         begin = source.index("typedef struct vk_queue_state {")
@@ -96,6 +99,7 @@ int main(void){
 """.replace("HELPER", helper)
         run_c(code)
 
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_actual_release_frontier_and_counter_expiry(self):
         core, exe = CORE.read_text(encoding='utf-8'), EXEC.read_text(encoding='utf-8')
         helper = function(core, "static void completion_events_publish(const cpend *c) {")

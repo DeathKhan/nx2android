@@ -4,11 +4,14 @@ from pathlib import Path
 import os
 import subprocess
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "dist/tests/spv-dump-keys"
 
 
+@unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
 class DumpKeysTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

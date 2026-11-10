@@ -5,9 +5,12 @@ import subprocess
 import tempfile
 import unittest
 from test_vk_compute_trace import extract
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"),"host compiler required")
 class PassDumpGate(unittest.TestCase):
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_actual_gate(self):
         s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         a=s.index("static int g_pd_fs_mode")

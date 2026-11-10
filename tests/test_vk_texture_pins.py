@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 try:
     from tests.test_vk_texture_registration import function
 except ModuleNotFoundError:
@@ -14,6 +16,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class TexturePins(unittest.TestCase):
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_native_images_survive_parked_snapshots_and_key_reuse(self):
         s=(ROOT/"nxnative/dm/android/gfx_vk_tex.c").read_text(encoding='utf-8')
         declarations=s[s.index("typedef struct { uint64_t pool;"):s.index("// The sRGB / UNORM twin")]

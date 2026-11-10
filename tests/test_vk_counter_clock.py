@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -17,6 +19,7 @@ def function(source,declaration):
 
 class CounterClock(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'),'a host C compiler is required')
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_actual_calibration_and_projection(self):
         dm=ROOT/'nxnative/dm';core=(dm/'android/gfx_vk_core.c').read_text(encoding='utf-8');os=(dm/'host/hle_os.c').read_text(encoding='utf-8')
         helper=core[core.index('static PFN_vkGetCalibratedTimestampsKHR g_gpu_calibrated;'):core.index('static void completion_start(void);')]
@@ -112,6 +115,7 @@ int main(void){
             subprocess.run([str(exe)],check=True,timeout=15)
 
     @unittest.skipUnless(shutil.which('cc'),'a host C compiler is required')
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_timestamp_recording_stages(self):
         dm=ROOT/'nxnative/dm';core=(dm/'android/gfx_vk_core.c').read_text(encoding='utf-8')
         nvn=(dm/'gfx/nvn/include/nvn.h').read_text(encoding='utf-8')

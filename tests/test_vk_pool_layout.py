@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -131,6 +133,7 @@ int main(int argc,char **argv){
 
 class PoolLayout(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_bundle_union_limits_and_actual_layout(self):
         target = ROOT / "target/tests"
         target.mkdir(parents=True, exist_ok=True)

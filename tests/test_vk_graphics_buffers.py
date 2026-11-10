@@ -5,6 +5,8 @@ import subprocess
 import tempfile
 import unittest
 from test_vk_compute_trace import extract
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 ROOT=Path(__file__).resolve().parents[1]
 SRC=ROOT/"nxnative/dm/android/gfx_vk_exec.c"
 @unittest.skipUnless(shutil.which("cc"),"host compiler required")
@@ -15,6 +17,7 @@ class GraphicsBuffers(unittest.TestCase):
             c,exe=Path(folder)/"test.c",Path(folder)/"test";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=10)
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_actual_selection_and_windows(self):
         s=SRC.read_text(encoding='utf-8');a=s.index("static uint64_t g_fs_buffer_key")
         actual=s[a:s.index("\nstatic void x_read(",a)]
@@ -82,6 +85,7 @@ int main(void){
  return 0;
 }
 """)
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_actual_copy_outside_pass_and_resume(self):
         s=SRC.read_text(encoding='utf-8');actual=extract(s,"static int fs_buffers_before_draw(")
         self.compile_run(r"""

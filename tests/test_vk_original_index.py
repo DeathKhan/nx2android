@@ -4,12 +4,15 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class OriginalIndex(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_capture_match_fallback_and_submission_lifetime(self):
         dm = ROOT / 'nxnative/dm'
         execute = (dm / 'android/gfx_vk_exec.c').read_text(encoding='utf-8')

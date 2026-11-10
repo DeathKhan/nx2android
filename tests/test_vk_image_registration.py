@@ -4,11 +4,14 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class ImageRegistration(unittest.TestCase):
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_storage_intent_and_original_snapshot(self):
         source = (ROOT / "nxnative/dm/android/gfx_common.c").read_text(encoding='utf-8')
         start = source.index("void mtl_reg_image(")

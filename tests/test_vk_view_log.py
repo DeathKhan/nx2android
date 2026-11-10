@@ -2,10 +2,13 @@
 from pathlib import Path
 import shutil,subprocess,tempfile,unittest
 from test_vk_storage_image import function
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 ROOT=Path(__file__).resolve().parents[1]
 SRC=ROOT/'nxnative/dm/android/gfx_vk_tex.c'
 class ViewLog(unittest.TestCase):
  @unittest.skipUnless(shutil.which('cc'),'host compiler required')
+ @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
  def test_actual_helper_filter_ranges_and_budget(self):
   s=SRC.read_text(encoding='utf-8');helpers='\n'.join(function(s,n) for n in ['static int view_log_size_parse(','static void view_log_selected('])
   code=r'''

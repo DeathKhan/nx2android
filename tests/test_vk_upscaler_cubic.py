@@ -5,6 +5,8 @@ import os
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -18,6 +20,7 @@ def function(source,declaration):
 
 class CubicUpscaler(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'),'a host C compiler is required')
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_live_filter_contract_and_recording(self):
         dm=ROOT/'nxnative/dm';source=(dm/'android/gfx_vk_exec.c').read_text(encoding='utf-8')
         profile=(dm/'games/040074A01BF12000/android.tsv').read_text(encoding='utf-8').splitlines()

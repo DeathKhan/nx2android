@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 ROOT=Path(__file__).resolve().parents[1]
 def function(s,decl):
     a=s.index(decl);b=s.index("{",a)+1;depth=1
@@ -12,6 +14,7 @@ def function(s,decl):
     return s[a:b]
 class Nv12Snapshot(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"),"host compiler required")
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_generation_bytes_lifetime_and_lock(self):
         s=(ROOT/"nxnative/dm/host/hle_codec_video.c").read_text(encoding='utf-8')
         methods="\n".join(function(s,x) for x in ("static uint32_t native_stride(","static uint64_t native_size(uint32_t w, uint32_t h) {",

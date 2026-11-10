@@ -4,12 +4,15 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class TextureDiagnostics(unittest.TestCase):
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_bounds_causes_fields_and_concurrent_registration(self):
         code = r"""
 #define _POSIX_C_SOURCE 200809L

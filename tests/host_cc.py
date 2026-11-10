@@ -1,8 +1,8 @@
 """What the host C compiler can build, for the tests that compile C harnesses (not a test module).
 
 The Windows release runner's `cc` is MinGW gcc: it has no <sys/mman.h>, no setenv and no
-libubsan, so harnesses that mprotect pools or run under UBSan are skipped there; macOS and
-Linux run them.
+libasan or libubsan, so harnesses that mprotect pools, call setenv or run under ASan / UBSan
+are skipped there (each test's skip says which); macOS and Linux run them.
 """
 import functools
 from pathlib import Path
@@ -47,3 +47,9 @@ def posix():
 def ubsan():
     """cc links -fsanitize=undefined."""
     return _builds('int main(void) { return 0; }\n', '-std=c11', '-fsanitize=undefined', '-fno-sanitize-recover=all')
+
+
+@functools.lru_cache(maxsize=None)
+def sanitizers():
+    """cc links -fsanitize=address,undefined (the harnesses built under both sanitizers; MinGW has no libasan or libubsan)."""
+    return _builds('int main(void) { return 0; }\n', '-std=c11', '-fsanitize=address,undefined')

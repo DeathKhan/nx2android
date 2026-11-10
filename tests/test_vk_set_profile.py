@@ -4,12 +4,15 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class DescriptorProfile(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_complete_windows_limits_and_auto_off(self):
         source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         start = source.index("enum { SET_PROFILE_ROWS")

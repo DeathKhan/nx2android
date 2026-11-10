@@ -5,9 +5,12 @@ import os
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT=Path(__file__).resolve().parents[1]
 class NativeMode(unittest.TestCase):
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_actual_selector(self):
         text=(ROOT/'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         start=text.index('static int upscaler_native_dispatch(');brace=text.index('{',start);end=brace+1;depth=1

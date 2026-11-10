@@ -1,4 +1,5 @@
 """The pause menu's frame cap and Resolution level (nxnative/dm/host/hle_framecap.c), with its actual C code over a stand-in for dm.h."""
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -73,7 +74,7 @@ int main(void) {
 '''
 
 # A game paced by the host (profile env DM_FRAME_CAP_MODE=pace, no gate): Nintendo Switch 2 Welcome Tour, whose Bezel engine runs as many fixed 1/60 s updates a frame as the
-# elapsed time asks, so the cap is only the present period, live from Off to 30 and back
+# elapsed time asks, so the cap is only the present period, live from Off to 30 and back. The profile env reaches the harness in its environment (MinGW has no setenv).
 HARNESS_PACE = r'''
 #include <assert.h>
 #include <stdlib.h>
@@ -82,7 +83,7 @@ int t_gate = 0, t_ms;
 uint8_t *dm_fps_state;
 void gate_obs_set(int id, void (*fn)(uint64_t *, int)) { (void)id; (void)fn; }
 int main(void) {
-    setenv("DM_FRAME_CAP_MODE", "pace", 1);
+    assert(getenv("DM_FRAME_CAP_MODE") && !strcmp(getenv("DM_FRAME_CAP_MODE"), "pace"));
     assert(dm_frame_cap_how() == DM_FRAME_CAP_PACE);
     assert(dm_frame_cap_period(16666667) == 16666667);       // off: the game's own period
     dm_frame_cap_set(30); assert(dm_frame_cap_period(16666667) == 33333333);
@@ -105,9 +106,9 @@ class FrameCap(unittest.TestCase):
         self.run_harness(HARNESS)
 
     def test_cap_paced_by_host(self):
-        self.run_harness(HARNESS_PACE)
+        self.run_harness(HARNESS_PACE, DM_FRAME_CAP_MODE='pace')
 
-    def run_harness(self, harness):
+    def run_harness(self, harness, **env):
         cc = shutil.which('cc') or shutil.which('clang')
         if not cc:
             self.skipTest('a C compiler is required')
@@ -118,7 +119,7 @@ class FrameCap(unittest.TestCase):
             Path(d, 'hle_framecap.c').write_text(SOURCE.read_text(encoding='utf-8'), encoding='utf-8')   # beside the stand-in dm.h
             exe = Path(d, 't')
             subprocess.run([cc, '-std=gnu11', '-I', d, str(Path(d, 'hle_framecap.c')), str(Path(d, 't.c')), '-o', str(exe), '-lm'], check=True)
-            self.assertEqual(subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout.strip(), 'ok')
+            self.assertEqual(subprocess.run([str(exe)], capture_output=True, text=True, check=True, env={**os.environ, **env}).stdout.strip(), 'ok')
 
 
 if __name__ == '__main__':

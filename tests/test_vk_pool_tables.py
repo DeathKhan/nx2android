@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = "nxnative/dm/android/gfx_vk_exec.c"
@@ -428,6 +430,7 @@ int main(int argc,char **argv){
 
 class PoolTables(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_real_table_construction_and_previous_regressions(self):
         source = (ROOT / SOURCE).read_text(encoding='utf-8')
         target = ROOT / "target/tests"
@@ -457,6 +460,7 @@ class PoolTables(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
 
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_ring_historical_snapshots_and_completed_set_ownership(self):
         source = (ROOT / SOURCE).read_text(encoding='utf-8')
         target = ROOT / "target/tests"

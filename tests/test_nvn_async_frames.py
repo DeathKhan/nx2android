@@ -1,6 +1,8 @@
 """Queued Android submits and presents keep captured frame identity while the guest advances."""
 from pathlib import Path
 import re, shutil, subprocess, tempfile, unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 ROOT=Path(__file__).resolve().parents[1]
 
 def function(s, signature):
@@ -11,6 +13,7 @@ def function(s, signature):
 
 class AsyncFrameIdentity(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'),'C compiler required')
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_actual_queued_replay(self):
         s=(ROOT/'nxnative/dm/gfx/nvn/hle_nvn.c').read_text(encoding='utf-8')
         declaration=re.search(r'typedef struct \{ int kind, n;.*?\} nvn_job;',s).group()

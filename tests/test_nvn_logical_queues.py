@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -179,6 +181,7 @@ int main(void) {
 
 class LogicalQueues(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_actual_scheduler(self):
         out = ROOT / "target/tests"
         out.mkdir(parents=True, exist_ok=True)
@@ -199,6 +202,7 @@ class LogicalQueues(unittest.TestCase):
 
 
     @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_live_trace_budget(self):
         src=(ROOT/"nxnative/dm/gfx/nvn/nvn_queue.inc").read_text(encoding='utf-8')
         start=src.index("static void nq_trace(")
@@ -248,6 +252,7 @@ int main(void) {
             subprocess.run([str(exe)],check=True,timeout=5)
 
     @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
+    @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
     def test_startup_gate_and_program_snapshot(self):
         hle = (ROOT/"nxnative/dm/gfx/nvn/hle_nvn.c").read_text(encoding='utf-8')
         common = (ROOT/"nxnative/dm/android/gfx_common.c").read_text(encoding='utf-8')

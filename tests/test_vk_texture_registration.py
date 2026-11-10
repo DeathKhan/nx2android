@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,6 +22,7 @@ def function(source, declaration):
 
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class TextureRegistration(unittest.TestCase):
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_registry_listing_is_bounded_metadata_copy(self):
         source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text(encoding='utf-8')
         common = (ROOT / "nxnative/dm/android/gfx_common.c").read_text(encoding='utf-8')
@@ -81,6 +84,7 @@ int main(void){
                             str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=10)
 
+    @unittest.skipUnless(host_cc.sanitizers(), 'a host C compiler with ASan and UBSan is required (MinGW has neither)')
     def test_identical_registration_preserves_generation_and_history(self):
         source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text(encoding='utf-8')
         start = source.index("enum { TREG_OLD")
