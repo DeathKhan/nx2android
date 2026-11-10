@@ -23,8 +23,9 @@ class AndroidMotion(unittest.TestCase):
             raise unittest.SkipTest('a C compiler is required')
         front = (ROOT / 'nxnative/dm/android/front_android.c').read_text(encoding='utf-8')
         hid = (ROOT / 'nxnative/dm/host/hle_hid.c').read_text(encoding='utf-8')
-        shake = hid[hid.index('#define SHAKE_HZ'):hid.index('void dm_input_set(')]
+        shake = hid[hid.index('#define SHAKE_HZ'):hid.index('static void mouse_latch(uint64_t pressed);')]
         motion = hid[hid.index('typedef struct { int64_t delta_ns'):hid.index('// SixAxisSensorHandle:')]
+        states = hid[hid.index('static int six_states('):hid.index('HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandles')]
         sensor = front[front.index('static void motion_feed('):front.index('static void *input_thread(')]
         harness = r'''
 #include <assert.h>
@@ -37,10 +38,13 @@ class AndroidMotion(unittest.TestCase):
 #include <string.h>
 #include <sys/types.h>
 #include "dm_input.h"
+#include "motion_fusion.h"
 #define LOG(...) do { if (0) printf(__VA_ARGS__); } while (0)
 static uint64_t clock_ns = 1000000000;
 static uint64_t guest_ns(void) { return clock_ns; }
-static _Atomic uint64_t g_btn, g_pad_btn[DM_PLAYERS];
+static uint64_t now_ns(void) { return clock_ns; }   // the host clock: the sensor events arrive at their timestamps
+static _Atomic uint64_t g_btn, g_sc_btn, g_pad_btn[DM_PLAYERS];
+static uint32_t merged_players(void) { return 0; }   // a single controller: player 1
 ''' + shake + motion + r'''
 enum { ASENSOR_TYPE_ACCELEROMETER = 1, ASENSOR_TYPE_GYROSCOPE = 4 };
 #define ASENSOR_STANDARD_GRAVITY 9.80665f
@@ -79,6 +83,15 @@ static void rotation_poll(int64_t now) { (void)now; }
 static void shake_sensor(int on) { (void)on; }
 static void pad_publish(void) { atomic_store(&g_pad_btn[0], g_shake_btn); shake_note(); }
 ''' + sensor + r'''
+// nn::hid's six-axis read (hle_hid.c six_states) for a full-key controller on npad id p: player p + 1, connected
+enum { KIND_NONE = 0, KIND_PAD, KIND_DUAL, KIND_LEFT, KIND_RIGHT };
+typedef struct { int pad, kind; } npad_ref;
+static npad_ref npad_resolve(uint32_t id) { return (npad_ref){.pad = (int)id, .kind = KIND_PAD}; }
+static int player_of(uint32_t id) { return (int)id; }
+static int six_connected(uint32_t h) { (void)h; return 1; }
+''' + states + r'''
+static int read_six(SixAxisState *s, int p) { return six_states(s, 1, (uint32_t)p << 8); }
+static int mo_moving(void) { motion_state ms; return motion_live(0, &ms); }   // the phone's motion reaches player 1
 static void event(int type, uint64_t time, float x, float y, float z) {
     pending = (ASensorEvent){.type = type, .timestamp = time, .vector = {x, y, z}};
     available = 1; assert(on_sensor(0, 0, NULL) == 1 && !available);
@@ -101,7 +114,7 @@ int main(int argc, char **argv) {
     if (g_gyro) event(ASENSOR_TYPE_GYROSCOPE, 1030000000, 0, (float)M_PI, 0);
     if (manual) { atomic_store(&g_btn, DM_BTN_SHAKE); shake_note(); }
     SixAxisState s;
-    six_sample(&s, clock_ns / SIX_PERIOD_NS, 1);
+    assert(read_six(&s, 0) == 1);
     const char *raw = getenv("DM_MOTION_RAW");
     int raw_motion = raw && atoi(raw) > 0;
     if (g_gyro && !manual && (raw_motion || fabsf(flick) <= 1.5f)) {
@@ -114,7 +127,7 @@ int main(int argc, char **argv) {
     } else if (manual || fabsf(flick) > 1.5f) {
         assert(shaking(clock_ns));
         if (!manual) assert(g_shake_btn == DM_BTN_SHAKE);
-        six_sample(&s, (clock_ns + 25000000) / SIX_PERIOD_NS, 1);
+        clock_ns += 25000000; assert(read_six(&s, 0) == 1);
         assert(fabsf(s.acc[0]) > 0.1f && fabsf(s.gyro[2]) > 0.1f);
         near(s.acc[1], 0); near(s.gyro[1], 0);
     } else {
@@ -122,7 +135,8 @@ int main(int argc, char **argv) {
         near(s.acc[0], 0); near(s.acc[1], 0); near(s.acc[2], -1);
     }
     // Player 2 never inherits the phone's motion or explicit player-1 shake.
-    six_sample(&s, clock_ns / SIX_PERIOD_NS, 0);
+    motion_state js; assert(!motion_joy(1, 0, &js) && !motion_live(1, &js));
+    assert(read_six(&s, 1) == 1);
     near(s.acc[0], 0); near(s.acc[1], 0); near(s.acc[2], -1);
     return 0;
 }
