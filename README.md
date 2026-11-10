@@ -17,12 +17,12 @@ Screenshots from the Odin 3 (the game's own picture, overlay off); frame rates a
 
 | | |
 |:---:|:---:|
-| ![Donkey Kong Bananza](docs/images/donkey-kong-bananza.jpg)<br>Donkey Kong Bananza<br><sub>this fork · update v458752 with DLC · 60 fps in caves and indoors, 30 outdoors</sub> | ![Nintendo Switch 2 Welcome Tour](docs/images/nintendo-switch-2-welcome-tour.jpg)<br>Nintendo Switch 2 Welcome Tour<br><sub>this fork · update 1.0.4 · 60 fps in the intro and expo hall (with the app's frame cap at 30 here: GPU 4-22 ms a frame)</sub> |
+| ![Donkey Kong Bananza](docs/images/donkey-kong-bananza.jpg)<br>Donkey Kong Bananza<br><sub>this fork · update v458752 with DLC · 60 fps (its movies at 30)</sub> | ![Nintendo Switch 2 Welcome Tour](docs/images/nintendo-switch-2-welcome-tour.jpg)<br>Nintendo Switch 2 Welcome Tour<br><sub>this fork · update 1.0.4 · 60 fps in the intro and expo hall (with the app's frame cap at 30 here: GPU 4-22 ms a frame)</sub> |
 | ![The Legend of Zelda: Ocarina of Time](docs/images/the-legend-of-zelda-ocarina-of-time.jpg)<br>The Legend of Zelda: Ocarina of Time<br><sub>this fork · update v131072 · 20-30 fps (30 outdoors in Kokiri Forest) · **work in progress**: plays from a save; lit surfaces bloom too bright, the title movie's enhancement network is skipped</sub> | |
 
 | Game | State on the Odin 3 |
 |---|---|
-| Donkey Kong Bananza (with its DLC) | Plays. 60 fps in caves and indoors, 30 outdoors (GPU work being cut); handheld mode by default |
+| Donkey Kong Bananza (with its DLC) | Plays. A smooth 60 fps in play, the movies at their own 30; handheld mode by default |
 | Nintendo Switch 2 Welcome Tour | Plays. Intro video and expo hall at 60 fps; mouse exhibits open with `DM_MOUSE=1` (the right stick or the touchscreen is the Joy-Con 2 mouse, R / ZR its buttons) |
 | The Legend of Zelda: Ocarina of Time | Work in progress. Loads a save and plays in Kokiri Forest at 20-30 fps (GPU about 20 ms a frame outdoors, mesh shaders run as compute); lit surfaces bloom too bright (open) |
 
