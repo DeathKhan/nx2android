@@ -310,7 +310,7 @@ class Misc(unittest.TestCase):
             self.assertIn('2 registered patches (dm/tools/sdk_patches.py: AddressRegionManager constructor)', lost[0])
             table['bb' * 16] = ('dm/tools/sdk_patches.py', ['z'])   # the derived build has cuts of its own
             self.assertEqual(pipeline.lost_patches(builds, d, ['main', 'sdk', 'subsdk0'], table), [])
-            self.assertIn('5b050c55b8264040b642a0cdca5ded83', pipeline.registered_patches())   # the real files load
+            self.assertIn('1643a838814f9c10c696f930ed681e7f', pipeline.registered_patches())   # the real files load (OoT's SDK 22 cut; 5b050c55 went to the engine-wide rules, nxnative 56e4f2ab9)
         finally: shutil.rmtree(d, ignore_errors=True)
 
     def test_app_stem(self):
