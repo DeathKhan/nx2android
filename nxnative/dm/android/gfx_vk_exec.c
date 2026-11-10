@@ -458,7 +458,8 @@ static void x_read(void) { light_diag_poll(); original_index_read(); set_profile
 // ---------------- conditional rendering (profile render_cond) ----------------
 // As nvn_mtl.m (OP_RENDER_COND): SetRenderEnableConditional draws while the 64-bit counters of the reports at addr and addr + 16 are equal / differ, until SetRenderEnable(true).
 // Evaluated on the CPU at replay from the records in memory: a report replayed earlier in this submission is not written yet (that happens when the GPU completes), so a timestamp
-// one counts with its known counter 0 (vk_sub_complete writes 0 there under the key) and any other one is unknown, which keeps drawing. Inside a block evaluated false, draws and
+// one counts with its known counter 0 (vk_sub_complete writes 0 there under the key) and any other one is unknown, which keeps drawing, until the GPU has completed
+// its submission and the counter is in memory (g_rc_occ). Inside a block evaluated false, draws and
 // clears are dropped. Mario vs. Donkey Kong (gsys, as Tears of the Kingdom and Animal Crossing) clears its HDR scene target under such a condition after lighting it: drawn
 // anyway, its levels were black under the HUD
 // Upstream ea0c98df3 / 04419bc25 (port): a timestamp report's known counter outlives the submission that replayed it until the GPU has completed that submission (vk_fence_done):
@@ -474,16 +475,17 @@ static int rc_queue_on(void) { static int on = -1; if (on < 0) { const char *e =
 static void rc_overwrite(uint64_t d, uint64_t n) {   // a buffer write replayed over [d, d + n): reports there are unknown until it lands
     for (int i = 0; i < g_rc_npend; i++) if (g_rc_pend[i].addr < d + n && d < g_rc_pend[i].addr + 16) { g_rc_pend[i].kind = 2; g_rc_pend[i].fence = mtl_last_fence() + 1; }
 }
-// Addresses ever written by a non-timestamp report: conditions on them keep drawing. A set that grows: the fixed 4096-slot table this was filled up in The Legend of
+// Addresses written by a non-timestamp report, with the submission of the latest one: a condition on one keeps drawing until that submission's reports have landed, then reads
+// the counter the GPU wrote. They were unknown for good, so a game that culls by occlusion queries drew everything: Ocarina of Time's main pass in Kokiri Forest drew up to
+// 958 draws (8.6 ms of GPU, Odin 3) where it draws at most 178 (3.1 ms) with its own results, 112,569 of 155,344 conditions in 300 frames evaluating false. A set that grows: the fixed 4096-slot table this was filled up in The Legend of
 // Zelda: Ocarina of Time (its reports move through their buffer as the camera turns), after which every report and every condition walked all 4096 slots (0.9 s of the
 // replay thread's 4.4 s over 8 s of camera turns, Odin 3) and new addresses were no longer recorded. Replay thread only
 static nvn_hmap g_rc_occ = {.klen = 8};
-static void rc_occ_add(uint64_t a) {
-    if (nvn_hm_get(&g_rc_occ, &a)) return;
-    nvn_hm_put(&g_rc_occ, &a, (void *)1);
+static void rc_occ_add(uint64_t a) {   // the value: the submission that writes it (as rc_note's fence)
+    if (nvn_hm_put(&g_rc_occ, &a, (void *)(uintptr_t)(mtl_last_fence() + 1))) return;
     if (g_rc_occ.n >= 4096 && !(g_rc_occ.n & (g_rc_occ.n - 1))) VKLOG("render conditions: %u addresses written by occlusion reports so far", g_rc_occ.n);
 }
-static int rc_occ_has(uint64_t a) { return nvn_hm_get(&g_rc_occ, &a) != NULL; }
+static uint64_t rc_occ_fence(uint64_t a) { return (uint64_t)(uintptr_t)nvn_hm_get(&g_rc_occ, &a); }
 static void rc_note(uint64_t a, int kind) {
     if (kind == 2) rc_occ_add(a);
     uint64_t f = mtl_last_fence() + 1;   // the submission being replayed (as OP_FENCE_SYNC)
@@ -491,8 +493,8 @@ static void rc_note(uint64_t a, int kind) {
     if (g_rc_npend < RC_PEND) { g_rc_pend[g_rc_npend].addr = a; g_rc_pend[g_rc_npend].fence = f; g_rc_pend[g_rc_npend++].kind = kind; }
 }
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at replay time
-    if (rc_occ_has(a)) return 0;
-    uint64_t done = vk_reports_fence_done();
+    uint64_t done = vk_reports_fence_done(), of = rc_occ_fence(a);
+    if (of > done) return 0;
     for (int i = g_rc_npend - 1; i >= 0; i--) if (g_rc_pend[i].addr == a && g_rc_pend[i].fence > done) { if (g_rc_pend[i].kind != 1) return 0; *v = 0; return 1; }
     *v = *(const volatile uint64_t *)(uintptr_t)a; return 1;
 }
