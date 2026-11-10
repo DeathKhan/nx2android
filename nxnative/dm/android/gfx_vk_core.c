@@ -1044,6 +1044,7 @@ static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t
 }
 // Pools not yet backed whose [lo, hi) lies in or crosses [addr, addr+len): backed (the write lock taken; the caller holds no pool lock). From the replay (vk_pool_of, vk_gmem_map)
 static vkpool_t *pool_find_locked(uint64_t addr, uint64_t len, int *across) {   // vk_pool_of's search, under either lock
+    if (len > UINT64_MAX - addr) return NULL;   // a range that wraps is in no pool (an indirect record at the top of the address space)
     int lo = 0, hi = g_npool;   // the last pool by lo that starts at or below addr
     while (lo < hi) { int m = (lo + hi) / 2; if (g_pool[g_pool_ord[m]].lo <= addr) lo = m + 1; else hi = m; }
     if (lo > 0) { vkpool_t *p = &g_pool[g_pool_ord[lo - 1]]; if (addr + len <= p->hi) return p; }
@@ -1116,6 +1117,7 @@ vkpool_t *vk_pool_holding(uint64_t addr, uint64_t len) {
     return r;
 }
 static vkpool_t *vk_pool_of_(uint64_t addr, uint64_t len, int back) {
+    if (len > UINT64_MAX - addr) return NULL;   // (as pool_find_locked: addr + len below would wrap)
     // the last pools this thread found, while none was added or removed: the replay looks up every buffer binding of every draw, and the read lock alone was ~6% of it
     static __thread struct { uint32_t gen; vkpool_t *p[4]; } c;   // gen: g_pool_gen + 1 (0: empty)
     uint32_t g = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE) + 1;

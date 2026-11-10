@@ -4756,7 +4756,7 @@ static void dispatch(const p_dispatch *d) {
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         vkCmdDispatchIndirect(cb, b, o);
     }
-    else if (d->ind) { VkBuffer b; VkDeviceSize o; if (vk_buf_at(d->ind, 12, &b, &o)) vkCmdDispatchIndirect(cb, b, o); else dispatched = 0; }
+    else if (d->ind) { VkBuffer b; VkDeviceSize o; if (!(d->ind & 3) && vk_buf_at(d->ind, 12, &b, &o) && !(o & 3)) vkCmdDispatchIndirect(cb, b, o); else dispatched = 0; }   // (Vulkan: a 4-byte-aligned offset)
     else vkCmdDispatch(cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     vk_pass_ts(1, (uint32_t)d->x, (uint32_t)d->y, PT_DISPATCH, (uint32_t)d->z);
     if (g_cs_images_n) cs_trace_images_copy(cb, cs->key, 1);
