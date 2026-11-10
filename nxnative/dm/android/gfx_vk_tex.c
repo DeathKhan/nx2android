@@ -343,13 +343,30 @@ static void img_drop(vkimg_t *im) { if (im->pins) {
     im->lin_mem = NULL; im->lin_len = 0; im->pkg_mem = NULL; im->pkg_len = 0; im->pkg_released = 1;
     im->orphan = 1; alias_unlink(im); g_tex_gen++; { extern uint64_t g_tex_gen_why[4]; g_tex_gen_why[0]++; } vk_tex_diag_native(TEX_DIAG_ORPHAN, NULL, im); return;
 } vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; g_img_vkbytes -= im->vkbytes; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+// A render target is also taken over when only the pool tables looked it up in that time. The tables' fill looks up every registered texture ID, so a target whose
+// texture the game leaves registered never aged: Ocarina of Time places each frame's targets at changing offsets of one pool and leaves the old textures registered,
+// and their images stayed (some 40 more a second while the camera turned, 2.1 GB within 15 seconds, and Android's low-memory killer ended the game). Such a target
+// was neither drawn to nor bound for RT_KEEP presents and a new texture is being made over part of its memory at another place, so the game has reused the memory
+// (on the console the new target's rendering overwrites the old one's texels; a frame's targets do not overlap each other, so one unused since the last present is dead).
+// Its description is remembered (g_reclaimed) so that the next fill does not make the image again from the registration (vk_tex_pool_ok); a bind or a draw to it
+// forgets that. A lookup by a fill never evicts (the table being filled may hold the view already)
+static __thread int t_pool_fill;
+static nvn_hmap g_reclaimed = {.klen = sizeof(akey)}; static uint64_t g_img_reclaimed;   // g_img_mu
+enum { RT_KEEP = 2 };
+static int rt_stale(const vkimg_t *o, int64_t off, int64_t size) {
+    return !t_pool_fill && o->rt_last && !o->packaged && !(o->off == off && o->size == size) && g_tex_frame - o->used_bind >= RT_KEEP && g_tex_frame + 1 - o->rt_last >= RT_KEEP;
+}
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
-        vkimg_t *o = g_by_key.vals[i]; if (!o || o->pins || o->pool != pool || o->off >= off + size || off >= o->off + o->size || g_tex_frame - o->used < EVICT_KEEP) continue;
+        vkimg_t *o = g_by_key.vals[i]; if (!o || o->pins || o->pool != pool || o->off >= off + size || off >= o->off + o->size || (g_tex_frame - o->used < EVICT_KEEP && !rt_stale(o, off, size))) continue;
         memcpy(&ks[n++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof(akey));
     }
-    for (int j = 0; j < n; j++) { vkimg_t *o = nvn_hm_get(&g_by_key, &ks[j]); if (!o) continue; nvn_hm_del(&g_by_key, &ks[j]); img_drop(o); g_img_evicted++; }
+    for (int j = 0; j < n; j++) { vkimg_t *o = nvn_hm_get(&g_by_key, &ks[j]); if (!o) continue;
+        if (g_tex_frame - o->used < EVICT_KEEP) {   // (kept until now by the fills alone)
+            if (g_reclaimed.n >= 32768) { free(g_reclaimed.keys); free(g_reclaimed.vals); nvn_hm_init(&g_reclaimed, sizeof(akey)); }
+            nvn_hm_put(&g_reclaimed, &ks[j], (void *)1); g_img_reclaimed++; }
+        nvn_hm_del(&g_by_key, &ks[j]); img_drop(o); g_img_evicted++; }
 }
 // Snapshot pins are keyed by serial plus the exact storage description. A serial can have
 // aliases with different IMAGE flags; releasing its final pin releases every resolved alias.
@@ -430,7 +447,9 @@ int vk_tex_pool_ok(const tex_t *t) {
     pthread_mutex_lock(&g_img_mu);
     vkimg_t *im = tex_image_find(t, &k, NULL);
     int looked = im && __atomic_load_n(&im->looked, __ATOMIC_ACQUIRE), pk = im && im->packaged, orphan = im && im->orphan; uint32_t ck = im ? im->pool_ck : 0;
+    int reclaimed = !im && t->pool && g_reclaimed.n && nvn_hm_get(&g_reclaimed, &k);
     pthread_mutex_unlock(&g_img_mu);
+    if (reclaimed) return 0;   // a render target whose memory a newer texture took (evict_overlaps): the dummy until it is bound or drawn to again
     if (orphan) return looked ? 2 : 0;   // a queued snapshot has native contents, not CPU storage
     if (!vk_pool_holding((uint64_t)(uintptr_t)t->mem, t->L.size)) return 0;   // CPU reads may cross chunks of the live logical pool
     uint32_t g = vk_pool_gen();
@@ -458,13 +477,14 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     vkimg_t *im = tex_image_find(t, &k, &pinned);
     if (!im) {
         if (keyed) evict_overlaps(k.pool, t->off, (int64_t)t->L.size);
+        if (keyed && !t_pool_fill && g_reclaimed.n && nvn_hm_get(&g_reclaimed, &k)) nvn_hm_del(&g_reclaimed, &k);
         if (vk_sub_open()) vk_img_budget_make_room(t->L.size);   // (the texture budget: the least recently drawn go once the GPU is past this submission)
         im = img_new(t, f, 0, VK_FORMAT_UNDEFINED); if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
         im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = t->d.flags; g_img_n++; g_img_bytes += t->L.size; g_img_vkbytes += im->vkbytes;
         if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);
     }
     tex_image_pin_resolved(pinned, im);
-    im->used = g_tex_frame; int orphan = im->orphan;
+    im->used = g_tex_frame; if (!t_pool_fill) im->used_bind = g_tex_frame; int orphan = im->orphan;
     pthread_mutex_unlock(&g_img_mu);
     // A finalized pool no longer supplies CPU bytes. A queued snapshot retains its native contents.
     if (orphan) return im;
@@ -601,8 +621,8 @@ void vk_tex_sweep(void) {
     free(v);
     static uint64_t total; total += idle + lru;
     if (g_tex_frame % 3000 == 0) { uint64_t bu, be, bb, bs, pn, pb, pby, pbb; vk_img_budget_stats(&bu, &be, &bb, &bs); vk_pool_stats(&pn, &pb, &pby, &pbb);
-        VKLOG("images: %llu live, %.0f MB of textures (%.0f MB of device memory, budget %.0f MB: %llu evicted, %.0f MB, in %llu sweeps), %llu evicted so far (a newer texture over their memory); memory pools: %llu chunks (%.2f GB), %llu backed (%.2f GB)",
-              (unsigned long long)g_img_n, g_img_bytes / 1048576.0, g_img_vkbytes / 1048576.0, bu / 1048576.0, (unsigned long long)be, bb / 1048576.0, (unsigned long long)bs, (unsigned long long)g_img_evicted,
+        VKLOG("images: %llu live, %.0f MB of textures (%.0f MB of device memory, budget %.0f MB: %llu evicted, %.0f MB, in %llu sweeps), %llu evicted so far (a newer texture over their memory; %llu of them render targets only the pool tables still looked up); memory pools: %llu chunks (%.2f GB), %llu backed (%.2f GB)",
+              (unsigned long long)g_img_n, g_img_bytes / 1048576.0, g_img_vkbytes / 1048576.0, bu / 1048576.0, (unsigned long long)be, bb / 1048576.0, (unsigned long long)bs, (unsigned long long)g_img_evicted, (unsigned long long)g_img_reclaimed,
               (unsigned long long)pn, pby / 1073741824.0, (unsigned long long)pb, pbb / 1073741824.0); }
     if ((idle || lru) && (g_tex_frame % 3000 == 0 || lru)) VKLOG("packaged textures: %llu not drawn for %d presents and %llu least recently drawn released their write protection (%llu pages; %llu so far); %d protected runs",
                     (unsigned long long)idle, PKG_IDLE, (unsigned long long)lru, (unsigned long long)(nvn_dirty_released() - before), (unsigned long long)total, runs);
@@ -746,8 +766,18 @@ typedef struct vview { VkImageView v; VkImageViewType type; VkFormat fmt; uint32
 static nvn_hmap g_views = {.klen = sizeof(vkimg_t *)};   // vkimg_t* → vview list
 static pthread_mutex_t g_view_mu = PTHREAD_MUTEX_INITIALIZER;
 extern uint64_t g_tex_gen;
+// The images whose views went, in order (gfx_vk_exec.c tbl_ring rewrites only the pool table entries that held one). vk_droplog_take: those after position from, -1 when
+// more went than the log or the caller holds; *to is the log's end either way
+enum { DROPLOG_N = 1024 }; static const void *g_droplog[DROPLOG_N]; static uint64_t g_droplog_seq;
+uint64_t vk_droplog_seq(void) { return __atomic_load_n(&g_droplog_seq, __ATOMIC_ACQUIRE); }
+int vk_droplog_take(uint64_t from, const void **out, int max, uint64_t *to) {
+    pthread_mutex_lock(&g_view_mu); uint64_t end = g_droplog_seq; int n = -1;
+    if (end - from <= DROPLOG_N && end - from <= (uint64_t)max) { n = 0; for (uint64_t i = from; i < end; i++) out[n++] = g_droplog[i % DROPLOG_N]; }
+    pthread_mutex_unlock(&g_view_mu); *to = end; return n;
+}
 static void vk_tex_view_drop_all(vkimg_t *im) {
     pthread_mutex_lock(&g_view_mu);
+    g_droplog[g_droplog_seq % DROPLOG_N] = im; __atomic_store_n(&g_droplog_seq, g_droplog_seq + 1, __ATOMIC_RELEASE);
     vview *v = nvn_hm_get(&g_views, &im); g_tex_gen++; { extern uint64_t g_tex_gen_why[4]; g_tex_gen_why[2]++; } vk_tex_diag_native(TEX_DIAG_VIEW_DROP, NULL, im);
     while (v) { vview *n = v->next; vk_defer_free_view(v->v); free(v); v = n; }
     nvn_hm_del(&g_views, &im);
