@@ -39,7 +39,8 @@ OP_BITCAST, OP_IADD, OP_IMUL, OP_SELECT, OP_IEQUAL, OP_ULESS, OP_SHR, OP_SHL, OP
 OP_EXT_INST, OP_EXT_IMPORT, OP_CAPABILITY, OP_MEMORY_MODEL = 12, 11, 17, 14
 DEC_BLOCK, DEC_BUFFER_BLOCK, DEC_ARRAY_STRIDE, DEC_BUILTIN, DEC_LOCATION, DEC_BINDING, DEC_SET, DEC_OFFSET = 2, 3, 6, 11, 30, 33, 34, 35
 BI_POSITION, BI_WORKGROUP_ID, BI_LOCAL_INDEX, BI_VERTEX_INDEX = 0, 26, 29, 42
-SC_INPUT, SC_UNIFORM, SC_OUTPUT, SC_WORKGROUP = 1, 2, 3, 4
+SC_INPUT, SC_UNIFORM, SC_OUTPUT, SC_WORKGROUP, SC_FUNCTION = 1, 2, 3, 4, 7
+OP_CONST_NULL = 46
 GLSL_UMIN = 38
 TYPE_OPS = set(range(19, 40)) | {41, 42, 43, 44, 45, 46}
 
@@ -170,10 +171,25 @@ def facts(i):
     return [w0, (i.get('max_v', 0) & 0xffff) | (i.get('max_p', 0) & 0xffff) << 16, len(i.get('vertex', ()))]
 
 
+def init_locals(m):
+    """Every Function variable of the kernel without an initializer gets its type's null constant → how many. The translator's locals are the shader's registers, which it
+    leaves undefined until their first store; a path that reads one before any store (Ocarina of Time's grass: task 99280b7b8aae78df, mesh 65a079a285d693a0 and
+    eb021183bf9b0092) got whatever the Adreno compiler left there, and the grass came out solid white. Zero made the three kernels deterministic and the grass green"""
+    ptr = {a[0]: a[2] for o, a in m.ins if o == OP_TYPE_PTR and a[1] == SC_FUNCTION}
+    null = {a[0]: a[1] for o, a in m.ins if o == OP_CONST_NULL}; n = 0
+    for o, a in m.ins:
+        if o != OP_VARIABLE or len(a) != 3 or a[2] != SC_FUNCTION or a[0] not in ptr: continue
+        t = ptr[a[0]]
+        if t not in null: null[t] = m.id(); m.new_types.append((OP_CONST_NULL, [t, null[t]]))
+        a.append(null[t]); n += 1
+    return n
+
+
 def wrap(spv, i, lay, size):
     """The translated kernel (job stage_memory = lay, shared = size bytes; dmsh_meshstage.memory) wrapped as described above → SPIR-V"""
     _check(i)
     m = _Mod(spv); words = size // 4
+    init_locals(m)
     # the kernel's entry point and its stage memory
     ep = next((a for o, a in m.ins if o == OP_ENTRY), None)
     if not ep or ep[0] != 5: raise ValueError('no GLCompute entry point')

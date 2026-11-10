@@ -2535,7 +2535,7 @@ static void drv_shared(int st, int bank, VkBuffer *buf, VkDeviceSize *off, int d
     uint64_t h;
     if (compact) h = drv_graphics_key(st);
     else { drv_segment(st, bank, d, dyn);
-        h = fnv(0xcbf29ce484222325ull, d, bank == 24 ? 0x100 : bank ? 0x968 : 0x648) ^ (uint64_t)bank << 56; }
+        h = fnv(0xcbf29ce484222325ull, d, bank == 24 ? 0x100 : bank ? 0x968 : DMSH_C0_SSBO_MS + 16 * DMSH_C0_SSBO_SLOTS) ^ (uint64_t)bank << 56; }   // (bank 0 through the mesh stage table, the last thing drv_segment writes: at 0x648 the task and mesh kernels, whose tables are at 0x670 / 0x770, all hashed alike and shared the first one built)
     unsigned k = (unsigned)(h % DRVC);
     if (g_drvc[k].epoch == g_set_epoch && g_drvc[k].h == h && !g_x_nodrvc) { *buf = g_drvc[k].b; *off = g_drvc[k].o; return; }
     if (compact) drv_segment(st, bank, d, dyn);
