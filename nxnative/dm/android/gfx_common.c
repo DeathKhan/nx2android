@@ -11,7 +11,7 @@ void mtl_vbuf_stats(uint64_t *a, uint64_t *b, uint64_t *c, uint64_t *d, uint64_t
 void mtl_res_counts(uint32_t tick, const char *why) { (void)tick; (void)why; }
 void mtl_res_snapshot(mtl_res_count *out) { memset(out, 0, sizeof *out); }
 void mtl_alloc_stats(uint64_t *w, uint64_t *g, int *n) { *w = *g = 0; *n = 0; }
-void mtl_args_stats(uint64_t *e, uint64_t *r) { *e = *r = 0; }
+void mtl_args_stats(uint64_t *e, uint64_t *r, uint64_t *p) { *e = *r = *p = 0; }   // (Metal argument blocks encoded, reused, patched: upstream nxnative adaff7356 added the third)
 void mtl_barrier_stats(uint64_t *s, uint64_t *f) { *s = *f = 0; }
 uint64_t mtl_blit_splits(void) { return 0; }
 void mtl_bw(uint64_t *l, uint64_t *s, uint64_t *f) { *l = *s = *f = 0; }
