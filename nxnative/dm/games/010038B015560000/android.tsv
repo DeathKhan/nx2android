@@ -1,0 +1,8 @@
+# FINAL FANTASY TACTICS - The Ivalice Chronicles on Android (keys in docs/ARCHITECTURE.md "Game profiles on Android")
+# The UI composite stores into its RGBA8 window image as r32ui from fragment shaders: DM_VK_UBWC bit 4 lists the integer formats on images flagged as images
+# (gfx_vk_tex.c), else the translucent UI comes out yellow and white. On the AYN Thor (Adreno 740, Turnip 27.0.0-R2), version 1.5.1: the initial settings,
+# the title and the prologue's first battle draw right at 60 fps. Not played further yet.
+status	experimental
+env	DM_VK_UBWC=7
+# Its UI composite draws in passes with no colour or depth target (image stores only): this fork runs those only with DM_VK_NOATT=1 (they hung the Adreno 830 in Welcome Tour)
+env	DM_VK_NOATT=1
