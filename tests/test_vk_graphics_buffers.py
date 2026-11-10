@@ -121,7 +121,7 @@ int main(void){
         self.assertNotIn("vk_tex_view(",note);self.assertNotIn("g_tvc[",note)
         self.assertLess(stage.index("tex_desc_for(st, b, h, &ii[nii + k], 0)"),stage.index("fs_trace_texture_note("))
         self.assertIn("g_claim_draw.count, g_claim_draw.indirect || g_fs_buffer_mesh",draw)
-        mesh=extract(s,"static void mesh_draw(const p_draw *d) {")
+        mesh=extract(s,"static void mesh_draw_one(const p_draw *d, uint32_t batch) {")
         self.assertLess(mesh.index("g_fs_buffer_mesh = 1"),mesh.index("ok = prepare_draw"))
         self.assertGreater(mesh.index("g_fs_buffer_mesh = 0"),mesh.index("ok = prepare_draw"))
 if __name__=="__main__":unittest.main()

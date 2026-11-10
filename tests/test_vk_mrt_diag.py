@@ -103,9 +103,12 @@ int main(void){
 """)
  def test_fenced_native_copy_and_completion(self):
   src=SRC.read_text(encoding='utf-8')
-  actual=extract(src,'static int mrt_copy(')+'\n'+extract(src,'static void mrt_poll(uint64_t done_fence) {')
+  attempts='static unsigned g_mrt_attempts;\n'   # the observer's re-arm count, declared beside mrt_poll
+  self.assertIn(attempts+'static void mrt_poll(uint64_t done_fence) {',src)
+  actual=extract(src,'static int mrt_copy(')+'\n'+attempts+extract(src,'static void mrt_poll(uint64_t done_fence) {')
   self.run_c(HEADER+r"""
 static uint64_t g_tex_frame=90,latest=10;static int g_sub_pass=4,g_draw_i=91,active;
+static unsigned g_mrt_skip,g_mrt_qualifying; // the observer's gate state, which a re-arm resets
 static int copies,barriers,hostbarriers,written,destroyed,freed,images,views,fail_alloc;
 static uint64_t vk_frame_current(void){return 90;}static uint64_t mtl_last_fence(void){return latest;}
 static VkCommandBuffer vk_cmd(void){assert(!active);return (VkCommandBuffer)(uintptr_t)1;}
@@ -154,8 +157,15 @@ int main(void){
  g_mrt_image=(vkimg_t){(VkImage)(uintptr_t)2,(VkDeviceMemory)malloc(1),g_mrt_format};g_mrt_view=(VkImageView)(uintptr_t)3;
  assert(mrt_copy(&color,0,0)&&mrt_copy(&color,0,1)&&mrt_copy(&g_mrt_image,1,1));
  assert(g_mrt_dumps[6].f==107&&g_mrt_dumps[6].w==1440&&g_mrt_dumps[6].h==810&&g_mrt_dumps[6].fence==13);
- g_mrt_done=1;mrt_poll(12);assert(written==4&&images==1);latest=13;mrt_poll(13);
- assert(written==7&&images==2&&views==2&&!g_mrt_image.img);
+ g_mrt_done=1;mrt_poll(12);assert(written==4&&images==1);g_mrt_qualifying=5;g_mrt_skip=2;latest=13;mrt_poll(13);
+ // covered nothing (no marker in the observer's debug target): dropped unwritten, the observer re-arms and keeps its image
+ assert(written==4&&destroyed==7&&freed==8&&images==1&&g_mrt_image.img&&g_mrt_attempts==1);
+ assert(!g_mrt_ndump&&!g_mrt_done&&!g_mrt_qualifying&&!g_mrt_skip);
+ assert(mrt_copy(&color,0,0)&&mrt_copy(&color,0,1)&&mrt_copy(&g_mrt_image,1,1));
+ assert(g_mrt_dumps[2].binding==1&&g_mrt_dumps[2].fence==14);
+ ((uint32_t*)g_mrt_dumps[2].p)[3]=0x43415252u; // a covered fragment's marker
+ g_mrt_done=1;mrt_poll(13);assert(written==4&&images==1);latest=14;mrt_poll(14);
+ assert(written==7&&images==2&&views==2&&!g_mrt_image.img&&g_mrt_attempts==1);
  unsigned saved=g_mrt_ndump;g_mrt_ndump=MRT_DUMPS;assert(!mrt_copy(&color,0,0));g_mrt_ndump=saved;
  fail_alloc=1;assert(!mrt_copy(&color,0,0)&&g_mrt_failed&&g_mrt_ndump==saved);
  return 0;
@@ -251,7 +261,7 @@ int main(void){
   self.assertIn('candidate_logs<3&&S.sh[1]&&S.sh[1]->key==g_mrt_key&&count==396',prep)
   self.assertIn('S.pass_w==128&&S.pass_h==128',prep)
   self.assertLess(prep.index('MRT eligibility:'),prep.index('!mrt_choose('))
-  mesh=extract(s,'static void mesh_draw(const p_draw *d) {')
+  mesh=extract(s,'static void mesh_draw_one(const p_draw *d, uint32_t batch) {')
   self.assertLess(mesh.index('g_fs_buffer_mesh = 1'),mesh.index('prepare_draw('))
   self.assertLess(mesh.index('vkCmdDrawIndexedIndirect('),mesh.index('mrt_after_draw('))
   self.assertLess(mesh.index('mrt_after_draw('),mesh.index('if(g_mrt_active)mrt_abort();'))

@@ -90,7 +90,7 @@ int main(void){
    f=extract(s,"static void "+name+("(const p_draw *d) {" if name=="draw" else "(const p_draw_idx *d) {"))
    self.assertGreater(f.index("pass_journal_draw("),f.index("if (!prepare_draw("))
    self.assertLess(f.index("pass_journal_draw("),f.index("draw_allowed()"))
-  f=extract(s,"static void mesh_draw(const p_draw *d) {")
+  f=extract(s,"static void mesh_draw_one(const p_draw *d, uint32_t batch) {")
   self.assertIn('if (ok) pass_journal_draw("mesh", count, 1, d->ind, vs->key, ts ? ts->key : 0, ms->key)',f)
   self.assertLess(f.index("mesh-emitted"),f.index("vkCmdDrawIndexedIndirect"))
   end=extract(s,"void vk_end_pass(")

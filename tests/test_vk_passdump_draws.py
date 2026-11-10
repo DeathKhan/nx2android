@@ -88,7 +88,7 @@ int main(void){
     def test_only_emitted_guest_draws_hook_and_preserve_readback_order(self):
         s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         for name,count in [("static void draw(const p_draw *d) {",4),
-                           ("static void draw_idx(",3),("static void mesh_draw(const p_draw *d) {",1)]:
+                           ("static void draw_idx(",3),("static void mesh_draw_one(const p_draw *d, uint32_t batch) {",1)]:
             f=extract(s,name)
             self.assertEqual(f.count("pass_dump_draw_checkpoint("),count)
             self.assertEqual(f.count("vk_occ_draw();"),count)
