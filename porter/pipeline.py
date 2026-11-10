@@ -266,7 +266,7 @@ class Port:
         o.keys = Path(keys).expanduser().resolve() if keys else None
         try: self.tools = toolchain.require(self.cfg, str(o.keys) if o.keys else None, adb=o.install)
         except toolchain.ToolError as e: raise BuildError(str(e)) from e
-        o.out = Path(o.out or self.cfg.get('out') or o.folder).expanduser().resolve()
+        o.out = Path(o.out or self.cfg.get('out') or (o.folder.parent if o.folder.is_file() else o.folder)).expanduser().resolve()   # (a .nup given in place of its folder: beside it)
         # the chosen dotnet first on PATH, in this process too: Windows finds a program by the parent's PATH, not the one passed to the child (upstream runs `dotnet` by name)
         os.environ['PATH'] = os.pathsep.join([str(self.tools['dotnet'].parent), os.environ.get('PATH', '')])
         os.environ['DOTNET_ROOT'] = str(toolchain.dotnet_root(self.tools['dotnet']))   # where nx_extract.exe's apphost looks for the runtime (else the system's, which may lack .NET 10)
