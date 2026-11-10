@@ -849,13 +849,13 @@ static void ov_fps(VkCommandBuffer cb, int64_t now, int what) {
         if (bat > -100 && bat < 1000) { snprintf(part[np].s, 16, "BAT %dC", bat); part[np].widest = bat >= 100 ? part[np].s : "BAT 99C"; part[np++].hot = bat >= 45; }
     }
     if (!np) return;   // (Show temperatures alone on a device that gives none)
-    float cw = ov_fps_cell() * (ovf_ready() ? 0.80f : 1), ch = (float)g_ov.gh, m = (float)g_sext.height * 0.02f, r = ch / 2, pad = r * 0.9f, sep = cw * 1.1f;
+    float cw = ov_fps_cell() * (ovf_ready() ? 0.80f : 1), ch = (float)g_ov.gh, m = (float)g_sext.height * 0.006f, r = ch / 2, pad = r * 0.9f, sep = cw * 1.1f, pv = ch * 0.3f, bh = ch + 2 * pv;   // (snug in the corner; pv: room above and below the text)
     float w = 2 * pad + (float)(np - 1) * sep; for (int i = 0; i < np; i++) w += ov_fps_w(part[i].widest, cw);
     int pos = dm_overlay_fps_pos() & 3;   // (the bottom corners are clear of the gesture bar in the middle, the right ones of the system handle half way down the right edge)
-    float x0 = pos & 1 ? (float)g_sext.width - m - w : m, y0 = pos & 2 ? (float)g_sext.height - m - ch : m, bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1];
-    ov_rect(cb, x0, y0, x0 + w, y0 + ch, bx - 2, by - 2, bx + 2, by + 2, 0.50f);   // the box: square-cornered, as much room each side
+    float x0 = pos & 1 ? (float)g_sext.width - m - w : m, y0 = pos & 2 ? (float)g_sext.height - m - bh : m, bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1];
+    ov_rect(cb, x0, y0, x0 + w, y0 + bh, bx - 2, by - 2, bx + 2, by + 2, 0.50f);   // the box: square-cornered, as much room each side
     float x = x0 + pad;
-    for (int i = 0; i < np; i++) { ov_fps_text(cb, part[i].s, part[i].hot, x, y0, cw); x += ov_fps_w(part[i].widest, cw) + sep; }
+    for (int i = 0; i < np; i++) { ov_fps_text(cb, part[i].s, part[i].hot, x, y0 + pv, cw); x += ov_fps_w(part[i].widest, cw) + sep; }
 }
 static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) {   // (alpha: the player's opacity; each control at its own size factor)
     float W = (float)g_sext.width, H = (float)g_sext.height, k = H / t->dh * dm_overlay_scale(), b[4]; const ov_ctl *L = OV_LAYOUTS[t->layout];
