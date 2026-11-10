@@ -20,6 +20,7 @@ C = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 #include "nvn_obj.h"
@@ -108,9 +109,25 @@ static size_t rec_expand(const uint8_t *rec,uint8_t *out) { (void)rec;(void)out;
 
 HOST_SIGNAL
 
-typedef struct { _Alignas(8) uint8_t bytes[2048];size_t n; } commands;
+// A recording's records: a control entry holds their address / 8 in 44 bits (nvn_obj.h ctl_e: every address below 2^47). A host with a 48-bit address space
+// (arm64 Linux, where stacks, the heap and ASan's fake stacks lie above 2^47) gives the records memory mapped below it, as the game's command memory is
+enum { CMD_BYTES = 2048, CMD_ARENA = 64 * CMD_BYTES };
+typedef struct { uint8_t *bytes;size_t n; } commands;
+static uint8_t *cmd_arena(void) {
+ static uint8_t *arena;if(arena)return arena;
+ for(int i=0;i<16 && !arena;i++) {   // a free address below 2^47 (a hint the kernel may move: the result is checked)
+  void *want=(void *)(uintptr_t)((UINT64_C(1)<<45)+(uint64_t)i*(UINT64_C(1)<<40)),*m=mmap(want,CMD_ARENA,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+  if(m==MAP_FAILED)continue;
+  if((uintptr_t)m+CMD_ARENA<=(UINT64_C(1)<<47))arena=m;else munmap(m,CMD_ARENA);
+ }
+ assert(arena);return arena;
+}
+static uint8_t *cmd_bytes(commands *c) {
+ static size_t used;if(!c->bytes) { assert(used+CMD_BYTES<=CMD_ARENA);c->bytes=cmd_arena()+used;used+=CMD_BYTES; }
+ return c->bytes;
+}
 static void emit(commands *c,unsigned op,const void *data,size_t n) {
- size_t z=(n+15)&~(size_t)7;assert(c->n+z<sizeof c->bytes);op_hdr h={op,(uint32_t)z};memcpy(c->bytes+c->n,&h,8);
+ cmd_bytes(c);size_t z=(n+15)&~(size_t)7;assert(c->n+z<CMD_BYTES);op_hdr h={op,(uint32_t)z};memcpy(c->bytes+c->n,&h,8);
  if(n)memcpy(c->bytes+c->n+8,data,n);c->n+=z;
 }
 static void mark(commands *c,int x) { p_clear_color v={.rgba={(float)x,0,0,1}};emit(c,OP_CLEAR_COLOR,&v,sizeof v); }
@@ -144,7 +161,7 @@ int main(void) {
  p_bind_program bp={.prog=&prog};p_set_rt rt={.n=1};rt.color[0]=&tex;
  emit(&nested,OP_BIND_PROGRAM,&bp,sizeof bp);emit(&nested,OP_SET_RT,&rt,sizeof rt);mark(&nested,10);
  event(&first,OP_WAIT_EVENT,&word,1);memcpy(first.bytes+first.n,nested.bytes,nested.n);first.n+=nested.n;   // a call is copied in when it is recorded (f02d0474c), so the nested records are the recording's own
- sync_t sa={0},sb={0};submit(&a,&first,&sa);prog.serial=82;tex.serial=92;memset(nested.bytes,0xcc,sizeof nested.bytes);memset(first.bytes,0xcc,sizeof first.bytes);   // (the submitted recording itself: the queue must have copied it)
+ sync_t sa={0},sb={0};submit(&a,&first,&sa);prog.serial=82;tex.serial=92;memset(nested.bytes,0xcc,CMD_BYTES);memset(first.bytes,0xcc,CMD_BYTES);   // (the submitted recording itself: the queue must have copied it)
  mark(&producer,20);event(&producer,OP_SIGNAL_EVENT,&word,1);submit(&b,&producer,&sb);
  nvn_queue_test_hold(0);finish(&sa);finish(&sb);retired();
  assert(nmarkers==2&&markers[0]==20&&markers[1]==10);assert(seen_prog==81&&seen_tex==91);
