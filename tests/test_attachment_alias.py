@@ -43,6 +43,8 @@ static void fake_clear(VkCommandBuffer cb,uint32_t na,const VkClearAttachment *a
  cleared_base_layer=r->baseArrayLayer;cleared_layers=r->layerCount;
 }
 #define vkCmdClearAttachments fake_clear
+// DM_VK_PASS_DUMP's journal line (gfx_vk_exec.c pass_journal_clear): off here; it only logs, it records no command
+static void pass_journal_clear(const char *kind,const VkClearAttachment *a,const VkClearRect *r,uint32_t mask){(void)kind;(void)a;(void)r;(void)mask;}
 #define VKRED_ONCE(...) ((void)0)
 ''' + helpers + clear + r'''
 int main(void) {
@@ -82,7 +84,8 @@ int main(void) {
  return 0;
 }
 '''
-        with tempfile.TemporaryDirectory() as folder:
+        (ROOT/'target/tests').mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='attachment-alias-',dir=ROOT/'target/tests') as folder:
             src=Path(folder)/'test.c';src.write_text(code);exe=Path(folder)/'test'
             result=subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-I',str(ROOT/'nxnative/dm/third_party/vulkan-headers/include'),str(src),'-o',str(exe)],capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)

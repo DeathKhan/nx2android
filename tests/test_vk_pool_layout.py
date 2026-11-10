@@ -14,8 +14,9 @@ def fixture():
     defs = header[header.index("enum { RK_SUPPORT"):header.index("_Static_assert(sizeof(dmsv_bind)")]
     bent = source[source.index("typedef struct __attribute__((packed)) { uint64_t key;"):
                   source.index("static const uint8_t *g_bundle;")]
+    # ends at vk_shaders_open itself rather than its comment, which upstream nx2android #173 (stricter index checks) rewrote
     scan = source[source.index("static unsigned g_pool_kinds"):
-                  source.index("// Every entry is checked")]
+                  source.index("void vk_shaders_open(")]
     layout = source[source.index("static int g_pool_nt"):
                     source.index("// Is the id used only")]
     return r"""

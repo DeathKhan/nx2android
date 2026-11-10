@@ -220,19 +220,22 @@ int main(void){
  vk_occ_reset();open_pass();draw(99);report_to(a);close_pass();
  execute_query_cb(99);execute_query_cb(1);complete(cur(),1);
  assert(a[0]==17&&get_calls==1&&!pools[cur()->oq[0]].available[1]&&!failure_lines);
- // Completion must fail loudly instead of publishing fake counts on unavailable results.
+ // An unavailable result is no longer fatal (8569eeb7b "non-fatal occlusion readback": a few queries per submission part never
+ // become available on the Odin 3 in Ocarina of Time): completion logs the full diagnostics for the first failures and counts the
+ // query as visible (1 sample), so a render condition reading it draws. It never publishes a diagnostic read as the guest's count.
  clear_state();vk_occ_reset();open_pass();draw(9);close_pass();
- pools[cur()->oq[0]].available[0]=0;expect_die=1;
- if(!setjmp(death)){complete(cur(),1);abort();}expect_die=0;
+ pools[cur()->oq[0]].available[0]=0;expect_die=1;complete(cur(),1);expect_die=0;
  assert(failure_lines==4&&strstr(failure_log,"frame 123 fence 456 slot 0"));
  assert(strstr(failure_log,"queries 1 begins 1 ends 1 block resets 1"));
  assert(strstr(failure_log,"begin/reset/end parts 0/0/0"));
- assert(g_occ_completed==0&&diagnostic_reads==1); // unavailable diagnostics never become guest results
+ assert(g_occ_completed==1&&diagnostic_reads==1); // counted as visible; unavailable diagnostics never become guest results
  assert(strstr(failure_log,"query draw calls 1")&&strstr(failure_log,"available 0 (failed query)"));
- // Even a second read that succeeds is evidence only: the original failure remains fatal.
- failure_lines=0;failure_log[0]=0;diagnostic_releases=1;expect_die=1;
- if(!setjmp(death)){complete(cur(),1);abort();}expect_die=0;
- assert(g_occ_completed==0&&strstr(failure_log,"available 1 (failed query)"));
+ // Even a second read that succeeds is evidence only: the failed query still counts as 1, not the 9 samples the diagnostic read saw.
+ // (completion consumed the posts, so the same submission is recorded again)
+ clear_state();vk_occ_reset();open_pass();draw(9);close_pass();
+ pools[cur()->oq[0]].available[0]=0;diagnostic_releases=1;expect_die=1;complete(cur(),1);expect_die=0;
+ assert(diagnostic_reads==1&&pools[cur()->oq[0]].available[0]);
+ assert(g_occ_completed==1&&strstr(failure_log,"available 1 (failed query)"));
  diagnostic_releases=0;
  // A query ending in the wrong native part is identified independently of reset ownership.
  failure_lines=0;failure_log[0]=0;cur()->nmain_used=2;cur()->mains[1]=3;
@@ -342,8 +345,11 @@ int main(void){
         self.assertLess(end.index('vk_occ_end();'), end.index('vkCmdEndRenderPass('))
         self.assertIn('if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) vk_occ_reset();', runtime)
         self.assertRegex(runtime, r'vk_occ_end\(\);\s*vkCmdDraw\(cb, 3, 1, 0, 0\);')
-        guest_calls = re.findall(r'vk_occ_draw\(\);\s*vkCmdDraw\w*\(', runtime)
+        # the indirect draws choose between the count and the plain indirect command after the one vk_occ_draw
+        # (170571070, #151: indirect-count multi-draws honour the GPU's count): `vk_occ_draw(); if (mcb) vkCmdDraw...IndirectCount(`
+        guest_calls = re.findall(r'vk_occ_draw\(\);\s*(?:if \(mcb\) )?vkCmdDraw\w*\(', runtime)
         self.assertEqual(len(guest_calls), 8)  # includes the raster draw of mesh emulation
+        self.assertEqual(len(re.findall(r'vk_occ_draw\(\);', runtime)), 8)  # and no other guest draw counts
 
 
 if __name__ == '__main__':

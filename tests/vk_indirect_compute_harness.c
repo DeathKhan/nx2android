@@ -62,6 +62,63 @@ int vk_sub_open(void) { return 1; }
 VkCommandBuffer vk_cmd(void) { return (VkCommandBuffer)2; }
 static void wait_fence(uint64_t fence);
 void img_sub_free_(void *p) { abort(); }
+// This fork's replay services around stage_set and dispatch, all off here as in a default run: the pool tables ring, dummy pools, MRT and
+// light diagnostics, compute and fragment traces, texture dumps, the movie / upscaler kernels, dynamic sampler slots, descriptor pools
+#include <math.h>
+uint64_t g_vk_nbar, g_tex_frame, g_ubd_racy;
+static int g_drv_compact = 1, g_buffer_memo = 1;   // production defaults (DM_VK_DRV_COMPACT / DM_VK_BUFFER_MEMO)
+static int g_mrt_active, g_fs_buffer_collect, g_gmem_log, g_up_native_trace, g_x_nosetc_bits, g_pool_tex_base, g_pool_samp_base, g_pool_strict, g_up_diag_left;
+static int g_cs_buffer_collect, g_cs_trace_collect, g_cs_trace_dump, g_cs_trace_buffers;
+static unsigned g_cs_trace_seen, g_cs_images_n, g_cs_images_copies, g_cs_buffers_n, g_cs_buffers_reserved;
+static uint64_t g_ring_full, g_ring_patch, g_ring_ids, g_ring_hits, g_ring_none, g_ring_ns;
+static int g_pdum_lo = -1, g_pdum_hi, g_pdum_nf; static unsigned g_pdum_kinds; static uint32_t g_pdum_f[16];
+static vkimg_t *g_desc_im;
+static vkpool_t *pool_back_at(uint64_t addr, uint64_t len) { abort(); }   // the fixture's pools are made backed
+static void sbuf_desc(int st, const dmsv_bind *b, VkDescriptorBufferInfo *bi) { abort(); }
+static void light_diag_support(int st, const vkshader_t *s, VkDescriptorBufferInfo *bi) { abort(); }
+static void mrt_support(int st, const vkshader_t *s, VkDescriptorBufferInfo *bi) { abort(); }
+static void fs_trace_texture_note(int st, const dmsv_bind *b, uint64_t h, const VkDescriptorImageInfo *ii, vkimg_t *im) { abort(); }
+static VkSampler samp_dynamic_slot(int st, int slot, int dynslots) { abort(); }
+static void cs_trace_buffer_note(int st, uint64_t shader, const dmsv_bind *b, const VkDescriptorBufferInfo *source) { abort(); }
+static int cs_trace_match(uint64_t key) { return 0; }
+static void cs_trace_images_copy(VkCommandBuffer cb, uint64_t key, int after) { abort(); }
+static void cs_trace_buffers_copy(VkCommandBuffer cb, uint64_t key, int after) { abort(); }
+void vk_texdump_note(vkimg_t *im) {}
+int vk_upscale_square_key(uint64_t key) { return 0; }
+int vk_upscale_square(vkimg_t *src, VkImageView source_view, vkimg_t *dst, const VkImageBlit *region) { abort(); }
+int vk_movie_fill_kernel(uint64_t key) { return 0; }
+int vk_movie_fill(vkimg_t *out, uint32_t view_format, uint32_t level, uint32_t layer) { abort(); }
+int vk_movie_fill_note(uint64_t key) { abort(); }
+int vk_tex_storage_prepare(const tex_t *t, const view_t *v) { abort(); }
+void mtl_tex_gpu_written(const tex_t *t) { abort(); }
+static int vk_gpu_pending(uint64_t a, uint64_t n) { return 0; }
+static void descriptor_pools_reset(vksub_t *s) {}
+#define UNEXPECTED { fprintf(stderr, "unexpected call: %s\n", __func__); abort(); }
+uint64_t g_tex_gen_why[4];
+__thread const char *vk_mem_tag;
+int dm_sdk_ounce(void) { return 0; }
+uint64_t mtl_last_fence(void) { return g_fence; }
+uint64_t nvn_replaying_job(void) { return 0; }
+// no pool tables (vk_pool_n / vk_tbl_n 0), no registry snapshot: the set memo proves nothing from the registries and claims no leases
+int vk_pool_n(void) { return 0; } int vk_pool_samp_n(void) { return 0; } unsigned vk_pool_kinds(void) { return 0; } int vk_tbl_n(void) { return 0; }
+VkDescriptorSetLayout vk_tbl_dsl(void) UNEXPECTED
+int vk_tex_id_max(void) { return 0; } int vk_samp_id_max(void) { return 0; }
+void vk_tex_pool_fill(int on) UNEXPECTED
+int vk_tex_pool_ok(const tex_t *t) UNEXPECTED
+int vk_registry_snapshot(uint64_t *textures, uint64_t *samplers) { return 0; }
+uint64_t vk_reglog_visible_end(uint64_t before) { return 0; } uint64_t vk_reglog_head(void) { return 0; } int vk_reglog_pending(uint64_t p, uint64_t before) { return 0; }
+uint64_t vk_reglog_take(uint64_t from, uint64_t before, int *tids, int max, int *n) UNEXPECTED
+uint64_t vk_droplog_seq(void) { return 0; }
+int vk_droplog_take(uint64_t from, const void **out, int max, uint64_t *to) { *to = 0; return 0; }
+uint64_t vk_descriptor_lease(VkDescriptorSet set, int rewrite) { return 0; }
+int vk_descriptor_claim(VkDescriptorSet set, uint64_t lease) { return 0; }
+int vk_alloc_sets_owned(VkDescriptorSetLayout l, int n, VkDescriptorSet *out) UNEXPECTED
+VkBuffer vk_gmem_map(VkDeviceSize *len) UNEXPECTED
+VkBuffer vk_gmem_log_disabled(void) UNEXPECTED
+const vkfmt_t *vk_fmt(int nvn_format) UNEXPECTED
+vkimg_t *vk_tex(const tex_t *t) UNEXPECTED
+VkImageView vk_tex_view(const tex_t *t, const view_t *v, int dim, int arrayed, int view_kind, vkimg_t **img_out) UNEXPECTED
+void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) UNEXPECTED
 
 // Vulkan allocation and command sink: host and device argument bytes are separate.
 typedef struct { uint8_t *bytes; size_t size; VkBufferUsageFlags usage; int write_stage, visible; } Buffer;
@@ -173,7 +230,7 @@ static void wait_fence(uint64_t fence) { assert(g_slot[0].blk[0].used != 0); run
 int mtl_wait(uint64_t fence, uint64_t timeout) { wait_fence(fence); return 1; }
 static void make_pool(uint64_t lo, uint64_t hi, uint64_t base, uint64_t end, uint64_t boff) {
     int i = g_npool++; assert(i < MAXPOOL); VkBuffer b = make_buffer(boff + hi - lo, POOL_USAGE); buffers[nbuffer++] = buffer(b);
-    g_pool[i] = (vkpool_t){.lo=lo,.hi=hi,.base=base,.end=end,.boff=boff,.buf=b}; g_pool_ord[i]=i; g_pool_gen++;
+    g_pool[i] = (vkpool_t){.lo=lo,.hi=hi,.base=base,.end=end,.boff=boff,.buf=b,.backed=1};   // (the fork backs lazy pools at their first GPU use) g_pool_ord[i]=i; g_pool_gen++;
 }
 static void produce(uint64_t addr, const uint32_t values[3]) {
     for (int i = 0; i < 3; i++) { VkBuffer b; VkDeviceSize o; assert(vk_buf_at(addr + 4*i, 4, &b, &o));

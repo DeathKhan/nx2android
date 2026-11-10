@@ -30,7 +30,9 @@ class CubeViews(unittest.TestCase):
 #include <stdarg.h>
 #include "nxnative/dm/gfx/nvn/nvn_obj.h"
 #include "nxnative/dm/gfx/nvn/nvn_hmap.h"
-#define VKLOG(...) ((void)0)
+// a function, not ((void)0): view_log_selected (DM_VK_VIEW_LOG_SIZE) only uses its parameters in its log line
+static void vklog_ignore(const char *fmt, ...) { (void)fmt; }
+#define VKLOG(...) vklog_ignore(__VA_ARGS__)
 static int red_calls;
 static char last_red[512];
 static void capture_red(const char *fmt, ...) {
@@ -58,6 +60,16 @@ static const vkfmt_t format = {.vk=VK_FORMAT_R8G8B8A8_UNORM, .kind=1, .bpb=4};
 static const vkfmt_t *vk_fmt(int f) { (void)f; return &format; }
 static vkimg_t *vk_tex(const tex_t *t) { (void)t; return &image; }
 static void alias_check(vkimg_t *im) { (void)im; }
+// symbols of this fork the cut code calls: movie zero-copy textures (movie_zc.h), the native-texture diagnostics (gfx_vk_texture_diag.h),
+// tex_desc_for's descriptor-image note and DM_VK_UP_NATIVE_TRACE; none of them is enabled here
+int zc_tex_wants(const void *mem, uint64_t len) { (void)mem; (void)len; return 0; }
+enum { TEX_DIAG_VIEW_DROP = 2 };
+static int diag_drops;
+static void vk_tex_diag_native(unsigned cause, const tex_t *t, const vkimg_t *im) { assert(cause == TEX_DIAG_VIEW_DROP && !t && im); diag_drops++; }
+uint64_t g_tex_gen_why[4];
+static vkimg_t *g_desc_im;
+static int g_up_native_trace;
+static void up_native_texture_trace(const dmsv_bind *b, uint64_t h, const VkDescriptorImageInfo *ii, vkimg_t *im, int storage, int cached) { (void)b; (void)h; (void)ii; (void)im; (void)storage; (void)cached; abort(); }
 // gfx_vk.h declares this; vk_tex_view calls it before its definition
 VkImageView vk_tex_view_as(const tex_t *t, const view_t *vw, int dim, int arrayed, int as_attachment, vkimg_t **img_out, VkFormat vfmt);
 static void vk_watch(const vkimg_t *im, const char *s) { (void)im; (void)s; }
@@ -90,12 +102,12 @@ static VkImageView vk_dummy_view(int dim, int arr, int ms, int storage, int is_i
         code += setup + '    return im;\n}\n'
         code += between(tex, 'typedef struct vview', '// ---------------- texture / sampler ID tables')
         code += between(exe, 'enum { TVC =', 'static uint64_t g_num_um')
-        code += between(exe, 'static int tex_desc_for(', '// Reuse within a submission')
+        code += between(exe, 'static int tex_desc_for(', "// Resolve every stage's storage images")
         code += r'''
 static void reset(int target, unsigned w, unsigned h, unsigned layers, unsigned samples) {
     vk_tex_view_drop_all(&image); memset(g_tvc,0,sizeof g_tvc); ++g_set_epoch;
     texture=(tex_t){.d={.target=target,.width=w,.height=h,.depth=layers,.levels=3,.samples=samples,.format=0x25}};
-    vkimg_t *created=img_new(&texture,&format); image=*created; free(created);
+    vkimg_t *created=img_new(&texture,&format,0,VK_FORMAT_UNDEFINED); image=*created; free(created);   // no storage usage requested
     image.img=(VkImage)(uintptr_t)1; has_subview=0; view_calls=dummy_calls=lookup_calls=0;
     dummy=(VkImageView)(uintptr_t)10000;
 }
@@ -110,7 +122,11 @@ static void rejected(int arr) {
     assert(dummy_calls==1 && view_calls==calls);
     // Rejection never caches the incompatible real view (or a dummy as real).
     tex_desc_for(1,&b,1,&ii,0); assert(dummy_calls==2 && lookup_calls==2 && view_calls==calls);
+    // This fork refuses a storage view of an image its storage preflight has not given STORAGE usage (vk_tex_view_as, RED 162;
+    // 97b0fa5ed) before any cube check: give the image the usage a successful preflight would, so the storage request reaches the cube rule
+    VkImageUsageFlags usage=image.usage; image.usage|=VK_IMAGE_USAGE_STORAGE_BIT;
     tex_desc_for(1,&b,1,&ii,1); assert(ii.imageView==dummy && dummy_storage==1 && dummy_dim==3 && dummy_arr==arr);
+    image.usage=usage;
 }
 static void accepted(int arr, unsigned base, unsigned count) {
     dmsv_bind b={.dim=3,.flags=arr}; VkDescriptorImageInfo ii;
@@ -124,7 +140,7 @@ static void accepted(int arr, unsigned base, unsigned count) {
     assert(vk_tex_view(&texture,has_subview?&subview:NULL,3,arr,0,NULL)==saved && view_calls==calls);
 }
 int main(int argc, char **argv) {
-    (void)argv;
+    (void)argv; (void)storage_view_compatible;   // cut with img_new's neighbours; storage preflight is not exercised here
     if (argc>1) {
         reset(4,16,16,7,1); accepted(0,0,6);
         reset(4,16,16,8,1); has_subview=1; subview=(view_t){.set_layers=1,.min_layer=2,.nlayers=6}; accepted(0,2,6);
@@ -167,10 +183,16 @@ int main(int argc, char **argv) {
     assert(vk_tex_view(&texture,&subview,1,0,0,NULL)); assert(last_view.viewType==VK_IMAGE_VIEW_TYPE_2D && last_view.subresourceRange.baseArrayLayer==2);
     assert(vk_tex_view(&texture,&subview,3,0,1,NULL)); assert(last_view.viewType==VK_IMAGE_VIEW_TYPE_2D && last_view.subresourceRange.layerCount==1);
     assert(red_calls==1); // the production VKRED_ONCE keeps repeated refusals quiet
+    // Without that usage even a compatible cube gets the dummy as a storage image, and the fork's preflight RED says why
+    reset(8,16,16,1,1); { dmsv_bind b={.dim=3}; VkDescriptorImageInfo ii; image.usage&=~(VkImageUsageFlags)VK_IMAGE_USAGE_STORAGE_BIT;
+      tex_desc_for(1,&b,1,&ii,1); assert(ii.imageView==dummy && dummy_storage==1 && !view_calls);
+      assert(red_calls==2 && strstr(last_red,"storage image used without successful preflight")); }
     vk_tex_view_drop_all(&image); free(g_views.keys); free(g_views.vals);
 }
 '''
-        with tempfile.TemporaryDirectory() as folder:
+        target = ROOT / 'target/tests'
+        target.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='cube-views-', dir=target) as folder:
             src=Path(folder)/'cube.c';src.write_text(code);binary=Path(folder)/'cube'
             subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-I',str(ROOT),'-I',str(ROOT/'nxnative/dm/gfx/nvn/include'),'-I',str(ROOT/'nxnative/dm/third_party/vulkan-headers/include'),str(src),'-o',str(binary),'-pthread'],check=True)
             for mode in ([], ['non-multiple-layers']):

@@ -61,6 +61,8 @@ static void logger(const char *s,...){(void)s;}
 #define VKRED_ONCE(n,...) logger(__VA_ARGS__)
 static uint32_t vk_mem_type(uint32_t types,VkMemoryPropertyFlags req,VkMemoryPropertyFlags avoid){(void)types;(void)req;(void)avoid;return 0;}
 static void vk_end_pass_land(void){}
+// gfx_vk_pipeline_cache.inc (upstream nx2android #213): every vkCreateComputePipelines marks the on-disk pipeline cache dirty
+static unsigned pcache_changes;static void vk_pipeline_cache_changed(void){pcache_changes++;}
 static VkCommandBuffer vk_cmd(void){return H(VkCommandBuffer,1);}
 static void vk_tex_prepare(VkCommandBuffer cb,vkimg_t *out){(void)cb;assert(out);}
 static void vk_img_barrier_all(VkCommandBuffer cb){(void)cb;phase=0;}
@@ -147,6 +149,7 @@ int main(void) {
  .dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},.dstOffsets={{0,0,0},{1920,1080,1}}};
  for(int i=0;i<12;i++)assert(vk_upscale_square(&in,source_view,&out,&r));
  assert(dispatches==12&&sets==12&&blits==12&&registered==1&&out.gpu_w&&next_image==2);
+ assert(pcache_changes==1); // the one pipeline build marked the pipeline cache for saving
  VkImage old=g_square.image.img;unsigned old_sets=sets,old_dispatch=dispatches,old_blits=blits;
  r.srcOffsets[0].x=1;assert(!vk_upscale_square(&in,source_view,&out,&r));r.srcOffsets[0].x=0;
  r.srcOffsets[1].x=1439;assert(!vk_upscale_square(&in,source_view,&out,&r));r.srcOffsets[1].x=1440;

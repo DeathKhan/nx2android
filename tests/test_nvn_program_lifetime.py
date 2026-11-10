@@ -31,6 +31,9 @@ class ProgramLifetime(unittest.TestCase):
             'FLAT': function(source, 'static size_t sub_flat('),
             'COPY': function(source, 'static uint64_t sub_copy('),
         }
+        # prog_key tells a live program by nvnProgramInitialize's magic (upstream nx2android e69473622): MAGIC comes from nvn_obj.h
+        obj = (ROOT / 'nxnative/dm/gfx/nvn/nvn_obj.h').read_text()
+        parts['MAGICDEF'] = next(l for l in obj.splitlines() if l.startswith('#define MAGIC('))
         code = r'''
 #include <assert.h>
 #include <stdint.h>
@@ -45,6 +48,8 @@ class ProgramLifetime(unittest.TestCase):
 #include <time.h>
 #include <errno.h>
 #define NVN(name,ret,...) static ret name(__VA_ARGS__)
+MAGICDEF
+#define PROG_MAGIC MAGIC('P','R','O','G') /* what nvnProgramInitialize writes */
 typedef int NVNboolean;
 typedef struct { uint64_t data; const void *control; } NVNshaderData;
 typedef struct { uint32_t magic,nstage; NVNshaderData sd[6]; uint64_t serial; } prog_t;
@@ -75,7 +80,7 @@ static int keys_hash(const NVNshaderData *sd,int require_mapping,uint8_t out[8])
 }
 static void (*g_nvn_on_shader)(const uint8_t[8],const void *,uint64_t,uint32_t);
 static void assert_locked(void){int r=pthread_mutex_trylock(&g_sub_mu);assert(r==EBUSY);}
-static void mtl_prog_forget(const prog_t *p){assert_locked();assert(p->magic==123);forget_count++;}
+static void mtl_prog_forget(const prog_t *p){assert_locked();assert(p->magic==PROG_MAGIC);forget_count++;}
 static void mtl_prog_release(prog_t *p){if(p->serial)assert_locked();release_count++;}
 static void mtl_prog_prefetch(const prog_t *p){(void)p;}
 static int observe_wait(pthread_cond_t *cv,pthread_mutex_t *mu,const struct timespec *ts){atomic_fetch_add(&waits,1);return pthread_cond_timedwait(cv,mu,ts);}
@@ -103,7 +108,7 @@ static void queue_bind(void){
 static void replay_one(uint64_t expected_serial){
  pthread_mutex_lock(&g_sub_mu);
  p_bind_program *b=(void *)(uintptr_t)(copied+8);const prog_t *p=b->prog;
- assert(p->magic==123&&p->serial==expected_serial&&p->nstage==1);
+ assert(p->magic==PROG_MAGIC&&p->serial==expected_serial&&p->nstage==1);
  assert(*(const unsigned char *)p->sd[0].control==0x11);
  assert(*(const unsigned char *)(uintptr_t)p->sd[0].data==0x22);
  uint8_t key[8];assert(prog_key(p,0,key));for(int i=0;i<8;i++)assert(key[i]==0x33);
@@ -112,7 +117,7 @@ static void replay_one(uint64_t expected_serial){
  pthread_mutex_lock(&g_job_mu);g_job_done++;pthread_cond_broadcast(&g_jobdone_cv);pthread_mutex_unlock(&g_job_mu);
 }
 static void make_program(void){
- program=calloc(1,sizeof *program);program->magic=123;
+ program=calloc(1,sizeof *program);program->magic=PROG_MAGIC;
  unsigned char *ctl=malloc(16),*code=malloc(8);memset(ctl,0x11,16);memset(code,0x22,8);
  NVNshaderData sd={(uintptr_t)code,ctl};assert(nvnProgramSetShaders(program,1,&sd));
  assert(program->sd[0].control!=ctl);free(ctl); // SetShaders preserved control when keying must wait for a mapped code area
@@ -122,8 +127,11 @@ int main(void){
  unsetenv("DM_NVN_SHDUMP");unsetenv("DM_NVN_PROGTRACE");pthread_t thread;
  make_program();uint64_t s=program->serial;queue_bind();reset_wait();
  assert(!pthread_create(&thread,NULL,finalize_thread,NULL));wait_blocked();
- assert(!forget_count&&program->magic==123);replay_one(s);pthread_join(thread,NULL);
+ assert(!forget_count&&program->magic==PROG_MAGIC);replay_one(s);pthread_join(thread,NULL);
  assert(atomic_load(&finished)&&forget_count==1&&!program->magic);
+ assert(cache[s].ok==1); // the live program's replay kept its key in its record
+ // a bind replayed after Finalize still keys the program, but makes no record nothing would drop (upstream e69473622)
+ {memset(&cache[s],0,sizeof cache[s]);uint8_t key[8];assert(prog_key(program,0,key));for(int i=0;i<8;i++)assert(key[i]==0x33);assert(!cache[s].ok);}
  free((void *)program->sd[0].control);free((void *)(uintptr_t)program->sd[0].data);free(program);
  make_program();s=program->serial;queue_bind();reset_wait();
  const void *old_ctl=program->sd[0].control;uint64_t old_code=program->sd[0].data;

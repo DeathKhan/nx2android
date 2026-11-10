@@ -36,30 +36,37 @@ def production():
     drvs = replay[replay.index('static uint32_t g_dispatch'):replay.index('// vk_samp_by_id without')]
     cache = replay[replay.index('enum { SETC'):replay.index('// A binding that runs past')]
     memo = replay[replay.index('enum { MEMO_CB'):replay.index('// ---------------- draws')]
-    indirect = replay[replay.index('static void compute_warm_start(void) {'):replay.index('// ---------------- copies and clears')]
+    # up to the mesh emulation (its kernels' SPIR-V headers are generated at build time): the fork's upscaler, pass-through and skip rules,
+    # dispatch_indirect_spans and dispatch
+    indirect = replay[replay.index('static void compute_warm_start(void) {'):replay.index('#include "meshlaunch_comp.spv.h"')]
     indirect = indirect[indirect.index('\n}') + 2:]
     ubd = core[core.index('typedef struct { uint64_t lo, hi; VkBuffer sb;'):core.index('// the draw bisection')]
     infl = core[core.index('typedef struct { uint64_t lo, hi, fence; const uint8_t *data; }'):core.index('int vk_ubd_overlaps')]
-    functions = ''.join(function(core, sig) for sig in [
-        'vkpool_t *vk_pool_of(', 'uint32_t vk_pool_gen(', 'int vk_buf_at(',
-        'static vksub_t *cur(', 'void *vk_scratch(', 'void vk_img_barrier_all('])
-    # Single-line production functions need their line, not the next function.
-    for sig in ['uint32_t vk_pool_gen(', 'static vksub_t *cur(']:
-        functions = functions.replace(function(core, sig), next(x for x in core.splitlines() if x.startswith(sig)) + '\n')
-    driver = function(replay, 'static uint64_t c2_handle(') + drvs + cache + memo + indirect
+    # Single-line production functions need their line, not the next function. vk_pool_of is the fork's wrapper over vk_pool_of_
+    # (a per-thread cache of the last pools, and lazy backing: the fixture's pools are made backed)
+    single = ('vkpool_t *vk_pool_of(', 'vkpool_t *vk_pool_peek(', 'uint32_t vk_pool_gen(', 'static vksub_t *cur(', 'static VkDeviceSize scratch_cap(void) {')
+    functions = ''.join(next(x for x in core.splitlines() if x.startswith(sig)) + '\n' if sig in single else function(core, sig) for sig in [
+        'static vkpool_t *pool_find_locked(', 'static vkpool_t *vk_pool_of_(', 'vkpool_t *vk_pool_of(', 'vkpool_t *vk_pool_peek(', 'uint32_t vk_pool_gen(', 'int vk_buf_at(',
+        'static vksub_t *cur(', 'static VkDeviceSize scratch_cap(void) {', 'void *vk_scratch(', 'void vk_img_barrier_all('])
+    # the fork's storage-buffer dynamic offsets and storage-image preparation, used by the set memo and dispatch
+    fork = function(replay, 'static uint32_t storage_dynamic_offset(') + function(replay, 'static void stage_storage_prepare(')
+    driver = function(replay, 'static uint64_t c2_handle(') + drvs + cache + fork + memo + indirect
     lifecycle = function(core, 'static void slot_recycle(')
     end_pass = next(x for x in replay.splitlines() if x.startswith('void vk_end_pass_land(')) + '\n'
     wrapper = ('stage_set(st, s, offsets, NULL)' if 'uint32_t *dofs, VkDescriptorBufferInfo *' in replay
                else 'stage_set(st, s, offsets)')
     usage = core[core.index('static const VkBufferUsageFlags POOL_USAGE0'):core.index('static VkResult pool_copied_alloc')]
-    return header, state, slots, functions + ubd + infl + end_pass, driver, lifecycle, wrapper, usage
+    # the fork reads uniform bytes through deferred updates (vk_ubd_read)
+    ubd_read = function(core, 'void vk_ubd_read(')
+    return header, state, slots, functions + ubd + infl + ubd_read + end_pass, driver, lifecycle, wrapper, usage
 
 
 @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
 class IndirectCompute(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory(prefix='vk-indirect-compute-')
+        (ROOT / 'target/tests').mkdir(parents=True, exist_ok=True)
+        cls.tmp = tempfile.TemporaryDirectory(prefix='vk-indirect-compute-', dir=ROOT / 'target/tests')
         cls.addClassCleanup(cls.tmp.cleanup)
         folder = Path(cls.tmp.name)
         header, state, slots, core, replay, lifecycle, wrapper, usage = production()
@@ -72,7 +79,7 @@ class IndirectCompute(unittest.TestCase):
         cls.exe = folder / 'check'
         subprocess.run(['cc', '-std=gnu11', '-pthread', '-Wall', '-Wextra', '-Werror',
                         '-Wno-unused-parameter', '-Wno-unused-function',
-                        '-Wno-unused-variable', '-Wno-missing-field-initializers', '-Wno-dangling-else',
+                        '-Wno-unused-variable', '-Wno-missing-field-initializers', '-Wno-dangling-else', '-Wno-misleading-indentation',
                         '-I' + str(folder), '-I' + str(DM / 'third_party/vulkan-headers/include'),
                         '-I' + str(DM / 'gfx/nvn'), '-I' + str(DM / 'gfx/nvn/include'),
                         '-I' + str(DM / 'android'), str(folder / 'check.c'),

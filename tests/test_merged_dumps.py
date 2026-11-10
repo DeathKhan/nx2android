@@ -9,16 +9,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 from porter import dumps
 from porter.upstream import nsp
+
+# This fork's porter reads every package's titles from its content metas (nx_extract --contents through package_reader: pipeline.scan),
+# which takes a merged base + update + DLC dump as each of its titles. These synthetic dumps hold tickets only, which only the ticket
+# reader can name: the warning of #201 lives in title_of, which scan_nsps uses through its earlier form scan_nsps(folder, exts, keys)
+# (legacy_contents), so the scans below go through that form.
+def ticket_scan(folder, keys=None, env=None, want=None):
+    return nsp.scan_nsps(Path(folder), dumps.EXTS, keys)
 
 
 class MergedDumps(unittest.TestCase):
     BASE = 0x0100000000AAA000
 
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(prefix='nx2a_merged_dump_')
+        (ROOT / 'target/tests').mkdir(parents=True, exist_ok=True)
+        tmp = tempfile.TemporaryDirectory(prefix='nx2a_merged_dump_', dir=ROOT / 'target/tests')
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
 
@@ -80,11 +89,11 @@ class MergedDumps(unittest.TestCase):
         base = self.dump('Merged.nsp', [self.BASE + 0x800, self.BASE])
         update = self.dump('Update [v262144].nsp', [self.BASE + 0x800])
         with patch.object(nsp, 'say') as say:
-            app, fam = nsp.scan_nsps(self.root)
+            app, fam = ticket_scan(self.root)
         self.assertEqual(app, self.BASE)
         self.assertEqual(fam['base'], base)
         self.assertEqual(fam['updates'], [(262144, update)])
-        self.assertEqual(nsp.nsp_versions(fam, []), {'v0': None, 'v262144': update})
+        self.assertEqual(nsp.nsp_versions(fam), {'v0': None, 'v262144': update})
         say.assert_called_once()
 
     def test_meta_titles_on_cartridge_join_ticket_titles(self):
@@ -102,14 +111,14 @@ class MergedDumps(unittest.TestCase):
         self.assertIn(f'{self.BASE + 0x800:016X}', say.call_args.args[0])
 
     def test_inspect_json_remains_one_document_with_warning(self):
-        from porter import cli, config
+        from porter import cli, config, pipeline
         base = 0x010043B013C5C000   # a supported profile, with no game data
         for tids, expected_status in (([base, base + 0x800], 0),
                                       ([base + 0x800, base + 0x1001], 2)):
             with self.subTest(tids=tids):
                 self.dump('Merged.nsp', tids)
                 out, err = io.StringIO(), io.StringIO()
-                with patch.object(config, 'load', return_value={}), \
+                with patch.object(config, 'load', return_value={}), patch.object(pipeline, 'scan', ticket_scan), \
                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     status = cli.main(['inspect', str(self.root), '--json'])
                 self.assertEqual(status, expected_status)

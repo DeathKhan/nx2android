@@ -49,6 +49,8 @@ static int dm_codec_copy_last_nv12(uint64_t expected,void *dst,uint64_t cap){
 }
 static uint32_t vk_mem_type(uint32_t types,VkMemoryPropertyFlags req,VkMemoryPropertyFlags avoid){(void)types;(void)req;(void)avoid;return 0;}
 static void vk_end_pass_land(void){}
+// gfx_vk_pipeline_cache.inc (upstream nx2android #213): every vkCreateComputePipelines marks the on-disk pipeline cache dirty
+static unsigned pcache_changes;static void vk_pipeline_cache_changed(void){pcache_changes++;}
 static VkCommandBuffer vk_cmd(void){return H(VkCommandBuffer,1);}
 static void vk_tex_prepare(VkCommandBuffer cb,vkimg_t *out){(void)cb;assert(out);}
 static void vk_img_barrier_all(VkCommandBuffer cb){(void)cb;}
@@ -128,6 +130,7 @@ int main(void){
  image_format[500]=out.fmt;
  for(pic_gen=1;pic_gen<=12;pic_gen++)assert(vk_movie_fill(&out,VK_FORMAT_R8G8B8A8_UNORM,0,0));
  assert(sets==12&&dispatches==12&&copies==12&&blits==12&&registered==1&&out.gpu_w&&buffer_lookups==12&&!stages);
+ assert(pcache_changes==1); // the one pipeline build marked the pipeline cache for saving
  pic_gen--;assert(vk_movie_fill(&out,VK_FORMAT_R8G8B8A8_UNORM,0,0));
  assert(sets==12&&dispatches==12&&copies==13&&blits==13); // Same picture only copies; no stale descriptor rebinding.
  assert(vk_movie_fill(&out,VK_FORMAT_R8G8B8A8_UNORM,1,1));

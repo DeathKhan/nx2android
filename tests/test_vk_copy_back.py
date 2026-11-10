@@ -38,9 +38,11 @@ static void vkCmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, V
 FUNCTION
 int main(void) {
     VkCommandBuffer cb = (VkCommandBuffer)(uintptr_t)1;
-    pools_readback_barrier(cb); assert(calls==0); // zero-copy: no new synchronization
-    g_shadow_pools=1; pools_readback_barrier(cb); pools_readback_barrier(cb); assert(calls==2);
-    g_shadow_pools=0; pools_readback_barrier(cb); assert(calls==2);
+    // 8569eeb7b: zero-copy (directly mapped AHardwareBuffer) pools hold GPU-written results the guest reads after a fence too, and a
+    // fence wait alone does not make device writes visible to the host: every submission part publishes them, shadow pools or not
+    pools_readback_barrier(cb); assert(calls==1);
+    g_shadow_pools=1; pools_readback_barrier(cb); pools_readback_barrier(cb); assert(calls==3);
+    g_shadow_pools=0; pools_readback_barrier(cb); assert(calls==4);
 }
 '''.replace('FUNCTION', function)
         with tempfile.TemporaryDirectory(prefix='nx2a-readback-') as tmp:
@@ -99,6 +101,10 @@ static int checked_mprotect(void *a, size_t n, int prot) {
     return mprotect(a, n, prot);
 }
 #define mprotect checked_mprotect
+// nvn_dirty.c's content hash (137e10afc) uses clang's rotate builtin (the NDK and Xcode builds are clang); the host gcc lacks it
+#if !defined(__clang__) && !defined(__builtin_rotateleft64)
+#define __builtin_rotateleft64(x, n) ((uint64_t)(x) << (n) | (uint64_t)(x) >> ((64 - (n)) & 63))
+#endif
 DIRTY
 typedef struct { uint64_t lo, hi, mem; uint8_t *shadow; int synced, flags, baseline_complete, noncoherent; uint8_t *baseline; uint64_t stamp, stamp0; const void *span; } vkpool_t;
 static vkpool_t g_pool[5]; static int g_npool = 5;

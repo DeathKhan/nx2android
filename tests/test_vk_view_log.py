@@ -51,7 +51,11 @@ int main(int argc,char **argv){
    subprocess.run(['cc','-std=gnu11','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(c),'-o',str(e)],check=True)
    for value in ['off','1524x928','1524x928bad','4294967296x928']:subprocess.run([str(e),value],check=True,timeout=10)
  def test_actual_cached_and_created_hooks(self):
-  body=function(SRC.read_text(),'VkImageView vk_tex_view(')
+  # vk_tex_view is now a wrapper over vk_tex_view_as (integer storage views, FINAL FANTASY TACTICS): the hooks live in vk_tex_view_as,
+  # and every vk_tex_view request must still reach them through it
+  src=SRC.read_text()
+  self.assertIn('return vk_tex_view_as(t, vw, dim, arrayed, view_kind, img_out, 0);',function(src,'VkImageView vk_tex_view('))
+  body=function(src,'VkImageView vk_tex_view_as(')
   self.assertEqual(body.count('view_log_selected('),2)
   self.assertIn('view_log_selected(t,vw,im,dim,arrayed,view_kind,v,1); pthread_mutex_unlock',body)
   self.assertIn('view_log_selected(t,vw,im,dim,arrayed,view_kind,nv,0);\n    pthread_mutex_unlock',body)

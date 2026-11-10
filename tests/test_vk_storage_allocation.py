@@ -16,7 +16,9 @@ class StorageAllocation(unittest.TestCase):
         header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text()
         runtime = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text()
         image = re.search(r'typedef struct vkimg vkimg_t;\nstruct vkimg \{.*?\n\};', header, re.S).group()
-        helpers = '\n'.join(function(runtime, n) for n in ['static VkFormat storage_promote(', 'static vkimg_t *img_new('])
+        # img_new calls vk_int_fmt (DM_VK_UBWC bit 4: integer storage views, FINAL FANTASY TACTICS); it only needs V.pd and the
+        # format-properties stub below, so the production function is cut in rather than stubbed
+        helpers = '\n'.join(function(runtime, n) for n in ['VkFormat vk_int_fmt(', 'static VkFormat storage_promote(', 'static vkimg_t *img_new('])
         code = r'''
 #define VK_NO_PROTOTYPES
 #define VK_USE_64_BIT_PTR_DEFINES 0
