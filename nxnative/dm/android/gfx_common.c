@@ -56,6 +56,7 @@ void mtl_sm_stats(uint64_t *p, uint64_t *c, uint64_t *w) { *p = *c = *w = 0; }
 void mtl_pool_stats(uint64_t s[6]) { memset(s, 0, 6 * sizeof *s); }
 unsigned mtl_cpu_tex_count(void) { return 0; }
 uint64_t mtl_pkg_edge_skips(void) { return 0; }
+uint64_t mtl_pkg_copy_absorbs(void) { return 0; }   // (the Metal backend's packaged-texture copy count, hle_nvn.c's stats line; upstream nxnative bbea4c90f)
 void mtl_pso_line(char *out, size_t n) { if (n) out[0] = 0; }
 int mtl_pso_prebuild_tool(void) { return 0; }   // DM_PSO_PREBUILD=tool is a Metal pipeline-archive step: no such tool here, the game runs
 void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) { (void)f; (void)gpu_ms; (void)frame_ms; }   // DM_AB phases
