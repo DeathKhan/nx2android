@@ -40,6 +40,14 @@ static void gws_stamp(gws_span *s) {   // the stamp first, then the protection (
     s->rg = e > a ? nvn_dirty_span((const void *)a, e - a) : NULL;
     if (s->rg) nvn_dirty_protect((const void *)a, e - a);
 }
+// A span whose overlap with [lo, hi) holds no whole page of it, and which does not cover it, is a sliver of something beside it and does not decide (upstream nxnative
+// c06d1e79a): gws_cpu_since cannot answer for it, and taking its silence as the GPU's made Ocarina of Time's CPU-filled terrain height / hole maps GPU textures (tiles
+// vanished or showed another tile). A span that covers the whole texture keeps the GPU's
+static int gws_sliver(const gws_span *s, uintptr_t lo, uintptr_t hi) {
+    if (s->lo <= lo && s->hi >= hi) return 0;
+    uintptr_t a, e; whole_pages(MAXU(lo, s->lo), MINU(hi, s->hi), &a, &e);
+    return e <= a;
+}
 static int gws_cpu_since(gws_span *s, uintptr_t lo, uintptr_t hi) {   // the CPU wrote a whole page of [lo, hi) within the span after its stamp; g_gws_mu held
     uintptr_t a, e; whole_pages(MAXU(lo, s->lo), MINU(hi, s->hi), &a, &e);
     if (e <= a || !s->rg) return 0;
@@ -84,7 +92,7 @@ void vcs_gpu_written(uintptr_t lo, uintptr_t hi) {
 int vcs_owned(uintptr_t lo, uintptr_t hi) {
     int owned = 0;
     pthread_mutex_lock(&g_gws_mu);
-    for (size_t i = gws_find(lo); i < g_ngws && g_gws[i].lo < hi && !owned; i++) owned = !gws_cpu_since(&g_gws[i], lo, hi);
+    for (size_t i = gws_find(lo); i < g_ngws && g_gws[i].lo < hi && !owned; i++) owned = !gws_sliver(&g_gws[i], lo, hi) && !gws_cpu_since(&g_gws[i], lo, hi);
     pthread_mutex_unlock(&g_gws_mu);
     return owned;
 }

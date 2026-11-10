@@ -54,6 +54,14 @@ int main(void) {
     size_t before = vcs_spans(); vcs_unc_take(9, at(40), at(41)); vcs_gpu_written(at(40), at(44));
     vcs_range_gone(at(40), at(48));
     CHECK("a pool's spans go with it", vcs_spans() == before && !vcs_owned(at(40), at(44)) && !vcs_unc_taken(9));
+    // a span's sliver inside a texture (gws_sliver, upstream nxnative c06d1e79a: Ocarina of Time's terrain tiles): less than a page of it, not covering it
+    vcs_gpu_written(at(50), at(52) + PG / 2); cpu_write(52, 3);
+    CHECK("a neighbour's span reaching less than a page into a texture does not make it the GPU's", !vcs_owned(at(52), at(55)));
+    CHECK("while the drawn texture stays the GPU's", vcs_owned(at(50), at(52) + PG / 2));
+    vcs_gpu_written(at(56), at(62)); vcs_gpu_written(at(56), at(59)); vcs_gpu_written(at(59) + 2560, at(62)); cpu_write(56, 6);   // a 2,560-byte remnant of the old span between two newer ones
+    CHECK("a sub-page remnant of an old span inside a texture the CPU rewrote does not keep it the GPU's", !vcs_owned(at(56), at(62)));
+    vcs_gpu_written(at(63), at(64)); cpu_write(63, 1);
+    CHECK("a texture smaller than a page over storage the GPU wrote stays the GPU's", vcs_owned(at(63), at(63) + PG / 4));
     printf("cpu storage: %u checks, %u failed\n", checks, failed);
     return failed != 0;
 }
