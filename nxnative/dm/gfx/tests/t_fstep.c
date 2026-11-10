@@ -216,6 +216,18 @@ int main(void) {
         snprintf(b, sizeof b, "title at 0.1, open world at 1.5 (TotK): probes stop after the first (probes %llu, frames at hold 3 %llu)", (unsigned long long)m.s.probes, (unsigned long long)h3);
         check(m.s.probes <= 2 && m.s.k == 2, b);
     }
+    {   // Ocarina of Time on the Odin 3 (2026-11-10): the title screen at 0.27, then Kokiri Forest, whose GPU time follows the view at a clock that is at its maximum at
+        // every hold: 1.25 looking one way, 2.05 the other (here for a second in every 6.7). The first probe fails and leaves a reference of about 1.25, which does not fit hold 1; the heavy view is 1.6 times
+        // it, so every turn of the camera was a probe to hold 1: 60-90 late frames each, and hold 3 after them (358 late frames of 900, 4 probes in 17 s)
+        sim m = {0}; nvn_fgpu g = {0}; uint64_t h1 = 0;
+        for (int i = 0; i < 7200; i++) {
+            double w = i < 600 ? 0.27 : fmod(m.real, 400) < 60 ? 2.05 : 1.25;
+            m.slow = nvn_fstep_gpu_slowed(&g, w, m.s.k ? m.s.k : 1, 1, nvn_fstep_probe_phase(&m.s));
+            run(&m, 1, w, 1, 3, 0); h1 += i >= 1200 && m.s.k == 1;
+        }
+        snprintf(b, sizeof b, "GPU time follows the view, never fits hold 1 (OoT): one probe (probes %llu, frames at hold 1 after it %llu, reference %.2f)", (unsigned long long)m.s.probes, (unsigned long long)h1, g.ref);
+        check(m.s.probes <= 1 && h1 == 0, b);
+    }
     {   // Breath of the Wild on an iPhone (2026-10-21): frames of 0.80 / 0.92 vsyncs at hold 1 for 20 s, three pipeline compiles step to 2, and the scene costs the same there:
         // every other frame is above FSTEP_FIT, so no 30 fit in a row; the cost that held hold 1 starts one probe, which holds
         sim m = {0};
