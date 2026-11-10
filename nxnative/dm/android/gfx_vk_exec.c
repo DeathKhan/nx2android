@@ -1167,11 +1167,16 @@ void vk_pass_dump_poll(uint64_t done_fence) {   // gfx_vk_present.c, every prese
     }
     g_npd = 0; g_pd_state = 0;
 }
-// DM_VK_CRUMBS=1 (start-up), for a device lost (a GPU hang): every pass end and dispatch writes {submission, pass} into host-visible memory after a full barrier, and the host
-// keeps the shaders each pass drew with; when the device is lost (vk_crumbs_report), the last work the GPU finished and the passes after it are logged
+// Crumbs, for a GPU hang or a lost device: what each pass recorded, kept by the host always (a few stores a draw): its submission, its draws and dispatches, and the
+// shader keys of the last CRUMB_KEYS distinct pipelines it used (vertex / fragment / geometry keys of a draw, a dispatch's compute key). vk_crumbs_log lists one
+// submission's passes: on a lost device the first unfinished one (vk_device_lost, gfx_vk_core.c), and a submission the GPU took over DM_VK_HANG_MS on, or whose end it
+// never wrote (the driver's hang recovery cuts a hung submission short and signals its fence; hang_check, gfx_vk_core.c). DM_VK_CRUMBS=1 (start-up) adds GPU marks:
+// every pass end and dispatch writes {submission, pass} into host-visible memory after a full barrier, so a lost device also says the last work the GPU finished
+// (vk_crumbs_report). The per-submission listing and the larger ring are droidplay-core's idea (f77a684b8, 2b3a134aa), on our crumbs
+enum { CRUMB_RING = 2048, CRUMB_KEYS = 8 };
 static int g_crumbs = -1; static VkBuffer g_crumb_buf; static volatile uint32_t *g_crumb;
-typedef struct { uint32_t sub; int pass, n; uint64_t k[8][3]; } crumb_t; static crumb_t g_cring[512]; static unsigned g_cn;
-static int crumbs_on(void) {
+typedef struct { uint32_t sub, draws, dispatches; int pass, n, next; uint64_t k[CRUMB_KEYS][3]; } crumb_t; static crumb_t g_cring[CRUMB_RING]; static unsigned g_cn;
+static int crumbs_on(void) {   // the GPU marks (DM_VK_CRUMBS=1)
     if (g_crumbs < 0) { const char *e = getenv("DM_VK_CRUMBS"); g_crumbs = e && atoi(e);
         if (g_crumbs) { VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
             VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &g_crumb_buf)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, g_crumb_buf, &rq);
@@ -1179,20 +1184,46 @@ static int crumbs_on(void) {
             VkDeviceMemory m; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, g_crumb_buf, m, 0)); void *p; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p)); g_crumb = p; g_crumb[0] = 0; } }
     return g_crumbs;
 }
-static crumb_t *crumb_cur(void) { crumb_t *c = &g_cring[(g_cn ? g_cn - 1 : 0) % 512]; uint32_t sub = (uint32_t)mtl_last_fence() + 1;
-    if (!g_cn || c->sub != sub || c->pass != g_sub_pass - 1) { c = &g_cring[g_cn++ % 512]; memset(c, 0, sizeof *c); c->sub = sub; c->pass = g_sub_pass - 1; } return c; }
-static void crumb_draw(uint64_t a, uint64_t b, uint64_t c3) { if (!crumbs_on()) return; crumb_t *c = crumb_cur();
-    for (int i = 0; i < c->n; i++) if (c->k[i][0] == a && c->k[i][1] == b && c->k[i][2] == c3) return; if (c->n < 8) { c->k[c->n][0] = a; c->k[c->n][1] = b; c->k[c->n][2] = c3; c->n++; } }
+static crumb_t *crumb_cur(void) { crumb_t *c = &g_cring[(g_cn ? g_cn - 1 : 0) % CRUMB_RING]; uint32_t sub = (uint32_t)mtl_last_fence() + 1;
+    if (!g_cn || c->sub != sub || c->pass != g_sub_pass - 1) { c = &g_cring[g_cn++ % CRUMB_RING]; memset(c, 0, sizeof *c); c->sub = sub; c->pass = g_sub_pass - 1; } return c; }
+static void crumb_keys(crumb_t *c, uint64_t a, uint64_t b, uint64_t c3) {   // the pipeline's keys, unless already among the pass's last CRUMB_KEYS (the oldest goes)
+    for (int i = 0; i < c->n; i++) if (c->k[i][0] == a && c->k[i][1] == b && c->k[i][2] == c3) return;
+    uint64_t *k = c->k[c->next]; k[0] = a; k[1] = b; k[2] = c3; c->next = (c->next + 1) % CRUMB_KEYS; if (c->n < CRUMB_KEYS) c->n++;
+}
+static void crumb_draw(uint64_t a, uint64_t b, uint64_t c3) { crumb_t *c = crumb_cur(); c->draws++; crumb_keys(c, a, b, c3); }
 static void crumb_mark(int dispatch) { if (!crumbs_on()) return; VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
     vkCmdFillBuffer(cb, g_crumb_buf, 0, 4, ((uint32_t)(mtl_last_fence() + 1) & 0xffff) << 16 | (dispatch ? 0x8000u : 0) | ((uint32_t)(g_sub_pass - 1) & 0x7fff)); }
-void vk_crumbs_report(void) {
+static void crumb_dispatch(uint64_t key) { crumb_t *c = crumb_cur(); c->dispatches++; crumb_keys(c, 0, 0, key); crumb_mark(1); }
+// The passes submission fence recorded, in order, at most 24 lines: a run of passes with the same shaders as the one before is one line. Any thread (the completion
+// thread's hang check, a lost device's): the replay may be recording a later submission meanwhile, so a pass being written can read torn
+void vk_crumbs_log(uint64_t fence, const char *why) {
+    uint32_t sub = (uint32_t)fence; unsigned end = g_cn, first = end > CRUMB_RING ? end - CRUMB_RING : 0, found = 0, lines = 0, same = 0, sdraws = 0; const crumb_t *prev = NULL;
+    VKLOG("[hang] submission %llu (%s), what it recorded:", (unsigned long long)fence, why);
+    for (unsigned i = first; i < end; i++) {
+        const crumb_t *c = &g_cring[i % CRUMB_RING]; if (c->sub != sub) continue;
+        found++;
+        if (prev && c->n == prev->n && !memcmp(c->k, prev->k, sizeof c->k)) { same++; sdraws += c->draws + c->dispatches; prev = c; continue; }
+        if (same) { VKLOG("[hang]   and %u more passes with the same shaders (%u draws and dispatches)", same, sdraws); same = sdraws = 0; lines++; }
+        if (lines >= 24) continue;
+        char ks[CRUMB_KEYS * 56 + 1]; int o = 0; ks[0] = 0;
+        for (int k = 0; k < c->n; k++) { const uint64_t *x = c->k[(c->next - c->n + k + CRUMB_KEYS) % CRUMB_KEYS];   // oldest first
+            o += x[0] | x[1] ? snprintf(ks + o, sizeof ks - (size_t)o, " %016llx/%016llx/%016llx", (unsigned long long)x[0], (unsigned long long)x[1], (unsigned long long)x[2])
+                             : snprintf(ks + o, sizeof ks - (size_t)o, " cs %016llx", (unsigned long long)x[2]); if (o >= (int)sizeof ks) break; }
+        VKLOG("[hang]   pass %d: %u draws, %u dispatches; last shaders (vertex/fragment/geometry or cs):%s", c->pass, c->draws, c->dispatches, c->n ? ks : " none");
+        lines++; prev = c;
+    }
+    if (same) VKLOG("[hang]   and %u more passes with the same shaders (%u draws and dispatches)", same, sdraws);
+    if (!found) VKLOG("[hang]   nothing kept (older than the last %d passes recorded, or no pass)", CRUMB_RING);
+    else if (lines >= 24) VKLOG("[hang]   (%u passes in all; the first 24 lines shown)", found);
+}
+void vk_crumbs_report(void) {   // DM_VK_CRUMBS=1: where the GPU marks say it got to, and the passes after it
     if (g_crumbs <= 0 || !g_crumb) return;
     uint32_t v = g_crumb[0], sub = v >> 16, pass = v & 0x7fff;
     VKLOG("[crumbs] the GPU last finished submission %u (low 16 bits) %s %u", sub, v & 0x8000 ? "a dispatch after pass" : "pass", pass);
     int shown = 0;
-    for (unsigned i = g_cn > 512 ? g_cn - 512 : 0; i < g_cn && shown < 12; i++) { crumb_t *c = &g_cring[i % 512];
+    for (unsigned i = g_cn > CRUMB_RING ? g_cn - CRUMB_RING : 0; i < g_cn && shown < 12; i++) { crumb_t *c = &g_cring[i % CRUMB_RING];
         if ((c->sub & 0xffff) < sub || ((c->sub & 0xffff) == sub && c->pass <= (int)pass)) continue;
-        shown++; VKLOG("[crumbs] then submission %u pass %d:", c->sub, c->pass);
+        shown++; VKLOG("[crumbs] then submission %u pass %d (%u draws, %u dispatches):", c->sub, c->pass, c->draws, c->dispatches);
         for (int k = 0; k < c->n; k++) VKLOG("[crumbs]   shaders %016llx %016llx %016llx", (unsigned long long)c->k[k][0], (unsigned long long)c->k[k][1], (unsigned long long)c->k[k][2]); }
 }
 void vk_prof_end(void) {
@@ -4764,7 +4795,7 @@ static void dispatch(const p_dispatch *d) {
     if (selected_trace) VKLOG("compute trace key %016llx native dispatch %s%s", (unsigned long long)cs->key,
         dispatched ? "recorded" : "not recorded: indirect buffer unavailable", dispatched && d->ind ? " (indirect counts remain GPU-owned)" : "");
     if (!g_x_nodispbar) vk_img_barrier_all(cb);   // DM_VK_X_NODISPBAR=1 (live, a cost measurement that may draw wrong): no barrier after the dispatch
-    if (crumbs_on()) { crumb_t *c = crumb_cur(); if (c->n < 8) { c->k[c->n][0] = 0; c->k[c->n][1] = 0; c->k[c->n][2] = cs->key; c->n++; } crumb_mark(1); }
+    crumb_dispatch(cs->key);
     if (g_x_tracepass == -2 || mdi_log_now()) {   // (DM_VK_TRACE_PASS=-2 lists the dispatches too, with their storage buffers: the addresses for a DM_CTL memdump)
         char sb[512]; int o = 0; for (int r = 0; r < 16 && o < (int)sizeof sb - 40; r++) if (S.ssbo[5][r].addr) o += snprintf(sb + o, sizeof sb - (size_t)o, " s%d %#llx+%#llx", r, (unsigned long long)S.ssbo[5][r].addr, (unsigned long long)S.ssbo[5][r].size);
         VKLOG("--- dispatch %016llx %dx%dx%d%s after pass %d;%s", (unsigned long long)cs->key, d->x, d->y, d->z, d->ind ? " (indirect)" : "", g_sub_pass - 1, o ? sb : " no storage buffers");

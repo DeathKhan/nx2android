@@ -56,6 +56,7 @@ static void log_message(const char *f,...){if(strncmp(f,"cut stats",9))return;va
 #define VKCHK(x) assert((x)==VK_SUCCESS)
 static void die(const char *f,...){(void)f;abort();}
 static void vk_crumbs_report(void){}
+static void vk_device_lost(VkResult r,const char *w){(void)r;(void)w;}
 static void pools_readback_barrier(VkCommandBuffer cb){assert(cb==slot.main);readbacks++;}
 static void vk_img_barrier_all(VkCommandBuffer cb){assert(cb==slot.up);}
 static VkResult vkEndCommandBuffer(VkCommandBuffer cb){assert(cb);end_calls++;return VK_SUCCESS;}

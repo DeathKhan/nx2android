@@ -444,6 +444,7 @@ static int drv_has_gpu(PFN_vkGetInstanceProcAddr g) {
     return ok;
 }
 
+static PFN_vkGetDeviceFaultInfoEXT g_fault_info;   // VK_EXT_device_fault on (vk_init): what the driver says of a lost device (vk_device_lost); NULL: not offered
 void vk_init(void) {
     static int done; if (done) return; done = 1;
     { const char *e = getenv("DM_VK_DYN_SSBO"); V.dyn_ssbo = e && atoi(e); }
@@ -629,12 +630,18 @@ void vk_init(void) {
     float prio = 1;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, V.qf, 1, &prio};
     void *dnext = mr_chain(ex, ne, &enf, on, &non);   // DM_VK_MEMREPORT: the driver's memory reports, when it has them (gfx_vk_memreport.inc)
+    // VK_EXT_device_fault, where offered: what the driver says of a lost device (vk_device_lost's fault_log); its vendor binary stays off
+    static VkPhysicalDeviceFaultFeaturesEXT dfault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (has_ext(ex, ne, "VK_EXT_device_fault")) { VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dfault}; vkGetPhysicalDeviceFeatures2(V.pd, &q); }
+    if (dfault.deviceFault) { on[non++] = "VK_EXT_device_fault"; dfault.deviceFaultVendorBinary = VK_FALSE; dfault.pNext = dnext; dnext = &dfault; }
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, dnext, 0, 1, &qci, 0, NULL, non, on, NULL};
     VKCHK(vkCreateDevice(V.pd, &dci, NULL, &V.dev));
     vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)p_vkGetInstanceProcAddr(V.inst, "vkGetDeviceProcAddr");
 #define VK_LOADD(f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f); if (!f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f "KHR"); if (!f) f = (PFN_##f)p_vkGetInstanceProcAddr(V.inst, #f);   // a promoted function by its extension's name (Vulkan 1.1 / 1.2 devices)
     VK_DEV_FNS(VK_LOADD)
-    mem_acct_install(); kt_install(); uab_install(); mr_install();   // device memory accounting (DM_VK_MEM_ACCT): every vkAllocateMemory / vkFreeMemory through the function table goes through it
+    mem_acct_install(); kt_install(); uab_install(); mr_install();
+    if (dfault.deviceFault) g_fault_info = (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(V.dev, "vkGetDeviceFaultInfoEXT");
+    VKLOG("VK_EXT_device_fault %s", g_fault_info ? "on: a lost device logs what the driver says of it" : "not offered by the driver");   // device memory accounting (DM_VK_MEM_ACCT): every vkAllocateMemory / vkFreeMemory through the function table goes through it
     gpu_clock_init(clock_extension);
     // A driver can report the timeline-semaphore feature (and Vulkan 1.3) and still export no vkWaitSemaphores: the emulator's ranchu / gfxstream driver does
     // (both the device and the instance dispatcher return null for it and for vkGetSemaphoreCounterValue), and the first wait then called address 0
@@ -1387,7 +1394,8 @@ static void wait_fence(uint64_t f) {
     if (!f) return;
     if (!V.has_timeline) { mtl_wait(f, ~0ull); return; }
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &g_timeline, &f};
-    VkResult r = vkWaitSemaphores(V.dev, &wi, UINT64_MAX); if (r != VK_SUCCESS) die("[vk] GPU timeline wait did not complete: %d", r);
+    VkResult r = vkWaitSemaphores(V.dev, &wi, UINT64_MAX);
+    if (r != VK_SUCCESS) { if (r == VK_ERROR_DEVICE_LOST) vk_device_lost(r, "the GPU timeline wait"); die("[vk] GPU timeline wait did not complete: %d", r); }
 }
 // The slot's command buffers are reset on the completion thread once its submission is done (completion_main), not when the replay begins them again: an
 // implicit reset at vkBeginCommandBuffer took 7% of Xenoblade Chronicles 3's replay thread at a submission's start and more at every part (its battles
@@ -1518,7 +1526,7 @@ static int vk_cmd_split_(void) {
             VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, n, cbs, 0, NULL};
             vk_stage_flush();   // (staged uploads before the part that may read them)
             pthread_mutex_lock(&g_vk_queue_mu); VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu);
-            if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit (part): %d (device lost?)", r); }
+            if (r) { if (r == VK_ERROR_DEVICE_LOST) vk_device_lost(r, "vkQueueSubmit (a part)"); die("[vk] vkQueueSubmit (part): %d (device lost?)", r); }
             sub_stats("a long submission: part sent early", s->nmain_used);
             part_sent(s);
             s->nmain_sent = s->nmain_used;
@@ -1602,7 +1610,7 @@ void vk_stage_flush(void) {
     vk_img_barrier_all(g_stage.cb); VKCHK(vkEndCommandBuffer(g_stage.cb));
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &g_stage.cb, 0, NULL};
     pthread_mutex_lock(&g_vk_queue_mu); VkResult r = vkQueueSubmit(V.q, 1, &si, g_stage.fence); pthread_mutex_unlock(&g_vk_queue_mu);
-    if (r) die("[vk] staging vkQueueSubmit: %d (device lost?)", r);
+    if (r) { if (r == VK_ERROR_DEVICE_LOST) vk_device_lost(r, "the staging vkQueueSubmit"); die("[vk] staging vkQueueSubmit: %d (device lost?)", r); }
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     VKCHK(vkWaitForFences(V.dev, 1, &g_stage.fence, VK_TRUE, ~0ull)); VKCHK(vkResetFences(V.dev, 1, &g_stage.fence));
     clock_gettime(CLOCK_MONOTONIC, &t1); g_stage.wait_ns += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
@@ -2308,15 +2316,61 @@ static void completion_events_publish(const cpend *c) {
         if (o->kind == 1) nvn_event_publish_gpu(o->val, o->mode, o->v, c->fence);
     }
 }
+// ---------------- a lost device, a hung submission ----------------
+// A GPU hang on Adreno: the driver's hang recovery cuts the hung submission short (its fence signals, its end timestamp is never written) and gives the context up a few
+// seconds later (VK_ERROR_DEVICE_LOST from the next submission or wait). Either way the log says what the submission recorded (vk_crumbs_log, gfx_vk_exec.c's crumbs), and a
+// lost device what the driver says of it, where it has VK_EXT_device_fault (enabled in vk_init when offered): its description, each fault's kind and address, the vendor's
+// records (a hang, unlike a page fault, may have none). The idea is droidplay-core's (f77a684b8)
+static void fault_log(void) {   // (g_fault_info: vkGetDeviceFaultInfoEXT, loaded in vk_init where the extension is on)
+    if (!g_fault_info) { VKLOG("[RED] the driver has no VK_EXT_device_fault: nothing more on why"); return; }
+    VkDeviceFaultCountsEXT n = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT}; VkResult q = g_fault_info(V.dev, &n, NULL);
+    if (q < 0) { VKLOG("[RED] VK_EXT_device_fault: vkGetDeviceFaultInfoEXT %d", q); return; }
+    VkDeviceFaultAddressInfoEXT ad[16]; VkDeviceFaultVendorInfoEXT vd[16]; uint32_t na = n.addressInfoCount, nv = n.vendorInfoCount;
+    if (n.addressInfoCount > 16) n.addressInfoCount = 16;
+    if (n.vendorInfoCount > 16) n.vendorInfoCount = 16;
+    n.vendorBinarySize = 0;   // (no vendor binary: deviceFaultVendorBinary stays off)
+    VkDeviceFaultInfoEXT fi = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, NULL, "", ad, vd, NULL};
+    q = g_fault_info(V.dev, &n, &fi);
+    VKLOG("[RED] VK_EXT_device_fault (%d): \"%s\", %u fault addresses, %u vendor records", q, fi.description, na, nv);
+    static const char *const kind[] = {"none", "read of an invalid address", "write of an invalid address", "execution of an invalid address", "instruction pointer, unknown",
+                                       "instruction pointer, invalid", "instruction pointer of the fault"};
+    for (uint32_t i = 0; i < n.addressInfoCount; i++)
+        VKLOG("[RED]   fault: %s at %#llx (precision %#llx)", (unsigned)ad[i].addressType < 7 ? kind[ad[i].addressType] : "?", (unsigned long long)ad[i].reportedAddress, (unsigned long long)ad[i].addressPrecision);
+    for (uint32_t i = 0; i < n.vendorInfoCount; i++)
+        VKLOG("[RED]   vendor record: \"%s\", code %#llx, data %#llx", vd[i].description, (unsigned long long)vd[i].vendorFaultCode, (unsigned long long)vd[i].vendorFaultData);
+}
+void vk_device_lost(VkResult r, const char *where) {   // once, from whichever thread sees the loss first
+    static int once; if (__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL)) return;
+    uint64_t done = vk_fence_done();
+    VKLOG("[RED] the GPU was lost (%d, %s): submissions completed up to %llu of %llu", r, where, (unsigned long long)done, (unsigned long long)mtl_last_fence());
+    void vk_crumbs_log(uint64_t fence, const char *why); vk_crumbs_log(done + 1, "the first one not completed: the GPU was in it or past it");
+    void vk_crumbs_report(void); vk_crumbs_report();
+    fault_log();
+}
+// The completion thread, for each submission with its timestamps: one the GPU took over DM_VK_HANG_MS (default 200; 0: off) on, or whose end timestamp was never written
+// though its fence signalled, is logged with what it recorded, at most three. Breath of the Wild on an Adreno 830 (droidplay-core): three submissions of 249-281 ms with
+// their ends unwritten, each holding one draw, before the device was lost
+static void hang_check(const cpend *c, VkResult tr, const uint64_t ts[2]) {
+    static int ms = -1, logged; if (ms < 0) { const char *e = getenv("DM_VK_HANG_MS"); ms = e ? atoi(e) : 200; }
+    if (ms <= 0 || logged >= 3 || c->slot < 0) return;
+    void vk_crumbs_log(uint64_t fence, const char *why); char why[160];
+    if (tr == VK_NOT_READY) snprintf(why, sizeof why, "its end timestamp never written though its fence signalled: the driver's hang recovery cut it short?");
+    else if (tr == VK_SUCCESS && ts[1] > ts[0] && (double)(ts[1] - ts[0]) * V.props.limits.timestampPeriod > ms * 1e6)
+        snprintf(why, sizeof why, "%.0f ms on the GPU, over DM_VK_HANG_MS=%d", (double)(ts[1] - ts[0]) * V.props.limits.timestampPeriod / 1e6, ms);
+    else return;
+    logged++; VKLOG("[RED] submission %llu: %s", (unsigned long long)c->fence, why); vk_crumbs_log(c->fence, why);
+}
 static void *completion_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "dm-vk-complete");
     for (;;) {
         pthread_mutex_lock(&g_cmu);
         while (!g_ch) pthread_cond_wait(&g_ccv, &g_cmu);
         cpend *c = g_ch; pthread_mutex_unlock(&g_cmu);
-        if (V.has_timeline) wait_fence(c->fence); else { VkResult r = vkWaitForFences(V.dev, 1, &g_fring[c->fence % NFRING], VK_TRUE, UINT64_MAX); if (r != VK_SUCCESS) die("[vk] GPU fence wait did not complete: %d", r); }
+        if (V.has_timeline) wait_fence(c->fence); else { VkResult r = vkWaitForFences(V.dev, 1, &g_fring[c->fence % NFRING], VK_TRUE, UINT64_MAX); if (r != VK_SUCCESS) { if (r == VK_ERROR_DEVICE_LOST) vk_device_lost(r, "the GPU fence wait"); die("[vk] GPU fence wait did not complete: %d", r); } }
         uint64_t submit_ts[2] = {0};
-        int submit_timed = g_tsq && c->slot >= 0 && vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof submit_ts, submit_ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+        VkResult tsr = g_tsq && c->slot >= 0 ? vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof submit_ts, submit_ts, 8, VK_QUERY_RESULT_64_BIT) : VK_ERROR_UNKNOWN;
+        int submit_timed = tsr == VK_SUCCESS;
+        if (g_tsq) hang_check(c, tsr, submit_ts);
         int clock_reports = 0; for (int i = 0; i < c->n; i++) clock_reports += c->ops[i].q >= 0 && c->ops[i].kind == 2;
         gpu_clock_pair clock = ((perf_frame_on() && submit_timed) || clock_reports) && c->slot >= 0 ? gpu_clock_sample() : (gpu_clock_pair){0};
         uint64_t frame_begin = 0, frame_end = 0;
@@ -2412,7 +2466,7 @@ uint64_t mtl_sub_commit(void) {
         fe = g_fring[f % NFRING]; VKCHK(vkResetFences(V.dev, 1, &fe)); si.pNext = NULL; si.signalSemaphoreCount = 0;
     }
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); pthread_mutex_lock(&g_vk_queue_mu); VkResult r = vkQueueSubmit(V.q, 1, &si, fe); pthread_mutex_unlock(&g_vk_queue_mu); clock_gettime(CLOCK_MONOTONIC, &t1); g_ns_submit += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
-    if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit: %d (device lost?)", r); }
+    if (r) { if (r == VK_ERROR_DEVICE_LOST) vk_device_lost(r, "vkQueueSubmit"); die("[vk] vkQueueSubmit: %d (device lost?)", r); }
     s->fence = f;
     cpend *c = calloc(1, sizeof *c); c->fence = f; c->frame = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED); c->n = s->npost; c->rslot = g_cur; c->occ_parts = occ_parts; c->slot = s->no_ts ? -1 : g_cur; s->no_ts = 0;
     c->npass = g_npass[g_cur]; memcpy(c->pmeta, g_pmeta[g_cur], sizeof(pass_meta) * (size_t)c->npass);
