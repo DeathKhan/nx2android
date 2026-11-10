@@ -20,7 +20,7 @@ def function(source, name):
 
 class CompletedAdpf(unittest.TestCase):
     def test_actual_records_consumer_and_lifecycle(self):
-        source = (ROOT / 'nxnative/dm/android/perf_android.c').read_text()
+        source = (ROOT / 'nxnative/dm/android/perf_android.c').read_text(encoding='utf-8')
         helpers = '\n'.join(function(source, name) for name in (
             'static int perf_completed_enabled(',
             'static int hint_completed_frame(',
@@ -195,7 +195,7 @@ int main(int argc,char **argv) {
         target=ROOT/'target/tests'
         target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='adpf-completed-',dir=target) as folder:
-            path=Path(folder);(path/'test.c').write_text(code)
+            path=Path(folder);(path/'test.c').write_text(code, encoding='utf-8')
             subprocess.run([os.environ.get('CC','cc'),'-std=c11','-g','-O1',
                 '-fsanitize=address,undefined','-pthread','-I',str(ROOT/'nxnative/dm/android'),
                 str(path/'test.c'),'-o',str(path/'test')],check=True)

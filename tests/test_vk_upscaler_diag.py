@@ -19,7 +19,7 @@ def extract(source, declaration):
 class UpscalerImageDiagnostic(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "host compiler required")
     def test_actual_resolver_reasons_and_log_budget(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         helpers = "\n".join(extract(source, x) for x in (
             "static void upscaler_image_diag(", "static int upscaler_image_at(", "static int upscaler_alpha_compatible("))
         poll = extract(source, '{ const char *e = getenv("DM_VK_UPSCALER_DIAG")')
@@ -124,7 +124,7 @@ int main(void){
             code=code.replace(key,value)
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="upscaler-diag-",dir=target) as folder:
-            src,exe=Path(folder)/"check.c",Path(folder)/"check";src.write_text(code)
+            src,exe=Path(folder)/"check.c",Path(folder)/"check";src.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",
                 "-I"+str(ROOT/"nxnative/dm/third_party/vulkan-headers/include"),str(src),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=15)

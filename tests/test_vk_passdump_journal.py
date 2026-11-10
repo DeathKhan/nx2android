@@ -6,7 +6,7 @@ ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"),"host compiler required")
 class PassJournal(unittest.TestCase):
  def test_actual_helpers(self):
-  s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+  s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
   a=s.index("enum { PD_JOURNAL_MAX")
   actual=s[a:s.index("static void pass_dump_depth(void);",a)]
   # The intrusive draw capture is a separate subsystem with its own actual-helper tests.
@@ -80,12 +80,12 @@ int main(void){
 """
   target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
   with tempfile.TemporaryDirectory(prefix="pass-journal-",dir=target) as temp:
-   c,exe=Path(temp)/"t.c",Path(temp)/"t";c.write_text(code)
+   c,exe=Path(temp)/"t.c",Path(temp)/"t";c.write_text(code, encoding='utf-8')
    subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror","-fsanitize=address,undefined","-I"+str(ROOT/"nxnative/dm/third_party/vulkan-headers/include"),str(c),"-o",str(exe)],check=True)
    subprocess.run([str(exe)],check=True,timeout=10)
   self.assertNotIn("vkCmd",actual);self.assertNotIn("vk_tex(",actual);self.assertNotIn("g_tracing",actual)
  def test_recording_hooks(self):
-  s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+  s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
   for name in ("draw","draw_idx"):
    f=extract(s,"static void "+name+("(const p_draw *d) {" if name=="draw" else "(const p_draw_idx *d) {"))
    self.assertGreater(f.index("pass_journal_draw("),f.index("if (!prepare_draw("))

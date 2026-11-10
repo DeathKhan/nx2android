@@ -10,9 +10,9 @@ class ReadbackRanges(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_eligibility_and_range_capacity(self):
         dm = Path(__file__).resolve().parents[1] / 'nxnative/dm/android'
-        core = (dm/'gfx_vk_core.c').read_text()
-        exec_src = (dm/'gfx_vk_exec.c').read_text()
-        header = (dm/'gfx_vk.h').read_text()
+        core = (dm/'gfx_vk_core.c').read_text(encoding='utf-8')
+        exec_src = (dm/'gfx_vk_exec.c').read_text(encoding='utf-8')
+        header = (dm/'gfx_vk.h').read_text(encoding='utf-8')
         def enum_declaration(first_member):
             start = header.index('enum { ' + first_member)
             return header[start:header.index('};', start) + 2]
@@ -91,6 +91,6 @@ int main(void) {
         target = dm.parents[2] / 'target/tests'; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='nx2a-readback-ranges-', dir=target) as tmp:
             c, exe = Path(tmp)/'check.c', Path(tmp)/'check'
-            c.write_text(harness)
+            c.write_text(harness, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)

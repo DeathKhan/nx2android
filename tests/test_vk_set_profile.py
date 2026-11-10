@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class DescriptorProfile(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
     def test_complete_windows_limits_and_auto_off(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         start = source.index("enum { SET_PROFILE_ROWS")
         helpers = source[start:source.index("// content hash of descriptor sets", start)]
         code = r"""
@@ -85,7 +85,7 @@ int main(void) {
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="set-profile-", dir=target) as folder:
             src, exe = Path(folder) / "check.c", Path(folder) / "check"
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                             "-fsanitize=address,undefined", str(src), "-o", str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)

@@ -12,7 +12,7 @@ def function(s, signature):
 class AsyncFrameIdentity(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'),'C compiler required')
     def test_actual_queued_replay(self):
-        s=(ROOT/'nxnative/dm/gfx/nvn/hle_nvn.c').read_text()
+        s=(ROOT/'nxnative/dm/gfx/nvn/hle_nvn.c').read_text(encoding='utf-8')
         declaration=re.search(r'typedef struct \{ int kind, n;.*?\} nvn_job;',s).group()
         replay=function(s,'static void *replay_main(')
         push=function(s,'static uint64_t job_push(')
@@ -93,7 +93,7 @@ int main(void){
         for key,value in [('DECL',declaration),('REPLAY',replay),('PUSH',push)]:code=code.replace(key,value)
         parent=ROOT/'target/tests';parent.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='async-frames-',dir=parent) as tmp:
-            p=Path(tmp);(p/'main.c').write_text(code)
+            p=Path(tmp);(p/'main.c').write_text(code, encoding='utf-8')
             subprocess.run(['cc','-std=c11','-g','-O1','-pthread','-fsanitize=address,undefined',str(p/'main.c'),'-o',str(p/'test')],check=True,capture_output=True)
             subprocess.run([str(p/'test')],check=True,timeout=10)
 if __name__=='__main__':unittest.main()

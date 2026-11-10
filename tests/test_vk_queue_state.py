@@ -25,7 +25,7 @@ def run_c(code):
     target.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=target, prefix="vk-queue-") as temp:
         src, exe = Path(temp) / "test.c", Path(temp) / "test"
-        src.write_text(code)
+        src.write_text(code, encoding='utf-8')
         subprocess.run(["cc", "-std=gnu11", "-g", "-O1", "-fsanitize=address,undefined",
                         "-fno-omit-frame-pointer", str(src), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
@@ -34,7 +34,7 @@ def run_c(code):
 @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
 class VulkanQueue(unittest.TestCase):
     def test_actual_queue_state_and_target_lifetime(self):
-        source = EXEC.read_text()
+        source = EXEC.read_text(encoding='utf-8')
         begin = source.index("typedef struct vk_queue_state {")
         end = source.index("static int tfc_ready(void) {", begin)
         helper = source[begin:end]
@@ -97,7 +97,7 @@ int main(void){
         run_c(code)
 
     def test_actual_release_frontier_and_counter_expiry(self):
-        core, exe = CORE.read_text(), EXEC.read_text()
+        core, exe = CORE.read_text(encoding='utf-8'), EXEC.read_text(encoding='utf-8')
         helper = function(core, "static void completion_events_publish(const cpend *c) {")
         value = function(exe, "static int rc_value(uint64_t a, uint64_t *v) {")
         code = r"""

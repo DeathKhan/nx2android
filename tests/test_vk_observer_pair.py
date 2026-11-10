@@ -6,7 +6,7 @@ ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"),"host compiler required")
 class ObserverPair(unittest.TestCase):
  def test_atomic_loader(self):
-  source=(ROOT/"nxnative/dm/android/gfx_vk_shader.c").read_text()
+  source=(ROOT/"nxnative/dm/android/gfx_vk_shader.c").read_text(encoding='utf-8')
   actual=extract(source,"int vk_shader_observer_pair(")
   body=r"""
 #define _POSIX_C_SOURCE 200809L
@@ -66,13 +66,13 @@ int main(int argc,char**argv){
 """
   target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
   with tempfile.TemporaryDirectory(prefix="observer-pair-",dir=target) as tmp:
-   tmp=Path(tmp);c=tmp/"pair.c";e=tmp/"pair";c.write_text(body)
+   tmp=Path(tmp);c=tmp/"pair.c";e=tmp/"pair";c.write_text(body, encoding='utf-8')
    subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror","-Wno-misleading-indentation","-fsanitize=address,undefined","-pthread",str(c),"-o",str(e)],check=True)
    for scenario in range(5):
     d=tmp/str(scenario);d.mkdir();subprocess.run([str(e),str(scenario),str(d)],check=True,timeout=10)
  def test_integration_identity(self):
-  s=(ROOT/"nxnative/dm/android/gfx_vk_shader.c").read_text()
-  e=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+  s=(ROOT/"nxnative/dm/android/gfx_vk_shader.c").read_text(encoding='utf-8')
+  e=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
   alt=extract(s,"static VkShaderModule alt_module(")
   self.assertIn('return s->mod; // the observer pair',alt)
   self.assertIn('k->alt == 2',extract(e,"static int async_pipe("))

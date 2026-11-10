@@ -19,8 +19,8 @@ def function(source,declaration):
 class CubicUpscaler(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'),'a host C compiler is required')
     def test_live_filter_contract_and_recording(self):
-        dm=ROOT/'nxnative/dm';source=(dm/'android/gfx_vk_exec.c').read_text()
-        profile=(dm/'games/040074A01BF12000/android.tsv').read_text().splitlines()
+        dm=ROOT/'nxnative/dm';source=(dm/'android/gfx_vk_exec.c').read_text(encoding='utf-8')
+        profile=(dm/'games/040074A01BF12000/android.tsv').read_text(encoding='utf-8').splitlines()
         linear=next(row.split('=',1)[1] for row in profile if row.startswith('env\tDM_VK_UPSCALER_LINEAR_CS='))
         keys=linear.split(',')
         encoded='131d7dcc054f92b9,eb0af4c68c522092,0e351bd8ef324466,446761e211ec30d8,8df4d4ba8fa94292,1c144a902af468de,c8910045dc5b59af,d19ea940b265456f'.split(',')
@@ -180,7 +180,7 @@ int main(int argc,char **argv){
         code=code.replace('ENCODED_KEYS',','.join('UINT64_C(0x'+k+')' for k in encoded))
         target=ROOT/'target/tests';target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-upscaler-cubic-',dir=target) as folder:
-            src,exe=Path(folder)/'test.c',Path(folder)/'test';src.write_text(code)
+            src,exe=Path(folder)/'test.c',Path(folder)/'test';src.write_text(code, encoding='utf-8')
             subprocess.run(['cc','-std=c11','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
                 '-I'+str(dm/'third_party/vulkan-headers/include'),str(src),'-o',str(exe)],check=True)
             env=dict(os.environ,DM_VK_UPSCALER_LINEAR_CS=linear)
@@ -195,7 +195,7 @@ int main(int argc,char **argv){
                 subprocess.run([str(exe),str(expected)],env=e,check=True,timeout=15)
 
     def test_extension_enablement_is_capability_gated(self):
-        core=(ROOT/'nxnative/dm/android/gfx_vk_core.c').read_text()
+        core=(ROOT/'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         self.assertIn('V.has_filter_cubic = has_ext(ex, ne, "VK_EXT_filter_cubic");',core)
         self.assertIn('if (V.has_filter_cubic) on[non++] = "VK_EXT_filter_cubic";',core)
         self.assertNotIn('on[non++] = "VK_QCOM_filter_cubic_weights"',core)

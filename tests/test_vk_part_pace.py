@@ -16,7 +16,7 @@ def function(source,declaration):
 class PartPace(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'),'a host C compiler is required')
     def test_parts_last_to_the_end_of_the_submission(self):
-        exe=(ROOT/'nxnative/dm/android/gfx_vk_exec.c').read_text()
+        exe=(ROOT/'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         self.assertIn('static int g_pace; static uint64_t g_sub_d0, g_sub_hist[8]; static unsigned g_sub_hn;',exe)
         pace=function(exe,'static uint64_t part_pace(uint64_t floor)')
         code=r"""
@@ -42,7 +42,7 @@ int main(void){
 """
         target=ROOT/'target/tests';target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='part-pace-',dir=target) as t:
-            src=Path(t)/'test.c';out=Path(t)/'test';src.write_text(code)
+            src=Path(t)/'test.c';out=Path(t)/'test';src.write_text(code, encoding='utf-8')
             subprocess.run(['cc','-std=c11','-g','-O1','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-fno-omit-frame-pointer',str(src),'-o',str(out)],check=True)
             subprocess.run([str(out)],check=True,timeout=15)
 

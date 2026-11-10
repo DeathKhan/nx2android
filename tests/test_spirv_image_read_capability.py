@@ -79,13 +79,13 @@ class ImageReadCapability(unittest.TestCase):
     def test_actual_image_load_emitter(self):
         dotnet=os.environ.get('DOTNET') or shutil.which('dotnet')
         if not dotnet:self.skipTest('requires .NET 10; set DOTNET')
-        src=(ROOT/'nxnative/dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs').read_text()
+        src=(ROOT/'nxnative/dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs').read_text(encoding='utf-8')
         actual=m.method(src,'GenerateImageLoad')
         parent=ROOT/'target/tests';parent.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='image-read-',dir=parent) as tmp:
             p=Path(tmp)
-            (p/'test.csproj').write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>')
-            (p/'Program.cs').write_text(MOCK+actual+CHECKS)
+            (p/'test.csproj').write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>', encoding='utf-8')
+            (p/'Program.cs').write_text(MOCK+actual+CHECKS, encoding='utf-8')
             r=subprocess.run([dotnet,'run','--project',str(p/'test.csproj'),'-c','Release','--verbosity','quiet'],capture_output=True,text=True,timeout=120)
             self.assertEqual(r.returncode,0,r.stdout+r.stderr)
             self.assertIn('PASS',r.stdout)

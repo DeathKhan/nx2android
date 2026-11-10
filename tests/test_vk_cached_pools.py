@@ -17,7 +17,7 @@ class CachedPools(unittest.TestCase):
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         start = src.index('static void pool_cache_sync(')
         function = src[start:src.index('\n}\n', start)+3]
         harness = r'''
@@ -67,7 +67,7 @@ int main(void) {
 '''.replace('FUNCTION', function)
         with tempfile.TemporaryDirectory(prefix='nx2a-flush-ranges-') as tmp:
             c, exe = Path(tmp)/'check.c', Path(tmp)/'check'
-            c.write_text(harness)
+            c.write_text(harness, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
 
@@ -77,7 +77,7 @@ int main(void) {
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         start = src.index('static void wait_fence(uint64_t f) {')
         wait = src[start:src.index('\n}\n', start)+3]
         completion = next(line for line in src.splitlines() if 'g_fring[c->fence % NFRING]' in line)
@@ -110,7 +110,7 @@ COMPLETION
 '''.replace('WAIT', wait).replace('COMPLETION', completion)
         with tempfile.TemporaryDirectory(prefix='nx2a-gpu-wait-') as tmp:
             c, exe = Path(tmp)/'check.c', Path(tmp)/'check'
-            c.write_text(harness)
+            c.write_text(harness, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             for timeline in ('0', '1'):
                 for result in ('0', '-4', '2'):  # success, device lost, timeout
@@ -123,7 +123,7 @@ COMPLETION
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         def function(name):
             start = src.index(name)
             return src[start:src.index('\n}\n', start)+3]
@@ -236,7 +236,7 @@ int main(int argc, char **argv) {
 '''.replace('MEM_TYPE', function('uint32_t vk_mem_type(')).replace('USAGE', usage).replace('ALLOCATE', function('static VkResult pool_copied_alloc(')).replace('\nCACHE\n', '\n' + function('static void pool_cache_sync(') + '\n').replace('SELECT', select)
         with tempfile.TemporaryDirectory(prefix='nx2a-cached-pool-') as tmp:
             c, exe = Path(tmp)/'check.c', Path(tmp)/'check'
-            c.write_text(harness)
+            c.write_text(harness, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers',
                             '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)

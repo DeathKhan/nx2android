@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class RenderDocCapture(unittest.TestCase):
     def test_actual_module(self):
-        src = (ROOT / "nxnative/dm/android/renderdoc_capture.c").read_text()
+        src = (ROOT / "nxnative/dm/android/renderdoc_capture.c").read_text(encoding='utf-8')
         src = src.replace('#include "dm.h"', '').replace('#include "../third_party/renderdoc/renderdoc_app.h"', '')
         code = r"""
 #define _GNU_SOURCE
@@ -104,24 +104,24 @@ int main(void) { reset(1);dm_renderdoc_capture();dm_renderdoc_poll();dm_renderdo
         tdroot = ROOT / "target/tests"
         tdroot.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="renderdoc-", dir=tdroot) as td:
-            p=Path(td);(p/"test.c").write_text(code)
+            p=Path(td);(p/"test.c").write_text(code, encoding='utf-8')
             for flags in ([], ["-DDM_RELEASE=1"]):
                 subprocess.run(["cc","-std=c11","-g","-O1","-fsanitize=address,undefined","-pthread"]+flags+[
                                 "-I"+str(ROOT/"nxnative/dm/third_party/renderdoc"),str(p/"test.c"),"-o",str(p/"test")],check=True)
                 subprocess.run([str(p/"test")],check=True)
 
     def test_command_and_present_hooks(self):
-        hid=(ROOT/"nxnative/dm/host/hle_hid.c").read_text()
+        hid=(ROOT/"nxnative/dm/host/hle_hid.c").read_text(encoding='utf-8')
         cap=hid.index('if (!strcmp(line, "rdoccapture"))')
         self.assertGreater(hid.rfind('#if defined(__ANDROID__)',0,cap),hid.rfind('#endif',0,cap))
         self.assertIn('dm_renderdoc_capture(); continue;',hid[cap:cap+180])
-        present=(ROOT/"nxnative/dm/android/gfx_vk_present.c").read_text()
+        present=(ROOT/"nxnative/dm/android/gfx_vk_present.c").read_text(encoding='utf-8')
         call=present.index('dm_renderdoc_poll();')
         vk=present.rfind('r = vkQueuePresentKHR',0,call)
         unlock=present.rfind('pthread_mutex_unlock(&g_vk_queue_mu);',0,call)
         self.assertGreater(vk,0);self.assertGreater(unlock,vk)
         self.assertLess(call,present.index('if (r == VK_ERROR_OUT_OF_DATE_KHR)',vk))
-        build=(ROOT/"nxnative/dm/android/build.py").read_text()
+        build=(ROOT/"nxnative/dm/android/build.py").read_text(encoding='utf-8')
         self.assertIn("'android/*.c'",build)
 
 if __name__ == '__main__':unittest.main()

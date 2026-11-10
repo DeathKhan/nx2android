@@ -19,6 +19,6 @@ public class Check {
   long[] want={r,r|d,d,d|l,l,l|u,u,u|r,0,0};
   for(int i=0;i<want.length;i++) if(PadMath.direction(v[i][0],v[i][1])!=want[i])throw new AssertionError(i);
  }
-}''')
+}''', encoding='utf-8')
             subprocess.run(['javac', '-d', t, str(ROOT / 'nxnative/dm/android/java/org/nx2a/PadMath.java'), str(p)], check=True)
             subprocess.run(['java', '-cp', t, 'org.nx2a.Check'], check=True)

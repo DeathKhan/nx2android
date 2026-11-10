@@ -96,13 +96,13 @@ class HangReport(unittest.TestCase):
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        ex = (ANDROID / 'gfx_vk_exec.c').read_text()
+        ex = (ANDROID / 'gfx_vk_exec.c').read_text(encoding='utf-8')
         exec_cut = ex[ex.index('// Crumbs, for a GPU hang or a lost device'):ex.index('void vk_prof_end(void) {')]
-        core = (ANDROID / 'gfx_vk_core.c').read_text()
+        core = (ANDROID / 'gfx_vk_core.c').read_text(encoding='utf-8')
         core_cut = core[core.index('// ---------------- a lost device, a hung submission'):core.index('static void *completion_main(void *a) {')]
         with tempfile.TemporaryDirectory(prefix='nx2a-hang-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
-            c.write_text(HARNESS.replace('EXEC', exec_cut).replace('CORE', core_cut))
+            c.write_text(HARNESS.replace('EXEC', exec_cut).replace('CORE', core_cut), encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-missing-field-initializers', '-Wno-format-truncation',
                             '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             out = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)

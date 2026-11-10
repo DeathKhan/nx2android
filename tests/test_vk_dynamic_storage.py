@@ -12,9 +12,9 @@ class DynamicStorage(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_limits_layouts_and_effective_addresses(self):
         dm = ROOT / 'nxnative/dm/android'
-        shader = (dm / 'gfx_vk_shader.c').read_text()
-        execute = (dm / 'gfx_vk_exec.c').read_text()
-        header = (dm / 'gfx_vk.h').read_text()
+        shader = (dm / 'gfx_vk_shader.c').read_text(encoding='utf-8')
+        execute = (dm / 'gfx_vk_exec.c').read_text(encoding='utf-8')
+        header = (dm / 'gfx_vk.h').read_text(encoding='utf-8')
         declarations = []
         for first in ('RK_SUPPORT', 'RD_UBO'):
             start = header.index('enum { ' + first)
@@ -142,7 +142,7 @@ int main(void) {
         target = ROOT / 'target/tests'; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='dynamic-storage-', dir=target) as folder:
             src, exe = Path(folder) / 'check.c', Path(folder) / 'check'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                             '-I' + str(ROOT / 'nxnative/dm/third_party/vulkan-headers/include'), str(src), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)

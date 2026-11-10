@@ -18,9 +18,9 @@ def function(source,declaration):
 @unittest.skipUnless(shutil.which("cc"),"a host C compiler is required")
 class SamplerHistory(unittest.TestCase):
     def test_actual_registration_lookup_and_native_parameter_cache(self):
-        source=(ROOT/"nxnative/dm/android/gfx_vk_tex.c").read_text()
-        obj=(ROOT/"nxnative/dm/gfx/nvn/nvn_obj.h").read_text()
-        exe_source=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        source=(ROOT/"nxnative/dm/android/gfx_vk_tex.c").read_text(encoding='utf-8')
+        obj=(ROOT/"nxnative/dm/gfx/nvn/nvn_obj.h").read_text(encoding='utf-8')
+        exe_source=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         par=next(line.split("//")[0] for line in obj.splitlines() if "} samp_par;" in line)
         state=source[source.index("static samp_par *g_sreg;"):source.index("uint64_t mtl_samp_seq(void)")]
         parts={
@@ -152,7 +152,7 @@ int main(void){
         for marker,value in parts.items():code=code.replace("\n"+marker+"\n","\n"+value+"\n")
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(dir=target,prefix="sampler-history-") as temp:
-            src,exe=Path(temp)/"test.c",Path(temp)/"test";src.write_text(code)
+            src,exe=Path(temp)/"test.c",Path(temp)/"test";src.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=gnu11","-O1","-g","-Wall","-Wextra","-Werror",
                             "-fsanitize=address,undefined","-fno-omit-frame-pointer",str(src),"-o",str(exe),"-lpthread"],check=True)
             subprocess.run([str(exe)],check=True)

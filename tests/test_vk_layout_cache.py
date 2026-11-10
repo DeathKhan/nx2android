@@ -19,7 +19,7 @@ class LayoutCache(unittest.TestCase):
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        src = (DM / 'android/gfx_vk_shader.c').read_text()
+        src = (DM / 'android/gfx_vk_shader.c').read_text(encoding='utf-8')
         start = src.index('static VkDescriptorSetLayout shader_layout(')
         helper = src[start:src.index('\n}\n', start) + 3]
         code = r'''
@@ -79,7 +79,7 @@ int main(void) {
         with tempfile.TemporaryDirectory(prefix='vk-layout-test-') as temp:
             cfile = Path(temp) / 'layout.c'
             exe = Path(temp) / 'layout-test'
-            cfile.write_text(code)
+            cfile.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                             '-idirafter', str(headers),
                             '-I' + str(DM / 'gfx/nvn'), str(cfile), '-o', str(exe)], check=True)

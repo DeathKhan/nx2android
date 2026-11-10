@@ -22,7 +22,7 @@ def function(source, declaration):
 class OcclusionCounter(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_real_query_lifetime_and_ordered_reports(self):
-        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         start = runtime.index('enum { OCC_BLOCK')
         helpers = runtime[start:runtime.index('void mtl_init(', start)]
         trace_field = next(line.split('//')[0].strip() for line in runtime.splitlines() if '} occ[MAIN_CBS];' in line)
@@ -260,7 +260,7 @@ int main(void){
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-occlusion-', dir=target) as folder:
             src, exe = Path(folder) / 'check.c', Path(folder) / 'check'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                             '-Wno-missing-field-initializers', '-fsanitize=address,undefined',
                             str(src), '-o', str(exe)], check=True)
@@ -268,7 +268,7 @@ int main(void){
 
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_deferred_query_commands_preserve_draw_order(self):
-        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_dq.c').read_text()
+        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_dq.c').read_text(encoding='utf-8')
         commands = runtime[runtime.index('#define DQ_CMDS'):runtime.index('#define DQ_SYNC')]
         for name in ['vkCmdBeginQuery', 'vkCmdEndQuery']:
             self.assertIn(f'X({name})', commands)
@@ -334,13 +334,13 @@ int main(void){
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-occlusion-dq-', dir=target) as folder:
             src, exe = Path(folder) / 'check.c', Path(folder) / 'check'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                             str(src), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
 
     def test_exec_hooks_exclude_internal_clear(self):
-        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text()
+        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         end = function(runtime, 'void vk_end_pass(')
         self.assertLess(end.index('vk_occ_end();'), end.index('vkCmdEndRenderPass('))
         self.assertIn('if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) vk_occ_reset();', runtime)

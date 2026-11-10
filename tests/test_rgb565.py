@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which('cc'), 'host C compiler required')
 class Packed565(unittest.TestCase):
     def test_rgb_and_bgr_channel_order(self):
-        source = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text()
+        source = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text(encoding='utf-8')
         table = source[source.index('enum { K_NONE'):source.index('static vkfmt_t g_fmt')]
         code = r'''
 #include <assert.h>
@@ -41,7 +41,7 @@ int main(void) {
         with tempfile.TemporaryDirectory() as folder:
             src = Path(folder) / 'test.c'
             exe = Path(folder) / 'test'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             # The production table deliberately truncates extension enums to
             # uint16_t; vk_fmt reconstructs those unrelated packed formats.
             # GCC warns about that with -Woverflow, clang with -Wconstant-conversion;

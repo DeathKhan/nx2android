@@ -5,7 +5,7 @@ ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"), "host compiler required")
 class NativeSidecar(unittest.TestCase):
  def test_native_rgba_bytes_and_opt_in(self):
-  s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+  s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
   a=s.index("        // Keep all four native RGBA8/BGRA8 channels too:")
   b=s.index("        if (pr && atoi(pr) && (d->f ==",a)
   actual=s[a:b]
@@ -46,7 +46,7 @@ int main(int argc,char **argv) {
 """
   target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
   with tempfile.TemporaryDirectory(prefix="pass-native-",dir=target) as tmp:
-   c,exe=Path(tmp)/"test.c",Path(tmp)/"test";c.write_text(code)
+   c,exe=Path(tmp)/"test.c",Path(tmp)/"test";c.write_text(code, encoding='utf-8')
    subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror","-fsanitize=address,undefined","-I"+str(ROOT/"nxnative/dm/third_party/vulkan-headers/include"),str(c),"-o",str(exe)],check=True)
    subprocess.run([str(exe),tmp],check=True,timeout=10)
   self.assertNotIn("vkCmd",actual)

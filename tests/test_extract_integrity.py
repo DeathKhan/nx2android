@@ -39,14 +39,14 @@ class ExtractIntegrity(unittest.TestCase):
         cls.work = Path(cls.folder.name)
         cls.env = dict(os.environ, DOTNET_CLI_HOME=str(cls.work / 'cli'), DOTNET_NOLOGO='1', DOTNET_SKIP_FIRST_TIME_EXPERIENCE='1',
                        DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE='true')
-        (cls.work / 'NuGet.Config').write_text('<configuration><packageSources><clear /></packageSources></configuration>')
+        (cls.work / 'NuGet.Config').write_text('<configuration><packageSources><clear /></packageSources></configuration>', encoding='utf-8')
         # Compile the full production source with the exact cached LibHac version; never fetch or install test dependencies.
         (cls.work / 'Fixture.csproj').write_text(f'''<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>
 <OutputType>Exe</OutputType><TargetFramework>{target}</TargetFramework><StartupObject>IntegrityFixture</StartupObject>
 <AllowUnsafeBlocks>true</AllowUnsafeBlocks><EnableDefaultCompileItems>false</EnableDefaultCompileItems><NuGetAudit>false</NuGetAudit>
 </PropertyGroup><ItemGroup><Compile Include="{escape(str(PROJECT.with_name('Program.cs')))}" />
 <Compile Include="{escape(str(REPO / 'tests/nx_extract_integrity_fixture.cs'))}" />
-<Reference Include="LibHac"><HintPath>{escape(str(dlls[-1]))}</HintPath></Reference></ItemGroup></Project>''')
+<Reference Include="LibHac"><HintPath>{escape(str(dlls[-1]))}</HintPath></Reference></ItemGroup></Project>''', encoding='utf-8')
         built = subprocess.run([str(cls.dotnet), 'build', str(cls.work / 'Fixture.csproj'), '--nologo', '-v:q'],
                                cwd=cls.work, env=cls.env, text=True, capture_output=True, timeout=120)
         if built.returncode: raise AssertionError(built.stdout + built.stderr)

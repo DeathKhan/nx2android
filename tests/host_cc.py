@@ -30,7 +30,7 @@ def _builds(code, *flags):
         return False
     with tempfile.TemporaryDirectory() as d:
         c = Path(d) / 'probe.c'
-        c.write_text(code)
+        c.write_text(code, encoding='utf-8')
         try:
             return subprocess.run(['cc', *flags, str(c), '-o', str(Path(d) / 'probe')], capture_output=True, timeout=60).returncode == 0
         except (OSError, subprocess.SubprocessError):

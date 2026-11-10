@@ -10,7 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"),"host compiler required")
 class DrawCheckpoints(unittest.TestCase):
     def test_actual_checkpoint_helpers_and_fence_window(self):
-        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         a=s.index("// Deliberately intrusive diagnostic:")
         helpers=s[a:s.index("static void pass_dump_draw_geometry",a)]
         poll=extract(s,"void vk_pass_dump_poll(")
@@ -80,13 +80,13 @@ int main(void){
         code=code.replace("HELPERS",helpers).replace("INITIAL",extract(s,"static int pass_dump_draw_initial(")).replace("POLL",poll)
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="draw-checkpoints-",dir=target) as tmp:
-            c,exe=Path(tmp)/"t.c",Path(tmp)/"t";c.write_text(code)
+            c,exe=Path(tmp)/"t.c",Path(tmp)/"t";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=gnu11","-O1","-g","-Wall","-Wextra","-Werror",
                             "-fsanitize=address,undefined",str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=10)
 
     def test_only_emitted_guest_draws_hook_and_preserve_readback_order(self):
-        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         for name,count in [("static void draw(const p_draw *d) {",4),
                            ("static void draw_idx(",3),("static void mesh_draw(const p_draw *d) {",1)]:
             f=extract(s,name)

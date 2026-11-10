@@ -12,11 +12,11 @@ class GraphicsBuffers(unittest.TestCase):
     def compile_run(self,code):
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="graphics-buffers-",dir=target) as folder:
-            c,exe=Path(folder)/"test.c",Path(folder)/"test";c.write_text(code)
+            c,exe=Path(folder)/"test.c",Path(folder)/"test";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=10)
     def test_actual_selection_and_windows(self):
-        s=SRC.read_text();a=s.index("static uint64_t g_fs_buffer_key")
+        s=SRC.read_text(encoding='utf-8');a=s.index("static uint64_t g_fs_buffer_key")
         actual=s[a:s.index("\nstatic void x_read(",a)]
         self.compile_run(r"""
 #define _POSIX_C_SOURCE 200809L
@@ -83,7 +83,7 @@ int main(void){
 }
 """)
     def test_actual_copy_outside_pass_and_resume(self):
-        s=SRC.read_text();actual=extract(s,"static int fs_buffers_before_draw(")
+        s=SRC.read_text(encoding='utf-8');actual=extract(s,"static int fs_buffers_before_draw(")
         self.compile_run(r"""
 #include <stdint.h>
 #include <assert.h>

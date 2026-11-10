@@ -13,7 +13,7 @@ class DumpKeysTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         OUT.mkdir(parents=True, exist_ok=True)
-        src = (ROOT / "nxnative/dm/android/gfx_vk_shader.c").read_text()
+        src = (ROOT / "nxnative/dm/android/gfx_vk_shader.c").read_text(encoding='utf-8')
         begin = src.index("static int spv_runtime_dump_match(")
         selector = src[begin:src.index("static int spv_runtime_extra(", begin)]
         begin = src.index("static void spv_runtime_dump(", src.index("static int spv_runtime_contract("))
@@ -78,7 +78,7 @@ int main(int argc,char **argv) {
 }
 '''
         c = OUT / "dump-keys.c"
-        c.write_text(harness)
+        c.write_text(harness, encoding='utf-8')
         cls.exe = OUT / "dump-keys"
         subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", "-fno-omit-frame-pointer",

@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which('cc'), 'host C compiler required')
 class UniformShadowBounds(unittest.TestCase):
     def test_shadow_descriptor_and_full_range_fallbacks(self):
-        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text()
+        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         start = source.index('static void cbuf_desc(')
         pos = source.index('{', start) + 1; depth = 1
         while depth:
@@ -97,7 +97,7 @@ int main(void) {
         with tempfile.TemporaryDirectory(prefix='nx2a-ubo-bounds-', dir=target) as folder:
             src = Path(folder) / 'test.c'
             exe = Path(folder) / 'test'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                             '-fsanitize=address,undefined', str(src), '-o', str(exe)],
                            check=True, capture_output=True, text=True)

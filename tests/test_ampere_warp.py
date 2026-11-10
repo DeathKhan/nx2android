@@ -181,19 +181,19 @@ class AmpereWarp(unittest.TestCase):
         dotnet = os.environ.get('DOTNET') or shutil.which('dotnet')
         if not dotnet:
             self.skipTest('requires .NET 10; set DOTNET to its executable')
-        src = (INST / 'InstEmitAmpereTensor.cs').read_text()
+        src = (INST / 'InstEmitAmpereTensor.cs').read_text(encoding='utf-8')
         # Prevent any new Ampere operation from bypassing the tested warp helper.
         self.assertEqual(src.count('context.Shuffle('), 1)
         self.assertNotIn('context.Ballot(', src)
         names = ['ALaneId','AGpr','AWarpShuffle','LdsmLane','AMovm','ARedux','AMatch']
         emitted = '\n'.join(method(src,n) for n in names)
-        emitted += method((INST/'InstEmitWarp.cs').read_text(),'EmitBallot')
-        emitted += method((INST/'InstEmitMove.cs').read_text(),'EmitLoadSubgroupLaneId')
+        emitted += method((INST/'InstEmitWarp.cs').read_text(encoding='utf-8'),'EmitBallot')
+        emitted += method((INST/'InstEmitMove.cs').read_text(encoding='utf-8'),'EmitLoadSubgroupLaneId')
         out = ROOT / 'target/tests';out.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='ampere-warp-',dir=out) as tmp:
             p=Path(tmp)
-            (p/'test.csproj').write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>')
-            (p/'Program.cs').write_text(MOCK+emitted+CHECKS)
+            (p/'test.csproj').write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>', encoding='utf-8')
+            (p/'Program.cs').write_text(MOCK+emitted+CHECKS, encoding='utf-8')
             run=subprocess.run([dotnet,'run','--project',str(p/'test.csproj'),'-c','Release','--verbosity','quiet'],capture_output=True,text=True,timeout=120)
             self.assertEqual(run.returncode,0,run.stdout+run.stderr)
             self.assertIn('PASS:',run.stdout)

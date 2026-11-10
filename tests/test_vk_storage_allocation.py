@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 class StorageAllocation(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'C compiler required')
     def test_actual_image_creation_contract(self):
-        header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text()
-        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text()
+        header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text(encoding='utf-8')
+        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text(encoding='utf-8')
         image = re.search(r'typedef struct vkimg vkimg_t;\nstruct vkimg \{.*?\n\};', header, re.S).group()
         # img_new calls vk_int_fmt (DM_VK_UBWC bit 4: integer storage views, FINAL FANTASY TACTICS); it only needs V.pd and the
         # format-properties stub below, so the production function is cut in rather than stubbed
@@ -82,7 +82,7 @@ int main(void){
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='storage-allocation-', dir=scratch) as folder:
             p = Path(folder)
-            (p / 'check.c').write_text(code)
+            (p / 'check.c').write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                             '-I', str(ROOT / 'nxnative/dm/third_party/vulkan-headers/include'),
                             str(p / 'check.c'), '-o', str(p / 'check')], check=True)

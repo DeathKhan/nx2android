@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class MeshOcclusion(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "C compiler required")
     def test_actual_final_draw_query_order(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         start = source.index("    if (ok) { cb = vk_cmd();", source.index("static void mesh_draw(const p_draw *d) {"))
         end = source.index("    if (g_mesh_draws++", start)
         code = r"""
@@ -41,7 +41,7 @@ int main(void){for(allowed=0;allowed<2;allowed++)for(debug=0;debug<2;debug++){ru
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="mesh-query-", dir=scratch) as folder:
             p = Path(folder)
-            (p / "check.c").write_text(code)
+            (p / "check.c").write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", str(p / "check.c"), "-o", str(p / "check")], check=True)
             subprocess.run([str(p / "check")], check=True)
 

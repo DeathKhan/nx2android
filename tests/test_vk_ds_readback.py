@@ -46,12 +46,12 @@ class DepthStencilReadback(unittest.TestCase):
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        src = TEX.read_text()
+        src = TEX.read_text(encoding='utf-8')
         start = src.index('static void ds_texels(')
         cut = src[start:src.index('\n}\n', start) + 3]
         with tempfile.TemporaryDirectory(prefix='nx2a-ds-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
-            c.write_text(HARNESS.replace('CUT', cut))
+            c.write_text(HARNESS.replace('CUT', cut), encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             out = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
             self.assertEqual(out.returncode, 0, out.stderr)

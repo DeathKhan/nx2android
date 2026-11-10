@@ -99,9 +99,9 @@ class FrameCap(unittest.TestCase):
         if not cc:
             self.skipTest('a C compiler is required')
         with tempfile.TemporaryDirectory() as d:
-            Path(d, 'dm.h').write_text(STUB)
-            Path(d, 't.c').write_text('#include "dm.h"\n' + harness)
-            Path(d, 'hle_framecap.c').write_text(SOURCE.read_text(encoding='utf-8'))   # beside the stand-in dm.h
+            Path(d, 'dm.h').write_text(STUB, encoding='utf-8')
+            Path(d, 't.c').write_text('#include "dm.h"\n' + harness, encoding='utf-8')
+            Path(d, 'hle_framecap.c').write_text(SOURCE.read_text(encoding='utf-8'), encoding='utf-8')   # beside the stand-in dm.h
             exe = Path(d, 't')
             subprocess.run([cc, '-std=gnu11', '-I', d, str(Path(d, 'hle_framecap.c')), str(Path(d, 't.c')), '-o', str(exe), '-lm'], check=True)
             self.assertEqual(subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout.strip(), 'ok')

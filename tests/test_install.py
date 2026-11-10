@@ -93,7 +93,7 @@ class RomfsAt(unittest.TestCase):
         for rel, n in [*((f'RomFS/{r}', n) for r, n in ROM.items()), ('mods/main', 10), ('shaders.dmsv', 4)]: (d / rel).parent.mkdir(parents=True, exist_ok=True); (d / rel).write_bytes(b'x' * n)
         (d / 'env.txt').write_text('# porter\nDM_LANG=en-US\n', encoding='utf-8')
         self.bytes = sum(p.stat().st_size for p in d.rglob('*') if p.is_file())
-        (d / datapack.MANIFEST).write_text(json.dumps(dict(title_id='0100000000AAA000', name='Test Game', package=PKG, version='v65536', display='1.1.0', requires=[], bytes=self.bytes)))
+        (d / datapack.MANIFEST).write_text(json.dumps(dict(title_id='0100000000AAA000', name='Test Game', package=PKG, version='v65536', display='1.1.0', requires=[], bytes=self.bytes)), encoding='utf-8')
         self.apk = apk_file(self.t / 'Test.apk')
 
     def tearDown(self): install.Adb = self.real; shutil.rmtree(self.t, ignore_errors=True)

@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def fixture():
-    source = (ROOT / "nxnative/dm/android/gfx_vk_shader.c").read_text()
-    header = (ROOT / "nxnative/dm/android/gfx_vk.h").read_text()
+    source = (ROOT / "nxnative/dm/android/gfx_vk_shader.c").read_text(encoding='utf-8')
+    header = (ROOT / "nxnative/dm/android/gfx_vk.h").read_text(encoding='utf-8')
     defs = header[header.index("enum { RK_SUPPORT"):header.index("_Static_assert(sizeof(dmsv_bind)")]
     bent = source[source.index("typedef struct __attribute__((packed)) { uint64_t key;"):
                   source.index("static const uint8_t *g_bundle;")]
@@ -137,7 +137,7 @@ class PoolLayout(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="pool-layout-", dir=target) as folder:
             folder = Path(folder)
             source, exe = folder / "fixture.c", folder / "fixture"
-            source.write_text(fixture())
+            source.write_text(fixture(), encoding='utf-8')
             subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                             "-Wno-misleading-indentation", "-fsanitize=address,undefined", "-pthread",
                             "-I" + str(ROOT / "nxnative/dm/third_party/vulkan-headers/include"),

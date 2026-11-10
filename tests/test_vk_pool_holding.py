@@ -21,7 +21,7 @@ def function(source, declaration):
 class PoolHolding(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_actual_indexed_lookup_against_linear_oracle(self):
-        source = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        source = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         helpers = '\n'.join(function(source, declaration) for declaration in (
             'static void pool_ord_insert(', 'static void pool_ord_remove(',
             'vkpool_t *vk_pool_holding('))
@@ -131,7 +131,7 @@ int main(void){
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='pool-holding-', dir=target) as folder:
             src, exe = Path(folder) / 'test.c', Path(folder) / 'test'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                             '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
                             '-pthread', str(src), '-o', str(exe)], check=True)

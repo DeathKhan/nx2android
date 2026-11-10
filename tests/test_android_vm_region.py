@@ -58,11 +58,11 @@ int main(void) {
 @unittest.skipUnless(Path('/proc/self/maps').exists(), 'Linux /proc/self/maps is required')
 class AndroidVmRegion(unittest.TestCase):
     def test_tagged_and_split(self):
-        src = (COMPAT / 'darwin_compat.c').read_text()
+        src = (COMPAT / 'darwin_compat.c').read_text(encoding='utf-8')
         cut = src[src.index('static int prot_of('):src.index('kern_return_t mach_vm_region(')]
         with tempfile.TemporaryDirectory(prefix='nx2a-vmregion-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
-            c.write_text(HARNESS.replace('CUT', cut))
+            c.write_text(HARNESS.replace('CUT', cut), encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(COMPAT / 'include'), str(c), '-o', str(exe)], check=True)
             out = subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
             self.assertEqual(out.returncode, 0, out.stderr)

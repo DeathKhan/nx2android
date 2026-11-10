@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which('cc'),'host C compiler required')
 class AttachmentAlias(unittest.TestCase):
     def test_inactive_aliases_mask_transitions_and_clears(self):
-        source=(ROOT/'nxnative/dm/android/gfx_vk_exec.c').read_text()
+        source=(ROOT/'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         start=source.index('static void color_alias_map(')
         helpers=source[start:source.index('// Render passes.',start)]
         start=source.index('static void clear_color(const p_clear_color *c)')
@@ -86,7 +86,7 @@ int main(void) {
 '''
         (ROOT/'target/tests').mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='attachment-alias-',dir=ROOT/'target/tests') as folder:
-            src=Path(folder)/'test.c';src.write_text(code);exe=Path(folder)/'test'
+            src=Path(folder)/'test.c';src.write_text(code, encoding='utf-8');exe=Path(folder)/'test'
             result=subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-I',str(ROOT/'nxnative/dm/third_party/vulkan-headers/include'),str(src),'-o',str(exe)],capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
             result=subprocess.run([str(exe)],capture_output=True,text=True)

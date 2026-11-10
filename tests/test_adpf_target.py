@@ -22,7 +22,7 @@ def function(source, name):
 class AdpfTarget(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_actual_targets_and_report_failures(self):
-        runtime = (ROOT / 'nxnative/dm/android/perf_android.c').read_text()
+        runtime = (ROOT / 'nxnative/dm/android/perf_android.c').read_text(encoding='utf-8')
         start = runtime.index('typedef struct APerformanceHintManager')
         state = runtime[start:runtime.index('static int64_t perf_now(', start)]
         start = runtime.index('static int hint_target_fps(')
@@ -130,7 +130,7 @@ int main(void){
         target = ROOT / 'target/tests'; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='adpf-target-', dir=target) as folder:
             src, exe = Path(folder) / 'check.c', Path(folder) / 'check'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                             str(src), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)

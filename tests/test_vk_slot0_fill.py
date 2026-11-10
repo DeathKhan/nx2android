@@ -72,7 +72,7 @@ class Slot0Fill(unittest.TestCase):
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        src = EXEC.read_text()
+        src = EXEC.read_text(encoding='utf-8')
         rpkey = next(line for line in src.splitlines() if '} rpkey;' in line)
         def cut(start, end_marker):
             a = src.index(start); return src[a:src.index(end_marker, a)]
@@ -80,7 +80,7 @@ class Slot0Fill(unittest.TestCase):
                 + cut('static int adreno_model(', 'static int slot0_scratch('))
         with tempfile.TemporaryDirectory(prefix='nx2a-slot0-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
-            c.write_text(HARNESS.replace('RPKEY', rpkey).replace('CUTS', cuts))
+            c.write_text(HARNESS.replace('RPKEY', rpkey).replace('CUTS', cuts), encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-missing-field-initializers', '-pthread',
                             '-I', str(EXEC.parents[1] / 'gfx/nvn'), '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             for mode in range(5):

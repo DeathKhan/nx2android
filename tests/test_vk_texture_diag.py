@@ -76,7 +76,7 @@ int main(void){
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="texture-diag-", dir=target) as directory:
             source, exe = Path(directory) / "test.c", Path(directory) / "test"
-            source.write_text(code)
+            source.write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                             "-Wno-misleading-indentation", "-fsanitize=address,undefined", "-pthread",
                             "-I" + str(ROOT / "nxnative/dm/gfx/nvn"),
@@ -85,7 +85,7 @@ int main(void){
             subprocess.run([str(exe)], check=True, timeout=15)
 
     def test_every_generation_writer_and_identical_registration_guard(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text(encoding='utf-8')
         self.assertEqual(source.count("g_tex_gen++"), 4)
         for cause in ("TEX_DIAG_FIRST_USE", "TEX_DIAG_VIEW_DROP", "TEX_DIAG_ORPHAN"):
             self.assertEqual(source.count("vk_tex_diag_native(" + cause), 1)

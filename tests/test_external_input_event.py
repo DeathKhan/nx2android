@@ -23,7 +23,7 @@ static inline int AInputEvent_getType(const AInputEvent *e) { return e->type; }
 static inline int AInputEvent_getSource(const AInputEvent *e) { return e->source; }
 static inline int AInputEvent_getDeviceId(const AInputEvent *e) { return e->device; }
 static inline int AMotionEvent_getAction(const AInputEvent *e) { return e->action; }
-''')
+''', encoding='utf-8')
             source = root / 'check.c'
             source.write_text('''
 #include <assert.h>
@@ -37,7 +37,7 @@ int main(void) {
  b.action=1; assert(!external_moves_match(&a,&b));
  return 0;
 }
-''')
+''', encoding='utf-8')
             exe = root / 'check'
             subprocess.run([cc, '-Wall', '-Wextra', '-Werror', '-I'+t, '-I'+str(ROOT/'nxnative/dm/android'), str(source), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True)

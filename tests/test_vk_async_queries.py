@@ -21,8 +21,8 @@ def function(source, declaration):
 class AsyncQueries(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_counted_pipeline_lifecycle(self):
-        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text()
-        core = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
+        core = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         worker = function(source, 'static void *async_pipe_thread(')
         self.assertIn('async_pipe_complete(&k, p);', worker)
         code = r'''
@@ -129,7 +129,7 @@ int main(void){
         target = ROOT / 'target/tests'; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-async-queries-', dir=target) as folder:
             src, exe = Path(folder)/'check.c', Path(folder)/'check'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-pthread','-fsanitize=address,undefined',str(src),'-o',str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=15)
 

@@ -119,7 +119,7 @@ class MutableLoads(unittest.TestCase):
         dotnet = os.environ.get("DOTNET") or shutil.which("dotnet")
         if not dotnet:
             self.skipTest("requires .NET 10; set DOTNET")
-        source = SOURCE.read_text()
+        source = SOURCE.read_text(encoding='utf-8')
         names = ("Optimize", "HasSideEffects", "ReadsMutableMemory", "UsedByCall",
                  "IsWorthPropagating", "PropagateExpression")
         actual = chr(10).join(helper.method(source, name) for name in names)
@@ -129,10 +129,10 @@ class MutableLoads(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mutable-loads-", dir=parent) as folder:
             p = Path(folder)
             project = p / "test.csproj"
-            project.write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>')
+            project.write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>', encoding='utf-8')
             program = p / "Program.cs"
             def run(text):
-                program.write_text(text)
+                program.write_text(text, encoding='utf-8')
                 return subprocess.run([dotnet, "run", "--project", str(project), "-c", "Release", "--verbosity", "quiet"],
                                       capture_output=True, text=True, timeout=120)
             result = run(code)

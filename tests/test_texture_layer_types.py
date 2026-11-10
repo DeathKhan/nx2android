@@ -108,16 +108,16 @@ class TextureLayerTypes(unittest.TestCase):
     def test_actual_type_inference(self):
         dotnet=os.environ.get("DOTNET") or shutil.which("dotnet")
         if not dotnet:self.skipTest("requires .NET 10; set DOTNET")
-        source=SOURCE.read_text()
+        source=SOURCE.read_text(encoding='utf-8')
         actual="\n".join(helper.method(source,n) for n in ("GetVarTypeFromUses","GetSourceVarType"))
         actual=actual.replace("private static","public static")
         code=MOCK+"\nstatic class Actual {\n"+actual+CHECKS
         parent=ROOT/"target/tests";parent.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="texture-layer-types-",dir=parent) as folder:
             p=Path(folder);project=p/"test.csproj"
-            project.write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>')
+            project.write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>', encoding='utf-8')
             def run(text):
-                (p/"Program.cs").write_text(text)
+                (p/"Program.cs").write_text(text, encoding='utf-8')
                 return subprocess.run([dotnet,"run","--project",str(project),"-c","Release","--verbosity","quiet"],capture_output=True,text=True,timeout=120)
             r=run(code)
             self.assertEqual(r.returncode,0,r.stdout+r.stderr)

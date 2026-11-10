@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class DescriptorHash(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text()
+        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         fnv = source[source.index('static inline uint64_t fnv('):
                      source.index('static void drv_shared(')]
         cache = source[source.index('enum { SETC ='):source.index('static struct { uint64_t h, epoch; VkBuffer b;')]
@@ -133,7 +133,7 @@ int main(int argc, char **argv) {
         cls.addClassCleanup(cls.tmp.cleanup)
         src = Path(cls.tmp.name) / 'test.c'
         cls.exe = Path(cls.tmp.name) / 'test'
-        src.write_text(code)
+        src.write_text(code, encoding='utf-8')
         subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-I',
                         str(ROOT / 'nxnative/dm/third_party/vulkan-headers/include'),
                         str(src), '-o', str(cls.exe)], check=True, capture_output=True, text=True)

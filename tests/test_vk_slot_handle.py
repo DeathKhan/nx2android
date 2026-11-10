@@ -30,7 +30,7 @@ int main(void) {
         with tempfile.TemporaryDirectory() as temp:
             c = pathlib.Path(temp) / 'slot.c'
             out = pathlib.Path(temp) / 'slot'
-            c.write_text(source)
+            c.write_text(source, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', str(root), str(c), '-o', str(out)], check=True)
             subprocess.run([str(out)], check=True)
 

@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"),"host compiler required")
 class PassDumpGate(unittest.TestCase):
     def test_actual_gate(self):
-        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         a=s.index("static int g_pd_fs_mode")
         actual=s[a:s.index("void vk_pass_dump_poll(",a)]
         code=r"""
@@ -68,7 +68,7 @@ int main(void) {
 """
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="passdump-gate-",dir=target) as temp:
-            c,exe=Path(temp)/"t.c",Path(temp)/"t";c.write_text(code)
+            c,exe=Path(temp)/"t.c",Path(temp)/"t";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=gnu11","-O1","-g","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=10)
         prepare=extract(s,"static int prepare_draw(")

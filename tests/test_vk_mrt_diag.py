@@ -30,11 +30,11 @@ class MRT(unittest.TestCase):
  def run_c(self,body):
   target=ROOT/'target/tests';target.mkdir(parents=True,exist_ok=True)
   with tempfile.TemporaryDirectory(prefix='mrt-',dir=target) as tmp:
-   c,e=Path(tmp)/'t.c',Path(tmp)/'t';c.write_text(body)
+   c,e=Path(tmp)/'t.c',Path(tmp)/'t';c.write_text(body, encoding='utf-8')
    subprocess.run(['cc','-std=gnu11','-O1','-g','-Wall','-Wextra','-Werror','-Wno-unused-variable','-Wno-missing-field-initializers','-fsanitize=address,undefined','-I'+str(ROOT/'nxnative/dm/third_party/vulkan-headers/include'),str(c),'-o',str(e)],check=True)
    subprocess.run([str(e)],check=True,timeout=10)
  def test_selection_attachment_support(self):
-  src=SRC.read_text()
+  src=SRC.read_text(encoding='utf-8')
   actual='\n'.join(extract(src,'static '+sig+('(void) {' if sig=='void mrt_attach' else '(')) for sig in ['uint32_t mrt_active_slots','int mrt_match','int mrt_choose','void mrt_attach','void mrt_detach','void mrt_support'])
   self.run_c(HEADER+r"""
 typedef struct {uint64_t key;} vkshader_t;
@@ -102,7 +102,7 @@ int main(void){
 }
 """)
  def test_fenced_native_copy_and_completion(self):
-  src=SRC.read_text()
+  src=SRC.read_text(encoding='utf-8')
   actual=extract(src,'static int mrt_copy(')+'\n'+extract(src,'static void mrt_poll(uint64_t done_fence) {')
   self.run_c(HEADER+r"""
 static uint64_t g_tex_frame=90,latest=10;static int g_sub_pass=4,g_draw_i=91,active;
@@ -162,7 +162,7 @@ int main(void){
 }
 """)
  def test_observer_opt_in_exact_gate_skip_and_pair_refusal(self):
-  src=SRC.read_text()
+  src=SRC.read_text(encoding='utf-8')
   functions=['static int fs_buffer_number(', 'static int pass_dump_fs_parse(', 'static uint32_t mrt_active_slots(', 'static int mrt_match(', 'static int mrt_choose(', 'static int mrt_observer_match(', 'static int mrt_prepare(']
   actual='\n'.join(extract(src,x) for x in functions)
   self.run_c(HEADER+r"""
@@ -235,7 +235,7 @@ int main(void){
 }
 """)
  def test_actual_hooks_preserve_original_path(self):
-  s=SRC.read_text();prepare=extract(s,'static int prepare_draw(');stage=extract(s,'static VkDescriptorSet stage_set(')
+  s=SRC.read_text(encoding='utf-8');prepare=extract(s,'static int prepare_draw(');stage=extract(s,'static VkDescriptorSet stage_set(')
   self.assertIn('!(g_mrt_active && st == 1)',stage)
   self.assertIn('light_diag_support(st, s, &bi[nw]); mrt_support(st, s, &bi[nw]);',stage)
   self.assertIn('k.wmask[1] = 0xf; k.blend_en &= ~2u;',prepare)

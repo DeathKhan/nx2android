@@ -7,7 +7,7 @@ SRC=ROOT/'nxnative/dm/android/gfx_vk_tex.c'
 class ViewLog(unittest.TestCase):
  @unittest.skipUnless(shutil.which('cc'),'host compiler required')
  def test_actual_helper_filter_ranges_and_budget(self):
-  s=SRC.read_text();helpers='\n'.join(function(s,n) for n in ['static int view_log_size_parse(','static void view_log_selected('])
+  s=SRC.read_text(encoding='utf-8');helpers='\n'.join(function(s,n) for n in ['static int view_log_size_parse(','static void view_log_selected('])
   code=r'''
 #include <assert.h>
 #include <stdint.h>
@@ -47,13 +47,13 @@ int main(int argc,char **argv){
 '''.replace('HELPERS',helpers)
   target=ROOT/'target/tests';target.mkdir(parents=True,exist_ok=True)
   with tempfile.TemporaryDirectory(prefix='view-log-',dir=target)as tmp:
-   c,e=Path(tmp)/'t.c',Path(tmp)/'t';c.write_text(code)
+   c,e=Path(tmp)/'t.c',Path(tmp)/'t';c.write_text(code, encoding='utf-8')
    subprocess.run(['cc','-std=gnu11','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(c),'-o',str(e)],check=True)
    for value in ['off','1524x928','1524x928bad','4294967296x928']:subprocess.run([str(e),value],check=True,timeout=10)
  def test_actual_cached_and_created_hooks(self):
   # vk_tex_view is now a wrapper over vk_tex_view_as (integer storage views, FINAL FANTASY TACTICS): the hooks live in vk_tex_view_as,
   # and every vk_tex_view request must still reach them through it
-  src=SRC.read_text()
+  src=SRC.read_text(encoding='utf-8')
   self.assertIn('return vk_tex_view_as(t, vw, dim, arrayed, view_kind, img_out, 0);',function(src,'VkImageView vk_tex_view('))
   body=function(src,'VkImageView vk_tex_view_as(')
   self.assertEqual(body.count('view_log_selected('),2)

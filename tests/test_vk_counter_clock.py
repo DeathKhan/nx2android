@@ -18,7 +18,7 @@ def function(source,declaration):
 class CounterClock(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'),'a host C compiler is required')
     def test_actual_calibration_and_projection(self):
-        dm=ROOT/'nxnative/dm';core=(dm/'android/gfx_vk_core.c').read_text();os=(dm/'host/hle_os.c').read_text()
+        dm=ROOT/'nxnative/dm';core=(dm/'android/gfx_vk_core.c').read_text(encoding='utf-8');os=(dm/'host/hle_os.c').read_text(encoding='utf-8')
         helper=core[core.index('static PFN_vkGetCalibratedTimestampsKHR g_gpu_calibrated;'):core.index('static void completion_start(void);')]
         project=function(os,'uint64_t guest_ns_at_host_time(')
         code=r'''
@@ -107,18 +107,18 @@ int main(void){
 '''.replace('HELPER',helper).replace('PROJECT',project)
         target=ROOT/'target/tests';target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-counter-clock-',dir=target) as folder:
-            src,exe=Path(folder)/'test.c',Path(folder)/'test';src.write_text(code)
+            src,exe=Path(folder)/'test.c',Path(folder)/'test';src.write_text(code, encoding='utf-8')
             subprocess.run(['cc','-std=gnu11','-g','-O1','-Wall','-Wextra','-Werror','-Wno-misleading-indentation','-fsanitize=address,undefined','-I'+str(dm/'third_party/vulkan-headers/include'),'-I'+str(dm/'gfx/nvn'),str(src),'-o',str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=15)
 
     @unittest.skipUnless(shutil.which('cc'),'a host C compiler is required')
     def test_timestamp_recording_stages(self):
-        dm=ROOT/'nxnative/dm';core=(dm/'android/gfx_vk_core.c').read_text()
-        nvn=(dm/'gfx/nvn/include/nvn.h').read_text()
+        dm=ROOT/'nxnative/dm';core=(dm/'android/gfx_vk_core.c').read_text(encoding='utf-8')
+        nvn=(dm/'gfx/nvn/include/nvn.h').read_text(encoding='utf-8')
         at=nvn.index('NVN_COUNTER_TYPE_TIMESTAMP =')
         start=nvn.rfind('typedef enum {',0,at)
         counter_enum=nvn[start:nvn.index('} NVNcounterType;',at)+len('} NVNcounterType;')]
-        metal=(dm/'gfx/nvn/nvn_mtl.m').read_text()
+        metal=(dm/'gfx/nvn/nvn_mtl.m').read_text(encoding='utf-8')
         self.assertIn('int top = o->type == 0x10;',metal)
         self.assertIn('ns = top ? c0 : c1;',metal)
         code=r"""
@@ -156,12 +156,12 @@ int main(void){
 """.replace('COUNTERS',counter_enum).replace('REPORT',function(core,'void mtl_sub_counter('))
         target=ROOT/'target/tests';target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-counter-record-',dir=target) as folder:
-            src,exe=Path(folder)/'test.c',Path(folder)/'test';src.write_text(code)
+            src,exe=Path(folder)/'test.c',Path(folder)/'test';src.write_text(code, encoding='utf-8')
             subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(dm/'third_party/vulkan-headers/include'),str(src),'-o',str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=15)
 
     def test_completion_integration(self):
-        core=(ROOT/'nxnative/dm/android/gfx_vk_core.c').read_text()
+        core=(ROOT/'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         completion=function(core,'static void *completion_main(')
         self.assertEqual(completion.count('gpu_clock_sample()'),1)
         self.assertIn('ts = nvn_timestamp_from_ns(guest_ns_at_host_time(host))',completion)

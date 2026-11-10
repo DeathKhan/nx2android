@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class IndexSnapshot(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_capture_timing_alignment_bounds_and_completion(self):
-        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text()
+        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         start = source.index('// BEGIN original-index GPU snapshot diagnostic')
         helper = source[start:source.index('// END original-index GPU snapshot diagnostic', start)]
         code = r'''
@@ -77,7 +77,7 @@ int main(void){
 }
 '''.replace('HELPER', helper)
         with tempfile.TemporaryDirectory(prefix='index-snapshot-') as tmp:
-            p = Path(tmp); (p / 'test.c').write_text(code)
+            p = Path(tmp); (p / 'test.c').write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-O1', '-g', '-fsanitize=address,undefined',
                             '-I' + str(ROOT / 'nxnative/dm/third_party/vulkan-headers/include'),
                             str(p / 'test.c'), '-o', str(p / 'test')], check=True, text=True)

@@ -12,10 +12,10 @@ class PushMemo(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
     def test_changed_push_bytes_and_cached_shader_dependency(self):
         dm = ROOT / "nxnative/dm"
-        source = (dm / "android/gfx_vk_exec.c").read_text()
-        header = (dm / "android/gfx_vk.h").read_text()
-        obj = (dm / "gfx/nvn/nvn_obj.h").read_text()
-        abi = (dm / "gfx/nvn/dmsh_abi.h").read_text()
+        source = (dm / "android/gfx_vk_exec.c").read_text(encoding='utf-8')
+        header = (dm / "android/gfx_vk.h").read_text(encoding='utf-8')
+        obj = (dm / "gfx/nvn/nvn_obj.h").read_text(encoding='utf-8')
+        abi = (dm / "gfx/nvn/dmsh_abi.h").read_text(encoding='utf-8')
         declarations = []
         start = header.index("enum { RK_SUPPORT")
         declarations.append(header[start:header.index("};", start) + 2])
@@ -102,7 +102,7 @@ int main(void) {
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="push-memo-", dir=target) as folder:
             src, exe = Path(folder) / "check.c", Path(folder) / "check"
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                             "-fsanitize=address,undefined",
                             "-I" + str(dm / "third_party/vulkan-headers/include"),

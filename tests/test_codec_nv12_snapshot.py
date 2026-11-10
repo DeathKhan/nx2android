@@ -13,7 +13,7 @@ def function(s,decl):
 class Nv12Snapshot(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"),"host compiler required")
     def test_generation_bytes_lifetime_and_lock(self):
-        s=(ROOT/"nxnative/dm/host/hle_codec_video.c").read_text()
+        s=(ROOT/"nxnative/dm/host/hle_codec_video.c").read_text(encoding='utf-8')
         methods="\n".join(function(s,x) for x in ("static uint32_t native_stride(","static uint64_t native_size(uint32_t w, uint32_t h) {",
             "static void last_nv12_set(","static void last_nv12_forget(","int dm_codec_last_nv12(","int dm_codec_copy_last_nv12(","static void pool_native_write("))
         code=r"""
@@ -75,7 +75,7 @@ int main(void){
         code=code.replace("METHODS",methods)
         dest=ROOT/"target/tests";dest.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="codec-nv12-",dir=dest) as folder:
-            c=Path(folder)/"check.c";exe=Path(folder)/"check";c.write_text(code)
+            c=Path(folder)/"check.c";exe=Path(folder)/"check";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=gnu11","-Wall","-Wextra","-Werror","-fsanitize=address,undefined","-pthread",str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=15)
 if __name__=="__main__":unittest.main()

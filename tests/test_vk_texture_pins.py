@@ -15,7 +15,7 @@ ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class TexturePins(unittest.TestCase):
     def test_native_images_survive_parked_snapshots_and_key_reuse(self):
-        s=(ROOT/"nxnative/dm/android/gfx_vk_tex.c").read_text()
+        s=(ROOT/"nxnative/dm/android/gfx_vk_tex.c").read_text(encoding='utf-8')
         declarations=s[s.index("typedef struct { uint64_t pool;"):s.index("// The sRGB / UNORM twin")]
         start=s.index("typedef struct tex_pin_image")
         pins=s[start:s.index("static vkimg_t *vk_tex_(const tex_t *t);",start)]
@@ -133,7 +133,7 @@ int main(void){
             code=code.replace(k,v)
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="texture-pins-",dir=target) as tmp:
-            src=Path(tmp)/"test.c";exe=Path(tmp)/"test";src.write_text(code)
+            src=Path(tmp)/"test.c";exe=Path(tmp)/"test";src.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror",
                             "-Wno-misleading-indentation","-fsanitize=address,undefined",
                             "-I"+str(ROOT/"nxnative/dm/gfx/nvn"),

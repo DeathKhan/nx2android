@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class ImageRegistration(unittest.TestCase):
     def test_storage_intent_and_original_snapshot(self):
-        source = (ROOT / "nxnative/dm/android/gfx_common.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_common.c").read_text(encoding='utf-8')
         start = source.index("void mtl_reg_image(")
         pos = source.index("{", start) + 1
         depth = 1
@@ -56,7 +56,7 @@ int main(void) {
         code=code.replace("HELPER",helper)
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="image-registration-",dir=target) as tmp:
-            src=Path(tmp)/"test.c";exe=Path(tmp)/"test";src.write_text(code)
+            src=Path(tmp)/"test.c";exe=Path(tmp)/"test";src.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror",
                 "-fsanitize=address,undefined",
                 "-I"+str(ROOT/"nxnative/dm/gfx/nvn"),

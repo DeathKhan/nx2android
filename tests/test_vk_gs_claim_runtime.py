@@ -18,7 +18,7 @@ def function(source, declaration):
 class Claims(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'),'a host C compiler is required')
     def test_bounds_disjoint_storage_and_memo(self):
-        dm=ROOT/'nxnative/dm/android';source=(dm/'gfx_vk_exec.c').read_text();header=(dm/'gfx_vk.h').read_text()
+        dm=ROOT/'nxnative/dm/android';source=(dm/'gfx_vk_exec.c').read_text(encoding='utf-8');header=(dm/'gfx_vk.h').read_text(encoding='utf-8')
         enums=[]
         for name in ('RK_SUPPORT','RD_UBO','RS_NONE'):
             start=header.index('enum { '+name);enums.append(header[start:header.index('};',start)+2])
@@ -138,12 +138,12 @@ int main(void){
         code=code.replace('ENUMS','\n'.join(enums)).replace('HELPER',helper).replace('MEMO\n',memo+'\n').replace('DYNAMIC\n',dynamic+'\n').replace('HASH\n',hash_function+'\n')
         target=ROOT/'target/tests';target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-gs-claim-runtime-',dir=target) as folder:
-            src,exe=Path(folder)/'check.c',Path(folder)/'check';src.write_text(code)
+            src,exe=Path(folder)/'check.c',Path(folder)/'check';src.write_text(code, encoding='utf-8')
             subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(dm),str(src),'-o',str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=15)
 
     def test_runtime_binding_and_input_capture(self):
-        source=(ROOT/'nxnative/dm/android/gfx_vk_exec.c').read_text()
+        source=(ROOT/'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         for decl in ('static void draw(const p_draw *d) {','static void draw_idx(const p_draw_idx *d) {'):
             draw=function(source,decl)
             self.assertLess(draw.index('g_claim_draw ='),draw.index('prepare_draw('))

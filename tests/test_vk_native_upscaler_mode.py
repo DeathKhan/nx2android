@@ -9,7 +9,7 @@ import unittest
 ROOT=Path(__file__).resolve().parents[1]
 class NativeMode(unittest.TestCase):
     def test_actual_selector(self):
-        text=(ROOT/'nxnative/dm/android/gfx_vk_exec.c').read_text()
+        text=(ROOT/'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         start=text.index('static int upscaler_native_dispatch(');brace=text.index('{',start);end=brace+1;depth=1
         while depth:
             depth+=(text[end]=='{')-(text[end]=='}');end+=1
@@ -40,7 +40,7 @@ int main(void) {
 '''
         parent=ROOT/'target/tests';parent.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='native-mode-',dir=parent) as d:
-            p=Path(d);(p/'test.c').write_text(code)
+            p=Path(d);(p/'test.c').write_text(code, encoding='utf-8')
             subprocess.run([os.environ.get('CC','cc'),'-std=c11','-O1','-g','-fsanitize=address,undefined',str(p/'test.c'),'-o',str(p/'test')],check=True)
             r=subprocess.run([str(p/'test')],capture_output=True,text=True)
             self.assertEqual(r.returncode,0,r.stdout+r.stderr);print(r.stdout.strip())

@@ -117,7 +117,7 @@ class MemReport(unittest.TestCase):
             self.skipTest('NDK Vulkan headers are required')
         with tempfile.TemporaryDirectory(prefix='nx2a-memreport-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
-            c.write_text(HARNESS)
+            c.write_text(HARNESS, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-missing-field-initializers', '-pthread', '-I', str(DM / 'android'), '-I', str(DM / 'gfx/nvn'),
                             '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             out = subprocess.run([str(exe)], capture_output=True, text=True)

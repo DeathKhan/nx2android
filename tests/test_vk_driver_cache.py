@@ -19,8 +19,8 @@ def function(source, signature):
 
 
 def harness():
-    source = (DM / 'android/gfx_vk_exec.c').read_text()
-    core = (DM / 'android/gfx_vk_core.c').read_text()
+    source = (DM / 'android/gfx_vk_exec.c').read_text(encoding='utf-8')
+    core = (DM / 'android/gfx_vk_core.c').read_text(encoding='utf-8')
     cache = next(line for line in source.splitlines() if 'g_drvc[DRVC];' in line)
     scratch_type = next(line for line in core.splitlines() if line.endswith('} scratch_blk;'))
     scratch_size = next(line for line in core.splitlines() if line.startswith('#define SCRATCH_BLOCK '))
@@ -264,7 +264,7 @@ class DriverCache(unittest.TestCase):
         cls.addClassCleanup(cls.temp.cleanup)
         cfile = Path(cls.temp.name) / 'driver.c'
         cls.exe = Path(cls.temp.name) / 'driver'
-        cfile.write_text(harness())
+        cfile.write_text(harness(), encoding='utf-8')
         subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers',
                         '-I' + str(DM / 'third_party/vulkan-headers/include'),
                         str(cfile), '-o', str(cls.exe)], check=True)

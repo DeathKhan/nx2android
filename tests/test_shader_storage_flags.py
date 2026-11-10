@@ -20,7 +20,7 @@ def exporter():
     # Load the production classifier/serializer and their constants without
     # starting the command-line exporter or requiring a game shader package.
     source = TOOLS / 'shader_vk.py'
-    tree = ast.parse(source.read_text())
+    tree = ast.parse(source.read_text(encoding='utf-8'))
     names = {'TEX_BASE', 'SSBO', 'KIND', 'DESC', 'SAMP_NONE', 'GMEM_MAP_CB_SLOT', 'GMEM_LOG_CB_OFFSET', 'POOL_MIN'}
     nodes = [n for n in tree.body if
              isinstance(n, ast.FunctionDef) and n.name in ('classify', 'refl_bin', 'pool_array') or

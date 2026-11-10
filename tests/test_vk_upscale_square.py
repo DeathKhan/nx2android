@@ -11,13 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 class SquareUpscaler(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "host compiler required")
     def test_commands_contract_lifetime(self):
-        source = (ROOT / "nxnative/dm/android/upscale_square_vk.c").read_text()
+        source = (ROOT / "nxnative/dm/android/upscale_square_vk.c").read_text(encoding='utf-8')
         source = source[source.index("typedef struct { uint32_t w, h; }"):]
         code = PREAMBLE + source + MAIN
         target = ROOT / "target/tests"; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="square-upscale-", dir=target) as folder:
             c, exe = Path(folder) / "check.c", Path(folder) / "check"
-            c.write_text(code)
+            c.write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                 "-Wno-missing-field-initializers", "-Wno-unused-variable", "-Wno-unused-function",
                 "-fsanitize=address,undefined", "-I" + str(ROOT / "nxnative/dm/third_party/vulkan-headers/include"),
@@ -26,7 +26,7 @@ class SquareUpscaler(unittest.TestCase):
     @unittest.skipUnless(shutil.which("glslc") and shutil.which("spirv-val") and shutil.which("cc"), "shader/compiler tools required")
     def test_actual_shader_transfer(self):
         shader = ROOT / "nxnative/dm/android/shaders/upscale_square.comp"
-        s = shader.read_text()
+        s = shader.read_text(encoding='utf-8')
         self.assertIn("textureLod(src, uv, 0.0)", s)
         self.assertNotIn("clamp(", s)
         expression = re.search(r"vec4\((encoded \* abs\(encoded\)), 1.0\)", s).group(1).replace("abs(", "fabsf(")
@@ -34,7 +34,7 @@ class SquareUpscaler(unittest.TestCase):
         code += "int main(void){assert(decode(4)==16&&decode(-2)==-4&&decode(0)==0); float filtered=(0.f+1.f)*.5f;assert(decode(filtered)==.25f&&decode(filtered)!=(decode(0)+decode(1))*.5f);return 0;}\n"
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="square-shader-",dir=target) as folder:
-            p=Path(folder);(p/"math.c").write_text(code)
+            p=Path(folder);(p/"math.c").write_text(code, encoding='utf-8')
             subprocess.run(["glslc","--target-env=vulkan1.1","-O",str(shader),"-o",str(p/"shader.spv")],check=True)
             subprocess.run(["spirv-val","--target-env","vulkan1.1",str(p/"shader.spv")],check=True)
             subprocess.run(["cc","-std=c11","-fsanitize=address,undefined",str(p/"math.c"),"-lm","-o",str(p/"math")],check=True)

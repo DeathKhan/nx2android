@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"), "host compiler required")
 class LightDiagnostic(unittest.TestCase):
     def test_actual_control_and_snapshot_lifetime(self):
-        src = (ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
-        shader = (ROOT/"nxnative/dm/android/gfx_vk_shader.c").read_text()
+        src = (ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
+        shader = (ROOT/"nxnative/dm/android/gfx_vk_shader.c").read_text(encoding='utf-8')
         start = src.index("static uint64_t g_light_diag_key")
         actual = src[start:src.index("static uint64_t g_fs_buffer_key", start)]
         fill = extract(shader, "void vk_support_values(")
@@ -78,7 +78,7 @@ int main(void) {
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="light-diag-",dir=target) as temp:
             c,exe=Path(temp)/"t.c",Path(temp)/"t"
-            c.write_text(code)
+            c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=10)
         self.assertIn("case RK_SUPPORT: light_diag_support(st, s, &bi[nw]); mrt_support(st, s, &bi[nw]); break;", extract(src,"static VkDescriptorSet stage_set("))

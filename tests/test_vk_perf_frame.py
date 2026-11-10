@@ -21,7 +21,7 @@ def function(source, declaration):
 class FrameTiming(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_completed_sealed_frames(self):
-        core = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        core = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         start = core.index('static int perf_frame_on(')
         end = core.index('double mtl_gpu_ms(', start)
         helper = core[start:end]
@@ -122,14 +122,14 @@ int main(int argc,char **argv) {
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-perf-frame-', dir=target) as folder:
             src, exe = Path(folder) / 'test.c', Path(folder) / 'test'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-g', '-O1', '-Wall', '-Wextra', '-Werror',
                             '-fsanitize=address,undefined', '-pthread', str(src), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
             subprocess.run([str(exe), 'off'], check=True, timeout=15)
 
     def test_completion_and_registration_order(self):
-        core = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        core = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         completion = function(core, 'static void *completion_main(')
         commit = function(core, 'uint64_t mtl_sub_commit(')
         self.assertLess(commit.index('perf_frame_submit(c->frame, c->fence)'), commit.index('g_ct->next = c'))

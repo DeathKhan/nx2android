@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which('cc'), 'host C compiler required')
 class TextureSwizzle(unittest.TestCase):
     def test_view_override_format_mapping_and_attachment_identity(self):
-        source=(ROOT/'nxnative/dm/android/gfx_vk_tex.c').read_text()
+        source=(ROOT/'nxnative/dm/android/gfx_vk_tex.c').read_text(encoding='utf-8')
         helper=source[source.index('static VkComponentSwizzle swz_comp'):source.index('__thread VkFormat vk_view_fmt')]
         code=r'''
 #include <vulkan/vulkan_core.h>
@@ -50,7 +50,7 @@ int main(void) {
 }
 '''
         with tempfile.TemporaryDirectory() as folder:
-            src=Path(folder)/'test.c';src.write_text(code);exe=Path(folder)/'test'
+            src=Path(folder)/'test.c';src.write_text(code, encoding='utf-8');exe=Path(folder)/'test'
             subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-I',str(ROOT/'nxnative/dm/third_party/vulkan-headers/include'),str(src),'-o',str(exe)],check=True)
             result=subprocess.run([str(exe)],capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)

@@ -53,7 +53,7 @@ class PixelFont(unittest.TestCase):
         if not cc: self.skipTest('a C compiler is needed')
         with tempfile.TemporaryDirectory() as t:
             c, exe = Path(t) / 'h.c', Path(t) / 'h'
-            c.write_text(HARNESS)
+            c.write_text(HARNESS, encoding='utf-8')
             subprocess.run([cc, '-std=c11', '-Wall', '-Werror', f'-I{DM / "android"}', str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe), str(PACK)], check=True)
 
@@ -62,21 +62,21 @@ class PixelFont(unittest.TestCase):
         if not cc: self.skipTest('a C compiler is needed')
         with tempfile.TemporaryDirectory() as t:
             c, exe = Path(t) / 'f.c', Path(t) / 'f'
-            c.write_text(FALLBACK)
+            c.write_text(FALLBACK, encoding='utf-8')
             subprocess.run([cc, '-std=c11', '-Wall', '-Werror', f'-I{DM / "android"}', str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True)
 
     def test_fallback_header_matches_the_pack(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location('make_pixel_font', DM / 'tools/make_pixel_font.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-        self.assertEqual((DM / 'android/pixel_font_latin1.h').read_text(), m.latin1_header(PACK.read_bytes()))
+        self.assertEqual((DM / 'android/pixel_font_latin1.h').read_text(encoding='utf-8'), m.latin1_header(PACK.read_bytes()))
 
     def test_converter(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location('make_pixel_font', DM / 'tools/make_pixel_font.py'); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
         with tempfile.TemporaryDirectory() as t:
             b = Path(t) / 'f.bdf'
-            b.write_text('STARTFONT 2.1\nCHARS 2\nSTARTCHAR b\nENCODING 66\nDWIDTH 3 0\nBBX 2 1 0 -1\nBITMAP\nC0\nENDCHAR\nSTARTCHAR a\nENCODING 65\nDWIDTH 2 0\nBBX 1 2 1 0\nBITMAP\n80\n00\nENDCHAR\nENDFONT\n')
+            b.write_text('STARTFONT 2.1\nCHARS 2\nSTARTCHAR b\nENCODING 66\nDWIDTH 3 0\nBBX 2 1 0 -1\nBITMAP\nC0\nENDCHAR\nSTARTCHAR a\nENCODING 65\nDWIDTH 2 0\nBBX 1 2 1 0\nBITMAP\n80\n00\nENDCHAR\nENDFONT\n', encoding='utf-8')
             out = m.pack(m.glyphs(b))
         self.assertEqual(out[:8], b'NXPF\x02\0\0\0')
         self.assertEqual(out[8:20], bytes([2, 65, 0, 0, 1, 0, 0, 0, 2, 1, 0, 0]))   # sorted: A first, bitmap offset 0

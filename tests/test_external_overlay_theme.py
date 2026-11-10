@@ -30,7 +30,7 @@ public class Check {
   try { OverlayTheme.read(new StringReader("layout\\tphone\\t1\\tbroken\\ta.png\\t2\\t1"), "phone"); throw new AssertionError(); }
   catch (IOException expected) {}
  }
-}''')
+}''', encoding='utf-8')
             source = ROOT / 'nxnative/dm/android/java/org/nx2a/OverlayTheme.java'
             manifest = ROOT / 'nxnative/dm/android/themes/ergo/theme.tsv'
             subprocess.run(['javac', '-d', t, str(source), str(check)], check=True)

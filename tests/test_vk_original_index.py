@@ -12,9 +12,9 @@ class OriginalIndex(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_capture_match_fallback_and_submission_lifetime(self):
         dm = ROOT / 'nxnative/dm'
-        execute = (dm / 'android/gfx_vk_exec.c').read_text()
-        header = (dm / 'android/gfx_vk.h').read_text()
-        obj = (dm / 'gfx/nvn/nvn_obj.h').read_text()
+        execute = (dm / 'android/gfx_vk_exec.c').read_text(encoding='utf-8')
+        header = (dm / 'android/gfx_vk.h').read_text(encoding='utf-8')
+        obj = (dm / 'gfx/nvn/nvn_obj.h').read_text(encoding='utf-8')
         decl = []
         for first in ('RK_SUPPORT', 'RD_UBO', 'RS_NONE'):
             at = header.index('enum { ' + first)
@@ -97,7 +97,7 @@ int main(void){
         target = ROOT / 'target/tests'; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='original-index-', dir=target) as folder:
             src, exe = Path(folder) / 'check.c', Path(folder) / 'check'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                             str(src), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)

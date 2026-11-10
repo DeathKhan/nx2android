@@ -119,7 +119,7 @@ TINY = '''
 
 def assemble(text):
     with tempfile.TemporaryDirectory() as d:
-        Path(d, 'a.spvasm').write_text(text)
+        Path(d, 'a.spvasm').write_text(text, encoding='utf-8')
         subprocess.run([SPIRV_AS, '--target-env', 'vulkan1.1', Path(d, 'a.spvasm'), '-o', Path(d, 'a.spv')], check=True)
         return Path(d, 'a.spv').read_bytes()
 

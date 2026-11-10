@@ -21,7 +21,7 @@ def function(source, declaration):
 class ProgramLifetime(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_queued_finalize_and_replacement(self):
-        source = (ROOT / 'nxnative/dm/gfx/nvn/hle_nvn.c').read_text()
+        source = (ROOT / 'nxnative/dm/gfx/nvn/hle_nvn.c').read_text(encoding='utf-8')
         parts = {
             'WAIT': function(source, 'static int job_wait('),
             'DRAIN': function(source, 'static void nvn_drain(void) {'),
@@ -32,7 +32,7 @@ class ProgramLifetime(unittest.TestCase):
             'COPY': function(source, 'static uint64_t sub_copy('),
         }
         # prog_key tells a live program by nvnProgramInitialize's magic (upstream nx2android e69473622): MAGIC comes from nvn_obj.h
-        obj = (ROOT / 'nxnative/dm/gfx/nvn/nvn_obj.h').read_text()
+        obj = (ROOT / 'nxnative/dm/gfx/nvn/nvn_obj.h').read_text(encoding='utf-8')
         parts['MAGICDEF'] = next(l for l in obj.splitlines() if l.startswith('#define MAGIC('))
         code = r'''
 #include <assert.h>
@@ -157,12 +157,12 @@ int main(void){
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='nvn-program-lifetime-', dir=target) as folder:
             src, exe = Path(folder) / 'test.c', Path(folder) / 'test'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-g', '-O1', '-Wall', '-Wextra', '-Werror', '-Wno-misleading-indentation', '-pthread', '-fsanitize=address,undefined', str(src), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
 
     def test_lifecycle_lock_order(self):
-        source = (ROOT / 'nxnative/dm/gfx/nvn/hle_nvn.c').read_text()
+        source = (ROOT / 'nxnative/dm/gfx/nvn/hle_nvn.c').read_text(encoding='utf-8')
         final = function(source, 'NVN(nvnProgramFinalize,')
         self.assertLess(final.index('nvn_drain();'), final.index('pthread_mutex_lock(&g_sub_mu)'))
         self.assertLess(final.index('mtl_prog_release('), final.index('pthread_mutex_unlock(&g_sub_mu)'))

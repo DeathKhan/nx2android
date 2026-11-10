@@ -21,7 +21,7 @@ def function(source, declaration):
 class CompactDriver(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
     def test_content_dependencies_cache_and_legacy_paths(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         code = r"""
 #include <assert.h>
 #include <stdint.h>
@@ -165,7 +165,7 @@ int main(void){
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="vk-driver-compact-", dir=target) as folder:
             src, exe = Path(folder) / "test.c", Path(folder) / "test"
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                             "-fsanitize=address,undefined", "-I" + str(ROOT / "nxnative/dm/gfx/nvn"),
                             str(src), "-o", str(exe)], check=True)

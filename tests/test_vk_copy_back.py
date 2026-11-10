@@ -17,7 +17,7 @@ class CopyBack(unittest.TestCase):
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        core = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        core = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         start = core.index('static void pools_readback_barrier(VkCommandBuffer cb) {')
         function = core[start:core.index('\n}\n', start)+3]
         harness = r'''
@@ -47,16 +47,16 @@ int main(void) {
 '''.replace('FUNCTION', function)
         with tempfile.TemporaryDirectory(prefix='nx2a-readback-') as tmp:
             c, exe = Path(tmp)/'check.c', Path(tmp)/'check'
-            c.write_text(harness)
+            c.write_text(harness, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
 
     @unittest.skipUnless(host_cc.posix(), 'a POSIX host C compiler is required (<sys/mman.h>, pthread, setenv)')
     def test_protected_pools(self):
         dm = Path(__file__).resolve().parents[1] / 'nxnative/dm'
-        dirty = (dm / 'gfx/nvn/nvn_dirty.c').read_text()
+        dirty = (dm / 'gfx/nvn/nvn_dirty.c').read_text(encoding='utf-8')
         dirty = '\n'.join(s for s in dirty.splitlines() if not s.startswith('#include'))
-        core = (dm / 'android/gfx_vk_core.c').read_text()
+        core = (dm / 'android/gfx_vk_core.c').read_text(encoding='utf-8')
         start = core.index('static void pools_copy_back(const struct vksub *s) {')
         copy_back = core[start:core.index('\n}\n', start) + 3]
         if 'static uint64_t pool_merge_back(' in core:
@@ -440,7 +440,7 @@ int main(int argc, char **argv) {
 '''.replace('DIRTY', dirty).replace('CACHE_SYNC', cache_sync).replace('SYNC', sync).replace('COPY_BACK', copy_back)
         with tempfile.TemporaryDirectory(prefix='nx2a-copyback-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
-            c.write_text(harness)
+            c.write_text(harness, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-pthread', '-Wall', '-Wextra', '-Werror',
                             '-Wno-misleading-indentation', str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)

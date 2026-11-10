@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class DescriptorPool(unittest.TestCase):
     def test_allocation_budgets_failures_and_pool_lifetimes(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text(encoding='utf-8')
         start = source.index("enum { DP_TYPES")
         declarations = source[start:source.index("struct vksub {", start)]
         start = source.index("enum { DP_SETS")
@@ -205,14 +205,14 @@ int main(void) {
         target = ROOT / "target/tests"; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="descriptor-pool-", dir=target) as tmp:
             src = Path(tmp) / "test.c"; exe = Path(tmp) / "test"
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                             "-fsanitize=address,undefined", "-I" + str(ROOT / "nxnative/dm/third_party/vulkan-headers/include"),
                             str(src), "-o", str(exe), "-lpthread"], check=True)
             subprocess.run([str(exe)], check=True)
 
     def test_registered_need_pointer_survives_hashmap_growth(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text(encoding='utf-8')
         start = source.index("static nvn_hmap g_dsl_need")
         register = source[start:source.index("// Allocate exactly one set", start)]
         register = next(line for line in source.splitlines() if line.startswith("enum { DP_TYPES")) + "\n" + register
@@ -254,7 +254,7 @@ int main(void) {
         target = ROOT / "target/tests"; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="descriptor-registry-", dir=target) as tmp:
             src = Path(tmp) / "test.c"; exe = Path(tmp) / "test"
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                             "-fsanitize=address,undefined",
                             "-I" + str(ROOT / "nxnative/dm/third_party/vulkan-headers/include"),

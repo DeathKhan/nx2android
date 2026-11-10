@@ -66,11 +66,11 @@ class GeometryClaims(unittest.TestCase):
     def test_valid_modules_and_conservative_refusals(self):
         scratch=ROOT/'target/tests';scratch.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='gs-claim-',dir=scratch) as tmp:
-            p=Path(tmp);(p/'main.c').write_text(HARNESS)
+            p=Path(tmp);(p/'main.c').write_text(HARNESS, encoding='utf-8')
             subprocess.run(['cc','-std=c11','-g','-O1','-fsanitize=address,undefined','-I'+str(ROOT/'nxnative/dm/android'),str(ROOT/'nxnative/dm/android/gfx_vk_gs_claim.c'),str(p/'main.c'),'-o',str(p/'run')],check=True)
             def run(name, source, accept, env='vulkan1.1'):
                 with self.subTest(name=name):
-                    src=p/(name+'.asm');inp=p/(name+'.spv');out=p/(name+'.out.spv');src.write_text(source)
+                    src=p/(name+'.asm');inp=p/(name+'.spv');out=p/(name+'.out.spv');src.write_text(source, encoding='utf-8')
                     subprocess.run(['spirv-as','--target-env',env,str(src),'-o',str(inp)],check=True,capture_output=True)
                     subprocess.run(['spirv-val','--target-env',env,str(inp)],check=True,capture_output=True)
                     r=subprocess.run([str(p/'run'),str(inp),str(out)],capture_output=True,text=True)

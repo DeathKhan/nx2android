@@ -111,8 +111,8 @@ class CasLoops(unittest.TestCase):
     def test_actual_emitters(self):
         dotnet=os.environ.get('DOTNET') or shutil.which('dotnet')
         if not dotnet:self.skipTest('requires .NET 10; set DOTNET')
-        global_src=(TRANS/'Optimizations/GlobalToStorage.cs').read_text()
-        shared_src=(TRANS/'HelperFunctionManager.cs').read_text()
+        global_src=(TRANS/'Optimizations/GlobalToStorage.cs').read_text(encoding='utf-8')
+        shared_src=(TRANS/'HelperFunctionManager.cs').read_text(encoding='utf-8')
         emit=method(global_src,'GenerateAtomicCasLoop')+method(shared_src,'GenerateSharedAtomicCasLoop')
         start=global_src.index('                    Operand lblLoopHead = Label();')
         end=global_src.index('context.MarkLabel(lblDone);',start)+len('context.MarkLabel(lblDone);')
@@ -120,8 +120,8 @@ class CasLoops(unittest.TestCase):
         parent=ROOT/'target/tests';parent.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='cas-loops-',dir=parent) as tmp:
             p=Path(tmp)
-            (p/'test.csproj').write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>')
-            (p/'Program.cs').write_text(MOCK+emit+CHECKS)
+            (p/'test.csproj').write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>', encoding='utf-8')
+            (p/'Program.cs').write_text(MOCK+emit+CHECKS, encoding='utf-8')
             r=subprocess.run([dotnet,'run','--project',str(p/'test.csproj'),'-c','Release','--verbosity','quiet'],capture_output=True,text=True,timeout=120)
             self.assertEqual(r.returncode,0,r.stdout+r.stderr)
             self.assertIn('PASS',r.stdout)

@@ -14,7 +14,7 @@ def extract(s, declaration):
 class ComputeTrace(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"),"host compiler required")
     def test_rgb9e5_actual_decoder(self):
-        src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         decoder=extract(src,"static void rgb9e5_floats(")
         code="#include <stdint.h>\n#include <math.h>\n#include <assert.h>\n"+decoder+r"""
 int main(void){
@@ -36,13 +36,13 @@ int main(void){
         self.assertGreaterEqual(writer.count("d->f == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32"),4)
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="rgb9e5-",dir=target) as folder:
-            c,exe=Path(folder)/"test.c",Path(folder)/"test";c.write_text(code)
+            c,exe=Path(folder)/"test.c",Path(folder)/"test";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",str(c),"-lm","-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=10)
 
     @unittest.skipUnless(shutil.which("cc"),"host compiler required")
     def test_actual_parser_and_capture_helpers(self):
-        src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         functions="\n".join(extract(src,x) for x in (
             "static void cs_trace_poll(","static int cs_trace_match(","static uint32_t cs_trace_bpp(",
             "static uint64_t cs_trace_image_bytes(","static void cs_trace_image_note(","static void cs_trace_images_copy("))
@@ -199,14 +199,14 @@ int main(void){
         code=code.replace("DECL_PD",pd).replace("DECL_CI",ci).replace("FUNCTIONS",functions)
         dest=ROOT/"target/tests";dest.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="compute-trace-",dir=dest) as d:
-            c=Path(d)/"check.c";exe=Path(d)/"check";c.write_text(code)
+            c=Path(d)/"check.c";exe=Path(d)/"check";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",
                 "-I"+str(ROOT/"nxnative/dm/third_party/vulkan-headers/include"),str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=15)
 
     @unittest.skipUnless(shutil.which("cc"),"host compiler required")
     def test_native_volume_writer_preserves_bytes_and_metadata(self):
-        src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         pd=next(x for x in src.splitlines() if x.startswith("typedef struct ") and x.endswith(" pdump_t;"))
         writer=extract(src,"static void pass_dump_raw_native(")
         code=r"""
@@ -232,12 +232,12 @@ int main(int argc,char **argv){
         code=code.replace("DECL_PD",pd).replace("WRITER",writer)
         parent=ROOT/"target/tests";parent.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="volume-writer-",dir=parent) as folder:
-            d=Path(folder);c=d/"check.c";exe=d/"check";c.write_text(code)
+            d=Path(folder);c=d/"check.c";exe=d/"check";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",
                 "-I"+str(ROOT/"nxnative/dm/third_party/vulkan-headers/include"),str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe),str(d)],check=True,timeout=15)
             self.assertEqual((d/"pass_07.raw").read_bytes(),bytes((i*7)&255 for i in range(48)))
-            m=json.loads((d/"pass_07.raw.json").read_text())
+            m=json.loads((d/"pass_07.raw.json").read_text(encoding='utf-8'))
             self.assertEqual((m["width"],m["height"],m["depth"]),(3,2,2))
             self.assertEqual((m["bytes"],m["written"],m["native_format"],m["view_format"]),(48,48,122,122))
             self.assertEqual((m["key"],m["binding"],m["phase"],m["mip"],m["layer"]),("00000000000009e6",4,"after",2,0))
@@ -249,7 +249,7 @@ int main(int argc,char **argv){
         self.assertIn("memset(g_pd, 0, sizeof g_pd)",extract(src,"static void pass_dump_arm("))
 
     def test_dispatch_and_completion_order(self):
-        src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         dispatch=extract(src,"static void dispatch(")
         self.assertLess(dispatch.index("cs_trace_match("),dispatch.index("skip_kernel("))
         self.assertLess(dispatch.index("cs_trace_images_copy(cb, cs->key, 0)"),dispatch.index("vkCmdDispatch(cb"))

@@ -12,8 +12,8 @@ class AsyncSideEffects(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_shader_side_effects_prevent_draw_skips(self):
         dm = ROOT / 'nxnative/dm/android'
-        header = (dm / 'gfx_vk.h').read_text()
-        source = (dm / 'gfx_vk_exec.c').read_text()
+        header = (dm / 'gfx_vk.h').read_text(encoding='utf-8')
+        source = (dm / 'gfx_vk_exec.c').read_text(encoding='utf-8')
         declarations = []
         for first in ('RK_SUPPORT', 'RD_UBO'):
             start = header.index('enum { ' + first)
@@ -107,7 +107,7 @@ int main(void) {
         target = ROOT / 'target/tests'; target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-async-side-effects-', dir=target) as folder:
             cfile, exe = Path(folder) / 'check.c', Path(folder) / 'check'
-            cfile.write_text(code)
+            cfile.write_text(code, encoding='utf-8')
             compile_result = subprocess.run(
                 ['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', str(cfile), '-o', str(exe)],
                 capture_output=True, text=True)

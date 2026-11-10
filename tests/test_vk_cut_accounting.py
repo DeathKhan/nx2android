@@ -17,8 +17,8 @@ class CutAccounting(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'),'a host C compiler is required')
     def test_actual_native_split_and_pass_accounting(self):
         dm=ROOT/'nxnative/dm'
-        core=(dm/'android/gfx_vk_core.c').read_text()
-        exe=(dm/'android/gfx_vk_exec.c').read_text()
+        core=(dm/'android/gfx_vk_core.c').read_text(encoding='utf-8')
+        exe=(dm/'android/gfx_vk_exec.c').read_text(encoding='utf-8')
         helpers=core[core.index('static int vk_cmd_split_(void);'):core.index('uint64_t g_up_gen;')]
         # sub_stats (the long-submission report) reads replay counters other units define: defined here instead
         helpers=helpers.replace('extern struct { uint64_t draws, skip_prog','static struct { uint64_t draws, skip_prog').replace('extern uint64_t g_set_new, g_pkg_n, g_pkg_bytes;','static uint64_t g_set_new, g_pkg_n, g_pkg_bytes;')
@@ -159,15 +159,15 @@ int main(void){
         code=code.replace('PART_SENT',function(core,'static void part_sent(')).replace('HELPERS',helpers).replace('PASS_CUT',function(exe,'static int pass_cut('))
         target=ROOT/'target/tests';target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='cut-accounting-',dir=target) as t:
-            src=Path(t)/'test.c';out=Path(t)/'test';src.write_text(code)
+            src=Path(t)/'test.c';out=Path(t)/'test';src.write_text(code, encoding='utf-8')
             subprocess.run(['cc','-std=c11','-g','-O1','-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread',
                             '-I'+str(dm/'third_party/vulkan-headers/include'),str(src),'-o',str(out)],check=True)
             subprocess.run([str(out)],check=True)
 
     def test_actual_callsite_and_submission_lifecycle(self):
         dm=ROOT/'nxnative/dm'
-        core=(dm/'android/gfx_vk_core.c').read_text()
-        exe=(dm/'android/gfx_vk_exec.c').read_text()
+        core=(dm/'android/gfx_vk_core.c').read_text(encoding='utf-8')
+        exe=(dm/'android/gfx_vk_exec.c').read_text(encoding='utf-8')
         begin=function(exe,'static int begin_pass(void)')
         self.assertIn('if (pass_cut(psplit, &g_cuts)) cb = vk_cmd();',begin)
         self.assertNotIn('g_cuts++',begin)

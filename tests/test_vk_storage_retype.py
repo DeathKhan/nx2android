@@ -59,16 +59,16 @@ int main(int argc,char **argv) {
 class StorageRetype(unittest.TestCase):
     @unittest.skipUnless(all(shutil.which(t) for t in ("cc", "spirv-as", "spirv-dis", "spirv-val")), "SPIR-V tools and C compiler required")
     def test_actual_image_write_retype(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_shader.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_shader.c").read_text(encoding='utf-8')
         start = source.index("typedef struct { const uint32_t *w; uint32_t fn, bound,")
         end = source.index("// A variant of a fragment shader that writes", start)
         scratch = ROOT / "target/tests"
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="storage-retype-", dir=scratch) as folder:
             p = Path(folder)
-            (p / "check.c").write_text(C_PREFIX + source[start:end] + C_MAIN)
+            (p / "check.c").write_text(C_PREFIX + source[start:end] + C_MAIN, encoding='utf-8')
             subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", str(p / "check.c"), "-o", str(p / "check")], check=True)
-            (p / "input.spvasm").write_text(ASM)
+            (p / "input.spvasm").write_text(ASM, encoding='utf-8')
             subprocess.run(["spirv-as", "--target-env", "vulkan1.1", str(p / "input.spvasm"), "-o", str(p / "input.spv")], check=True)
             for kind in (1, 2):
                 output = p / f"out{kind}.spv"
@@ -88,7 +88,7 @@ class StorageRetype(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("cc"), "C compiler required")
     def test_actual_descriptor_branch_records_storage_type(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         start = source.index("        case RK_IMG: case RK_IMG_UBO: {", source.index("static VkDescriptorSet stage_set("))
         end = source.index("        case RK_TBUF:", start)
         branch = source[start:end]
@@ -121,7 +121,7 @@ int main(void){for(int k=1;k<=2;k++)for(int n=0;n<=2;n++){run(k,n,3);run(k,n,64)
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="storage-mask-", dir=scratch) as folder:
             p = Path(folder)
-            (p / "check.c").write_text(code)
+            (p / "check.c").write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", str(p / "check.c"), "-o", str(p / "check")], check=True)
             subprocess.run([str(p / "check")], check=True)
 

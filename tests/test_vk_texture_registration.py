@@ -21,8 +21,8 @@ def function(source, declaration):
 @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
 class TextureRegistration(unittest.TestCase):
     def test_registry_listing_is_bounded_metadata_copy(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text()
-        common = (ROOT / "nxnative/dm/android/gfx_common.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text(encoding='utf-8')
+        common = (ROOT / "nxnative/dm/android/gfx_common.c").read_text(encoding='utf-8')
         actual = function(source, "void vk_registry_texlist(")
         route = function(common, "void dm_gfx_texlist(")
         code = r"""
@@ -74,7 +74,7 @@ int main(void){
         code = code.replace("ACTUAL", actual).replace("ROUTE", route)
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="texture-list-",dir=target) as tmp:
-            c,exe=Path(tmp)/"test.c",Path(tmp)/"test";c.write_text(code)
+            c,exe=Path(tmp)/"test.c",Path(tmp)/"test";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror","-Wno-address",
                             "-fsanitize=address,undefined","-pthread",
                             "-I"+str(ROOT/"nxnative/dm/gfx/nvn"),"-I"+str(ROOT/"nxnative/dm/gfx/nvn/include"),
@@ -82,7 +82,7 @@ int main(void){
             subprocess.run([str(exe)],check=True,timeout=10)
 
     def test_identical_registration_preserves_generation_and_history(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text(encoding='utf-8')
         start = source.index("enum { TREG_OLD")
         declarations = source[start:source.index("int vk_tex_id_max", start)]
         history = source[source.index("static struct { uint64_t id, refs, sampler_seq, texture_seq; } *g_registry_jobs;"):source.index("void mtl_reg_tex(")]
@@ -202,7 +202,7 @@ int main(void){
         with tempfile.TemporaryDirectory(prefix="texture-registration-", dir=target) as tmp:
             src = Path(tmp) / "test.c"
             exe = Path(tmp) / "test"
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                             "-fsanitize=address,undefined", "-Wno-misleading-indentation",
                             "-I" + str(ROOT / "nxnative/dm/gfx/nvn"),

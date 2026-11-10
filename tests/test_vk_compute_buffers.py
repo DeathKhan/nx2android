@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 @unittest.skipUnless(shutil.which("cc"),"host C compiler required")
 class ComputeBuffers(unittest.TestCase):
     def test_actual_gpu_copy_bounds_and_completion(self):
-        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         start=s.index("enum { CS_BUFFER_BINDINGS")
         actual=s[start:s.index("// Bounded native-upscaler diagnostics",start)]
         code=r"""
@@ -160,13 +160,13 @@ int main(int argc,char **argv){
         code=code.replace("ACTUAL",actual)
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="compute-buffers-",dir=target) as tmp:
-            c,exe=Path(tmp)/"test.c",Path(tmp)/"test";c.write_text(code)
+            c,exe=Path(tmp)/"test.c",Path(tmp)/"test";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=c11","-O1","-g","-Wall","-Wextra","-Werror","-fsanitize=address,undefined",
                             "-I"+str(ROOT/"nxnative/dm/third_party/vulkan-headers/include"),str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe),tmp],check=True,timeout=15)
 
     def test_actual_dispatch_and_present_order(self):
-        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text()
+        s=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         dispatch=extract(s,"static void dispatch(")
         self.assertLess(dispatch.index("cs_trace_buffers_copy(cb, cs->key, 0)"),dispatch.index("vkCmdDispatch(cb"))
         self.assertGreater(dispatch.index("cs_trace_buffers_copy(cb, cs->key, 1)"),dispatch.index("vkCmdDispatch(cb"))

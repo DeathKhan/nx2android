@@ -21,7 +21,7 @@ def function(source, declaration):
 class HostReadback(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
     def test_actual_barrier_covers_zero_copy_and_shadow_pools(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text(encoding='utf-8')
         helper = function(source, "static void pools_readback_barrier(VkCommandBuffer cb) {")
         code = r"""
 #define VK_NO_PROTOTYPES
@@ -70,7 +70,7 @@ int main(void) {
         with tempfile.TemporaryDirectory(dir=target, prefix="host-readback-") as temp:
             c = Path(temp) / "test.c"
             exe = Path(temp) / "test"
-            c.write_text(code)
+            c.write_text(code, encoding='utf-8')
             subprocess.run([
                 "cc", "-std=c11", "-O1", "-g", "-fsanitize=address,undefined",
                 "-fno-omit-frame-pointer", "-I",
@@ -80,7 +80,7 @@ int main(void) {
             subprocess.run([str(exe)], check=True)
 
     def test_native_flush_points_precede_submission_and_cpu_release(self):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text(encoding='utf-8')
         split = function(source, "static int vk_cmd_split_(void) {")
         commit = function(source, "uint64_t mtl_sub_commit(void) {")
         completion = function(source, "static void *completion_main(void *a) {")

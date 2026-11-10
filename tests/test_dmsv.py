@@ -347,7 +347,7 @@ int main(int argc, char **argv) {   // each shader: key, stage, words, FNV-1a 64
 @unittest.skipUnless(host_cc.ubsan(), 'a host C compiler with UBSan (libubsan) is required')
 class ReflectionOffset(unittest.TestCase):
     def test_large_bounded_reflection_uses_wide_pointer_offset(self):
-        source = (REPO / 'nxnative/dm/android/gfx_vk_shader.c').read_text()
+        source = (REPO / 'nxnative/dm/android/gfx_vk_shader.c').read_text(encoding='utf-8')
         expression = re.search(r's->c1 = r \+ ([^;]+);', source).group(1)
         code = '''#include <stdint.h>
 #include <stddef.h>
@@ -357,7 +357,7 @@ int main(void) {int counts[]={0,1,107374181,107374182,214748363};
 for(unsigned i=0;i<sizeof counts/sizeof counts[0];i++)assert(offset(counts[i])==20+20ull*(unsigned)counts[i]);return 0;}
 '''
         with tempfile.TemporaryDirectory() as folder:
-            src, exe = Path(folder)/'offset.c', Path(folder)/'offset'; src.write_text(code)
+            src, exe = Path(folder)/'offset.c', Path(folder)/'offset'; src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-fsanitize=undefined', '-fno-sanitize-recover=all', str(src), '-o', str(exe)], check=True)
             result = subprocess.run([str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

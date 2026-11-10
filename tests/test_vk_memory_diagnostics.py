@@ -18,7 +18,7 @@ class MemoryDiagnostics(unittest.TestCase):
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         start = src.index('uint32_t vk_mem_type(')
         end = src.index('\n}\n', src.index('static void mem_diag_pool(')) + 3
         harness = r'''
@@ -56,7 +56,7 @@ int main(void) {
 '''.replace('FUNCTIONS', src[start:end])
         with tempfile.TemporaryDirectory(prefix='nx2a-pool-types-') as tmp:
             c, exe = Path(tmp)/'check.c', Path(tmp)/'check'
-            c.write_text(harness)
+            c.write_text(harness, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
 
@@ -66,7 +66,7 @@ int main(void) {
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
-        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text()
+        src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         helpers = src[src.index('// DM_VK_MEM_DIAG'):src.index('\nuint32_t vk_mem_type')]
         # pool_zero_copy takes a slab slot and, failing that, a kept buffer of the same size (the zcf cache): both, beside the logging
         helpers += src[src.index('typedef struct { AHardwareBuffer *ahb; VkBuffer buf; VkDeviceMemory mem; uint64_t size, fence; } zcfree_t;'):src.index('// Small pools take a slot of a slab')]
@@ -201,7 +201,7 @@ int main(void) {
 '''.replace('HELPERS', helpers).replace('FUNCTION', function)
         with tempfile.TemporaryDirectory(prefix='nx2a-memdiag-test-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
-            c.write_text(harness)
+            c.write_text(harness, encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers', '-Wno-unused-function', '-Wno-misleading-indentation',
                             '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)   # -Wno-unused-function: zcf_put has no caller in this cut; gcc flags the engine's dense one-liners
             for enabled in ('0', '1'):   # DM_VK_POOL_SLABS=0: the fault table walks the self-buffer path (a small pool would take a slab slot otherwise, and the mocks make no whole-slab buffer)

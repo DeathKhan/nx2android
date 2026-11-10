@@ -57,7 +57,7 @@ class ExternalDisplayTest(unittest.TestCase):
             for path, source in STUBS.items():
                 p = root / path
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(source)
+                p.write_text(source, encoding='utf-8')
                 paths.append(str(p))
             subprocess.run(['javac', '-d', str(root), str(SOURCE), *paths], check=True)
             subprocess.run(['java', '-cp', str(root), 'Check'], check=True)

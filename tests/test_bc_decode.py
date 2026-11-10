@@ -21,7 +21,7 @@ class BCDecode(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         lib = Path(cls.tmp.name) / 'bc.so'
-        source = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text()
+        source = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text(encoding='utf-8')
         adapter = source[source.index('static void bc_decode('):source.index('static pthread_mutex_t g_fmt_mu')]
         wrapper = Path(cls.tmp.name) / 'adapter.c'
         wrapper.write_text('#include <stdint.h>\n#include <stdlib.h>\n#include "nvn_bc.h"\n'
@@ -29,7 +29,7 @@ class BCDecode(unittest.TestCase):
                            '#define die(...) abort()\n' + adapter +
                            '\nvoid legacy_decode(unsigned dec, unsigned pixel, const uint8_t *src, size_t pitch, '
                            'uint32_t w, uint32_t h, uint32_t z, uint8_t *dst) {'
-                           'vkfmt_t f={dec,pixel};vk_bc_decode(&f,src,pitch,w,h,z,dst);}\n')
+                           'vkfmt_t f={dec,pixel};vk_bc_decode(&f,src,pitch,w,h,z,dst);}\n', encoding='utf-8')
         subprocess.run(['cc', '-shared', '-fPIC', '-O2', '-fno-strict-aliasing',
                         *getattr(cls, 'compiler_flags', []), '-I', str(TEX), str(TEX / 'nvn_bc.c'), str(TEX / 'nvn_deswizzle.c'),
                         str(TEX / '../nvn/nvn_tex.c'), str(ROOT / 'tests/bc_layout_fixture.c'), str(wrapper),

@@ -32,7 +32,7 @@ int main(void) {
 }
 '''
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'asc.c'; exe = Path(folder) / 'asc'; path.write_text(code)
+            path = Path(folder) / 'asc.c'; exe = Path(folder) / 'asc'; path.write_text(code, encoding='utf-8')
             result = subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', str(COMPAT),
                                      str(path), '-o', str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -40,7 +40,7 @@ int main(void) {
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_pcm_order_opt_in(self):
-        source = (COMPAT / 'audioconverter_mediacodec.c').read_text()
+        source = (COMPAT / 'audioconverter_mediacodec.c').read_text(encoding='utf-8')
         setup = source[source.index('struct dm_audio_converter {'):source.index('// one descriptor')]
         start = source.index('static void keep(')
         keep = source[start:source.index('// collect the codec', start)]
@@ -91,7 +91,7 @@ int main(int argc,char **argv) {
 '''
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'aac.c'; exe = Path(folder) / 'aac'
-            path.write_text(code)
+            path.write_text(code, encoding='utf-8')
             result = subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                                      '-Wno-unused-function', '-I', str(COMPAT), '-I', str(COMPAT / 'include'),
                                      str(path), '-o', str(exe)], capture_output=True, text=True)

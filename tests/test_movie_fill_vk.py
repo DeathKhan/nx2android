@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class MovieFill(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host compiler is required")
     def test_actual_movie_commands_and_lifetimes(self):
-        source = (ROOT / "nxnative/dm/android/movie_fill_vk.c").read_text()
+        source = (ROOT / "nxnative/dm/android/movie_fill_vk.c").read_text(encoding='utf-8')
         source = source[source.index("typedef struct { uint32_t w, h, word0, flags; }"):
                         source.index("// ---- DM_VK_MOVIE_FILL_CS ----")]
         code = r"""
@@ -172,7 +172,7 @@ int main(void){
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="movie-fill-", dir=target) as folder:
             c, exe = Path(folder) / "check.c", Path(folder) / "check"
-            c.write_text(code)
+            c.write_text(code, encoding='utf-8')
             subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                             "-Wno-missing-field-initializers", "-fsanitize=address,undefined",
                             "-I" + str(ROOT / "nxnative/dm/third_party/vulkan-headers/include"),

@@ -15,7 +15,7 @@ def function(source, name):
 
 
 def fixture(source):
-    header = (ROOT / "nxnative/dm/android/gfx_vk.h").read_text()
+    header = (ROOT / "nxnative/dm/android/gfx_vk.h").read_text(encoding='utf-8')
     defs = header[header.index("enum { RK_SUPPORT"):header.index("_Static_assert(sizeof(dmsv_bind)")]
     start = source.index("static struct { uint64_t h, epoch, tex, samp;")
     cache = source[start:source.index("// ---------------- the pool tables' ring", start)]
@@ -270,8 +270,8 @@ int main(int argc,char **argv){
 
 def ring_fixture(source):
     """Execute the real ring, registry snapshot and implicit sampler-version selector."""
-    tex = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text()
-    header = (ROOT / "nxnative/dm/android/gfx_vk.h").read_text()
+    tex = (ROOT / "nxnative/dm/android/gfx_vk_tex.c").read_text(encoding='utf-8')
+    header = (ROOT / "nxnative/dm/android/gfx_vk.h").read_text(encoding='utf-8')
     defs = header[header.index("enum { RK_SUPPORT"):header.index("_Static_assert(sizeof(dmsv_bind)")]
     start = source.index("// ---------------- the pool tables' ring")
     ring = source[start:source.index("static VkDescriptorSet tbl_set", start)]
@@ -411,14 +411,14 @@ int main(int argc,char **argv){
 class PoolTables(unittest.TestCase):
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
     def test_real_table_construction_and_previous_regressions(self):
-        source = (ROOT / SOURCE).read_text()
+        source = (ROOT / SOURCE).read_text(encoding='utf-8')
         target = ROOT / "target/tests"
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="pool-tables-", dir=target) as folder:
             folder = Path(folder)
             def compile_one(text, name):
                 c, exe = folder / (name + ".c"), folder / name
-                c.write_text(fixture(text))
+                c.write_text(fixture(text), encoding='utf-8')
                 subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                                 "-Wno-misleading-indentation", "-fsanitize=address,undefined",
                                 "-I" + str(ROOT / "nxnative/dm/third_party/vulkan-headers/include"),
@@ -440,14 +440,14 @@ class PoolTables(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("cc"), "a host C compiler is required")
     def test_ring_historical_snapshots_and_completed_set_ownership(self):
-        source = (ROOT / SOURCE).read_text()
+        source = (ROOT / SOURCE).read_text(encoding='utf-8')
         target = ROOT / "target/tests"
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="pool-ring-", dir=target) as folder:
             folder = Path(folder)
             def compile_one(text, name):
                 c, exe = folder / (name + ".c"), folder / name
-                c.write_text(ring_fixture(text))
+                c.write_text(ring_fixture(text), encoding='utf-8')
                 subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                                 "-Wno-misleading-indentation", "-pthread",
                                 "-fsanitize=address,undefined",
@@ -469,7 +469,7 @@ class PoolTables(unittest.TestCase):
             self.assertNotEqual(subprocess.run([str(old), "6"], capture_output=True, timeout=15).returncode, 0)
 
     def test_all_active_raster_stages_and_mesh_contract(self):
-        source = (ROOT / SOURCE).read_text()
+        source = (ROOT / SOURCE).read_text(encoding='utf-8')
         draw = function(source, "static int prepare_draw(")
         self.assertIn("poolmask |= tbl_kinds(S.sh[st]) >> TBL_SLOTS", draw)
         self.assertIn("st < 3", draw)
@@ -477,7 +477,7 @@ class PoolTables(unittest.TestCase):
         self.assertIn("tbl_set(ts ? tst : 0, ts, poolmask)", draw)
         mesh = function(source, "static void mesh_draw(const p_draw *d) {")
         self.assertIn("prepare_draw(prim, 1)", mesh)
-        shader = (ROOT / "nxnative/dm/android/gfx_vk_shader.c").read_text()
+        shader = (ROOT / "nxnative/dm/android/gfx_vk_shader.c").read_text(encoding='utf-8')
         self.assertIn('stage > 4) pfail = "a compute kernel has no pool table set"', shader)
 
 

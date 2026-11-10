@@ -7,7 +7,7 @@ from pathlib import Path
 import importlib.util,subprocess,os,shutil,tempfile,unittest
 ROOT=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('warp',ROOT/'tests/test_ampere_warp.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
-src=(ROOT/'nxnative/dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/Translation/HelperFunctionManager.cs').read_text()
+src=(ROOT/'nxnative/dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader/Translation/HelperFunctionManager.cs').read_text(encoding='utf-8')
 old=m.method(src,'GenerateHmma16816F16')
 new=m.method(src,'GenerateHmma16816F16Shuffle')
 # Add float-bit operations and shared-memory storage to the already tested SIMD mock.
@@ -77,8 +77,8 @@ class HmmaShuffle(unittest.TestCase):
         parent=ROOT/'target/tests';parent.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='hmma-shuffle-',dir=parent) as tmp:
             out=Path(tmp)
-            (out/'test.csproj').write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>')
-            (out/'Program.cs').write_text(mock+old+new+checks)
+            (out/'test.csproj').write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableNETAnalyzers>false</EnableNETAnalyzers></PropertyGroup></Project>', encoding='utf-8')
+            (out/'Program.cs').write_text(mock+old+new+checks, encoding='utf-8')
             run=subprocess.run([dotnet,'run','--project',str(out/'test.csproj'),'-c','Release','--verbosity','quiet'],capture_output=True,text=True,timeout=120)
             self.assertEqual(run.returncode,0,run.stdout+run.stderr)
             self.assertIn('PASS',run.stdout)

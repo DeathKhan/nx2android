@@ -63,12 +63,12 @@ int main(int argc, char **argv) {
 @unittest.skipUnless(shutil.which('cc') and host_cc.posix(), 'a POSIX host C compiler is required')
 class AndroidThermal(unittest.TestCase):
     def test_thermal_state(self):
-        src = SOURCE.read_text()
+        src = SOURCE.read_text(encoding='utf-8')
         start = src.index('// ---- thermal status (AThermal')
         end = src.index('\n}\n', src.index('int dm_thermal_now(void)')) + 3
         with tempfile.TemporaryDirectory(prefix='nx2a-thermal-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
-            c.write_text(HARNESS.replace('BLOCK', src[start:end]))
+            c.write_text(HARNESS.replace('BLOCK', src[start:end]), encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-pthread', str(c), '-o', str(exe)], check=True)
             for mode, env in (('0', {}), ('1', {}), ('2', {'DM_THERMAL_CAP': '0'}), ('3', {'NO_ATHERMAL': '1'})):
                 with self.subTest(mode=mode):

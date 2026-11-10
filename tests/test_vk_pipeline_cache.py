@@ -155,7 +155,7 @@ int main(int argc,char **argv) {
 }
 '''
         with tempfile.TemporaryDirectory(prefix='nx2a_pcache_') as tmp:
-            path = Path(tmp); (path/'test.c').write_text(code)
+            path = Path(tmp); (path/'test.c').write_text(code, encoding='utf-8')
             flags = ['-fsanitize=undefined', '-fno-sanitize-recover=all'] if ubsan() else []
             subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-missing-field-initializers','-pthread',*flags,
                             '-I'+str(DM/'third_party/vulkan-headers/include'),'-I'+str(DM/'android'),

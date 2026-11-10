@@ -149,17 +149,17 @@ class DataPack(unittest.TestCase):
                                  aoc=t / 'aoc', language='ja')
             o = t / 'out-data'
             self.assertTrue((o / 'mods/main.patched.bin').is_file()); self.assertTrue((o / 'RomFS/Data/a.bin').is_file()); self.assertTrue((o / 'aoc/1/d.bin').is_file())
-            env = (o / 'env.txt').read_text()
+            env = (o / 'env.txt').read_text(encoding='utf-8')
             self.assertIn('DM_LANG=ja', env); self.assertIn('DM_AOC_DIR=/sdcard/Android/data/org.nx2a.neo/files/aoc', env)
-            self.assertEqual((o / 'settings.txt').read_text(), 'docked=0\noverlay=1\nrumble=1\n')
+            self.assertEqual((o / 'settings.txt').read_text(encoding='utf-8'), 'docked=0\noverlay=1\nrumble=1\n')
             self.assertEqual((man['files'], man['bytes'], man['dlc'], man['requires']), (4, 35, [1], ['bcn']))   # the installer checks requires
             self.assertEqual(datapack.read_manifest(o)['package'], 'org.nx2a.neo')
             datapack.build(t / 'touch-data', profile=p, version='v196608', display='1.03', patched=t / 'patched', romfs=t / 'romfs', shaders=t / 'shaders.dmsv',
                            settings=pipeline.TOUCH_SETTINGS)   # --touch: the gamepad starts hidden, the profile's other settings stay
-            self.assertEqual((t / 'touch-data/settings.txt').read_text(), 'docked=0\noverlay=0\nrumble=1\n')
+            self.assertEqual((t / 'touch-data/settings.txt').read_text(encoding='utf-8'), 'docked=0\noverlay=0\nrumble=1\n')
             bare = android_profile.load(profile_dir([('status', 'experimental')]).name); os.environ.pop('DM_GAMES_DIR', None)   # no setting rows: --touch alone still writes the file
             datapack.build(t / 'bare-data', profile=bare, version='v196608', display='1.03', patched=t / 'patched', romfs=t / 'romfs', shaders=t / 'shaders.dmsv', settings=pipeline.TOUCH_SETTINGS)
-            self.assertEqual((t / 'bare-data/settings.txt').read_text(), 'overlay=0\n')
+            self.assertEqual((t / 'bare-data/settings.txt').read_text(encoding='utf-8'), 'overlay=0\n')
         finally:
             shutil.rmtree(t, ignore_errors=True)
 
@@ -396,7 +396,7 @@ class UntaggedXci(unittest.TestCase):   # issue #28: a cartridge dump named by i
     def setUp(self):
         rnd = random.Random(28); self.hk = bytes(rnd.getrandbits(8) for _ in range(32))
         self.d = Path(tempfile.mkdtemp(prefix='nx2a_test_xci_'))
-        self.keys = self.d / 'prod.keys'; self.keys.write_text(f'header_key = {self.hk.hex()}\n')
+        self.keys = self.d / 'prod.keys'; self.keys.write_text(f'header_key = {self.hk.hex()}\n', encoding='utf-8')
 
     def nca(self, tid, ctype):   # an NCA header (0xc00 bytes) whose second sector is encrypted as Nintendo does: AES-XTS, the sector number big-endian as the tweak
         from Crypto.Cipher import AES
@@ -429,7 +429,7 @@ class UntaggedXci(unittest.TestCase):   # issue #28: a cartridge dump named by i
     def test_without_keys_the_error_says_how(self):
         self.xci('hr-bdlwa.xci', [('d.cnmt.nca', self.nca(self.BASE, 1))])
         with self.assertRaisesRegex(pipeline.BuildError, r'hr-bdlwa\.xci: no ticket .*no prod\.keys.*\[01009D901BC56000\]\[v0\]'): pipeline.nsp.scan_nsps(self.d, ('nsp', 'xci'))
-        self.keys.write_text(f'header_key = {bytes(32).hex()}\n')   # another key: the header does not decrypt to NCA3
+        self.keys.write_text(f'header_key = {bytes(32).hex()}\n', encoding='utf-8')   # another key: the header does not decrypt to NCA3
         with self.assertRaisesRegex(pipeline.BuildError, 'no content meta NCA'): pipeline.nsp.scan_nsps(self.d, ('nsp', 'xci'), self.keys)
 
 

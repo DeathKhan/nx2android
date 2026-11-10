@@ -184,10 +184,10 @@ class LogicalQueues(unittest.TestCase):
         out.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out, prefix="logical-queues-") as temp:
             c, exe = Path(temp)/"test.c", Path(temp)/"test"
-            source=(ROOT/"nxnative/dm/gfx/nvn/hle_nvn.c").read_text()
+            source=(ROOT/"nxnative/dm/gfx/nvn/hle_nvn.c").read_text(encoding='utf-8')
             start=source.index("int nvn_host_signal_sync(")
             end=source.index("\n}",start)+2
-            c.write_text(C.replace("HOST_SIGNAL",source[start:end]))
+            c.write_text(C.replace("HOST_SIGNAL",source[start:end]), encoding='utf-8')
             subprocess.run(["cc", "-std=gnu11", "-O1", "-g", "-fsanitize=address,undefined",
                 "-fno-omit-frame-pointer", "-pthread",
                 "-I"+str(ROOT/"nxnative/dm/gfx/nvn"),
@@ -200,7 +200,7 @@ class LogicalQueues(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
     def test_live_trace_budget(self):
-        src=(ROOT/"nxnative/dm/gfx/nvn/nvn_queue.inc").read_text()
+        src=(ROOT/"nxnative/dm/gfx/nvn/nvn_queue.inc").read_text(encoding='utf-8')
         start=src.index("static void nq_trace(")
         trace=src[start:src.index("\n}\n",start)+2]
         code=r"""
@@ -242,15 +242,15 @@ int main(void) {
 """.replace("TRACE",trace)
         out=ROOT/"target/tests";out.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out,prefix="queue-diag-") as temp:
-            c,exe=Path(temp)/"test.c",Path(temp)/"test";c.write_text(code)
+            c,exe=Path(temp)/"test.c",Path(temp)/"test";c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=gnu11","-O1","-g","-fsanitize=address,undefined",
                 "-fno-omit-frame-pointer",str(c),"-o",str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=5)
 
     @unittest.skipUnless(shutil.which("cc"), "host C compiler required")
     def test_startup_gate_and_program_snapshot(self):
-        hle = (ROOT/"nxnative/dm/gfx/nvn/hle_nvn.c").read_text()
-        common = (ROOT/"nxnative/dm/android/gfx_common.c").read_text()
+        hle = (ROOT/"nxnative/dm/gfx/nvn/hle_nvn.c").read_text(encoding='utf-8')
+        common = (ROOT/"nxnative/dm/android/gfx_common.c").read_text(encoding='utf-8')
         gate = hle[hle.index("static pthread_once_t g_nq_config_once"):hle.index("\n#else\nint nvn_logical_queues_on")]
         start = common.index("void mtl_prog_snapshot(")
         end = common.index("\nvoid mtl_prog_unpin", start)
@@ -294,7 +294,7 @@ int main(int argc,char **argv) {
         out.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(dir=out,prefix="logical-gate-") as temp:
             c,exe=Path(temp)/"test.c",Path(temp)/"test"
-            c.write_text(code)
+            c.write_text(code, encoding='utf-8')
             subprocess.run(["cc","-std=gnu11","-O1","-g","-fsanitize=address,undefined",
                 "-fno-omit-frame-pointer","-pthread","-I"+str(ROOT/"nxnative/dm/gfx/nvn"),
                 "-I"+str(ROOT/"nxnative/dm/gfx/nvn/include"),str(c),"-o",str(exe)],check=True)

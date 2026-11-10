@@ -22,8 +22,8 @@ class BufferMemo(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_actual_mutable_descriptor_dependencies(self):
         dm = ROOT / 'nxnative/dm'
-        source = (dm / 'android/gfx_vk_exec.c').read_text()
-        header = (dm / 'android/gfx_vk.h').read_text()
+        source = (dm / 'android/gfx_vk_exec.c').read_text(encoding='utf-8')
+        header = (dm / 'android/gfx_vk.h').read_text(encoding='utf-8')
         decl = []
         for first in ('RK_SUPPORT', 'RD_UBO'):
             begin = header.index('enum { ' + first)
@@ -159,7 +159,7 @@ int main(void) {
         code = code.replace('enum { MEMO_CB', 'enum { RS_UBO = 4 };\nenum { MEMO_CB')
         target = ROOT / 'target/tests';target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-buffer-memo-',dir=target) as folder:
-            src,exe=Path(folder)/'check.c',Path(folder)/'check';src.write_text(code)
+            src,exe=Path(folder)/'check.c',Path(folder)/'check';src.write_text(code, encoding='utf-8')
             subprocess.run(['cc','-std=c11','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
                             '-I'+str(dm/'third_party/vulkan-headers/include'),str(src),'-o',str(exe)],check=True)
             subprocess.run([str(exe)],check=True,timeout=15)

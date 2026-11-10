@@ -27,7 +27,7 @@ def function(source, declaration):
 class UniformShadowOrdering(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text()
+        source = (ROOT / "nxnative/dm/android/gfx_vk_core.c").read_text(encoding='utf-8')
         helpers = "\n".join(function(source, name) for name in [
             "int vk_ubd_overlaps(",
             "int vk_gpu_pending(",
@@ -88,7 +88,7 @@ int main(int argc,char **argv) {
         path = Path(cls.folder.name)
         cls.exe = path / "probe"
         src = path / "probe.c"
-        src.write_text(prefix + helpers + suffix)
+        src.write_text(prefix + helpers + suffix, encoding='utf-8')
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", str(src), "-o", str(cls.exe)],
                        check=True, capture_output=True, text=True)

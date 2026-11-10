@@ -22,8 +22,8 @@ def function(source, declaration):
 class StorageImage(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_actual_promotion_preserves_resources_and_contents(self):
-        header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text()
-        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text()
+        header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text(encoding='utf-8')
+        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text(encoding='utf-8')
         image_type = re.search(r'typedef struct vkimg vkimg_t;\nstruct vkimg \{.*?\n\};', header, re.S).group()
         helper = '\n'.join(function(runtime, n) for n in ['static VkFormat storage_promote(', 'static int storage_view_compatible(', 'int vk_tex_storage_prepare('])
         code = r'''
@@ -148,7 +148,7 @@ int main(void){
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-storage-image-', dir=target) as folder:
             src, exe = Path(folder) / 'check.c', Path(folder) / 'check'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                             '-I', str(ROOT / 'nxnative/dm/third_party/vulkan-headers/include'),
                             str(src), '-o', str(exe)], check=True)
@@ -157,8 +157,8 @@ int main(void){
 
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     def test_real_storage_views_have_identity_usage_and_one_mip(self):
-        header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text()
-        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text()
+        header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text(encoding='utf-8')
+        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text(encoding='utf-8')
         image_type = re.search(r'typedef struct vkimg vkimg_t;\nstruct vkimg \{.*?\n\};', header, re.S).group()
         view_type = re.search(r'typedef struct vview \{[^\n]+', runtime).group()
         helpers = '\n'.join(function(runtime, name) for name in [
@@ -257,7 +257,7 @@ int main(void){
         target.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='vk-storage-view-', dir=target) as folder:
             src, exe = Path(folder) / 'check.c', Path(folder) / 'check'
-            src.write_text(code)
+            src.write_text(code, encoding='utf-8')
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
                             '-Wno-misleading-indentation', '-Wno-sign-compare', '-fsanitize=address,undefined',
                             '-I', str(ROOT / 'nxnative/dm/third_party/vulkan-headers/include'),
@@ -265,7 +265,7 @@ int main(void){
             subprocess.run([str(exe)], check=True, timeout=15)
 
     def test_preflight_and_cache_distinguish_storage(self):
-        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text()
+        runtime = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         draw = function(runtime, 'static int prepare_draw(')
         self.assertLess(draw.index('stage_storage_prepare('), draw.index('if (!begin_pass()'))
         dispatch = function(runtime, 'static void dispatch(')
