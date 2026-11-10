@@ -843,9 +843,13 @@ static void six_sample_live(SixAxisState *s, int64_t samp, const motion_state *m
 }
 // The Android device's own motion (front_android.c, the fork): the phone's gyroscope and accelerometer already in the Switch controller's frame (acc in G, flat face up 0 0 -1;
 // gyro in revolutions / s, right-hand rule), as dm_motion_set_switch takes them for player 1, whose rotation rate is in rad/s (motion_fusion.h). The sensor's timestamp is not the
-// host clock's, so the sample's time is its arrival
+// host clock's, so the sample's time is its arrival. While player 1's controller is shaken (DM_BTN_SHAKE: the front end's automatic shake, which DM_MOTION_RAW=1 turns off,
+// or an explicit Shake) its six-axis sensor reports the made-up side-to-side shake instead of the device's measured motion, as the fork's Android motion did before the
+// re-sync with upstream (docs/DEVELOPMENT_GUIDE.md, Android motion; Super Mario Odyssey's cap throw was checked with that shake); a controller's motion keeps upstream's added shake
+static _Atomic int g_motion_device;   // the Android front end feeds the device's motion
 void dm_motion_set_device(const float acc[3], const float gyro[3], int64_t t_ns) {
     (void)t_ns; float rot[3] = {gyro[0] * (float)(2 * M_PI), gyro[1] * (float)(2 * M_PI), gyro[2] * (float)(2 * M_PI)};
+    atomic_store(&g_motion_device, 1);
     motion_set(0, acc, rot, 1, 0);
 }
 static void six_sample(SixAxisState *s, int64_t samp, int shakes) {
@@ -875,8 +879,11 @@ static int six_states(SixAxisState *out, int n, uint32_t h) {
     int pl = ref.kind >= KIND_DUAL ? ref.pad : player_of(h >> 8 & 0xff), shakes = pl == 0 && ref.kind < KIND_DUAL;
     motion_state ms;
     int live = ref.kind >= KIND_DUAL ? motion_joy(ref.pad, ref.kind == KIND_LEFT ? 0 : ref.kind == KIND_RIGHT ? 1 : (int)(h >> 16 & 1), &ms) : motion_live(pl, &ms);
-    if (live) { for (int i = 0; i < n; i++) six_sample_live(&out[i], samp - i, &ms, shakes); return n; }
-    for (int i = 0; i < n; i++) six_sample(&out[i], samp - i, shakes);
+    int replace = shakes && atomic_load(&g_motion_device);   // the Android device's motion: a shake replaces it (dm_motion_set_device)
+    for (int i = 0; i < n; i++) {
+        if (live && !(replace && shaking((uint64_t)(samp - i) * SIX_PERIOD_NS))) six_sample_live(&out[i], samp - i, &ms, shakes);
+        else six_sample(&out[i], samp - i, shakes);
+    }
     return n;
 }
 HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", "six-axis sensor handles: two for handheld / dual Joy-Cons, one otherwise",
