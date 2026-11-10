@@ -251,7 +251,8 @@ void hid_keys_init(void) {
 //   registered textures of that target (2 = 3D) with storage address and block-linear layout (nvn_mtl.m dm_gfx_texlist), "texraw <serial> <path>"
 //   saves a host texture's level 0 raw, every slice (a cube's six faces, a 3D texture's depth slices) (nvn_mtl.m dm_gfx_texraw), "drag <x0> <y0> <x1> <y1> [seconds=0.3]" moves one finger in a straight line between the two normalized picture
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
-//   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "program <n>" makes oe::ExecuteProgram(n) with no parameters (a multi-program application's way between its programs, headless), "webshot <path>" saves the offline page shown as a PNG, "#…" is ignored.
+//   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "program <n>" makes oe::ExecuteProgram(n) with no parameters (a multi-program application's way between its programs, headless), "webshot <path>" saves the offline page shown as a PNG, "memreport" (Android) logs
+//   the Vulkan backend's live memory by object kind (DM_VK_MEMREPORT), "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
 static void *ctl_main(void *arg) {
     // Only lines appended from now on: the file outlives the run (the Android app's files folder), and reading it from the start replayed every
@@ -275,6 +276,7 @@ static void *ctl_main(void *arg) {
 #if defined(__ANDROID__)
                 if (!strcmp(line, "rdoccapture")) { void dm_renderdoc_capture(void); dm_renderdoc_capture(); continue; }
                 if (!strcmp(line, "rdocstatus")) { void dm_renderdoc_status(void); dm_renderdoc_status(); continue; }
+                if (!strcmp(line, "memreport")) { void dm_gfx_memreport(void); dm_gfx_memreport(); continue; }   // the Vulkan backend's memory by object kind (gfx_vk_memreport.inc)
 #endif
                 if (!strcmp(line, "dump")) { crash_dump_now("DM_CTL dump"); continue; }
                 if (!strncmp(line, "program ", 8)) { void dm_oe_execute(int index, const void *param, size_t n); LOG("DM_CTL: oe::ExecuteProgram(%d)", atoi(line + 8)); dm_oe_execute(atoi(line + 8), NULL, 0); continue; }

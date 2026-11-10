@@ -428,6 +428,7 @@ static void mem_acct_install(void) {
     real_vkCreateGraphicsPipelines = vkCreateGraphicsPipelines; real_vkCreateComputePipelines = vkCreateComputePipelines; vkCreateGraphicsPipelines = acct_gpipe; vkCreateComputePipelines = acct_cpipe;
     VKLOG("device memory accounting on (DM_VK_MEM_ACCT=0: off): a line at each 512 MB more per tag, each allocation of 64 MB or more, the table at each 512 MB more in all");
 }
+#include "gfx_vk_memreport.inc"   // DM_VK_MEMREPORT: live memory by object kind, ours and (VK_EXT_device_memory_report) the driver's
 static int drv_has_gpu(PFN_vkGetInstanceProcAddr g) {
     PFN_vkCreateInstance ci = (PFN_vkCreateInstance)g(NULL, "vkCreateInstance"); VkInstance in; int ok = 0;
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "dmhost", 1, "nxnative", 1, VK_API_VERSION_1_3};
@@ -627,12 +628,13 @@ void vk_init(void) {
     VkPhysicalDeviceFeatures2 enf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, ff.pNext, en};
     float prio = 1;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, V.qf, 1, &prio};
-    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enf, 0, 1, &qci, 0, NULL, non, on, NULL};
+    void *dnext = mr_chain(ex, ne, &enf, on, &non);   // DM_VK_MEMREPORT: the driver's memory reports, when it has them (gfx_vk_memreport.inc)
+    VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, dnext, 0, 1, &qci, 0, NULL, non, on, NULL};
     VKCHK(vkCreateDevice(V.pd, &dci, NULL, &V.dev));
     vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)p_vkGetInstanceProcAddr(V.inst, "vkGetDeviceProcAddr");
 #define VK_LOADD(f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f); if (!f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f "KHR"); if (!f) f = (PFN_##f)p_vkGetInstanceProcAddr(V.inst, #f);   // a promoted function by its extension's name (Vulkan 1.1 / 1.2 devices)
     VK_DEV_FNS(VK_LOADD)
-    mem_acct_install(); kt_install(); uab_install();   // device memory accounting (DM_VK_MEM_ACCT): every vkAllocateMemory / vkFreeMemory through the function table goes through it
+    mem_acct_install(); kt_install(); uab_install(); mr_install();   // device memory accounting (DM_VK_MEM_ACCT): every vkAllocateMemory / vkFreeMemory through the function table goes through it
     gpu_clock_init(clock_extension);
     // A driver can report the timeline-semaphore feature (and Vulkan 1.3) and still export no vkWaitSemaphores: the emulator's ranchu / gfxstream driver does
     // (both the device and the instance dispatcher return null for it and for vkGetSemaphoreCounterValue), and the first wait then called address 0
