@@ -9,6 +9,24 @@ Port your own Nintendo Switch games to Android, natively: the game's own arm64 c
 
 This is the Android port of [nxnative](https://github.com/seedds/nxnative), which does the same on iPhone and iPad. Supported games: [Games](#games).
 
+## This fork: Nintendo Switch 2 games
+
+This fork adds Nintendo Switch 2 games to the porter, tuned on an AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver). It also carries a re-sync of the vendored nxnative with upstream.
+
+| Game | State on the Odin 3 |
+|---|---|
+| Donkey Kong Bananza (with its DLC) | Plays. 60 fps in caves and indoors, 30 outdoors (GPU work being cut); handheld mode by default |
+| Nintendo Switch 2 Welcome Tour | Plays. Intro video and expo hall at 60 fps; mouse exhibits need a Joy-Con 2 mouse, which the host does not provide yet |
+
+What the Switch 2 support adds, in short:
+
+- **Porter:** reads a game as a NUP container in place (base game, update and DLC, no keys needed), packs DLC as images, and takes an icon from an `icons` folder (`porter config icons <dir>`).
+- **Shaders:** NVN2 control sections, Ampere (sm86) jobs, push constants in bank 24, raw global memory through a pool table and buffer device addresses, per-vertex fragment inputs through a generated geometry shader on drivers without fragment-shader barycentrics, and task / mesh shaders run as compute plus an indirect draw on drivers without mesh shaders.
+- **Host:** the Switch 2 additions to vi, hid, oe and time; 614.4 MHz NVN timestamps; acceleration-structure size queries; zero-copy H.264 video (MediaCodec into Vulkan); memory pools backed on first GPU use and an image budget, so games with large pools fit in 16 GB; texture handle tables in one shared descriptor set.
+- **Bananza fixes:** the NDSR neural upscaler replaced by a cubic blit for its linear-output variants, real occlusion queries (the pink skin), geometry-shader side effects run once per primitive on Adreno (terrain gaps), the game's present-interval controller kept on its own pacing.
+
+Only your own dumps can be ported: this repository holds no game files, keys or built apps.
+
 ## Games
 
 These games play on Android. Tested on a Lenovo Legion Y700 (Snapdragon 8 Elite, Adreno 830), unless a game names another device. The device's GPU must read BC-compressed textures (Adreno, Xclipse; not Mali or PowerVR).
