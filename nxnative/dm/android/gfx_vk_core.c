@@ -2165,7 +2165,8 @@ int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off) {
     return 1;
 }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
-void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
+const uint64_t *vk_rest_h; int vk_rest_n;   // the command handles of this submission that follow the one being replayed (gfx_vk_exec.c occ_reset_next)
+void mtl_exec_rest(const uint64_t *h, int n) { vk_rest_h = h; vk_rest_n = n; }
 
 // completion: a queue of committed submissions, each with its CPU-visible effects
 typedef struct cpend { uint64_t fence, frame; post_op *ops; int n; int slot, rslot, occ_parts; int npass; pass_meta pmeta[PASSQ]; uint64_t t_begin, t_commit, part_ns[MAIN_CBS]; int nparts; struct cpend *next; } cpend;

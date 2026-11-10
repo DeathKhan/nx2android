@@ -1906,29 +1906,56 @@ static void *async_pipe_thread(void *arg) {
     }
     return NULL;
 }
-static int async_shader_writes(const vkshader_t *s) {
-    if (!s) return 0;
-    if (s->xfb) return 1;
-    for (int i = 0; i < s->nbind; i++) { const dmsv_bind *b = &s->b[i];
-        // The packed reflection does not reliably mark every write: images have no rw bit, and Bananza's shipped culling GS
-        // has an unmarked storage buffer. Match stage_set's conservative dirty tracking: any storage resource may be written,
-        // including raw-global memory maps, texel buffers and unclassified descriptors. A false positive only compiles sooner.
-        if ((b->flags & 4) || b->desc == RD_SSBO || b->desc == RD_STORAGE || b->desc == RD_STORAGE_TBUF) return 1;
+static int shader_wmem(vkshader_t *s);
+// The packed reflection does not reliably mark every write (images have no rw bit, and Bananza's shipped culling GS has an unmarked storage buffer), and a storage
+// binding says nothing either way: Ocarina of Time's large vertex shaders (27d946c5a63213a1, 321663d0cac5fd32) only read their three storage buffers, and counted as
+// writers each of their pipelines was compiled on the replay thread (1.1 s a pipeline, 6 s frozen at the first world entry; Odin 3, 2026-11-10). The SPIR-V itself
+// says whether a stage stores to memory (spv_wmem; without its SPIR-V a shader is assumed to write).
+static int async_shader_writes(vkshader_t *s) { return s && (s->xfb || shader_wmem(s)); }
+// Samples-passed counting: a draw left out changes a count only if the count is reported. The ops that follow the draw being replayed (the rest of its command buffer,
+// of the buffers that called it, and of the submission's later ones) are read up to the first samples-passed counter op: 1 when that is a reset (the samples of every
+// draw before it are discarded unreported), 0 when it is a report, a conditional-render op, or not found. One walk per stretch between counter ops.
+static const uint8_t *g_la_at, *g_la_ret[16]; static int g_la_depth; static uint32_t g_la_epoch;   // replay thread: the op after the current one, the callers' next ops
+static int occ_reset_next(void) {
+    static uint32_t epoch = ~0u; static int ans; extern const uint64_t *vk_rest_h; extern int vk_rest_n;
+    if (epoch == g_la_epoch) return ans;
+    epoch = g_la_epoch; ans = 0;
+    if (!g_la_at || g_la_depth > 16) return 0;
+    const uint8_t *p = g_la_at, *loc[32]; int nl = 0, up = g_la_depth, rest = 0;
+    for (int left = 400000; left > 0; left--) {
+        op_hdr h; memcpy(&h, p, sizeof h); const uint8_t *a = p + 8;
+        switch (h.op) {
+        case OP_END: if (nl) { p = loc[--nl]; continue; } if (up) { p = g_la_ret[--up]; continue; }
+            if (rest < vk_rest_n && vk_rest_h[rest]) { p = (const uint8_t *)(uintptr_t)vk_rest_h[rest++]; continue; }
+            return 0;
+        case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (nl == 32 || !t) return 0; loc[nl++] = p + h.size; p = (const uint8_t *)(uintptr_t)t; continue; }
+        case OP_REPORT_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) return 0; break; }
+        case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) return ans = 1; break; }
+        case OP_RENDER_COND: return 0;
+        default: break;
+        }
+        if (h.size < sizeof h) return 0;
+        p += h.size;
     }
     return 0;
 }
-static int async_pipe(const pkey *k) {   // 1: queued (the draw is left out); under nothing (takes g_pipe_mu)
-    if (!g_async_pipe || k->alt == 2 || k->raster_discard || vk_occ_counting()) return 0;
+static int pipe_must_draw(const pkey *k) {   // 1: the draw cannot be left out while its pipeline is built
+    if (!g_async_pipe || k->alt == 2 || k->raster_discard) return 1;
     // Samples-passed is an observable draw side effect even without shader writes. Counting remains enabled after its first reset;
-    // without a proven next-reset-before-report lookahead, every later pipeline miss must preserve the draw.
+    // a pipeline miss must preserve the draw unless its samples are proven to be reset before any report (occ_reset_next).
+    if (vk_occ_counting() && !occ_reset_next()) return 1;
     // A regular rasterizing draw can still produce another draw's inputs (Bananza's culling GS writes indirect triangle counts).
     // Attachment age says nothing about these side effects: compile at once for writes in any graphics stage, as for XFB.
-    for (int st = 0; st < 5; st++) if (async_shader_writes(S.sh[st])) return 0;
-    for (int i = 0; i < S.ncol && i < 8; i++) if (S.rt_has_col[i] && (S.rt_col[i].d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 0;   // (the CPU reads it: lin_back)
+    for (int st = 0; st < 5; st++) if (async_shader_writes(S.sh[st])) return 1;
+    for (int i = 0; i < S.ncol && i < 8; i++) if (S.rt_has_col[i] && (S.rt_col[i].d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 1;   // (the CPU reads it: lin_back)
     int natt = 0; for (int i = 0; i < 9; i++) { const vkimg_t *a = P_att[i].im; if (!a) continue; natt++; if (a->rt_frames < 3) {
             if (g_prof_on) { static int n; if (n++ < 300) VKLOG("pipeline built here: attachment %d %ux%u nvn format %#x drawn in %llu presents in a row (shaders %016llx %016llx)", i, a->w, a->h, a->nvn_format, (unsigned long long)a->rt_frames, (unsigned long long)k->key[0], (unsigned long long)k->key[1]); }
-            return 0; } }   // (counted in this present too)
-    if (!natt) return 0;
+            return 1; } }   // (counted in this present too)
+    if (!natt) return 1;
+    return 0;
+}
+static int apq_push(const pkey *k) {   // 1: queued for the background threads, pending in the table; under nothing (takes g_pipe_mu)
     pthread_mutex_lock(&g_apq_mu);
     if (!g_apq_on) { for (int i = 0; i < 2; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
             if (!pthread_create(&t, &a, async_pipe_thread, NULL)) { g_apq_on++; }
@@ -1939,17 +1966,36 @@ static int async_pipe(const pkey *k) {   // 1: queued (the draw is left out); un
     if (ok) { pthread_mutex_lock(&g_pipe_mu); if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, PIPE_PENDING); pthread_mutex_unlock(&g_pipe_mu); }
     return ok;
 }
+static int async_pipe(const pkey *k) { return !pipe_must_draw(k) && apq_push(k); }   // 1: queued (the draw is left out)
+// A pipeline built here has a sibling that differs only in the fragment shader's depth-write variant (fdz, prepare_draw): which of the two a draw takes changes with
+// its depth buffer's last writers, and the other is asked for within the same present or soon after (Ocarina of Time: 20 of 31 shader sets met in two sessions were
+// built in both, one after the other, 0.6 s each for the large vertex shaders). The sibling is built on a background thread at the same time; a draw that needs it
+// and cannot be left out waits for that build (graphics_pipeline) instead of starting it.
+static void pipe_sibling(const pkey *k) {
+    const vkshader_t *fs = S.sh[1];
+    if (!g_async_pipe || !g_fdz || k->alt == 2 || k->raster_discard || !fs || fs->depth_repl || !k->dt || k->bias_en || !k->dfmt) return;
+    pkey sib = *k; sib.fdz = !k->fdz;
+    pthread_mutex_lock(&g_pipe_mu); int have = nvn_hm_get(&g_pipes, &sib) != NULL; pthread_mutex_unlock(&g_pipe_mu);
+    if (!have) apq_push(&sib);
+}
+// The long-frame line's "new pipelines" (hle_nvn.c): the graphics pipelines built on the replay thread and the time they took. It read 0 through frames frozen for seconds
+static uint64_t g_sync_pipes, g_sync_pipe_ns;
+void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = 0; *pso = __atomic_load_n(&g_sync_pipes, __ATOMIC_RELAXED); }
+void mtl_create_ns(uint64_t *lib, uint64_t *pso) { *lib = 0; *pso = __atomic_load_n(&g_sync_pipe_ns, __ATOMIC_RELAXED); }
 static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     if (g_last_p && !memcmp(k, &g_last_k, sizeof *k)) return g_last_p == (void *)1 ? VK_NULL_HANDLE : g_last_p;
     pthread_mutex_lock(&g_pipe_mu); VkPipeline p = nvn_hm_get(&g_pipes, k);
-    // This key may have been queued before query counting began. Wait for that build rather than dropping its now-observable draw.
-    while (p == PIPE_PENDING && vk_occ_counting()) { pthread_cond_wait(&g_pipe_ready, &g_pipe_mu); p = nvn_hm_get(&g_pipes, k); }
+    // This key may have been queued by a draw that could be left out, or as a sibling (pipe_sibling). Wait for that build rather than dropping a draw that cannot be.
+    while (p == PIPE_PENDING && pipe_must_draw(k)) { pthread_cond_wait(&g_pipe_ready, &g_pipe_mu); p = nvn_hm_get(&g_pipes, k); }
     pthread_mutex_unlock(&g_pipe_mu);
     if (p == PIPE_PENDING) return VK_NULL_HANDLE;
     if (p) { g_last_k = *k; g_last_p = p; return p == (void *)1 ? VK_NULL_HANDLE : p; }
     if (async_pipe(k)) return VK_NULL_HANDLE;
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
-    uint64_t tb = g_prof_on ? tick() : 0; p = build_pipeline(k, layout, stg); if (g_prof_on) g_prof_ns[0] += tick() - tb; g_vkst.pipes_built++;
+    pipe_sibling(k);
+    uint64_t tb = tick(); p = build_pipeline(k, layout, stg); tb = tick() - tb; if (g_prof_on) g_prof_ns[0] += tb; g_vkst.pipes_built++;
+    __atomic_add_fetch(&g_sync_pipes, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_sync_pipe_ns, tb, __ATOMIC_RELAXED);
+    if (tb > 50000000ull) VKLOG("pipeline built on the replay thread in %.0f ms (shaders %016llx %016llx %016llx; present %llu)", tb / 1e6, (unsigned long long)k->key[0], (unsigned long long)k->key[1], (unsigned long long)k->key[2], (unsigned long long)g_tex_frame);
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);
     if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
@@ -3520,7 +3566,7 @@ static int spv_wmem(const uint32_t *w, uint32_t n) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (!wc || i + wc > n) break;
         const uint32_t *o = w + i;
         if (op == 32 && wc >= 4 && o[1] < bound && (o[2] == 2 || o[2] == 11 || o[2] == 12 || o[2] == 5349)) mp[o[1]] = 1;   // OpTypePointer: Uniform, Image, StorageBuffer, PhysicalStorageBuffer
-        else if ((op == 59 || op == 65 || op == 66 || op == 67 || op == 60) && wc >= 3 && o[1] < bound && o[2] < bound && mp[o[1]] == 1) mp[o[2]] = 2;   // OpVariable, access chains, OpImageTexelPointer
+        else if ((op == 59 || op == 65 || op == 66 || op == 67 || op == 60 || op == 55 || op == 57 || op == 61 || op == 83 || op == 169 || op == 245) && wc >= 3 && o[1] < bound && o[2] < bound && mp[o[1]] == 1) mp[o[2]] = 2;   // OpVariable, access chains, OpImageTexelPointer; a pointer as a function's parameter or result, loaded, copied, selected
         else if (op == 62 && wc >= 3 && o[1] < bound && mp[o[1]] == 2) wr = 1;   // OpStore
         else if (op == 63 && wc >= 3 && o[1] < bound && mp[o[1]] == 2) wr = 1;   // OpCopyMemory
         else if (op == 99) wr = 1;   // OpImageWrite
@@ -5313,7 +5359,7 @@ static void prof_tick(void) {
     VKLOG("%s", line);
 }
 void mtl_exec(const uint8_t *p) {   // timed at the top level only (OP_CALL nests)
-    static int depth; uint64_t t0 = depth ? 0 : tnow(); depth++; if (depth == 1) prof_tick();
+    static int depth; uint64_t t0 = depth ? 0 : tnow(); depth++; if (depth == 1) { prof_tick(); g_la_depth = 0; g_la_epoch++; }
     exec_ops(p);
     if (!--depth) g_vkst.ns_exec += tnow() - t0;
 }
@@ -5323,15 +5369,15 @@ static void exec_ops(const uint8_t *p) {
         if (h.op < 64) g_sub_ops[h.op]++;
         static uint64_t skip = ~0ull; if (skip == ~0ull) { skip = 0; const char *e = getenv("DM_VK_SKIP_OPS"); for (const char *q = e; q && *q;) { char *n; long v = strtol(q, &n, 10); if (n == q) break; if (v > 0 && v < 64) skip |= 1ull << v; q = *n ? n + 1 : n; } }   // debugging: record ops not replayed
         if (h.op < 64 && h.op > 3 && (skip >> h.op & 1)) { p += h.size; continue; }
-        const uint8_t *a = p + 8;
+        const uint8_t *a = p + 8; g_la_at = p + h.size;
         switch (h.op) {
         case OP_END: return;
         case OP_BEGIN: break;
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
-        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); exec_ops((const uint8_t *)(uintptr_t)t); break; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (g_la_depth < 16) g_la_ret[g_la_depth] = p + h.size; g_la_depth++; exec_ops((const uint8_t *)(uintptr_t)t); g_la_depth--; break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
-        case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); mtl_sub_counter(ad, (uint32_t)t); break; }
-        case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) vk_occ_reset(); break; }
+        case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); g_la_epoch++; mtl_sub_counter(ad, (uint32_t)t); break; }
+        case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); g_la_epoch++; if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) vk_occ_reset(); break; }
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = mtl_last_fence() + 1; s->fenced = 1; break; }
         // Upstream's queue waits (hle_nvn.c nvnCommandBufferWaitEvent / WaitSync, ea0c98df3): the Apple scheduler parks the queue on them; this replay runs
         // submissions in their order and does not wait, as when the calls were no-ops. An event wait whose predicate does not hold yet is named once (an
