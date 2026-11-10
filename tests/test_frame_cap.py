@@ -7,12 +7,17 @@ import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / 'nxnative/dm/host/hle_framecap.c'
 
+HLE = r'''
+#include <stdint.h>
+extern uint8_t *dm_fps_state;   // hle.h: the frame step state page (+0 float target fps); NULL when the build has none
+'''
+
 STUB = r'''
 #include <stdint.h>
 #include <stdio.h>
 #define LOG(...) do { if (0) printf(__VA_ARGS__); } while (0)
 enum { OBS_FRAME_CAP = 28, OBS_RES_PARAM = 29 };
-enum { DM_FRAME_CAP_NONE, DM_FRAME_CAP_GAME, DM_FRAME_CAP_PACE };
+enum { DM_FRAME_CAP_NONE, DM_FRAME_CAP_GAME, DM_FRAME_CAP_PACE, DM_FRAME_CAP_STEP };
 enum { DM_RES_PERF, DM_RES_BALANCED, DM_RES_QUALITY, DM_RES_MAX, DM_RES_N };
 enum { DM_RES_P_GPU_PCT = 1, DM_RES_P_MIN_SCALE, DM_RES_P_NDSR_MIN, DM_RES_P_NDSR_MAX, DM_RES_P_N };
 extern int t_gate, t_ms;
@@ -28,6 +33,7 @@ HARNESS = r'''
 #include <assert.h>
 #include <math.h>
 int t_gate = 1, t_ms;
+uint8_t *dm_fps_state;
 static void (*g_fn[32])(uint64_t *, int);
 void gate_obs_set(int id, void (*fn)(uint64_t *, int)) { g_fn[id] = fn; }
 int nvn_game_interval(void) { return 2; }
@@ -71,7 +77,9 @@ int main(void) {
 HARNESS_PACE = r'''
 #include <assert.h>
 #include <stdlib.h>
+#include <string.h>
 int t_gate = 0, t_ms;
+uint8_t *dm_fps_state;
 void gate_obs_set(int id, void (*fn)(uint64_t *, int)) { (void)id; (void)fn; }
 int main(void) {
     setenv("DM_FRAME_CAP_MODE", "pace", 1);
@@ -82,6 +90,11 @@ int main(void) {
     assert(dm_frame_cap_period(0) == 0);                     // no period (unpaced) stays unpaced
     dm_frame_cap_set(60); assert(dm_frame_cap_period(16666667) == 16666667);
     dm_frame_cap_set(0); assert(dm_frame_cap_period(16666667) == 16666667);
+    // a main with frame step stubs (DM_FRAME_CAP_STEP): the host's step hold carries the cap (hle_nvn.c fps_step_cap), the present period is not held
+    static uint8_t page[32]; dm_fps_state = page; assert(dm_frame_cap_how() == DM_FRAME_CAP_PACE);   // target 0: the stubs run the game's own code
+    float target = 60.0f; memcpy(page, &target, sizeof target); assert(dm_frame_cap_how() == DM_FRAME_CAP_STEP);
+    dm_frame_cap_set(30); assert(dm_frame_cap() == 30 && dm_frame_cap_period(16666667) == 16666667);
+    dm_frame_cap_set(0);
     puts("ok"); return 0;
 }
 '''
@@ -100,6 +113,7 @@ class FrameCap(unittest.TestCase):
             self.skipTest('a C compiler is required')
         with tempfile.TemporaryDirectory() as d:
             Path(d, 'dm.h').write_text(STUB, encoding='utf-8')
+            Path(d, 'hle.h').write_text(HLE, encoding='utf-8')
             Path(d, 't.c').write_text('#include "dm.h"\n' + harness, encoding='utf-8')
             Path(d, 'hle_framecap.c').write_text(SOURCE.read_text(encoding='utf-8'), encoding='utf-8')   # beside the stand-in dm.h
             exe = Path(d, 't')

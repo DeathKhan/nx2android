@@ -13,8 +13,8 @@ class DescriptorHash(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
-        fnv = source[source.index('static inline uint64_t fnv('):
-                     source.index('static void drv_shared(')]
+        fnv_at = source.index('static inline uint64_t fnv(')
+        fnv = source[fnv_at:source.index('\n}\n', fnv_at) + 3]   # the hash alone (the driver-segment keys after it are not this test's)
         cache = source[source.index('enum { SETC ='):source.index('static struct { uint64_t h, epoch; VkBuffer b;')]
         start = source.index('    uint64_t h = fnv(0xcbf29ce484222325ull, &s->dsl')
         block = source[start:source.index('    // verify: the same content', start)]
@@ -26,7 +26,7 @@ class DescriptorHash(unittest.TestCase):
 #include <stdlib.h>
 #include <string.h>
 static uint64_t g_set_epoch = 1, g_set_hits, g_set_new, g_ns_set_hash, g_ns_set_new;
-static int g_tracing, g_x_nosetc, updates;
+static int g_tracing, g_x_nosetc, g_x_nosetc_bits, updates;
 static struct { VkDevice dev; } V;
 static uint64_t tick(void) { return 0; }
 static VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
@@ -41,6 +41,8 @@ static VkDescriptorSet cached(VkDescriptorSetLayout layout, VkWriteDescriptorSet
     struct { VkDescriptorSetLayout dsl; } shader = {layout}, *s = &shader;
     VkDescriptorSet set;
     uint64_t tb1 = 0;
+    int st = 1;   // a draw stage (DM_VK_X_NOSETC bits: 4 the draw stages, 2 the mesh kernels)
+    struct { uint64_t hash_ns, hits, fresh, new_ns; } *sp = NULL;   // DM_VK_SET_PROFILE off
 ''' + block + r'''
     return set;
 }

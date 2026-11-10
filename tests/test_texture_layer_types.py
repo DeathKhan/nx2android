@@ -16,7 +16,7 @@ spec.loader.exec_module(helper)
 
 MOCK = r"""
 using System;using System.Collections.Generic;
-enum AggregateType {S32,FP32,Bool}
+enum AggregateType {S32,U32,FP32,Bool}
 enum OperandType {LocalVariable,Constant,Argument}
 enum Instruction {Copy,ConditionalSelect,TextureSample,Add}
 [Flags] enum SamplerType {Texture1D=1,Texture2D=2,Texture3D=3,Array=256,Shadow=512}
@@ -122,7 +122,7 @@ class TextureLayerTypes(unittest.TestCase):
             r=run(code)
             self.assertEqual(r.returncode,0,r.stdout+r.stderr)
             self.assertIn("PASS",r.stdout);print(r.stdout.strip())
-            old=code.replace("return GetSourceVarType(operation, index, properties);","return InstructionInfo.GetSrcVarType(operation.Inst, index);")
+            old=code.replace("Note(GetSourceVarType(operation, index, properties));","Note(InstructionInfo.GetSrcVarType(operation.Inst, index));")
             self.assertNotEqual(code,old)
             bad=run(old);self.assertNotEqual(bad.returncode,0)
             self.assertIn("direct use mismatch",bad.stderr)

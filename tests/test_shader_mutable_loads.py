@@ -20,7 +20,7 @@ spec.loader.exec_module(helper)
 
 MOCK = r"""
 using System;using System.Linq;using System.Collections.Generic;
-enum Instruction {Copy,Load,Call,Add,Store,AtomicAdd,AtomicAnd,AtomicCompareAndSwap,AtomicMaxS32,AtomicMaxU32,AtomicMinS32,AtomicMinU32,AtomicOr,AtomicSwap,AtomicXor,ImageAtomic,Mask=0xffff}
+enum Instruction {Copy,Load,ImageLoad,Call,Add,Store,AtomicAdd,AtomicAnd,AtomicCompareAndSwap,AtomicMaxS32,AtomicMaxU32,AtomicMinS32,AtomicMinU32,AtomicOr,AtomicSwap,AtomicXor,ImageAtomic,Mask=0xffff}
 enum OperandType{LocalVariable,Constant}
 enum StorageKind{None,Input,InputPerPatch,Output,OutputPerPatch,ConstantBuffer,StorageBuffer,LocalMemory,SharedMemory,SharedMemory8,SharedMemory16,GlobalMemory,GlobalMemoryS8,GlobalMemoryS16,GlobalMemoryU8,GlobalMemoryU16,GlobalMemoryVector}
 enum TargetLanguage{Spirv}

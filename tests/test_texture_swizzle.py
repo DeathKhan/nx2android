@@ -12,7 +12,7 @@ ROOT=Path(__file__).resolve().parents[1]
 class TextureSwizzle(unittest.TestCase):
     def test_view_override_format_mapping_and_attachment_identity(self):
         source=(ROOT/'nxnative/dm/android/gfx_vk_tex.c').read_text(encoding='utf-8')
-        helper=source[source.index('static VkComponentSwizzle swz_comp'):source.index('__thread VkFormat vk_view_fmt')]
+        helper=source[source.index('static VkComponentSwizzle swz_comp'):source.index('// Passive diagnostic: first sixteen distinct')]   # sample_swizzle ends where the view log helpers begin
         code=r'''
 #include <vulkan/vulkan_core.h>
 #include <stdint.h>
