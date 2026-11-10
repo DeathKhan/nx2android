@@ -31,7 +31,7 @@ env	DM_VK_PASSTHRU_CS=5a7d69b067a7f011,55ee6dc89a2b64e2,4f41ccf24f163e0d
 # Only the observed final producer is filled; this key must also be in DM_VK_PASSTHRU_CS.
 env	DM_VK_MOVIE_FILL_CS=4f41ccf24f163e0d
 # The game's upscaler network (compute fa3033d05c0a41d6, 1440x810 to 1920x1080) is replaced by the host's bilinear scale and signed square, as on the other
-# profiles that name theirs: the network's dispatches were the largest single GPU cost on the Odin 3 (2026-11-09). No neural residual or sharpening.
+# profiles that name theirs (run on the Odin 3 since 2026-11-09). No neural residual or sharpening.
 env	DM_VK_UPSCALER_CS=fa3033d05c0a41d6
 env	DM_VK_UPSCALER_SQUARE_CS=fa3033d05c0a41d6
 # The image budget. Kokiri Forest holds about 2.96 GB of images on the Odin 3 (5,500 packaged textures, 1.9 GB) once render targets the game has reused are
