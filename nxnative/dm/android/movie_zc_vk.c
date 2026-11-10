@@ -117,7 +117,8 @@ static zc_conv *conv_get(VkFormat fmt, uint64_t ext, const VkAndroidHardwareBuff
     if (!g_zc_mod) { VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof movie_yuv_comp_spv, movie_yuv_comp_spv};
         if ((r = vkCreateShaderModule(V.dev, &mi, NULL, &g_zc_mod))) { VKRED_ONCE(305, "zero-copy movie: shader module failed (%d)", r); return NULL; } }
     VkComputePipelineCreateInfo pi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, g_zc_mod, "main", NULL}, c->pl, VK_NULL_HANDLE, -1};
-    if ((r = vkCreateComputePipelines(V.dev, V.pcache, 1, &pi, NULL, &c->pipe))) { VKRED_ONCE(306, "zero-copy movie: compute pipeline failed (%d)", r); return NULL; }
+    r = vkCreateComputePipelines(V.dev, V.pcache, 1, &pi, NULL, &c->pipe); vk_pipeline_cache_changed();   // (gfx_vk_pipeline_cache.inc: a new entry to save; upstream nx2android #213)
+    if (r) { VKRED_ONCE(306, "zero-copy movie: compute pipeline failed (%d)", r); return NULL; }
     // a combined sampler with a conversion may take several descriptors (combinedImageSamplerDescriptorCount, 3 at most): the pool is sized for that
     VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * ZC_SETS}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ZC_SETS}};
     VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, ZC_SETS, 2, ps};

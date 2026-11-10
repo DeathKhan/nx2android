@@ -269,3 +269,5 @@ uint64_t vk_present(const tex_t *t, double period, const int crop[4]);
 enum { PT_DISPATCH = 0xd15 };   // vk_pass_ts: a dispatch timed as a pass (its format field)
 vkshader_t *vk_shader_pv_gs(vkshader_t *fs);   // the generated pass-through geometry shader of a fragment shader with per-vertex inputs, NULL when the bundle has none
 vkshader_t *vk_shader_mesh_vs(vkshader_t *ms);   // the generated pass-through vertex shader of a mesh kernel (shader_meshwrap.mesh_vs_key), NULL when the bundle has none
+// Mark driver cache updates, including same-sized payload changes.
+void vk_pipeline_cache_changed(void);

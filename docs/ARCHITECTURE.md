@@ -37,6 +37,14 @@ A cross-bank hash collision compares the longer prefix, including the shorter
 bank's implicit zeros. The 1,024 CPU snapshots cost about 2.35 MiB of content;
 GPU-written segments must not enter this cache. This is a correctness guarantee,
 not a measured device performance result.
+The Vulkan pipeline cache is a writable driver product under `DM_ROOT`, separate
+from portable shader assets. Its envelope validates renderer ABI, device/driver
+identity, length and digest before driver creation. Legacy raw files retain the
+Vulkan version-one vendor/device/UUID check and migrate at the next save. Saves
+serialize through one I/O lock and fixed temporary name, publish atomically, and
+skip identical content by digest; incomplete snapshots and publication failures
+remain retryable. The legacy path cannot provide integrity guarantees absent from
+the old format.
 
 Vulkan pools that cannot use zero-copy keep a CPU snapshot of their synchronized GPU buffer. At completion only bytes changed by the GPU against that snapshot are merged back, preserving independent CPU writes made after synchronization, including writes in the same page. Mapped results are read through a 4 KB CPU buffer before byte comparisons, avoiding repeated byte reads from GPU-mapped memory. The existing cached/uncached pool coverage rules stay in place; a device-to-host memory barrier precedes completion. After a full completion merge, the next incremental sync refreshes only the snapshot blocks it uploads; initialization and untracked pools retain full snapshots. NVN CPU_UNCACHED pools merge only their tracked GPU-write ranges and keep the baseline complete after every merge, as they trusted those ranges before the baseline: an untracked GPU write stays in the GPU copy until a later tracked range over it merges it. A full snapshot at the next sync instead would copy the whole pool before every submission (Unicorn Overlord's 860 MB CPU_UNCACHED pool). The snapshot costs one extra byte of RAM per copied-pool byte and is freed with the pool; zero-copy pools need no snapshot. Games still have to synchronize CPU and GPU writes to the same bytes.
 

@@ -37,7 +37,8 @@ static int square_pipeline(void) {
     VkComputePipelineCreateInfo pi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, g_square.mod, "main", NULL},
         g_square.pl, VK_NULL_HANDLE, -1};
-    if ((r = vkCreateComputePipelines(V.dev, V.pcache, 1, &pi, NULL, &g_square.pipe))) { g_square.pipe = VK_NULL_HANDLE; goto fail; }
+    r = vkCreateComputePipelines(V.dev, V.pcache, 1, &pi, NULL, &g_square.pipe); vk_pipeline_cache_changed();   // (gfx_vk_pipeline_cache.inc: a new entry to save; upstream nx2android #213)
+    if (r) { g_square.pipe = VK_NULL_HANDLE; goto fail; }
     g_square.failed = 0; return 1;
 fail:
     VKRED_ONCE(342, "signed-square upscaler pipeline unavailable (%d); preserving native shader", r);

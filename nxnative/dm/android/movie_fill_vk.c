@@ -35,7 +35,8 @@ static int pipeline_get(void) {
     VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g.dsl, 1, &pr};
     if ((r = vkCreatePipelineLayout(V.dev, &pl, NULL, &g.pl))) { VKRED_ONCE(332, "movie fill: pipeline layout failed (%d)", r); return 0; }
     VkComputePipelineCreateInfo pi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, g.mod, "main", NULL}, g.pl, VK_NULL_HANDLE, -1};
-    if ((r = vkCreateComputePipelines(V.dev, V.pcache, 1, &pi, NULL, &g.pipe))) { VKRED_ONCE(333, "movie fill: compute pipeline failed (%d)", r); g.pipe = VK_NULL_HANDLE; return 0; }
+    r = vkCreateComputePipelines(V.dev, V.pcache, 1, &pi, NULL, &g.pipe); vk_pipeline_cache_changed();   // (gfx_vk_pipeline_cache.inc: a new entry to save; upstream nx2android #213)
+    if (r) { VKRED_ONCE(333, "movie fill: compute pipeline failed (%d)", r); g.pipe = VK_NULL_HANDLE; return 0; }
     g.failed = 0;
     return 1;
 }
