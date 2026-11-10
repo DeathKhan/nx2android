@@ -36,6 +36,8 @@ typedef struct { int n; uint64_t k[8][3]; } crumb_t;
 static int crumbs_on(void) { return 0; }
 static crumb_t *crumb_cur(void) { abort(); }
 static void crumb_mark(int n) { abort(); }
+static void crumb_dispatch(uint64_t key) { (void)key; }   /* gfx_vk_exec.c: a dispatch kept in the crumbs (host side only) */
+void vk_device_lost(VkResult r, const char *where) { (void)r; (void)where; }   /* gfx_vk_core.c: a lost device logged (VKCHK) */
 void vk_pass_ts(int a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {}
 int vk_readback_ranges(void) { return 0; }
 void vk_readback_unknown(void) { abort(); }
