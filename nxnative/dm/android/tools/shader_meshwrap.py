@@ -41,6 +41,8 @@ DEC_BLOCK, DEC_BUFFER_BLOCK, DEC_ARRAY_STRIDE, DEC_BUILTIN, DEC_LOCATION, DEC_BI
 BI_POSITION, BI_WORKGROUP_ID, BI_LOCAL_INDEX, BI_VERTEX_INDEX = 0, 26, 29, 42
 SC_INPUT, SC_UNIFORM, SC_OUTPUT, SC_WORKGROUP, SC_FUNCTION = 1, 2, 3, 4, 7
 OP_CONST_NULL = 46
+DEC_NO_CONTRACTION = 42
+FLOAT_ARITH = (127, 129, 131, 133, 136, 140, 141, 142, 148)   # FNegate FAdd FSub FMul FDiv FRem FMod VectorTimesScalar Dot
 GLSL_UMIN = 38
 TYPE_OPS = set(range(19, 40)) | {41, 42, 43, 44, 45, 46}
 
@@ -185,11 +187,23 @@ def init_locals(m):
     return n
 
 
+def no_contraction(m):
+    """Every float arithmetic result of the kernel is decorated NoContraction → how many. A game draws one geometry with two mesh shaders, a depth pre-pass and a
+    colour pass that tests depth EQUAL, so both must compute a vertex's position to the bit; a rasterising pipeline asks for that with an invariant position, a
+    compute kernel has no such output. The translator writes the shader's own fused multiply-adds as Fma, and what it left as a multiply and an add the Adreno
+    compiler fused in one kernel and not in the other: Ocarina of Time's grass (65a079a285d693a0 then eb021183bf9b0092) lost a few blades of the colour pass to
+    the depth test, which the lighting showed as saturated white specks (1-6 speck cells in each of 5 runs; 0 in 6 screenshots of 2 runs with this; GPU time alike)"""
+    ids = [a[1] for o, a in m.ins if o in FLOAT_ARITH]
+    for x in ids: m.decorate(x, DEC_NO_CONTRACTION)
+    return len(ids)
+
+
 def wrap(spv, i, lay, size):
     """The translated kernel (job stage_memory = lay, shared = size bytes; dmsh_meshstage.memory) wrapped as described above → SPIR-V"""
     _check(i)
     m = _Mod(spv); words = size // 4
     init_locals(m)
+    if i['kind'] == 'ms': no_contraction(m)
     # the kernel's entry point and its stage memory
     ep = next((a for o, a in m.ins if o == OP_ENTRY), None)
     if not ep or ep[0] != 5: raise ValueError('no GLCompute entry point')
