@@ -2491,7 +2491,8 @@ static void stage_storage_prepare(int st, vkshader_t *s) {
 // is an allocation and a vkUpdateDescriptorSets; the driver segment's copy is shared so that a set using it can match.
 enum { SETC = 8192, DRVC = 1024 };
 static struct { uint64_t h, epoch; VkDescriptorSetLayout l; VkDescriptorSet set; } g_setc[SETC];
-static struct { uint64_t h, epoch; VkBuffer b; VkDeviceSize o; } g_drvc[DRVC];
+// p points to immutable submission scratch; epoch must match before reading it. GPU-written segments must stay outside this cache.
+static struct { uint64_t h, epoch; VkBuffer b; VkDeviceSize o; const uint8_t *p; int compact; } g_drvc[DRVC];
 uint64_t g_set_hits, g_set_new, g_ns_set_build, g_ns_set_hash, g_ns_set_new;   // descriptor sets: reused, new; time collecting their descriptors, hashing them, allocating and writing new ones
 // DM_VK_SET_PROFILE=1: collect 64 complete presentation windows, then print the 32 costliest stage/shader pairs and turn off.
 // Existing collection/hash/new-set timers are reused. No per-binding clocks, guest-data reads or descriptor behavior changes.
@@ -2569,24 +2570,28 @@ static inline uint64_t fnv(uint64_t h, const void *p, size_t n) {
 }
 // Graphics c0 contains only one stage's 16 address/uint32-size entries, fixed point-size data and base instance.
 // Identify those exact bytes before constructing the 4 KB segment. Compute c0 and all other banks keep their full-byte key.
-static uint64_t drv_graphics_key(int st) {
-    struct { uint64_t address[16]; uint32_t size[16], base_instance, table; } key = {0};
+typedef struct { uint64_t address[16]; uint32_t size[16], base_instance, table; } drv_gkey;
+static drv_gkey g_drvk[DRVC];   // the compact entries' key fields, compared on a hit as the full path compares the bytes (upstream nx2android 88f75952c)
+static uint64_t drv_graphics_key(int st, drv_gkey *kp) {
+    drv_gkey key; memset(&key, 0, sizeof key);
     key.table = st == 0 ? DMSH_C0_SSBO_VS : st == 1 ? DMSH_C0_SSBO_PS : DMSH_C0_SSBO_GS;
     key.base_instance = g_draw_binst;
     for (int r = 0; r < 16; r++) { key.address[r] = S.ssbo[st][r].addr; key.size[r] = (uint32_t)S.ssbo[st][r].size; }
-    return fnv(0x6772617068696330ull, &key, sizeof key); // separate domain from the full-byte bank hashes
+    *kp = key; return fnv(0x6772617068696330ull, &key, sizeof key); // separate domain from the full-byte bank hashes
 }
 static void drv_shared(int st, int bank, VkBuffer *buf, VkDeviceSize *off, int dyn) {   // one copy per distinct content in the submission
     uint8_t d[0x1000]; int compact = g_drv_compact && bank == 0 && st >= 0 && st < 3;
-    uint64_t h;
-    if (compact) h = drv_graphics_key(st);
+    uint64_t h; drv_gkey gk;
+    if (compact) h = drv_graphics_key(st, &gk);
     else { drv_segment(st, bank, d, dyn);
         h = fnv(0xcbf29ce484222325ull, d, bank == 24 ? 0x100 : bank ? 0x968 : DMSH_C0_SSBO_MS + 16 * DMSH_C0_SSBO_SLOTS) ^ (uint64_t)bank << 56; }   // (bank 0 through the mesh stage table, the last thing drv_segment writes: at 0x648 the task and mesh kernels, whose tables are at 0x670 / 0x770, all hashed alike and shared the first one built)
     unsigned k = (unsigned)(h % DRVC);
-    if (g_drvc[k].epoch == g_set_epoch && g_drvc[k].h == h && !g_x_nodrvc) { *buf = g_drvc[k].b; *off = g_drvc[k].o; return; }
+    // a hash match is checked against the content: the key fields (compact) or the built bytes in the submission's scratch copy (p: valid while the epoch matches)
+    if (g_drvc[k].epoch == g_set_epoch && g_drvc[k].h == h && !g_x_nodrvc && g_drvc[k].compact == compact &&
+        (compact ? !memcmp(&g_drvk[k], &gk, sizeof gk) : !memcmp(g_drvc[k].p, d, sizeof d))) { *buf = g_drvc[k].b; *off = g_drvc[k].o; return; }
     if (compact) drv_segment(st, bank, d, dyn);
     uint8_t *p = vk_scratch(0x1000, V.props.limits.minUniformBufferOffsetAlignment, buf, off); memcpy(p, d, sizeof d);
-    g_drvc[k].h = h; g_drvc[k].epoch = g_set_epoch; g_drvc[k].b = *buf; g_drvc[k].o = *off;
+    g_drvc[k].h = h; g_drvc[k].epoch = g_set_epoch; g_drvc[k].b = *buf; g_drvc[k].o = *off; g_drvc[k].p = p; g_drvc[k].compact = compact; if (compact) g_drvk[k] = gk;
 }
 // A binding that runs past its chunk's end into the pool's next chunk (pools over ZC_CHUNK come in chunks, each its own buffer, and the replay looks a binding up by its first byte):
 // the GPU would read past the buffer, and with robustBufferAccess off it saw zeros. Found with smaller chunks in a fork: Pokemon Pokopia's per-frame constants, a 64 MB ring, crossed
