@@ -382,6 +382,31 @@ int main(void) {
             check(first_len == want[c] && m.s.k == 2 && m.s.failed == 1, b);
         }
     }
+    {   // A hold that held, then a longer one where the GPU's clock stretches the work (nvn_fstep.h kheld): Ocarina of Time on the Odin 3, 20-22 ms at hold 2, 26-31 ms at hold 3
+        // after one heavy moment. The frames come back to hold 2; a scene that really got heavier tries it three times, then stays at hold 3
+        for (int heavier = 0; heavier < 2; heavier++) {
+            sim m = {0}; run(&m, 60, 0.5, 1, 3, 0);
+            for (int i = 0; i < 400; i++) run(&m, 1, m.s.k == 1 ? 1.25 : 1.25, 1, 3, 0);   // the scene: 21 ms, so hold 2
+            int at2 = m.s.k == 2; run(&m, 3, 3.5, 1, 3, 0); int at3 = m.s.k == 3;          // one heavy moment
+            for (int i = 0; i < 3000; i++) { double w = heavier ? 2.3 : m.s.k == 3 ? 1.75 : 1.25; run(&m, 1, w, 1, 3, 0); }
+            if (!heavier) { snprintf(b, sizeof b, "a stretched GPU at hold 3 comes back to the hold 2 that held (k %d, failed %llu)", m.s.k, (unsigned long long)m.s.failed);
+                            check(at2 && at3 && m.s.k == 2 && m.s.failed == 0, b); }
+            else { snprintf(b, sizeof b, "  a scene that got heavier: three trials, then hold 3 stays (k %d, failed %llu)", m.s.k, (unsigned long long)m.s.failed);
+                   check(at2 && at3 && m.s.k == 3 && m.s.failed == 3, b); }
+        }
+    }
+    {   // The Odin 3 at hold 3 (FSTEP_MISS, FSTEP_SETTLE): frames of 1.2 vsyncs with a 1.86 every 12th, and a trial's first three frames shown at the old pace (3 vsyncs)
+        sim m = {0}; run(&m, 60, 0.5, 1, 3, 0); run(&m, 3, 4.4, 1, 3, 0);   // a load's heavy frames: hold 3
+        int at3 = m.s.k == 3, waited = -1, held2 = 0;
+        for (int i = 0; i < 1500; i++) {
+            int k0 = m.s.k; double w = m.s.k == 3 ? (i % 12 == 0 ? 1.86 : 1.2) : 1.2;
+            if (k0 == 2 && held2 < 3) { w = 3.0; held2++; }   // the trial's first frames still come at hold 3's pace
+            run(&m, 1, w, 1, 3, 0);
+            if (waited < 0 && k0 == 3 && m.s.k == 2) waited = i;
+        }
+        snprintf(b, sizeof b, "hold 3 with an odd heavier frame: a trial to 2 within %d frames, held through 3 slow first frames (k %d, failed %llu)", waited, m.s.k, (unsigned long long)m.s.failed);
+        check(at3 && waited >= 0 && waited < 120 && m.s.k == 2 && m.s.failed == 0, b);
+    }
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;
 }
