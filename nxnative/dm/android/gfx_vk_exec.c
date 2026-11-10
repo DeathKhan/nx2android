@@ -159,6 +159,7 @@ static int g_fdz = 1;  // DM_VK_FDZ (live): fragment-depth variants for draws on
 static uint64_t g_fdz_fs;   // DM_VK_FDZ_FS=<hex key> (live diagnostic): test late depth for this fragment shader, without a prior depth-writing pass
 static uint64_t g_depth_func_fs; static int g_depth_func;   // DM_VK_DEPTH_FUNC_FS=<hex key>:<NVN func 1..8> (live diagnostic); preserves depth enable/write
 enum { LRZ_READ = 2, LRZ_SWITCH = 4, LRZ_CUT = 8, LRZ_ALL = 14, LRZ_CUT_RD = 16, LRZ_CORNER = 32 };   /* LRZ_CUT_RD: only read at a cut; LRZ_CORNER: the last texel, not the first (tests) */   // DM_VK_LRZ_TOUCH bits: the read before a load pass, the write-back on a depth switch, the write-back at a cut
+static int g_x_nosetc_bits;   // DM_VK_X_NOSETC bits (bisection): 2 no set reuse for the mesh kernels, 4 none for the draw stages, 8 no table ring
 static int g_x_nosetc, g_x_nodrvc, g_x_landcut, g_x_nokeep, g_x_nobc, g_x_cutany, g_lrz_touch, g_xfb_on = 1, g_x_nogs, g_spv_alt, g_x_nodispbar; int g_x_noshc;   // g_xfb_on: DM_VK_XFB=0 captures no transform feedback (A/B)
 static int g_drv_compact = 1, g_buffer_memo = 1; // DM_VK_DRV_COMPACT / DM_VK_BUFFER_MEMO=0: independent live A/B
 static int g_x_nosetmemo, g_x_setverify;   // DM_VK_X_NOSETMEMO=1 (live, A/B): no per-stage set memo; DM_VK_X_SETVERIFY=1 (live): one memo hit in 64 checked (see stage_set)
@@ -441,7 +442,7 @@ static void x_read(void) { light_diag_poll(); original_index_read(); set_profile
     { const char *tf = getenv("DM_VK_TRACE_FRAME"); snprintf(g_x_traceframe, sizeof g_x_traceframe, "%s", tf && strcmp(tf, "0") ? tf : ""); }
     { const char *tz = getenv("DM_VK_TRACE_SIZE"); snprintf(g_x_tracesize, sizeof g_x_tracesize, "%s", tz ? tz : ""); } const char *e; g_x_nobar = (e = getenv("DM_VK_X_NOBAR")) && atoi(e); g_x_depth = (e = getenv("DM_VK_X_DEPTH")) && atoi(e); g_x_color = (e = getenv("DM_VK_X_COLOR")) && atoi(e);
     g_drv_compact = !((e = getenv("DM_VK_DRV_COMPACT")) && !atoi(e)); g_buffer_memo = !((e = getenv("DM_VK_BUFFER_MEMO")) && !atoi(e));
-    g_x_nosetc = (e = getenv("DM_VK_X_NOSETC")) && atoi(e); g_x_nodrvc = (e = getenv("DM_VK_X_NODRVC")) && atoi(e); g_x_landcut = (e = getenv("DM_VK_X_LANDCUT")) && atoi(e);
+    g_x_nosetc = (e = getenv("DM_VK_X_NOSETC")) && atoi(e) == 1; g_x_nosetc_bits = e ? atoi(e) & ~1 : 0; g_x_nodrvc = (e = getenv("DM_VK_X_NODRVC")) && atoi(e); g_x_landcut = (e = getenv("DM_VK_X_LANDCUT")) && atoi(e);
     g_x_nodispbar = (e = getenv("DM_VK_X_NODISPBAR")) && atoi(e);
     g_ubo_bounds = !((e = getenv("DM_VK_UBO_BOUNDS")) && !atoi(e));
     g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_spv_key = (e = getenv("DM_VK_SPV_KEY")) ? strtoull(e, NULL, 16) : 0; g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
@@ -2830,7 +2831,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
         else if (x->pTexelBufferView) h = fnv(h, x->pTexelBufferView, sizeof *x->pTexelBufferView);
     }
     unsigned k = (unsigned)(h % SETC); uint64_t tb2 = tick(); g_ns_set_hash += tb2 - tb1; if (sp) sp->hash_ns += tb2 - tb1;
-    if (g_setc[k].epoch == g_set_epoch && g_setc[k].h == h && g_setc[k].l == s->dsl && !g_tracing && !g_x_nosetc) { g_set_hits++; if (sp) sp->hits++; set = g_setc[k].set; }
+    if (g_setc[k].epoch == g_set_epoch && g_setc[k].h == h && g_setc[k].l == s->dsl && !g_tracing && !g_x_nosetc && !(g_x_nosetc_bits & (st >= 3 ? 2 : 4))) { g_set_hits++; if (sp) sp->hits++; set = g_setc[k].set; }
     else { set = vk_alloc_set(s->dsl); g_set_new++; if (sp) sp->fresh++;
         for (uint32_t i = 0; i < nw; i++) w[i].dstSet = set;
         vkUpdateDescriptorSets(V.dev, nw, w, 0, NULL);
@@ -3018,20 +3019,23 @@ static void tbl_trace(unsigned c, int st, const vkshader_t *s, int reused) {
 // (50-60 ms) a frame, and a fresh 68 MB descriptor pool for each. Instead RING_N sets live for the whole run, each with every pool kind and the samplers: a set the GPU is done
 // with (its last submission's fence completed, and not bound in the one being recorded) is brought up to date by rewriting only the IDs the registration log names after its
 // position (gfx_vk_tex.c vk_reglog_take, the entries visible to the replaying job), and written whole only when an image went or an ID got contents (the view drop, orphan and
-// first-use generations), pool memory changed (vk_pool_gen), the pool bases changed, the log wrapped or the replay went back to an earlier job. IDs that read the dummy for lack of
+// first-use generations), pool memory changed (vk_pool_gen), the pool bases changed, the log wrapped or the replay went back to an earlier job. An image whose views went
+// (eviction; gfx_vk_tex.c's drop log) has only the IDs that held it written again: Ocarina of Time places each frame's render targets at new offsets of one pool, so images
+// go nearly every frame, and every one had the set after it written whole (21 ms on the Odin 3, 4 x 65,536 entries). IDs that read the dummy for lack of
 // contents or of first-use budget are retried by later patches, RING_RETRY at a time. Each take marks the images the set holds as used by the submission (eviction waits for it)
-enum { RING_N = 6, RING_TIDS = 2048, RING_RETRY = 256 };
-typedef struct { VkDescriptorSet set; uint64_t fence, logpos, fullgen, sampgen, sampseq, jobpos; uint32_t poolgen; int tex_base, samp_base, valid; vkimg_t **img; size_t nimg, capimg; int *pend; size_t npend, cappend, pcur; } ring_slot;
+enum { RING_N = 6, RING_TIDS = 2048, RING_RETRY = 256, RING_DROPS = 1024 };
+typedef struct { VkDescriptorSet set; uint64_t fence, logpos, fullgen, sampgen, sampseq, jobpos, dropseq, firstgen; uint32_t poolgen; int tex_base, samp_base, valid; vkimg_t **img; int *itid; size_t nimg, capimg; int *pend; size_t npend, cappend, pcur; } ring_slot;
 static ring_slot g_ring[RING_N]; static int g_ring_on = -1, g_ring_cur = -1;
 uint64_t vk_reglog_visible_end(uint64_t before); uint64_t vk_reglog_head(void); int vk_reglog_pending(uint64_t p, uint64_t before); uint64_t vk_reglog_take(uint64_t from, uint64_t before, int *tids, int max, int *n);
 int vk_alloc_sets_owned(VkDescriptorSetLayout l, int n, VkDescriptorSet *out); unsigned vk_pool_kinds(void); uint64_t nvn_replaying_job(void);
 extern uint64_t g_tex_gen_why[4], g_samp_gen;
-static uint64_t ring_fullgen(void) { return g_tex_gen_why[0] + g_tex_gen_why[1] + g_tex_gen_why[2]; }
-static void ring_img(ring_slot *r, vkimg_t *im) {
+uint64_t vk_droplog_seq(void); int vk_droplog_take(uint64_t from, const void **out, int max, uint64_t *to);
+static uint64_t ring_fullgen(void) { return g_tex_gen_why[0]; }   // (view drops: the drop log; first uses: the waiting IDs)
+static void ring_img(ring_slot *r, vkimg_t *im, int tid) {
     if (!im) return;
-    if (r->nimg && r->img[r->nimg - 1] == im) return;   // (the same texture through each kind)
-    if (r->nimg == r->capimg) { r->capimg = r->capimg ? 2 * r->capimg : 4096; r->img = realloc(r->img, r->capimg * sizeof *r->img); }
-    r->img[r->nimg++] = im;
+    if (r->nimg && r->img[r->nimg - 1] == im && r->itid[r->nimg - 1] == tid) return;   // (the same texture through each kind)
+    if (r->nimg == r->capimg) { r->capimg = r->capimg ? 2 * r->capimg : 4096; r->img = realloc(r->img, r->capimg * sizeof *r->img); r->itid = realloc(r->itid, r->capimg * sizeof *r->itid); }
+    r->img[r->nimg] = im; r->itid[r->nimg++] = tid;
 }
 static void ring_pend(ring_slot *r, int tid) {
     if (r->npend == r->cappend) { r->cappend = r->cappend ? 2 * r->cappend : 1024; r->pend = realloc(r->pend, r->cappend * sizeof *r->pend); }
@@ -3057,8 +3061,8 @@ static int ring_entry(int st, ring_slot *r, int ps, int k, VkDescriptorImageInfo
     if (ok == 1) { if (*lazy_n < 64 && *lazy_b < (64u << 20)) { (*lazy_n)++; *lazy_b += t->L.size; } else return 1; }
     if (!ok) return 1;
     tex_desc_for(st, &vb, hh, d, 0); d->sampler = VK_NULL_HANDLE;
-    if (!d->imageView) { *d = dummy; return 0; }
-    ring_img(r, g_desc_im); return 0;
+    if (!d->imageView) { *d = dummy; return 1; }   // (no image yet: waits like one without contents)
+    ring_img(r, g_desc_im, k + g_pool_tex_base); return 0;
 }
 static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
     // Global sampler generations describe the newest registration, while queued jobs
@@ -3072,7 +3076,7 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
     if (!g_ring_on || !(poolmask & ((1u << POOL_TEX_SLOTS) - 1))) return VK_NULL_HANDLE;
     uint64_t t0 = tick(), f = mtl_last_fence() + 1, job = nvn_replaying_job(), jp = job ? job : UINT64_MAX, fg = ring_fullgen(), sg = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE); uint32_t pg = vk_pool_gen();
     if (g_ring_cur >= 0) { ring_slot *r = &g_ring[g_ring_cur];
-        if (r->valid && r->fence == f && r->fullgen == fg && r->sampgen == sg && r->sampseq == sampseq && r->poolgen == pg && r->tex_base == g_pool_tex_base && r->samp_base == g_pool_samp_base && r->jobpos <= jp && !vk_reglog_pending(r->logpos, jp)) {
+        if (r->valid && r->fence == f && r->fullgen == fg && r->sampgen == sg && r->sampseq == sampseq && r->poolgen == pg && r->tex_base == g_pool_tex_base && r->samp_base == g_pool_samp_base && r->jobpos <= jp && r->dropseq == vk_droplog_seq() && r->firstgen == g_tex_gen_why[1] && !vk_reglog_pending(r->logpos, jp)) {
             g_ring_hits++; g_ring_ns += tick() - t0; return r->set; } }
     // a set the GPU is done with and the recording command buffer does not hold: the most recently written one (fewest IDs to take again)
     uint64_t done = vk_fence_done(); int pick = -1;
@@ -3081,10 +3085,19 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
     if (pick < 0) { g_ring_none++; return VK_NULL_HANDLE; }
     ring_slot *r = &g_ring[pick]; const int NP = vk_pool_n(), NS = vk_pool_samp_n(); const unsigned kinds = vk_pool_kinds();
     static VkDescriptorImageInfo *dd; static VkWriteDescriptorSet *ww; static int *tids;
-    if (!dd) { dd = calloc((size_t)POOL_TEX_SLOTS * NP + NS + (size_t)(RING_TIDS + RING_RETRY) * POOL_TEX_SLOTS, sizeof *dd); ww = calloc((size_t)(RING_TIDS + RING_RETRY) * POOL_TEX_SLOTS + 8, sizeof *ww); tids = calloc(RING_TIDS, sizeof *tids); }
+    if (!dd) { dd = calloc((size_t)POOL_TEX_SLOTS * NP + NS + (size_t)(RING_TIDS + RING_RETRY) * POOL_TEX_SLOTS, sizeof *dd); ww = calloc((size_t)(RING_TIDS + RING_RETRY + RING_DROPS) * POOL_TEX_SLOTS + 8, sizeof *ww); tids = calloc(RING_TIDS + RING_DROPS, sizeof *tids); }
     int full = !r->valid || r->fullgen != fg || r->poolgen != pg || r->tex_base != g_pool_tex_base || r->samp_base != g_pool_samp_base || r->jobpos > jp || r->nimg > 8u * (size_t)NP;
     int lazy_n = 0; uint64_t lazy_b = 0; uint32_t nw = 0; uint64_t head = vk_reglog_head(), pos = r->logpos; int ntid = 0;
     if (!full) { pos = vk_reglog_take(r->logpos, jp, tids, RING_TIDS, &ntid); if (pos == UINT64_MAX || (ntid == RING_TIDS && vk_reglog_pending(pos, jp))) full = 1; }
+    // the images that went since this set was written: their IDs again, and out of the list before anything reads it (taken before the entries are written: one that
+    // goes while they are is found by the next set's take)
+    static const void *gone[RING_DROPS]; uint64_t dseq; int ngone = vk_droplog_take(r->dropseq, gone, RING_DROPS, &dseq); if (ngone < 0) full = 1;
+    if (!full && ngone) for (size_t i = 0; i < r->nimg; ) { int hit = 0; for (int q = 0; q < ngone && !hit; q++) hit = r->img[i] == gone[q];
+        if (!hit) { i++; continue; }
+        if (ntid == RING_TIDS + RING_DROPS) { full = 1; break; }
+        tids[ntid++] = r->itid[i]; r->nimg--; r->img[i] = r->img[r->nimg]; r->itid[i] = r->itid[r->nimg]; }
+    // an image got its contents at a real bind since (a first use): every ID that waits on the dummy is tried again now, not RING_RETRY of them
+    uint64_t fu = g_tex_gen_why[1]; int all = !full && r->firstgen != fu; if (all && r->npend > (size_t)(RING_TIDS + RING_DROPS - ntid)) full = 1;
     vk_tex_pool_fill(1);
     if (full) {   // every entry, as tbl_set's fill
         r->nimg = 0; r->npend = 0; r->pcur = 0; pos = vk_reglog_visible_end(jp); (void)head;   // later jobs' registrations stay in the log for the next patch
@@ -3100,8 +3113,9 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
         g_ring_full++;
     } else {   // the IDs logged since, and some of those left the dummy
         VkDescriptorImageInfo *d = dd; int nret = 0;
-        if (r->npend && ntid < RING_TIDS) { size_t room = (size_t)(RING_TIDS - ntid), take = r->npend < RING_RETRY ? r->npend : RING_RETRY; if (take > room) take = room;   // retried: removed from the list, added again by ring_entry's answer below
-            for (size_t i = 0; i < take && ntid < RING_TIDS + RING_RETRY; i++) { size_t j = (r->pcur + i) % r->npend; if (ntid < RING_TIDS) tids[ntid++] = r->pend[j]; nret++; }
+        const int cap = all ? RING_TIDS + RING_DROPS : RING_TIDS;
+        if (r->npend && ntid < cap) { size_t room = (size_t)(cap - ntid), take = all || r->npend < RING_RETRY ? r->npend : RING_RETRY; if (take > room) take = room;   // retried: removed from the list, added again by ring_entry's answer below
+            for (size_t i = 0; i < take; i++) { size_t j = (r->pcur + i) % r->npend; if (ntid < cap) tids[ntid++] = r->pend[j]; nret++; }
             if (take == r->npend) r->npend = 0; else { size_t keep = 0; int *np_ = malloc(r->npend * sizeof *np_);   // the ones not taken this time, in order after the cursor
                 for (size_t i = take; i < r->npend; i++) np_[keep++] = r->pend[(r->pcur + i) % r->npend]; memcpy(r->pend, np_, keep * sizeof *np_); free(np_); r->npend = keep; r->pcur = 0; } }
         for (int i = 0; i < ntid; i++) { int k = tids[i] - g_pool_tex_base; if (k < 1 || k >= NP) continue; int again = 0;
@@ -3118,7 +3132,7 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
         for (int k = 1; k < NS; k++) { VkSampler sm = k < hw && !(g_pdum_kinds & 16) ? vk_samp_by_id(g_pool_samp_base + k) : VK_NULL_HANDLE; d[k] = (VkDescriptorImageInfo){sm ? sm : vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; }
         ww[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, r->set, POOL_SAMP_B, 0, (uint32_t)NS, VK_DESCRIPTOR_TYPE_SAMPLER, d, NULL, NULL}; }
     if (nw) vkUpdateDescriptorSets(V.dev, nw, ww, 0, NULL);
-    r->valid = 1; r->fullgen = fg; r->sampgen = sg; r->sampseq = sampseq; r->poolgen = pg; r->tex_base = g_pool_tex_base; r->samp_base = g_pool_samp_base; r->jobpos = jp; r->logpos = pos; r->fence = f;
+    r->valid = 1; r->fullgen = fg; r->sampgen = sg; r->sampseq = sampseq; r->poolgen = pg; r->tex_base = g_pool_tex_base; r->samp_base = g_pool_samp_base; r->jobpos = jp; r->logpos = pos; r->fence = f; r->dropseq = dseq; r->firstgen = fu;
     for (size_t i = 0; i < r->nimg; i++) r->img[i]->last_use = f;   // (full rewrites drop the list; a view drop or orphan forces one before a freed image could be reached)
     g_ring_cur = pick; g_ring_ns += tick() - t0;
     return r->set;
@@ -3127,7 +3141,7 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
     uint64_t t0 = tick(); const int N = vk_tbl_n(), NP = vk_pool_n(), NS = vk_pool_samp_n(); const int ntbl = s && s->ntbl;
     static uint32_t words[2 * 65536 / 8]; static VkDescriptorImageInfo *ii;   // the handles read (8 bytes each), and TBL_SLOTS x N + POOL_TEX_SLOTS x NP + NS descriptors
     const p_bind_buf *u = ntbl && s->tbl_reg >= 0 && s->tbl_reg < 16 ? &S.ubo[st][s->tbl_reg] : NULL; uint32_t n = 0;
-    if (!ntbl && poolmask && !g_x_nosetc && !g_var_now) { VkDescriptorSet rs = tbl_ring(st, poolmask); if (rs) { g_ns_tbl += tick() - t0; g_tbl_binds++; return rs; } }
+    if (!ntbl && poolmask && !g_x_nosetc && !(g_x_nosetc_bits & 8) && !g_var_now) { VkDescriptorSet rs = tbl_ring(st, poolmask); if (rs) { g_ns_tbl += tick() - t0; g_tbl_binds++; return rs; } }
     if (u && u->addr && s->tbl_off >= 0) { uint64_t a = u->addr + (uint64_t)s->tbl_off, size = u->size ? u->size : 65536; if (size > 65536) size = 65536;
         vkpool_t *p = vk_pool_peek(a, 8);
         if (p && size > (uint64_t)s->tbl_off) { uint64_t bytes = size - (uint64_t)s->tbl_off; if (a + bytes > p->end) bytes = p->end > a ? p->end - a : 0;
@@ -4592,8 +4606,17 @@ static struct { VkBuffer b; VkDeviceMemory m; VkDeviceSize size, used; uint64_t 
 static struct { VkPipeline launch, prep; VkPipelineLayout pl; VkDescriptorSetLayout dl; int bad; } g_mesh_k;
 static uint64_t g_mesh_draws, g_mesh_skipped;
 static int mesh_emu_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_MESH_EMU"); on = !(e && !atoi(e)); if (!on) VKLOG("DM_VK_MESH_EMU=0: task / mesh draws are skipped"); } return on; }
+static void *g_mesh_alloc_p; static int g_mesh_dump_on;   // DM_VK_MESH_DUMP: the last allocation's host pointer (scratch only), the arena bypassed
+// A draw's outputs are read only by the draw recorded right after its kernels, in a pass that ends before the next mesh draw's kernels are recorded (vk_end_pass_land at
+// mesh_draw_one's start; commands run in order). So when a draw's buffers do not fit in what is left of the arena they start over at its beginning, where earlier draws'
+// outputs are finished with. Before this the rest of the submission's mesh draws took scratch at full capacity each (Ocarina of Time: 500 MB a submission slot, 2.5 GB in all)
+static uint64_t g_mesh_wraps;
+static void mesh_reserve(VkDeviceSize total) {
+    if (g_mesh_arena.epoch != g_set_epoch || !g_mesh_arena.b || total > g_mesh_arena.size || g_mesh_arena.used + total <= g_mesh_arena.size) return;
+    g_mesh_arena.used = 0; if (!g_mesh_wraps++) VKLOG("mesh emulation: the arena (%llu MB) is reused within a submission from here on", (unsigned long long)(g_mesh_arena.size >> 20));
+}
 static mesh_buf mesh_alloc(VkDeviceSize n) {   // GPU-only memory for this draw: the arena, else this submission's scratch
-    mesh_buf r; n = (n + 255) & ~255ull; if (!n) n = 256;
+    mesh_buf r; g_mesh_alloc_p = NULL; n = (n + 255) & ~255ull; if (!n) n = 256;
     if (g_mesh_arena.epoch != g_set_epoch) { g_mesh_arena.epoch = g_set_epoch; g_mesh_arena.used = 0; }
     if (!g_mesh_arena.b && !g_mesh_arena.bad) {
         const char *e = getenv("DM_VK_MESH_ARENA_MB"); VkDeviceSize mb = e && atoi(e) > 0 ? (VkDeviceSize)atoi(e) : 48;
@@ -4605,9 +4628,9 @@ static mesh_buf mesh_alloc(VkDeviceSize n) {   // GPU-only memory for this draw:
             else { g_mesh_arena.size = mb << 20; VKLOG("mesh emulation: %llu MB arena for the kernels' outputs", (unsigned long long)mb); } }
         if (g_mesh_arena.bad) VKLOG("[RED] mesh emulation: no arena (vkCreateBuffer / vkAllocateMemory failed); the outputs go to the submission's scratch memory");
     }
-    if (g_mesh_arena.b && g_mesh_arena.used + n <= g_mesh_arena.size) { r.b = g_mesh_arena.b; r.off = g_mesh_arena.used; r.len = n; g_mesh_arena.used += n; return r; }
+    if (!g_mesh_dump_on && g_mesh_arena.b && g_mesh_arena.used + n <= g_mesh_arena.size) { r.b = g_mesh_arena.b; r.off = g_mesh_arena.used; r.len = n; g_mesh_arena.used += n; return r; }
     if (g_mesh_arena.b && !g_mesh_arena.noted++) VKLOG("mesh emulation: the arena (%llu MB) is full this submission; the rest of its mesh draws use scratch memory (DM_VK_MESH_ARENA_MB)", (unsigned long long)(g_mesh_arena.size >> 20));
-    vk_scratch(n, 256, &r.b, &r.off); r.len = n; return r;
+    g_mesh_alloc_p = vk_scratch(n, 256, &r.b, &r.off); r.len = n; return r;
 }
 static int mesh_kernels(void) {   // meshlaunch.comp and meshprep.comp: three storage buffers, 32 bytes of push constants
     if (g_mesh_k.launch || g_mesh_k.bad) return !g_mesh_k.bad;
@@ -4652,14 +4675,20 @@ static int mesh_kernel(VkCommandBuffer cb, int st, vkshader_t *k, const mesh_buf
     vk_img_barrier_all(cb); return 1;
 }
 // A task-less indirect mesh draw's count is written by the GPU and has no bound here: its workgroups were capped at DM_VK_MESH_MAX (2048) and the rest dropped
-// without a word (Ocarina of Time's grass carpet in Link's house: the ground under it never drawn, the clear colour showing through as white). It is drawn as
-// DM_VK_MESH_BATCHES (start-up, default 4) slices of up to DM_VK_MESH_MAX workgroups each, meshprep.comp giving each slice its part of the count (an empty one
-// dispatches and draws nothing)
+// without a word. It is drawn as slices of up to DM_VK_MESH_MAX workgroups each, meshprep.comp giving each slice its part of the count. Every slice has buffers
+// of the full capacity (4 slices of every such draw took Ocarina of Time's world load over the Odin's memory), so the number of slices follows the count the
+// record holds now, which is the one the GPU wrote for an earlier frame (the record is pool memory, mapped here), with half as much again for growth, up to
+// DM_VK_MESH_BATCHES (start-up, default 8). The log has each new highest count
 static void mesh_draw_one(const p_draw *d, uint32_t batch);
 static void mesh_draw(const p_draw *d) {
-    static uint32_t batches; if (!batches) { const char *e = getenv("DM_VK_MESH_BATCHES"); batches = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 4; if (batches > 64) batches = 64; }
+    static uint32_t batches, cap_m, top; if (!batches) { const char *e = getenv("DM_VK_MESH_BATCHES"); batches = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 8; if (batches > 64) batches = 64;
+        e = getenv("DM_VK_MESH_MAX"); cap_m = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 2048; }
     vkshader_t *ts = S.sh[3]; int taskless = !(ts && ts->mesh_kind == 1 && S.sh[4] && S.sh[4]->mesh_task);
-    uint32_t n = d->ind && taskless ? batches : 1;
+    uint32_t n = 1;
+    if (d->ind && taskless) { VkBuffer rb; VkDeviceSize ro; uint32_t seen = vk_buf_at(d->ind, 8, &rb, &ro) ? *(const volatile uint32_t *)(uintptr_t)d->ind : 0;
+        uint64_t want = ((uint64_t)seen + seen / 2 + cap_m - 1) / cap_m; n = want < 1 ? 1 : want > batches ? batches : (uint32_t)want;
+        if (seen > top) { top = seen; VKLOG("mesh draw without a task shader: indirect count %u (capacity %u a slice, %u slices%s); mesh %016llx fragment %016llx", seen, cap_m, n,
+            want > batches ? ", NOT ENOUGH: DM_VK_MESH_BATCHES" : "", S.sh[4] ? (unsigned long long)S.sh[4]->key : 0ull, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull); } }
     for (uint32_t b = 0; b < n; b++) mesh_draw_one(d, b);
 }
 static void mesh_draw_one(const p_draw *d, uint32_t batch) {
@@ -4681,8 +4710,32 @@ static void mesh_draw_one(const p_draw *d, uint32_t batch) {
     VkCommandBuffer cb = vk_cmd();
     // the buffers: control words (host-written; an indirect draw's record copied in by meshprep.comp), the task payloads, the launch list, the vertices and indices
     mesh_buf ctl; uint32_t *cw = vk_scratch(64, 256, &ctl.b, &ctl.off); ctl.len = 64; memset(cw, 0, 64); cw[0] = first; cw[1] = ts ? ntask : nmesh;
-    mesh_buf taskout = mesh_alloc(ts ? (VkDeviceSize)ntask * pay * 4 : 256), launch = mesh_alloc(MESH_HDR_BYTES + (VkDeviceSize)nmesh * 8);
-    mesh_buf vtx = mesh_alloc((VkDeviceSize)nmesh * ms->mesh_max_v * (ms->mesh_ncomp ? ms->mesh_ncomp : 1) * 4), idx = mesh_alloc((VkDeviceSize)nmesh * ipw * 4);
+    // DM_VK_MESH_DUMP=n (live): the next n draws with a task shader keep their buffers in host-visible scratch; three submissions later the log has what the kernels wrote
+    static struct { uint64_t epoch, mk, tk, frame; int pass; uint32_t ntask, nmesh, pay, ncomp, maxv, ipw; const uint32_t *t, *l, *v, *i; } md[16]; static int nmd, md_left;
+    { const char *e = getenv("DM_VK_MESH_DUMP"); if (e && atoi(e) > 0 && !md_left && !nmd) { md_left = atoi(e) > 16 ? 16 : atoi(e); setenv("DM_VK_MESH_DUMP", "0", 1); } }
+    for (int q = 0; q < nmd; q++) if (md[q].epoch && vk_fence_done() >= md[q].epoch) {   // (epoch: the fence of the submission that ran the kernels)
+        const uint32_t *L = md[q].l, *T = md[q].t; const float *Vf = (const float *)md[q].v; uint32_t tot = L[0] < md[q].nmesh ? L[0] : md[q].nmesh, nz = 0, sum = 0, mx = 0;
+        for (uint32_t t = 0; t < md[q].ntask; t++) { uint32_t c = T[t * md[q].pay + 1]; if (c) nz++; sum += c; if (c > mx) mx = c; }
+        VKLOG("mesh dump: task %016llx mesh %016llx pass %d: header %u %u %u %u | %u %u %u %u %u | dropped %u; payload %u words, %u of %u tasks launch (sum %u, most %u); payload[0] %08x %08x %08x %08x %08x %08x %08x %08x",
+              (unsigned long long)md[q].tk, (unsigned long long)md[q].mk, md[q].pass, L[0], L[1], L[2], L[3], L[4], L[5], L[6], L[7], L[8], L[9], md[q].pay, nz, md[q].ntask, sum, mx, T[0], T[1], T[2], T[3], T[4], T[5], T[6], T[7]);
+        uint32_t nv = tot * md[q].maxv, w0 = 0, nan = 0, in = 0, zero = 0; float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+        for (uint32_t k = 0; k < nv; k++) { const float *P = Vf + (size_t)k * md[q].ncomp; if (P[0] != P[0] || P[1] != P[1] || P[3] != P[3]) { nan++; continue; } if (P[0] == 0 && P[1] == 0 && P[2] == 0 && P[3] == 0) { zero++; continue; } if (P[3] <= 0) { w0++; continue; }
+            float x = P[0] / P[3], y = P[1] / P[3], z = P[2] / P[3]; if (x >= -1 && x <= 1 && y >= -1 && y <= 1) in++; if (x < lo[0]) lo[0] = x; if (x > hi[0]) hi[0] = x; if (y < lo[1]) lo[1] = y; if (y > hi[1]) hi[1] = y; if (z < lo[2]) lo[2] = z; if (z > hi[2]) hi[2] = z; }
+        VKLOG("mesh dump:   %u workgroups, %u vertices: %u all-zero, %u NaN, %u w<=0, %u on screen; ndc x %g..%g y %g..%g z %g..%g", tot, nv, zero, nan, w0, in, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+        for (uint32_t g = 0; g < 3 && g < tot; g++) { uint32_t wg = g == 0 ? 0 : g == 1 ? tot / 2 : tot - 1; const float *P = Vf + (size_t)wg * md[q].maxv * md[q].ncomp; const uint32_t *I = md[q].i + (size_t)wg * md[q].ipw;
+            VKLOG("mesh dump:   workgroup %u (task %u, launch %u): v0 %g %g %g %g  v1 %g %g %g %g  v2 %g %g %g %g; indices %u %u %u %u %u %u .. last %u %u %u", wg, L[16 + 2 * wg], L[17 + 2 * wg], P[0], P[1], P[2], P[3],
+                  P[md[q].ncomp], P[md[q].ncomp + 1], P[md[q].ncomp + 2], P[md[q].ncomp + 3], P[2 * md[q].ncomp], P[2 * md[q].ncomp + 1], P[2 * md[q].ncomp + 2], P[2 * md[q].ncomp + 3], I[0], I[1], I[2], I[3], I[4], I[5], I[md[q].ipw - 3], I[md[q].ipw - 2], I[md[q].ipw - 1]);
+            for (uint32_t v = 0; v < 4 && v < md[q].maxv; v++) { char b[1024]; int n = 0; const uint32_t *U = (const uint32_t *)P + (size_t)v * md[q].ncomp; for (uint32_t c = 0; c < md[q].ncomp && n < 980; c++) n += snprintf(b + n, sizeof b - n, " %08x", U[c]); VKLOG("mesh dump:     wg %u v%u:%s", wg, v, b); } }
+        md[q].epoch = 0; int any = 0; for (int z = 0; z < nmd; z++) any |= md[z].epoch != 0; if (!any && !md_left) { nmd = 0; g_mesh_dump_on = 0; } }
+    int md_this = ts && md_left > 0;
+    if (md_this) { const char *f = getenv("DM_VK_MESH_DUMP_MESH"); char h[20]; snprintf(h, sizeof h, "%016llx", (unsigned long long)ms->key); if (f && *f && !strstr(f, h)) md_this = 0; }   // DM_VK_MESH_DUMP_MESH=key,key: only those mesh shaders
+    if (md_this) g_mesh_dump_on = 1;
+    { VkDeviceSize z[4] = {ts ? (VkDeviceSize)ntask * pay * 4 : 256, MESH_HDR_BYTES + (VkDeviceSize)nmesh * 8, (VkDeviceSize)nmesh * ms->mesh_max_v * (ms->mesh_ncomp ? ms->mesh_ncomp : 1) * 4, (VkDeviceSize)nmesh * ipw * 4}, t = 0;
+      for (int i = 0; i < 4; i++) t += z[i] ? (z[i] + 255) & ~255ull : 256; mesh_reserve(t); }
+    mesh_buf taskout = mesh_alloc(ts ? (VkDeviceSize)ntask * pay * 4 : 256); const uint32_t *md_t = g_mesh_alloc_p; mesh_buf launch = mesh_alloc(MESH_HDR_BYTES + (VkDeviceSize)nmesh * 8); const uint32_t *md_l = g_mesh_alloc_p;
+    mesh_buf vtx = mesh_alloc((VkDeviceSize)nmesh * ms->mesh_max_v * (ms->mesh_ncomp ? ms->mesh_ncomp : 1) * 4); const uint32_t *md_v = g_mesh_alloc_p; mesh_buf idx = mesh_alloc((VkDeviceSize)nmesh * ipw * 4); const uint32_t *md_i = g_mesh_alloc_p;
+    if (md_this && md_t && md_l && md_v && md_i && nmd < 16) { md_left--; md[nmd].frame = g_tex_frame; md[nmd].epoch = mtl_last_fence() + 1; md[nmd].mk = ms->key; md[nmd].tk = ts->key; md[nmd].pass = g_sub_pass; md[nmd].ntask = ntask; md[nmd].nmesh = nmesh; md[nmd].pay = pay;
+        md[nmd].ncomp = ms->mesh_ncomp ? ms->mesh_ncomp : 1; md[nmd].maxv = ms->mesh_max_v; md[nmd].ipw = ipw; md[nmd].t = md_t; md[nmd].l = md_l; md[nmd].v = md_v; md[nmd].i = md_i; nmd++; }
     if (d->ind) {   // {count, first} at a game address: meshprep.comp copies it into ctl and the header's dispatch arguments
         VkBuffer rb; VkDeviceSize ro; if (!vk_buf_at(d->ind, 8, &rb, &ro)) { g_mesh_skipped++; VKRED_ONCE(165, "DrawMeshTasksIndirect record outside the memory pools: skipped"); return; }
         mesh_buf rec = {rb, ro & ~255ull, (ro & 255) + 8}; uint32_t pc[8] = {(uint32_t)(ro & 255) / 4, ts ? cap_t : cap_m, ts != NULL, ipw, ts ? 0 : batch};
@@ -4718,7 +4771,18 @@ static void mesh_draw_one(const p_draw *d, uint32_t batch) {
     if(g_mrt_active)mrt_abort();
     { static int left = -1; const char *ml = getenv("DM_VK_MESH_LOG"); if (ml && atoi(ml) > 0 && left < 0) left = atoi(ml); if (left > 0) { left--;   // DM_VK_MESH_LOG=n (live): the next n mesh draws, each with its keys and pass
         VKLOG("mesh log: present %llu pass %d %ux%u: task %016llx mesh %016llx vs %016llx (outs %#x) fragment %016llx (ins %#x) workgroups %u%s", (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, ts ? (unsigned long long)ts->key : 0ull, (unsigned long long)ms->key,
-              (unsigned long long)vs->key, vs->out_locs, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull, S.sh[1] ? S.sh[1]->in_locs : 0, nmesh, ok ? "" : " [not prepared]"); if (!left) setenv("DM_VK_MESH_LOG", "0", 1); } }
+              (unsigned long long)vs->key, vs->out_locs, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull, S.sh[1] ? S.sh[1]->in_locs : 0, nmesh, ok ? "" : " [not prepared]");
+        { char b[900]; int n = 0; n += snprintf(b + n, sizeof b - n, "arena %llu scr %d%d%d%d launch %llu ind %llx count %d first %d", (unsigned long long)g_mesh_arena.used, md_t != NULL, md_l != NULL, md_v != NULL, md_i != NULL, (unsigned long long)launch.off, (unsigned long long)d->ind, d->count, d->first);
+          if (d->ind && vk_pool_of(d->ind, 1)) n += snprintf(b + n, sizeof b - n, " rec %u %u", ((const volatile uint32_t *)(uintptr_t)d->ind)[0], ((const volatile uint32_t *)(uintptr_t)d->ind)[1]);
+          for (int st = 3; st <= 4; st++) { for (int r = 0; r < 4; r++) { uint64_t a = S.ssbo[st][r].addr; if (!a) continue; n += snprintf(b + n, sizeof b - n, " | s%d.%d %llx+%llx", st, r, (unsigned long long)a, (unsigned long long)S.ssbo[st][r].size);
+                if (vk_pool_of(a, 1)) { const volatile uint32_t *w = (const volatile uint32_t *)(uintptr_t)a; n += snprintf(b + n, sizeof b - n, " %08x %08x %08x %08x", w[0], w[1], w[2], w[3]); } }
+              for (int r = 0; r < 6; r++) { uint64_t a = S.ubo[st][r].addr; if (!a) continue; n += snprintf(b + n, sizeof b - n, " | u%d.%d %llx+%llx", st, r, (unsigned long long)a, (unsigned long long)S.ubo[st][r].size); } }
+          VKLOG("mesh log:   %s", b);
+          n = 0; for (int st = 1; st <= 4; st += 3) for (int r = 0; r < 8; r++) { uint64_t a = S.ubo[st][r].addr, z = S.ubo[st][r].size; if (!a) continue; uint32_t h = 2166136261u; if (z <= 65536 && vk_pool_of(a, 1) && vk_pool_of(a + z - 1, 1)) for (uint64_t q = 0; q < z; q++) h = (h ^ ((const volatile uint8_t *)(uintptr_t)a)[q]) * 16777619u;
+              n += snprintf(b + n, sizeof b - n, " U%d.%d %llx+%llx #%08x", st, r, (unsigned long long)a, (unsigned long long)z, h); }
+          for (int r = 0; r < 32; r++) if (S.tex[1][r]) n += snprintf(b + n, sizeof b - n, " t%d=%llx", r, (unsigned long long)S.tex[1][r]);
+          VKLOG("mesh log:   %s", b); }
+        if (!left) setenv("DM_VK_MESH_LOG", "0", 1); } }
     if (g_mesh_draws++ < 8 || g_mesh_draws % 2000 == 0 || g_tracing || g_x_tracepass >= 0)
         VKLOG("mesh draw %llu: task %016llx (%u workgroups%s) → mesh %016llx (up to %u workgroups of %u vertices / %u primitives, %u components) → up to %u primitives; fragment %016llx%s%s", (unsigned long long)g_mesh_draws, ts ? (unsigned long long)ts->key : 0ull,
               ts ? ntask : 0, d->ind ? ", indirect" : "", (unsigned long long)ms->key, nmesh, ms->mesh_max_v, ms->mesh_max_p, ms->mesh_ncomp, nmesh * ms->mesh_max_p, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull,
