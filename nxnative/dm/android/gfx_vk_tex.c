@@ -252,6 +252,10 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f, VkImageUsageFlags extr
         ci.usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; im->usage = ci.usage; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
     if (r) { VKRED_ONCE(10, "vkCreateImage failed (%d): %ux%ux%u format %#x (vk %d) target %d levels %u layers %u samples %u", r, im->w, im->h, im->d, d->format, f->vk, d->target, im->levels, im->layers, im->samples); free(im); return NULL; }
     VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im->img, &req);
+    // Probe (logging only): an image of 256 MB or more, with whether its pool is VIRTUAL (sparse on the Switch, where only its touched pages have memory; here it is made
+    // whole). Before a size cap such as droidplay-core 6ab2640b4's: whether any game makes one at all
+    if (req.size >= (256ull << 20)) { static int n; if (n++ < 8) VKLOG("[probe] image of %.0f MB: %ux%ux%u, %u levels, %u layers, nvn format %#x (vk %d), texture flags %#x, pool flags %#x%s",
+        req.size / 1048576.0, im->w, im->h, im->d, im->levels, im->layers, d->format, f->vk, d->flags, t->pool ? t->pool->flags : 0, t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? " (VIRTUAL: sparse on the Switch)" : ""); }
     if ((ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) && im->w >= 256) { static int n; if (n++ < 16)   // UBWC check: a compressed target takes room for its metadata
         VKLOG("target %ux%u format %d%s: %llu bytes", im->w, im->h, f->vk, im->fixed_fmt ? " (format-listed)" : "", (unsigned long long)req.size); }
     VkDeviceSize moff;
@@ -733,8 +737,21 @@ static int tex_storage_ok(const tex_t *t, const vkfmt_t *f, int unc) {
              || ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && !(f && f->compressed)));
 }
 static void cpu_unc_take(const tex_t *t) { vcs_unc_take(t->serial, (uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size); }
+// Probe (logging only), where unc_rule is off: an uncompressed 2D texture whose storage the CPU flushed (nvnMemoryPoolFlushMappedRange, hle_nvn.c nvn_flushed) or that lies
+// in a CPU_UNCACHED pool, with data in it at its first use, starts as zeros here. droidplay-core 4a9f4ec6b fills such a texture once from its storage (Breath of the Wild's sky
+// table); whether any of our games has one, the first 8 say (DM_NVN_STORAGE_UNC=1 takes them from storage). At most 4096 textures are looked at
+static void unc_fill_probe(const tex_t *t, const vkfmt_t *f) {
+    static int checked, logged; int nvn_flushed(const void *p, uint64_t n);
+    if (logged >= 8 || checked >= 4096 || !tex_storage_ok(t, f, 1)) return;
+    if (!(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) && !nvn_flushed(t->mem, t->L.size)) return;
+    checked++;
+    if (vcs_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size) || !mem_any(t->mem, t->L.size)) return;
+    logged++; VKLOG("[probe] texture %ux%u nvn format %#x at %p (pool flags %#x): its storage %s and holds data at its first use, but it starts as zeros (no fill from storage: DM_NVN_STORAGE_UNC=1 takes it)",
+                    t->d.width, t->d.height, t->d.format, (const void *)t->mem, t->pool->flags, t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED ? "is CPU_UNCACHED" : "was flushed by the CPU");
+}
 static int cpu_content_unc(const tex_t *t, const vkfmt_t *f) {   // first use, uncompressed 2D (above)
-    if (!unc_rule() || !tex_storage_ok(t, f, 1)) return 0;
+    if (!unc_rule()) { unc_fill_probe(t, f); return 0; }
+    if (!tex_storage_ok(t, f, 1)) return 0;
     if (vcs_owned((uintptr_t)t->mem, (uintptr_t)t->mem + t->L.size) || !mem_any(t->mem, t->L.size)) return 0;
     static int n; if (n++ < 8) VKLOG("texture %ux%u nvn format %#x at %p (pool flags %#x): uncompressed, written by the CPU before its first use in storage the GPU has not written: uploaded from its storage",
                                      t->d.width, t->d.height, t->d.format, (const void *)t->mem, t->pool->flags);
@@ -1407,6 +1424,27 @@ VkBufferView vk_tbuf_view(const tex_t *t, int storage) {
     pthread_mutex_unlock(&g_tbuf_mu);
     return v;
 }
+// A depth / stencil image read back by the CPU (mtl_read_texels) is copied aspect by aspect: a buffer copy of the depth aspect holds 2 bytes a texel (D16) or 4 (D32F; D24
+// in the low 24 bits of 4) and one of the stencil aspect 1, tightly packed, whatever the combined texel's size. The guest's texels (bpb bytes each) are rebuilt from them:
+// DEPTH32F_STENCIL8 the float, then the stencil byte, then 3 zero bytes (Maxwell's ZF32_X24S8); DEPTH24_STENCIL8 the depth's low 24 bits with the stencil in the top byte
+// (the depth where the copy puts it, as before); STENCIL8 the stencil alone (also where it is kept in a combined image); DEPTH24 kept as D32F (a device without X8_D24
+// attachments) back to 24-bit unorm; DEPTH16 and DEPTH32F as copied. Before, the depth aspect alone was copied at the guest's pitch: DEPTH32F_STENCIL8's 8-byte rows over
+// 4-byte texels misread every row after the first (the rest stale scratch bytes), and STENCIL8 in a combined image read depth
+static void ds_texels(int nvn_format, VkFormat host, const uint8_t *dep, const uint8_t *sten, size_t n, uint8_t *out) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t d = 0; if (dep) memcpy(&d, dep + (host == VK_FORMAT_D16_UNORM ? 2 : 4) * i, host == VK_FORMAT_D16_UNORM ? 2 : 4);
+        uint8_t st = sten ? sten[i] : 0;
+        switch (nvn_format) {
+        case 0x31: out[i] = st; break;   // STENCIL8
+        case 0x32: memcpy(out + 2 * i, &d, 2); break;   // DEPTH16
+        case 0x33: if (host == VK_FORMAT_D32_SFLOAT) { float x; memcpy(&x, &d, 4); d = x <= 0 || x != x ? 0 : x >= 1 ? 0xffffffu : (uint32_t)(x * 16777215.0f + 0.5f); }   // DEPTH24
+                   d &= 0xffffffu; memcpy(out + 4 * i, &d, 4); break;
+        case 0x35: d = (d & 0xffffffu) | (uint32_t)st << 24; memcpy(out + 4 * i, &d, 4); break;   // DEPTH24_STENCIL8
+        case 0x36: memcpy(out + 8 * i, &d, 4); out[8 * i + 4] = st; memset(out + 8 * i + 5, 0, 3); break;   // DEPTH32F_STENCIL8
+        default: memcpy(out + 4 * i, &d, 4); break;   // DEPTH32F
+        }
+    }
+}
 // CPU readback of texels (ReadTexels): the image copied to scratch memory by a submission of its own, waited for
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     void mtl_sub_begin(void); uint64_t mtl_sub_commit(void); int mtl_wait(uint64_t, uint64_t);
@@ -1417,10 +1455,27 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     if (f->dec) { VKRED_ONCE(17, "ReadTexels of a BC texture decoded on the CPU: zeros returned"); mtl_sub_commit(); for (size_t z = 0; z < depth; z++) for (int y = 0; y < (r->height + 3) / 4; y++) memset(dst + z * img + (size_t)y * row, 0, row); return; }
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1;
     size_t pitch = (size_t)((r->width + bw - 1) / bw) * f->bpb, rows = (r->height + bh - 1) / bh;
+    int is3d = im->d > 1;
+    if (!(im->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {   // depth / stencil: each aspect copied apart, then the guest's texels (ds_texels above)
+        size_t n = (size_t)r->width * rows * depth, db = im->fmt == VK_FORMAT_D16_UNORM ? 2 : 4;
+        int want_d = (im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && t->d.format != 0x31, want_s = (im->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && (t->d.format == 0x31 || t->d.format == 0x35 || t->d.format == 0x36);
+        VkBuffer db_b = VK_NULL_HANDLE, sb_b = VK_NULL_HANDLE; VkDeviceSize db_o = 0, sb_o = 0; uint8_t *dp = NULL, *sp = NULL;
+        if (want_d) dp = vk_scratch(n * db, 16, &db_b, &db_o);
+        if (want_s) sp = vk_scratch(n, 16, &sb_b, &sb_o);
+        VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb);
+        for (int a = 0; a < 2; a++) { if (!(a ? sp : dp)) continue;
+            VkBufferImageCopy c = {a ? sb_o : db_o, 0, 0, {a ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, level, is3d ? 0 : layer0 + (uint32_t)r->zoffset, is3d ? 1 : (uint32_t)depth},
+                                   {r->xoffset, r->yoffset, is3d ? r->zoffset : 0}, {(uint32_t)r->width, (uint32_t)r->height, is3d ? (uint32_t)depth : 1}};
+            vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, a ? sb_b : db_b, 1, &c); }
+        mtl_wait(mtl_sub_commit(), ~0ull);
+        uint8_t *line = malloc(pitch); if (!line) { for (size_t z = 0; z < depth; z++) for (size_t y = 0; y < rows; y++) memset(dst + z * img + y * row, 0, row); return; }
+        for (size_t z = 0; z < depth; z++) for (size_t y = 0; y < rows; y++) { size_t k = (z * rows + y) * (size_t)r->width;
+            ds_texels(t->d.format, im->fmt, dp ? dp + k * db : NULL, sp ? sp + k : NULL, (size_t)r->width, line); memcpy(dst + z * img + y * row, line, pitch < row ? pitch : row); }
+        free(line); return;
+    }
     VkBuffer sb; VkDeviceSize so; uint8_t *p = vk_scratch(pitch * rows * depth, 16, &sb, &so);
     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb);
-    int is3d = im->d > 1;
-    VkBufferImageCopy c = {so, 0, 0, {im->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, level, is3d ? 0 : layer0 + (uint32_t)r->zoffset, is3d ? 1 : (uint32_t)depth},
+    VkBufferImageCopy c = {so, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, level, is3d ? 0 : layer0 + (uint32_t)r->zoffset, is3d ? 1 : (uint32_t)depth},
                            {r->xoffset, r->yoffset, is3d ? r->zoffset : 0}, {(uint32_t)r->width, (uint32_t)r->height, is3d ? (uint32_t)depth : 1}};
     vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &c);
     mtl_wait(mtl_sub_commit(), ~0ull);

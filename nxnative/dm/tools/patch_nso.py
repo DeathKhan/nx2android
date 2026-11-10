@@ -7,6 +7,7 @@
 #   svc #n, mrs cntpct_el0 → host gate (gate address taken from thread slot KGATE; once in C, gates.tsv is looked up by return point)
 #   sub sp, sp, xN      → xN rounded up to 16 first (Apple's kernel faults on a misaligned sp, Horizon does not; site_sp_align)
 #   ldxr* / ldxp → ldaxr* / ldaxp, stxr* / stxp → stlxr* / stlxp: every exclusive access gets acquire or release ordering (exclusive_order_sites; the games ran on the Switch's Cortex-A57 without it, Apple cores need it)
+#   DM_TARGET=android: every A-key pointer authentication instruction → its B-key twin (pac_b_key_sites; Android gives each thread its own A key, the B key is the process's)
 #   the completer of Trinity's per-frame rendezvous: dmb ish between its flag store and its load of the state word (trinity_completer_sites; exactly one such function in a module, or no change)
 #   spin wait loops     → a copy whose back-edges pass a spin gate (the host yields there; a busy poll costs nothing on the Switch, see "Spin waits")
 #   Registered cuts (CUTS of the patch files, restricted by NSO build ID, see "Registered patches"): before rewriting, the original bytes are asserted one by one and any mismatch aborts; results are listed in <name>.cuts.tsv
@@ -712,6 +713,43 @@ ORDERED = set(exclusive_order_sites(IMG, CODE_RANGES))   # changed_runs leaves t
 for o in ORDERED:
     struct.pack_into('<I', IMG, o, struct.unpack_from('<I', IMG, o)[0] | 0x8000)   # ldxr → ldaxr, stxr → stlxr, ldxp → ldaxp, stxp → stlxp
 if ORDERED: stats['exclusive_ordered'] = len(ORDERED)
+# Pointer authentication with the A key (DM_TARGET=android). Switch 2 SDKs sign return addresses with the B key (pacibsp / autibsp / retab) and hash frames with the generic
+# key (pacga); nn::os's contexts alone use the A key: the context start signs the entry with pacia on the thread that makes the context, and the started context checks it
+# with autiasp on whichever thread first runs it. On Linux a thread's keys are copied from its creator's at clone and change only at exec or with prctl(PR_PAC_RESET_KEYS),
+# but Android's bionic gives each new thread its own instruction A key (it signs its own code's return addresses with it), so a context made on one thread and started on
+# another fails the check, which a CPU with FEAT_FPAC (Snapdragon 8 Elite) turns into SIGILL: Ocarina of Time v131072's nn.npln.GrpcDispatcher at sdk+0x16d40c. Nothing in
+# the process resets the B key (the host never calls PR_PAC_RESET_KEYS), so it is the same on every thread. Apple targets are left as they are (the Mac runs the same
+# code with no fault). Each A-key instruction takes its B-key twin, so every signature is still made and checked: the hint forms
+# (pacia1716 / autia1716, paciaz / paciasp, autiaz / autiasp), pacia / paciza / autia / autiza, braa / braaz / blraa / blraaz, retaa. The data-key forms (pacda, autda,
+# ldraa) stay: no fault has shown bionic changing those per thread. The idea is droidplay-core 0afbc86fe's (a loader hook there); here it is a rewrite of the module like the exclusive ordering above
+PAC_HINT_B = {0xD503211F: 0xD503215F, 0xD503219F: 0xD50321DF,   # pacia1716 → pacib1716, autia1716 → autib1716
+              0xD503231F: 0xD503235F, 0xD503233F: 0xD503237F,   # paciaz → pacibz, paciasp → pacibsp
+              0xD503239F: 0xD50323DF, 0xD50323BF: 0xD50323FF,   # autiaz → autibz, autiasp → autibsp
+              0xD65F0BFF: 0xD65F0FFF}                            # retaa → retab
+def pac_b_key_twin(w):
+    """The B-key twin of an A-key instruction-address authentication word, or None for any other word"""
+    if w in PAC_HINT_B: return PAC_HINT_B[w]
+    if w & 0xFFFFCC00 == 0xDAC10000: return w | 0x400   # pacia / paciza / autia / autiza: data-processing (1 source), bit 13 zero modifier, bit 12 authenticate, bits 11:10 key (00 IA, 01 IB)
+    if w & 0xFEDFFC00 == 0xD61F0800: return w | 0x400   # braaz / blraaz (bit 24 clear) and braa / blraa (bit 24: a register modifier), bit 21 with link, bit 10 key B
+    return None
+def pac_b_key_sites(img, ranges):
+    """[(offset, B-key word)] for every A-key instruction-address authentication word in the code ranges, by the bytes each form must have (searched, not decoded word by word)"""
+    out = {}
+    for s, e in ranges:
+        for w in PAC_HINT_B:
+            needle = struct.pack('<I', w); o = img.find(needle, s, e)
+            while o >= 0:
+                if not o & 3: out[o] = PAC_HINT_B[w]
+                o = img.find(needle, o + 1, e)
+        for m in re.finditer(rb'\xC1\xDA|[\x1F\x3F][\xD6\xD7]', img[s:e]):   # the two upper bytes of the register forms (no match overlaps another)
+            o = s + m.start() - 2
+            if o & 3 or o < s: continue
+            t = pac_b_key_twin(struct.unpack_from('<I', img, o)[0])
+            if t is not None: out[o] = t
+    return sorted(out.items())
+PAC_B = pac_b_key_sites(IMG, CODE_RANGES) if TARGET == 'android' else []
+for o, w in PAC_B: struct.pack_into('<I', IMG, o, w)
+if PAC_B: stats['pac_b_key'] = len(PAC_B); print(f'{NAME}: {len(PAC_B)} A-key pointer authentication instruction(s) switched to the B key (Android gives each thread its own A key)')
 def trinity_completer_sites(img, ranges):
     """Offsets of the completer of Trinity's per-frame rendezvous (Game Freak; Pokémon Scarlet 1.0.0 main+0x28f872c, 4.0.0 main+0x2d0010c):
       stp x29,x30,[sp,#-0x20]!; stp x20,x19,[sp,#0x10]; mov x29,sp; ldr x8,[x0,#imm]; mov w9,#1; strb w9,[x8,#A]; ldrb w9,[x8,#A+1]; cbz w9,..;

@@ -579,7 +579,7 @@ static void bind_chmask(uint32_t mask) {
 // frame); a VkRenderPass is made once per set of formats and load operations, and an imageless framebuffer once per set of attachment descriptions, and passes
 // then begin with vkCmdBeginRenderPass (the battle's replay went from about 20 to 17.5 ms a frame). Pipelines are made against a compatible render pass (the same
 // formats, every load operation LOAD). DM_VK_RP=0 (start-up): dynamic rendering
-typedef struct { uint32_t ncol, cfmt[8], cload[8], dfmt, dload, sload, dstore, samples; } rpkey;
+typedef struct { uint32_t ncol, cfmt[8], cload[8], dfmt, dload, sload, dstore, samples, cstore[8]; } rpkey;   // cstore: 0 (memset) STORE; DONT_CARE for slot 0's scratch (DM_VK_SLOT0_FILL)
 typedef struct { VkRenderPass rp; uint32_t w, h, layers, n; struct { uint32_t usage, flags, w, h, layers, fmt, fmt2, fmt3, fmt4; } a[9]; } fbkey;   // fmt2..fmt4: a format-listed image's other formats (an imageless framebuffer names the image's whole list)
 static nvn_hmap g_rps = {.klen = sizeof(rpkey)}, g_fbs = {.klen = sizeof(fbkey)}; static pthread_mutex_t g_rp_mu = PTHREAD_MUTEX_INITIALIZER;
 // Without dynamic rendering (a Vulkan 1.1 / 1.2 device, V.has_dynrender) passes must be render pass objects, whatever DM_VK_RP says (vk_init refuses a device with neither)
@@ -614,7 +614,7 @@ static VkRenderPass rp_get(const rpkey *k) {
         VkAttachmentDescription2 ad[9]; VkAttachmentReference2 cr[8], dr; uint32_t na = 0;
         for (uint32_t i = 0; i < k->ncol; i++) {
             if (!k->cfmt[i]) { cr[i] = (VkAttachmentReference2){VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, NULL, VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT}; continue; }
-            ad[na] = (VkAttachmentDescription2){VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2, NULL, 0, (VkFormat)k->cfmt[i], (VkSampleCountFlagBits)k->samples, (VkAttachmentLoadOp)k->cload[i], VK_ATTACHMENT_STORE_OP_STORE,
+            ad[na] = (VkAttachmentDescription2){VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2, NULL, 0, (VkFormat)k->cfmt[i], (VkSampleCountFlagBits)k->samples, (VkAttachmentLoadOp)k->cload[i], (VkAttachmentStoreOp)k->cstore[i],
                 VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL};
             cr[i] = (VkAttachmentReference2){VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, NULL, na++, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT};
         }
@@ -698,7 +698,7 @@ static int pass_commit(void) {
         rpkey k; memset(&k, 0, sizeof k); k.ncol = P_ri.colorAttachmentCount; k.samples = S.samples ? S.samples : 1;
         fbkey fk; memset(&fk, 0, sizeof fk); VkImageView views[9]; VkClearValue cv[9]; uint32_t na = 0;
         for (uint32_t i = 0; i < k.ncol; i++) if (P_ca[i].imageView) {
-            k.cfmt[i] = P_att[i].fmt; k.cload[i] = P_ca[i].loadOp; cv[na] = P_ca[i].clearValue; views[na] = P_ca[i].imageView;
+            k.cfmt[i] = P_att[i].fmt; k.cload[i] = P_ca[i].loadOp; k.cstore[i] = P_ca[i].storeOp; cv[na] = P_ca[i].clearValue; views[na] = P_ca[i].imageView;
             fk.a[na].usage = P_att[i].im->usage; fk.a[na].flags = P_att[i].im->cflags; fk.a[na].w = P_att[i].w; fk.a[na].h = P_att[i].h; fk.a[na].layers = P_att[i].layers;
             fk.a[na].fmt = P_att[i].im->fixed_fmt ? (uint32_t)P_att[i].im->fmt : P_att[i].fmt; fk.a[na].fmt2 = (uint32_t)P_att[i].im->fmt2;
             fk.a[na].fmt3 = (uint32_t)P_att[i].im->fmt_cls[0]; fk.a[na].fmt4 = (uint32_t)P_att[i].im->fmt_cls[1]; na++; }   // (a format-listed image (DM_VK_UBWC): its whole list, as imageless framebuffers require)
@@ -1167,11 +1167,16 @@ void vk_pass_dump_poll(uint64_t done_fence) {   // gfx_vk_present.c, every prese
     }
     g_npd = 0; g_pd_state = 0;
 }
-// DM_VK_CRUMBS=1 (start-up), for a device lost (a GPU hang): every pass end and dispatch writes {submission, pass} into host-visible memory after a full barrier, and the host
-// keeps the shaders each pass drew with; when the device is lost (vk_crumbs_report), the last work the GPU finished and the passes after it are logged
+// Crumbs, for a GPU hang or a lost device: what each pass recorded, kept by the host always (a few stores a draw): its submission, its draws and dispatches, and the
+// shader keys of the last CRUMB_KEYS distinct pipelines it used (vertex / fragment / geometry keys of a draw, a dispatch's compute key). vk_crumbs_log lists one
+// submission's passes: on a lost device the first unfinished one (vk_device_lost, gfx_vk_core.c), and a submission the GPU took over DM_VK_HANG_MS on, or whose end it
+// never wrote (the driver's hang recovery cuts a hung submission short and signals its fence; hang_check, gfx_vk_core.c). DM_VK_CRUMBS=1 (start-up) adds GPU marks:
+// every pass end and dispatch writes {submission, pass} into host-visible memory after a full barrier, so a lost device also says the last work the GPU finished
+// (vk_crumbs_report). The per-submission listing and the larger ring are droidplay-core's idea (f77a684b8, 2b3a134aa), on our crumbs
+enum { CRUMB_RING = 2048, CRUMB_KEYS = 8 };
 static int g_crumbs = -1; static VkBuffer g_crumb_buf; static volatile uint32_t *g_crumb;
-typedef struct { uint32_t sub; int pass, n; uint64_t k[8][3]; } crumb_t; static crumb_t g_cring[512]; static unsigned g_cn;
-static int crumbs_on(void) {
+typedef struct { uint32_t sub, draws, dispatches; int pass, n, next; uint64_t k[CRUMB_KEYS][3]; } crumb_t; static crumb_t g_cring[CRUMB_RING]; static unsigned g_cn;
+static int crumbs_on(void) {   // the GPU marks (DM_VK_CRUMBS=1)
     if (g_crumbs < 0) { const char *e = getenv("DM_VK_CRUMBS"); g_crumbs = e && atoi(e);
         if (g_crumbs) { VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
             VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &g_crumb_buf)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, g_crumb_buf, &rq);
@@ -1179,20 +1184,46 @@ static int crumbs_on(void) {
             VkDeviceMemory m; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, g_crumb_buf, m, 0)); void *p; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p)); g_crumb = p; g_crumb[0] = 0; } }
     return g_crumbs;
 }
-static crumb_t *crumb_cur(void) { crumb_t *c = &g_cring[(g_cn ? g_cn - 1 : 0) % 512]; uint32_t sub = (uint32_t)mtl_last_fence() + 1;
-    if (!g_cn || c->sub != sub || c->pass != g_sub_pass - 1) { c = &g_cring[g_cn++ % 512]; memset(c, 0, sizeof *c); c->sub = sub; c->pass = g_sub_pass - 1; } return c; }
-static void crumb_draw(uint64_t a, uint64_t b, uint64_t c3) { if (!crumbs_on()) return; crumb_t *c = crumb_cur();
-    for (int i = 0; i < c->n; i++) if (c->k[i][0] == a && c->k[i][1] == b && c->k[i][2] == c3) return; if (c->n < 8) { c->k[c->n][0] = a; c->k[c->n][1] = b; c->k[c->n][2] = c3; c->n++; } }
+static crumb_t *crumb_cur(void) { crumb_t *c = &g_cring[(g_cn ? g_cn - 1 : 0) % CRUMB_RING]; uint32_t sub = (uint32_t)mtl_last_fence() + 1;
+    if (!g_cn || c->sub != sub || c->pass != g_sub_pass - 1) { c = &g_cring[g_cn++ % CRUMB_RING]; memset(c, 0, sizeof *c); c->sub = sub; c->pass = g_sub_pass - 1; } return c; }
+static void crumb_keys(crumb_t *c, uint64_t a, uint64_t b, uint64_t c3) {   // the pipeline's keys, unless already among the pass's last CRUMB_KEYS (the oldest goes)
+    for (int i = 0; i < c->n; i++) if (c->k[i][0] == a && c->k[i][1] == b && c->k[i][2] == c3) return;
+    uint64_t *k = c->k[c->next]; k[0] = a; k[1] = b; k[2] = c3; c->next = (c->next + 1) % CRUMB_KEYS; if (c->n < CRUMB_KEYS) c->n++;
+}
+static void crumb_draw(uint64_t a, uint64_t b, uint64_t c3) { crumb_t *c = crumb_cur(); c->draws++; crumb_keys(c, a, b, c3); }
 static void crumb_mark(int dispatch) { if (!crumbs_on()) return; VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
     vkCmdFillBuffer(cb, g_crumb_buf, 0, 4, ((uint32_t)(mtl_last_fence() + 1) & 0xffff) << 16 | (dispatch ? 0x8000u : 0) | ((uint32_t)(g_sub_pass - 1) & 0x7fff)); }
-void vk_crumbs_report(void) {
+static void crumb_dispatch(uint64_t key) { crumb_t *c = crumb_cur(); c->dispatches++; crumb_keys(c, 0, 0, key); crumb_mark(1); }
+// The passes submission fence recorded, in order, at most 24 lines: a run of passes with the same shaders as the one before is one line. Any thread (the completion
+// thread's hang check, a lost device's): the replay may be recording a later submission meanwhile, so a pass being written can read torn
+void vk_crumbs_log(uint64_t fence, const char *why) {
+    uint32_t sub = (uint32_t)fence; unsigned end = g_cn, first = end > CRUMB_RING ? end - CRUMB_RING : 0, found = 0, lines = 0, same = 0, sdraws = 0; const crumb_t *prev = NULL;
+    VKLOG("[hang] submission %llu (%s), what it recorded:", (unsigned long long)fence, why);
+    for (unsigned i = first; i < end; i++) {
+        const crumb_t *c = &g_cring[i % CRUMB_RING]; if (c->sub != sub) continue;
+        found++;
+        if (prev && c->n == prev->n && !memcmp(c->k, prev->k, sizeof c->k)) { same++; sdraws += c->draws + c->dispatches; prev = c; continue; }
+        if (same) { VKLOG("[hang]   and %u more passes with the same shaders (%u draws and dispatches)", same, sdraws); same = sdraws = 0; lines++; }
+        if (lines >= 24) continue;
+        char ks[CRUMB_KEYS * 56 + 1]; int o = 0; ks[0] = 0;
+        for (int k = 0; k < c->n; k++) { const uint64_t *x = c->k[(c->next - c->n + k + CRUMB_KEYS) % CRUMB_KEYS];   // oldest first
+            o += x[0] | x[1] ? snprintf(ks + o, sizeof ks - (size_t)o, " %016llx/%016llx/%016llx", (unsigned long long)x[0], (unsigned long long)x[1], (unsigned long long)x[2])
+                             : snprintf(ks + o, sizeof ks - (size_t)o, " cs %016llx", (unsigned long long)x[2]); if (o >= (int)sizeof ks) break; }
+        VKLOG("[hang]   pass %d: %u draws, %u dispatches; last shaders (vertex/fragment/geometry or cs):%s", c->pass, c->draws, c->dispatches, c->n ? ks : " none");
+        lines++; prev = c;
+    }
+    if (same) VKLOG("[hang]   and %u more passes with the same shaders (%u draws and dispatches)", same, sdraws);
+    if (!found) VKLOG("[hang]   nothing kept (older than the last %d passes recorded, or no pass)", CRUMB_RING);
+    else if (lines >= 24) VKLOG("[hang]   (%u passes in all; the first 24 lines shown)", found);
+}
+void vk_crumbs_report(void) {   // DM_VK_CRUMBS=1: where the GPU marks say it got to, and the passes after it
     if (g_crumbs <= 0 || !g_crumb) return;
     uint32_t v = g_crumb[0], sub = v >> 16, pass = v & 0x7fff;
     VKLOG("[crumbs] the GPU last finished submission %u (low 16 bits) %s %u", sub, v & 0x8000 ? "a dispatch after pass" : "pass", pass);
     int shown = 0;
-    for (unsigned i = g_cn > 512 ? g_cn - 512 : 0; i < g_cn && shown < 12; i++) { crumb_t *c = &g_cring[i % 512];
+    for (unsigned i = g_cn > CRUMB_RING ? g_cn - CRUMB_RING : 0; i < g_cn && shown < 12; i++) { crumb_t *c = &g_cring[i % CRUMB_RING];
         if ((c->sub & 0xffff) < sub || ((c->sub & 0xffff) == sub && c->pass <= (int)pass)) continue;
-        shown++; VKLOG("[crumbs] then submission %u pass %d:", c->sub, c->pass);
+        shown++; VKLOG("[crumbs] then submission %u pass %d (%u draws, %u dispatches):", c->sub, c->pass, c->draws, c->dispatches);
         for (int k = 0; k < c->n; k++) VKLOG("[crumbs]   shaders %016llx %016llx %016llx", (unsigned long long)c->k[k][0], (unsigned long long)c->k[k][1], (unsigned long long)c->k[k][2]); }
 }
 void vk_prof_end(void) {
@@ -1258,6 +1289,53 @@ static int pass_cut(int interior, uint64_t *cuts) {
     if (!interior) g_ord_parts++;
     g_cb_draws = 0; (*cuts)++; return 1;
 }
+// Adreno 8xx and an empty colour slot 0 (DM_VK_SLOT0_FILL). A pass whose colour attachments start past slot 0 (slot 0 a null view, VK_ATTACHMENT_UNUSED in a render
+// pass) hung the GPU of an Adreno 830 and lost the device every frame: a OnePlus Pad 3 (driver 0x8032004a) whose pass bound a target in slot 5 with slots 0-4 empty, which a
+// later pass drew into as slot 0; a scratch target in slot 0 alone fixed it (droidplay-core 87bd41d62, the idea). Preventive here: no such hang is known on the Odin 3's
+// driver (512.800). Slot 0 of such a pass gets a scratch RGBA8 image at least the pass's size (one, grown when a pass is larger; the old ones stay: submissions in flight
+// name their views), loaded and stored DONT_CARE (on a tiler it never leaves tile memory), and the pipelines write nothing to it (prepare_draw: write mask 0 where
+// P_att[0] is the scratch). Single-sample, single-layer passes only. DM_VK_SLOT0_FILL=1 / 0 (start-up): on / off whatever the GPU; by default on for the Adreno 8xx
+// (named "Adreno (TM) 8nn" by Qualcomm's driver and by Turnip), off elsewhere
+static vkimg_t g_s0_image; static VkImageView g_s0_view; static uint64_t g_s0_passes; static int g_s0_failed;
+static int adreno_model(const VkPhysicalDeviceProperties *p) {   // 830 for "Adreno (TM) 830" (Qualcomm's vendor ID), 0 for any other GPU
+    const char *n = p->vendorID == 0x5143 ? strstr(p->deviceName, "Adreno (TM) ") : NULL; return n ? atoi(n + 12) : 0;
+}
+static int slot0_fill_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_VK_SLOT0_FILL"); int m = adreno_model(&V.props);
+        on = e && *e ? atoi(e) != 0 : m >= 800 && m < 900;
+        VKLOG("empty colour slot 0: %s (DM_VK_SLOT0_FILL%s; %s)", on ? "a scratch target there in multi-target passes" : "left empty", e && *e ? "" : " default", V.props.deviceName); }
+    return on;
+}
+// whether a pass of ncol colour slots, slot 0 without a view, gets the scratch there
+static int slot0_fill_wanted(int ncol, int slot0_view, uint32_t samples, uint32_t layers) { return ncol > 1 && !slot0_view && samples == 1 && layers == 1 && slot0_fill_on(); }
+static int slot0_scratch(uint32_t w, uint32_t h) {   // the scratch image, at least w x h; 0: none could be made (the slot stays empty)
+    if (g_s0_view && g_s0_image.w >= w && g_s0_image.h >= h) return 1;
+    if (g_s0_failed) return 0;
+    vkimg_t im = {0}; VkImageView v = VK_NULL_HANDLE;
+    im.w = w > g_s0_image.w ? w : g_s0_image.w; im.h = h > g_s0_image.h ? h : g_s0_image.h;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {im.w, im.h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+                            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(V.dev, &ci, NULL, &im.img)) goto fail;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(V.dev, im.img, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
+    vk_mem_tag = "slot0-scratch"; VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &im.mem); vk_mem_tag = NULL;
+    if (r || vkBindImageMemory(V.dev, im.img, im.mem, 0)) goto fail;
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, im.img, VK_IMAGE_VIEW_TYPE_2D, ci.format, {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (vkCreateImageView(V.dev, &vi, NULL, &v)) goto fail;
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im.img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vkCmdPipelineBarrier(vk_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    im.fmt = ci.format; im.usage = ci.usage; im.aspect = VK_IMAGE_ASPECT_COLOR_BIT; im.d = im.layers = im.levels = im.samples = 1; im.vtype = VK_IMAGE_VIEW_TYPE_2D; im.layout = VK_IMAGE_LAYOUT_GENERAL;
+    VKLOG("empty colour slot 0: scratch target %ux%u (DM_VK_SLOT0_FILL)", im.w, im.h);
+    g_s0_image = im; g_s0_view = v; return 1;   // (the one before stays: a submission in flight may still name its view)
+fail:
+    VKLOG("[RED] empty colour slot 0: no scratch target %ux%u could be made: such passes keep it empty from here", im.w, im.h); g_s0_failed = 1;
+    if (v) vkDestroyImageView(V.dev, v, NULL);
+    if (im.img) vkDestroyImage(V.dev, im.img, NULL);
+    if (im.mem) vkFreeMemory(V.dev, im.mem, NULL);
+    return 0;
+}
 static int begin_pass(void) {
     if (S.pass_open) return 1;
     int psplit = g_psplit_now; g_psplit_now = 0;   // a pass split (prepare_draw): taken before any early return, so the flag never forces a later pass's cut
@@ -1320,6 +1398,12 @@ static int begin_pass(void) {
         if (w > 16384) w = 16384; if (h > 16384) h = 16384; if (!w) w = 1; if (!h) h = 1; layers = 1; samples = 1; ncol = 0;
         static int n; if (n++ < 6) VKLOG("pass with no attachments (%d target slots set, none a texture): rasterizer discard %d, vertex %016llx, fragment %016llx, %ux%u from the viewport", S.rt_n, S.rast_discard,
                                          S.sh[0] ? (unsigned long long)S.sh[0]->key : 0ull, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull, w, h);
+    }
+    if (have && slot0_fill_wanted(ncol, ca[0].imageView != VK_NULL_HANDLE, samples, layers) && slot0_scratch(w, h)) {   // an Adreno 8xx's empty slot 0 (DM_VK_SLOT0_FILL, above)
+        ca[0] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, g_s0_view, VK_IMAGE_LAYOUT_GENERAL, 0, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                            VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE};
+        S.cfmt[0] = VK_FORMAT_R8G8B8A8_UNORM; P_att[0].im = &g_s0_image; P_att[0].fmt = VK_FORMAT_R8G8B8A8_UNORM; P_att[0].layers = 1; P_att[0].w = g_s0_image.w; P_att[0].h = g_s0_image.h;
+        if (g_s0_passes++ < 4) VKLOG("empty colour slot 0: scratch target for a %ux%u pass with %d colour slots (DM_VK_SLOT0_FILL; %llu so far)", w, h, ncol, (unsigned long long)g_s0_passes);
     }
     // The cut (DM_VK_CB_DRAWS): only before a pass whose depth attachment no earlier pass of this submission drew with. Adreno keeps a low-resolution copy of a depth
     // attachment (LRZ) that it trusts within a command buffer; a pass that goes on with a depth buffer begun in an earlier command buffer had whole 8x8 blocks of its
@@ -3566,6 +3650,7 @@ static int prepare_draw(int prim, int indexed) {
             k.bl[i].src = S.blend[i].src_rgb; k.bl[i].dst = S.blend[i].dst_rgb; k.bl[i].srca = S.blend[i].src_a; k.bl[i].dsta = S.blend[i].dst_a; k.bl[i].eq = S.blend[i].eq_rgb; k.bl[i].eqa = S.blend[i].eq_a;
         }
     }
+    if (S.ncol > 1 && P_att[0].im == &g_s0_image) { k.wmask[0] = 0; k.blend_en &= ~1u; }   // slot 0's scratch (DM_VK_SLOT0_FILL): nothing written there
     if (g_mrt_active) { k.wmask[1] = 0xf; k.blend_en &= ~2u; } // probe output is independent of original output map/blend state
     // Dual-source blending: NVN blends colour target 0 with the shader's output 1 as its second source (factors SRC1_*, 0x10-0x13), the translator declares that output at
     // location 1, and Vulkan takes the second source only from location 0, index 1 (with location 1 the blend reads undefined values: Pokémon Legends: Arceus's post effects,
@@ -4764,7 +4849,7 @@ static void dispatch(const p_dispatch *d) {
     if (selected_trace) VKLOG("compute trace key %016llx native dispatch %s%s", (unsigned long long)cs->key,
         dispatched ? "recorded" : "not recorded: indirect buffer unavailable", dispatched && d->ind ? " (indirect counts remain GPU-owned)" : "");
     if (!g_x_nodispbar) vk_img_barrier_all(cb);   // DM_VK_X_NODISPBAR=1 (live, a cost measurement that may draw wrong): no barrier after the dispatch
-    if (crumbs_on()) { crumb_t *c = crumb_cur(); if (c->n < 8) { c->k[c->n][0] = 0; c->k[c->n][1] = 0; c->k[c->n][2] = cs->key; c->n++; } crumb_mark(1); }
+    crumb_dispatch(cs->key);
     if (g_x_tracepass == -2 || mdi_log_now()) {   // (DM_VK_TRACE_PASS=-2 lists the dispatches too, with their storage buffers: the addresses for a DM_CTL memdump)
         char sb[512]; int o = 0; for (int r = 0; r < 16 && o < (int)sizeof sb - 40; r++) if (S.ssbo[5][r].addr) o += snprintf(sb + o, sizeof sb - (size_t)o, " s%d %#llx+%#llx", r, (unsigned long long)S.ssbo[5][r].addr, (unsigned long long)S.ssbo[5][r].size);
         VKLOG("--- dispatch %016llx %dx%dx%d%s after pass %d;%s", (unsigned long long)cs->key, d->x, d->y, d->z, d->ind ? " (indirect)" : "", g_sub_pass - 1, o ? sb : " no storage buffers");

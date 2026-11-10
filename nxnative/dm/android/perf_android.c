@@ -439,3 +439,35 @@ void dm_perf_window(ANativeWindow *w, double fps) {
     LOG("[perf] window frame rate %.0f fps%s", fps, r ? " refused" : "");
 }
 
+// ---- thermal status (AThermal, Android 11): dm_thermal_now, for the host's thermal gates ----
+// hle_nvn.c reads dm_thermal_now() on iOS's NSProcessInfo scale (0 nominal, 1 fair, 2 serious, 3 critical): from 2 its thermal cap holds the frame step at 30 fps until the
+// device has been fair again for 30 s, and the frame step's slowed-clock probes run only at 1 or below. Android had only hle_nvn.c's weak -1, so neither ever acted, and the
+// SoC throttled mid-frame instead. AThermal's status (libandroid, API 30; through dlsym, as the hints above) is read once a second on a thread of its own (it is a binder call:
+// never on the frame's threads) and mapped: NONE 0; LIGHT and MODERATE 1 (the platform's "user experience not largely impacted"); SEVERE 2; CRITICAL, EMERGENCY and
+// SHUTDOWN 3; ERROR, or none read yet, -1. DM_THERMAL_CAP=0 (the cap's own switch, start-up) leaves it at -1 as before, so a run with the cap off is the run it was.
+// The idea is droidplay-core 4aa5e3bdc's (its thermal half)
+typedef struct AThermalManager AThermalManager;
+static struct { AThermalManager *(*acquire)(void); int (*status)(AThermalManager *); AThermalManager *mgr; } T;
+static int g_thermal = -1;   // the last state read (atomic loads and stores)
+static int thermal_scale(int status) { return status < 0 ? -1 : status == 0 ? 0 : status <= 2 ? 1 : status == 3 ? 2 : 3; }
+static void thermal_poll(void) {
+    int raw = T.status(T.mgr), s = thermal_scale(raw), was = __atomic_exchange_n(&g_thermal, s, __ATOMIC_RELAXED);
+    if (s != was) LOG("[perf] thermal status %d (AThermal): state %d (hle_nvn.c's thermal cap from 2; DM_THERMAL_CAP=0 turns it off)", raw, s);
+}
+static void *thermal_main(void *arg) {   // the manager too is a binder service: looked up here, not on the thread that first asks
+    (void)arg;
+    void *lib = dlopen("libandroid.so", RTLD_NOW);
+    if (lib) { T.acquire = (AThermalManager *(*)(void))dlsym(lib, "AThermal_acquireManager"); T.status = (int (*)(AThermalManager *))dlsym(lib, "AThermal_getCurrentThermalStatus"); }
+    if (!T.acquire || !T.status || !(T.mgr = T.acquire())) { LOG("[perf] no AThermal on this Android (11 and later have it): no thermal state for the host"); return NULL; }
+    for (;;) { thermal_poll(); struct timespec ts = {1, 0}; while (nanosleep(&ts, &ts) && errno == EINTR) {} }
+    return NULL;
+}
+static void thermal_start(void) {
+    const char *e = getenv("DM_THERMAL_CAP"); if (e && !strcmp(e, "0")) { LOG("[perf] DM_THERMAL_CAP=0: no thermal state for the host (as before AThermal)"); return; }
+    pthread_t th; if (pthread_create(&th, NULL, thermal_main, NULL)) { LOG("[RED] [perf] thermal status: no thread (%s)", strerror(errno)); return; }
+    pthread_setname_np(th, "dm-thermal"); pthread_detach(th);
+}
+int dm_thermal_now(void) {   // (overrides hle_nvn.c's weak -1)
+    static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, thermal_start);
+    return __atomic_load_n(&g_thermal, __ATOMIC_RELAXED);
+}

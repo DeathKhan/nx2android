@@ -17,7 +17,8 @@
 
 #define VKLOG(...) LOG("[vk] " __VA_ARGS__)
 #define VKRED_ONCE(id, ...) do { static int once_##id; if (!once_##id++) LOG("[RED] [vk] " __VA_ARGS__); } while (0)
-#define VKCHK(x) do { VkResult r_ = (x); if (r_ < 0) die("[vk] %s failed: %d", #x, r_); } while (0)
+void vk_device_lost(VkResult r, const char *where);   // once: what the first unfinished submission recorded, and VK_EXT_device_fault's report (gfx_vk_core.c); the caller dies after
+#define VKCHK(x) do { VkResult r_ = (x); if (r_ < 0) { if (r_ == VK_ERROR_DEVICE_LOST) vk_device_lost(r_, #x); die("[vk] %s failed: %d", #x, r_); } } while (0)
 
 // ---- Vulkan entry points (loaded from libvulkan.so) ----
 #define VK_FNS(X) \
@@ -102,6 +103,7 @@ void *vk_stage_alloc(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDevice
 void vk_stage_flush(void);                            // submit what it holds and wait
 extern __thread const char *vk_mem_tag;              // device memory accounting (gfx_vk_core.c mem_acct): the tag the next vkAllocateMemory on this thread is counted under
 void vk_mem_acct_report(const char *why);             // the per-tag table, logged
+void vk_memreport(const char *why);                   // live memory by object kind, ours and the driver's, then the tag table (DM_VK_MEMREPORT, DM_CTL "memreport"; gfx_vk_memreport.inc)
 void vk_defer_free_buffer(VkBuffer b, VkDeviceMemory m);   // destroyed once the GPU has passed the current submission
 void vk_defer_free_image(VkImage i, VkDeviceMemory m);
 VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, VkDeviceSize *off, void **sub);   // NULL on failure; *sub: a slot of a shared block, or NULL (memory of its own)
