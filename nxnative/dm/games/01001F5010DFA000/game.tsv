@@ -41,3 +41,7 @@ sys_resource	0x1000000
 # materials, terrain, water, lighting, shadows and post effects), 73 in the 678 GFPAK archives under bin/archive (Oodle Kraken entries, decoded with the game's own OodleLZ_Decompress), 40 in main
 shader_groups	/bin/=bin /system_resource/=systemresource
 shader_note	Pokémon Legends: Arceus shaders
+
+# ---- Frame rate ----
+# 60 fps: the present interval cut and the frame step stubs (patches.py). The game steps by a stored frame period; the stubs make it the vsyncs the host holds each frame
+fps_target	60
