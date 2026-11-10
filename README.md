@@ -13,18 +13,21 @@ This is the Android port of [nxnative](https://github.com/seedds/nxnative), whic
 
 This fork adds Nintendo Switch 2 games to the porter, tuned on an AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver). It also keeps the vendored nxnative trued up with upstream: nx2android's and nxnative's commits are taken one by one onto the fork's own work, with nxnative's Metal fixes ported to the Vulkan backend where they apply.
 
+**Download:** the porter with the Switch 2 support for Windows, macOS and Linux, from this fork's [Releases](https://github.com/DeathKhan/nx2android/releases) (`switch2-v1.0` and later).
+
 Screenshots from the Odin 3 (the game's own picture, overlay off); frame rates as measured there.
 
 | | |
 |:---:|:---:|
 | ![Donkey Kong Bananza](docs/images/donkey-kong-bananza.jpg)<br>Donkey Kong Bananza<br><sub>this fork · update v458752 with DLC · 60 fps (its movies at 30)</sub> | ![Nintendo Switch 2 Welcome Tour](docs/images/nintendo-switch-2-welcome-tour.jpg)<br>Nintendo Switch 2 Welcome Tour<br><sub>this fork · update 1.0.4 · 60 fps in the intro and expo hall (with the app's frame cap at 30 here: GPU 4-22 ms a frame)</sub> |
-| ![The Legend of Zelda: Ocarina of Time](docs/images/the-legend-of-zelda-ocarina-of-time.jpg)<br>The Legend of Zelda: Ocarina of Time<br><sub>this fork · update v131072 · 20-30 fps (30 outdoors in Kokiri Forest) · **work in progress**: plays from a save; the title movie's enhancement network is skipped</sub> | |
+| ![The Legend of Zelda: Ocarina of Time](docs/images/the-legend-of-zelda-ocarina-of-time.jpg)<br>The Legend of Zelda: Ocarina of Time<br><sub>this fork · update v131072 · 30 fps in Kokiri Forest (a heavy moment dips to 20 for a moment) · **work in progress**: plays from a save; the title movie's enhancement network is skipped</sub> | |
 
 | Game | State on the Odin 3 |
 |---|---|
 | Donkey Kong Bananza (with its DLC) | Plays. A smooth 60 fps in play, the movies at their own 30; handheld mode by default |
 | Nintendo Switch 2 Welcome Tour | Plays. Intro video and expo hall at 60 fps; mouse exhibits open with `DM_MOUSE=1` (the right stick or the touchscreen is the Joy-Con 2 mouse, R / ZR its buttons) |
-| The Legend of Zelda: Ocarina of Time | Work in progress. Loads a save and plays in Kokiri Forest at 20-30 fps (GPU about 20 ms a frame outdoors, mesh shaders run as compute); the lighting matches the Mac now (the bloom is fixed) |
+| The Legend of Zelda: Ocarina of Time | Work in progress. Loads a save and plays in Kokiri Forest at 30 fps (GPU about 20 ms a frame, mesh shaders run as compute); the lighting matches the Mac (the bloom is fixed) |
+| Pokémon Legends: Arceus (Switch) | Plays at 60 fps: the game's time follows the host's frame step, so 60 runs at the right speed; the pause menu's Frame cap picks 60 or 30 |
 
 What the Switch 2 support adds, in short:
 
