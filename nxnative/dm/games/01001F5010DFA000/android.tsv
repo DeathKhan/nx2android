@@ -2,7 +2,7 @@
 # Game Freak's engine on SDK 11.4.0; game.tsv and the shader tables are upstream's, checked by hand. 73 of its 12,851 shaders live only in Oodle Kraken GFPAK entries:
 # the porter decodes them with the game's own decoder on the device (dmhost, DM_OODLE_JOB), so a port needs the device connected.
 # On the Y700 (2026-10-30), docked and handheld, driven with DM_CTL: the opening (Arceus, the name, the fall), the beach with Laventon and the starters, the first walks.
-# 60 fps (30 on the Switch: patches.py), game time at real time (the same walk at 60 and pinned at 30), GPU 11-14.6 ms at the beach; a 30-minute soak kept one
+# 60 fps (30 on the Switch: patches.py), GPU 11-14.6 ms at the beach; a 30-minute soak kept one
 # process at a flat 1,307 MiB footprint with no audio underruns and no red log line. The washed-out picture it first had was the vertex outputs' Maxwell start values
 # (gfx_vk_shader.c spv_vs_init). Local wireless trades stay offline (nn::ldn cut): Trading Post → Local Communication not checked yet.
 status	playable
@@ -10,6 +10,6 @@ tested	v262144 Lenovo Legion Y700 TB322FC (Snapdragon 8 Elite, Adreno 830, Andro
 package	org.nx2a.plarceus
 orientation	landscape
 
-# The pause menu frame cap (hle_framecap.c) by host pacing: the game steps its time by the clock (the same walk at 60 and pinned at 30, above), so a frame held 33.3 ms
-# on screen keeps real time. Off / 60 run the 60 fps cut (patches.py); 30 holds the present period at two vsyncs
-env	DM_FRAME_CAP_MODE=pace
+# The game steps its time by a stored frame period, not by the clock (patches.py "frame_step"): on the Odin 3 (2026-11-10) the 60 fps cut alone ran everything at double
+# speed, and the pause menu's 30 by host pacing (DM_FRAME_CAP_MODE=pace, which this profile had) could not be right at both rates. With game.tsv's fps_target the period
+# follows the host's frame step, and the pause menu frame cap (hle_framecap.c) sets its hold: Off / 60 one vsync, 30 two

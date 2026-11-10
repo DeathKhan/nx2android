@@ -6,8 +6,11 @@
 // that long; the controller then asks for that interval itself, with its own hysteresis, and steps the game by it. A frame longer than the cap still reads as itself (the game
 // may go lower, as it does at 20 fps in its cutscenes). Off reads the measure untouched.
 // A game whose time follows the clock can be paced by the host instead (profile env DM_FRAME_CAP_MODE=pace: the present period is held at the cap's, hle_nvn.c present_period).
-// Neither: the cap is not offered (the menu says so) - nothing is changed.
+// A game whose main has frame step stubs (patch_nso.py FRAME_STEP) steps by the vsyncs the host holds each frame: the cap sets the shortest hold (hle_nvn.c fps_step_cap),
+// 30 = two vsyncs, and game time stays real time (DM_FRAME_CAP_STEP).
+// None of them: the cap is not offered (the menu says so) - nothing is changed.
 #include "dm.h"
+#include "hle.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +19,7 @@ static _Atomic int g_cap;   // 0 off, else fps (60, 30)
 static int g_pace = -1;
 int dm_frame_cap_how(void) {
     if (gate_obs_present(OBS_FRAME_CAP)) return DM_FRAME_CAP_GAME;
+    if (dm_fps_state) { float t; memcpy(&t, dm_fps_state, sizeof t); if (t > 0) return DM_FRAME_CAP_STEP; }   // (target 0: the stubs run the game's own code)
     if (g_pace < 0) { const char *e = getenv("DM_FRAME_CAP_MODE"); g_pace = e && !strcmp(e, "pace"); }
     return g_pace ? DM_FRAME_CAP_PACE : DM_FRAME_CAP_NONE;
 }

@@ -155,8 +155,9 @@ enum { OBS_UE_MALLOC = 21,                                       // Unreal's FMa
 void gate_obs_set(int id, void (*fn)(uint64_t *regs, int param));
 // The pause menu's frame cap (hle_framecap.c): 0 = off (the game's own rate), 60 or 30 fps. How a game is held to it: DM_FRAME_CAP_GAME, its own frame-rate controller
 // through an OBS_FRAME_CAP gate (the game picks the interval and steps by it); DM_FRAME_CAP_PACE, the host lengthens the present period (a game whose time follows the
-// clock, profile env DM_FRAME_CAP_MODE=pace); DM_FRAME_CAP_NONE, neither: the cap is not offered, as presenting a frame-stepped game slower would slow the game down
-enum { DM_FRAME_CAP_NONE, DM_FRAME_CAP_GAME, DM_FRAME_CAP_PACE };
+// clock, profile env DM_FRAME_CAP_MODE=pace); DM_FRAME_CAP_STEP, the host's frame step (a main with FRAME_STEP stubs and a target: 30 holds every frame two vsyncs and
+// the game steps by them, hle_nvn.c fps_step_cap); DM_FRAME_CAP_NONE, none of them: the cap is not offered, as presenting a frame-stepped game slower would slow the game down
+enum { DM_FRAME_CAP_NONE, DM_FRAME_CAP_GAME, DM_FRAME_CAP_PACE, DM_FRAME_CAP_STEP };
 int dm_frame_cap_how(void);
 int dm_frame_cap(void);
 void dm_frame_cap_set(int fps);
