@@ -41,7 +41,7 @@ DECL
 enum { MEMO_CB = 48, OP_BIND_SSBO = 123, SB_ALIGN = 256 };
 typedef struct { int stage,index;uint64_t addr,size; } p_bind_buf;
 typedef struct { int nbind,ndyn,setmemo;const dmsv_bind *b;uint8_t dyn[96],tbl[96]; } vkshader_t;
-typedef struct { uint64_t lo,hi,end;VkBuffer buf; } vkpool_t;
+typedef struct { uint64_t lo,hi,end;VkBuffer buf;VkDeviceSize boff; } vkpool_t;   // boff: where the pool starts in its buffer
 static struct { p_bind_buf ssbo[6][16],ubo[6][16]; } S;
 static struct { struct { VkPhysicalDeviceLimits limits; } props; } V;
 MEMO_TYPE
@@ -50,10 +50,14 @@ static uint64_t g_set_epoch=1,g_bind_gen[6],g_ssbo_gen[6],g_ubo_gen[6],g_ubd_gen
 static uint32_t g_draw_binst,pool_gen;
 static int g_buffer_memo=1,cb_reads,driver_reads;
 static VkDescriptorBufferInfo g_draw_claim,cb_value,driver_value;
-static vkpool_t pool={0x100000,0x200000,0x200000,(VkBuffer)(uintptr_t)3};
+static vkpool_t pool={0x100000,0x200000,0x200000,(VkBuffer)(uintptr_t)3,0};
+static int g_fs_buffer_collect,g_cs_buffer_collect;static uint64_t g_trace_sbuf_guest;   // the buffer-collect diagnostics (off)
+static const char *vk_pool_tag;
+static uint8_t *vk_scratch(uint64_t n,uint64_t al,VkBuffer *b,VkDeviceSize *o){(void)n;(void)al;(void)b;(void)o;assert(0&&"fixture's pool has no next chunk");return NULL;}
+static void vk_ubd_read(uint64_t a,uint64_t n,uint8_t *d){(void)a;(void)n;(void)d;assert(0&&"fixture's pool has no next chunk");}
 static uint32_t vk_pool_gen(void){return pool_gen;}
 static VkBuffer vk_zero_buffer(void){return (VkBuffer)(uintptr_t)99;}
-static vkpool_t *vk_pool_of(uint64_t a,int late){(void)late;return a>=pool.lo&&a<pool.hi?&pool:NULL;}
+static vkpool_t *vk_pool_of(uint64_t a,int late){(void)late;assert(vk_pool_tag&&!strcmp(vk_pool_tag,"storage"));return a>=pool.lo&&a<pool.hi?&pool:NULL;}
 static void vk_cross(int k,uint64_t a,uint64_t n,const vkpool_t *p){(void)k;(void)a;(void)n;(void)p;}
 static uint32_t ubo_word(int st,int reg,int off){(void)st;(void)reg;(void)off;assert(0&&"fixture has no uniform-held storage address");return 0;}
 void vk_gpu_wrote(uint64_t a,uint64_t n){(void)a;(void)n;}

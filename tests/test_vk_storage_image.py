@@ -163,7 +163,7 @@ int main(void){
         view_type = re.search(r'typedef struct vview \{[^\n]+', runtime).group()
         helpers = '\n'.join(function(runtime, name) for name in [
             'static VkComponentSwizzle swz_comp(', 'static VkComponentSwizzle apply(',
-            'static VkComponentMapping sample_swizzle(', 'VkImageView vk_tex_view('])
+            'static VkComponentMapping sample_swizzle(', 'VkImageView vk_tex_view_as(', 'VkImageView vk_tex_view('])   # vk_tex_view: vk_tex_view_as with no shader-declared format
         code = r'''
 #define VK_NO_PROTOTYPES
 #define VK_USE_64_BIT_PTR_DEFINES 0
@@ -196,6 +196,11 @@ static void log_ignore(const char *fmt,...){(void)fmt;}
 #define VKLOG(...) log_ignore(__VA_ARGS__)
 #define VKRED_ONCE(id,...) log_ignore(__VA_ARGS__)
 static vkimg_t *vk_tex(const tex_t *t){(void)t;return &image;}
+static unsigned logged_views;   // view_log_selected: the passive DM_VK_VIEW_LOG_SIZE diagnostic, told of every view handed out
+static void view_log_selected(const tex_t *t,const view_t *v,const vkimg_t *im,int dim,int arrayed,int kind,const vview *native,int cached){
+ (void)t;(void)v;(void)dim;(void)arrayed;(void)kind;(void)cached;assert(im==&image&&native&&native->v);logged_views++;
+}
+VkImageView vk_tex_view_as(const tex_t *t,const view_t *vw,int dim,int arrayed,int view_kind,vkimg_t **img_out,VkFormat vfmt);
 static void alias_check(vkimg_t *im){(void)im;}
 static void vk_watch(const vkimg_t *im,const char *why){(void)im;(void)why;}
 static void vk_texdump_note(vkimg_t *im){(void)im;}
@@ -246,6 +251,7 @@ int main(void){
  assert(last_usage&VK_IMAGE_USAGE_STORAGE_BIT);
  // An unsupported view format is refused even when the allocation supports storage.
  support=0;view.base_level=3;assert(!vk_tex_view(&tex,&view,1,0,2,&got));
+ assert(logged_views>=(unsigned)creates);
  while(head){vview *next=head->next;free(head);head=next;}
  return 0;
 }

@@ -208,7 +208,7 @@ int main(void){
     def test_native_volume_writer_preserves_bytes_and_metadata(self):
         src=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
         pd=next(x for x in src.splitlines() if x.startswith("typedef struct ") and x.endswith(" pdump_t;"))
-        writer=extract(src,"static void pass_dump_raw_native(")
+        writer=extract(src,"static void pass_dump_raw_native_named(")+"\n"+extract(src,"static void pass_dump_raw_native(")   # the "pass" prefix over the named writer
         code=r"""
 #include <vulkan/vulkan_core.h>
 #include <stdint.h>

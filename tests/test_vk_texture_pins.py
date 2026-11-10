@@ -19,6 +19,7 @@ class TexturePins(unittest.TestCase):
         declarations=s[s.index("typedef struct { uint64_t pool;"):s.index("// The sRGB / UNORM twin")]
         start=s.index("typedef struct tex_pin_image")
         pins=s[start:s.index("static vkimg_t *vk_tex_(const tex_t *t);",start)]
+        reclaimed=next(x for x in s.splitlines() if x.startswith("static nvn_hmap g_reclaimed"))   # evict_overlaps' memory of taken-over targets (vk_tex_pool_ok reads it)
         helpers="\n".join(function(s,d) for d in (
             "static void img_drop(", "void vk_tex_drop_pool(", "int vk_tex_pool_ok(",
             "size_t vk_img_list(", "void vk_img_evict("))
@@ -41,6 +42,7 @@ typedef struct vkimg {
 typedef struct {int depth,stencil;} vkfmt_t;
 typedef struct {nvn_hmap *h;uint32_t i;vkimg_t *im;} vk_img_ref;
 static uint64_t g_img_n,g_img_bytes,g_img_vkbytes,g_img_evicted,g_tex_gen=1;
+uint64_t g_tex_gen_why[4];   // gfx_vk_tex.c: generation bumps by cause (img_drop counts orphans)
 static unsigned freed,view_freed,alias_unlinked,mincores,holding_calls,dirty_released;
 static int storage_live=1;
 static vkfmt_t f;
@@ -56,6 +58,7 @@ static uint32_t vk_pool_gen(void){return 1;}
 static int range_mapped(const uint8_t *p,size_t n){(void)p;(void)n;mincores++;return storage_live;}
 #define die(...) do{fprintf(stderr,__VA_ARGS__);abort();}while(0)
 DECLARATIONS
+RECLAIMED
 static void img_drop(vkimg_t *im);
 PINS
 HELPERS
@@ -85,7 +88,7 @@ int main(void){
  old->lin_mem=(void *)1;old->lin_len=64;old->packaged=1;old->pkg_mem=(void *)2;old->pkg_len=64;
  unsigned before=freed;vk_tex_drop_pool(a.pool);
  assert(dirty_released==2&&!old->lin_mem&&!old->pkg_mem&&old->pkg_released);
- assert(!g_by_key.n&&old->orphan&&old->pins==1&&freed==before&&!view_freed);
+ assert(!g_by_key.n&&old->orphan&&old->pins==1&&freed==before&&!view_freed&&g_tex_gen_why[0]==1);
  // A new texture at the same address gets a distinct image; queued old metadata sees old contents.
  tex_t b=a;b.serial=20;vkimg_t *next=new_image(&b);assert(find(&a,NULL)==old&&find(&b,NULL)==next);
  storage_live=0;unsigned checked=holding_calls;
@@ -125,11 +128,12 @@ int main(void){
  before=freed;mtl_tex_unpin(x.serial);assert(freed==before+1);
  x.serial=0;mtl_tex_snapshot(&copy,&x);mtl_tex_pin(0);mtl_tex_unpin(0);
  assert(!g_tex_pins.n&&!g_by_key.n&&!g_by_serial.n&&!g_img_n&&!g_img_bytes&&!g_img_vkbytes);
+ assert(!g_reclaimed.n&&!g_img_reclaimed);   // nothing here takes over a render target
  cleanup_map(&g_tex_pins);cleanup_map(&g_by_key);cleanup_map(&g_by_serial);
  puts("native texture pins: exact aliases, queued lifetime, pool detach, key reuse and final release passed");
 }
 """
-        for k,v in (("DECLARATIONS",declarations),("PINS",pins),("HELPERS",helpers)):
+        for k,v in (("DECLARATIONS",declarations),("RECLAIMED",reclaimed),("PINS",pins),("HELPERS",helpers)):
             code=code.replace(k,v)
         target=ROOT/"target/tests";target.mkdir(parents=True,exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="texture-pins-",dir=target) as tmp:

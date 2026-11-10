@@ -41,7 +41,7 @@ static uint32_t g_draw_binst,g_dispatch[3];
 static uint64_t g_set_epoch=1;
 static int g_drv_compact=1,g_x_nodrvc,ounce,segment_calls,allocations;
 enum { DRVC=1024,MAX_ALLOCATIONS=1024 };
-static struct { uint64_t h,epoch; VkBuffer b; VkDeviceSize o; } g_drvc[DRVC];
+CACHE
 static uint8_t scratch[MAX_ALLOCATIONS][4096];
 static uint64_t c2_salt;
 static int dm_sdk_ounce(void){return ounce;}
@@ -56,6 +56,7 @@ SEGMENT
 static void drv_segment(int st,int bank,uint8_t *d,int dyn){segment_calls++;actual_drv_segment(st,bank,d,dyn);}
 FNV
 KEY
+static uint64_t graphics_key(int st){drv_gkey k;uint64_t h=drv_graphics_key(st,&k);return h;}
 SHARED
 static uint8_t *bytes(VkBuffer b,VkDeviceSize o){
  assert(b==1&&o%4096==0&&o/4096<(uint64_t)allocations);return scratch[o/4096];
@@ -72,7 +73,7 @@ static void graphics_oracle(int st,uint8_t *expected){
 }
 static uint64_t legacy_key(int st,int bank,int dyn){
  uint8_t expected[4096];actual_drv_segment(st,bank,expected,dyn);
- return fnv(UINT64_C(0xcbf29ce484222325),expected,bank==24?0x100:bank?0x968:0x648)^((uint64_t)bank<<56);
+ return fnv(UINT64_C(0xcbf29ce484222325),expected,bank==24?0x100:bank?0x968:DMSH_C0_SSBO_MS+16*DMSH_C0_SSBO_SLOTS)^((uint64_t)bank<<56);   // bank 0: through the mesh stage table
 }
 static void check_bytes(int st,int bank,int dyn,VkBuffer b,VkDeviceSize o){
  uint8_t expected[4096];actual_drv_segment(st,bank,expected,dyn);
@@ -86,7 +87,7 @@ static void fresh_case(int st,int bank,int dyn){
  memset(g_drvc,0,sizeof g_drvc);
  VkBuffer a,b;VkDeviceSize x,y;int before=allocations,segments=segment_calls;
  call_checked(st,bank,dyn,&a,&x);assert(allocations==before+1&&segment_calls==segments+1);
- uint64_t h=g_drv_compact&&!bank&&st>=0&&st<3?drv_graphics_key(st):legacy_key(st,bank,dyn);
+ uint64_t h=g_drv_compact&&!bank&&st>=0&&st<3?graphics_key(st):legacy_key(st,bank,dyn);
  assert(g_drvc[h%DRVC].h==h&&g_drvc[h%DRVC].epoch==g_set_epoch);
  call_checked(st,bank,dyn,&b,&y);assert(a==b&&x==y&&allocations==before+1);
  assert(segment_calls==segments+(g_drv_compact&&!bank&&st>=0&&st<3?1:2));
@@ -101,28 +102,28 @@ int main(void){
  }
  g_draw_binst=91;
  // Equal stage data still occupies different table offsets.
- uint64_t h0=drv_graphics_key(0),h1=drv_graphics_key(1),h2=drv_graphics_key(2);
+ uint64_t h0=graphics_key(0),h1=graphics_key(1),h2=graphics_key(2);
  assert(h0!=h1&&h0!=h2&&h1!=h2);
  for(int st=0;st<3;st++){
   fresh_case(st,0,0);
-  assert(drv_graphics_key(st)!=legacy_key(st,0,0)); // compact/full domains do not alias these inputs
+  assert(graphics_key(st)!=legacy_key(st,0,0)); // compact/full domains do not alias these inputs
   VkBuffer b;VkDeviceSize o;uint64_t previous;int n;
   // Each of all16 address and low32 size fields is a real dependency.
   for(int i=0;i<16;i++){
-   previous=drv_graphics_key(st);S.ssbo[st][i].addr^=UINT64_C(0x8000000000000001);
-   assert(drv_graphics_key(st)!=previous);n=allocations;call_checked(st,0,0,&b,&o);assert(allocations==n+1);
-   previous=drv_graphics_key(st);S.ssbo[st][i].size^=UINT64_C(0x80000001);
-   assert(drv_graphics_key(st)!=previous);n=allocations;call_checked(st,0,0,&b,&o);assert(allocations==n+1);
+   previous=graphics_key(st);S.ssbo[st][i].addr^=UINT64_C(0x8000000000000001);
+   assert(graphics_key(st)!=previous);n=allocations;call_checked(st,0,0,&b,&o);assert(allocations==n+1);
+   previous=graphics_key(st);S.ssbo[st][i].size^=UINT64_C(0x80000001);
+   assert(graphics_key(st)!=previous);n=allocations;call_checked(st,0,0,&b,&o);assert(allocations==n+1);
    // The segment deliberately truncates sizes to uint32; unrelated CPU fields are absent.
-   previous=drv_graphics_key(st);S.ssbo[st][i].size^=UINT64_C(1)<<44;S.ssbo[st][i].unrelated++;
-   assert(drv_graphics_key(st)==previous);n=allocations;call_checked(st,0,1,&b,&o);assert(allocations==n);
+   previous=graphics_key(st);S.ssbo[st][i].size^=UINT64_C(1)<<44;S.ssbo[st][i].unrelated++;
+   assert(graphics_key(st)==previous);n=allocations;call_checked(st,0,1,&b,&o);assert(allocations==n);
   }
-  previous=drv_graphics_key(st);g_draw_binst++;assert(drv_graphics_key(st)!=previous);
+  previous=graphics_key(st);g_draw_binst++;assert(graphics_key(st)!=previous);
   n=allocations;call_checked(st,0,0,&b,&o);assert(allocations==n+1);
   // Other stages, handles, push banks, dispatch and compute UBOs do not affect graphics c0.
-  previous=drv_graphics_key(st);S.ssbo[(st+1)%3][0].addr++;S.ubo[5][7].addr++;
+  previous=graphics_key(st);S.ssbo[(st+1)%3][0].addr++;S.ubo[5][7].addr++;
   S.tex[st][0]++;S.img[st][0]++;S.samp[st][0]++;S.push[0][17]++;g_dispatch[0]++;
-  assert(drv_graphics_key(st)==previous);n=allocations;call_checked(st,0,0,&b,&o);assert(allocations==n);
+  assert(graphics_key(st)==previous);n=allocations;call_checked(st,0,0,&b,&o);assert(allocations==n);
  }
  // Epoch and no-cache guard must never return a prior submission's or disabled entry.
  VkBuffer a,b;VkDeviceSize x,y;int before;
@@ -156,7 +157,9 @@ int main(void){
             "SEGMENT": function(source, "static void drv_segment(").replace(
                 "static void drv_segment(", "static void actual_drv_segment(", 1),
             "FNV": function(source, "static inline uint64_t fnv("),
-            "KEY": function(source, "static uint64_t drv_graphics_key("),
+            "CACHE": next(x for x in source.splitlines() if "g_drvc[DRVC];" in x),
+            # drv_gkey, g_drvk (the compact entries' key fields) and drv_graphics_key
+            "KEY": source[source.index("_Static_assert(DMSH_C0_SSBO_MS"):source.index("\n}\n", source.index("static uint64_t drv_graphics_key(")) + 3],
             "SHARED": function(source, "static void drv_shared("),
         }
         for marker, helper in helpers.items():

@@ -25,6 +25,9 @@ def harness():
     scratch_type = next(line for line in core.splitlines() if line.endswith('} scratch_blk;'))
     scratch_size = next(line for line in core.splitlines() if line.startswith('#define SCRATCH_BLOCK '))
     hash_fn = function(source, 'static inline uint64_t fnv(').replace('fnv(', 'production_fnv(', 1)
+    bda = next(line for line in core.splitlines() if line.startswith('#define BDA_ALLOC_FLAGS('))
+    start = source.index('_Static_assert(DMSH_C0_SSBO_MS')   # the compact graphics c0 key (drv_gkey, g_drvk, drv_graphics_key)
+    graphics_key = source[start:source.index('\n}\n', source.index('static uint64_t drv_graphics_key(', start)) + 3]
     return r'''
 #include <vulkan/vulkan_core.h>
 #include <assert.h>
@@ -32,12 +35,18 @@ def harness():
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-static struct { VkDevice dev; VkPhysicalDeviceProperties props; } V;
+#include "dmsh_abi.h"
+static struct { VkDevice dev; VkPhysicalDeviceProperties props; int has_bda; } V;
 typedef struct { int stage, index; uint64_t addr, size; } p_bind_buf;
-static struct { p_bind_buf ssbo[6][16], ubo[6][16]; uint64_t tex[6][256], img[6][8], samp[6][128]; } S;
+static struct { p_bind_buf ssbo[6][16], ubo[6][16]; uint64_t tex[6][256], img[6][8], samp[6][128]; uint8_t push[2][0x100]; } S;
 static uint32_t g_dispatch[3], g_draw_binst;
 static uint64_t g_set_epoch = 1;
-static int g_x_nodrvc;
+static int g_x_nodrvc, g_drv_compact = 1, ounce;   /* g_drv_compact: graphics c0 by its key fields (DM_VK_DRV_COMPACT); ounce: an NVN2 game */
+static int dm_sdk_ounce(void) { return ounce; }
+static const char *vk_mem_tag;
+static void log_ignore(const char *f, ...) { (void)f; }
+#define VKLOG(...) log_ignore(__VA_ARGS__)
+static VkDeviceSize scratch_cap(void) { return 256u << 20; }
 enum { DRVC = 1024 };
 ''' + cache + '\n' + scratch_type + '\n' + scratch_size + r'''
 /* Only the slot fields vk_scratch uses; mapped bytes are owned by mocked Vulkan. */
@@ -82,7 +91,8 @@ static uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags required, VkMem
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *ai,
     const VkAllocationCallbacks *callbacks, VkDeviceMemory *memory) {
-    (void)device; (void)callbacks; void *p = malloc((size_t)ai->allocationSize); assert(p);
+    (void)device; (void)callbacks; assert(vk_mem_tag && !strcmp(vk_mem_tag, "scratch") && !ai->pNext);   /* (no buffer device address here) */
+    void *p = malloc((size_t)ai->allocationSize); assert(p);
     *memory = (VkDeviceMemory)(uintptr_t)p; return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset) {
@@ -96,16 +106,20 @@ VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice device, VkDeviceMemory memor
 #define POOL_USAGE (VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
 #define VKCHK(call) assert((call) == VK_SUCCESS)
 #define realloc move_metadata
-''' + function(core, 'void *vk_scratch(') + r'''
+''' + bda + '\n' + function(core, 'void *vk_scratch(') + r'''
 #undef realloc
 ''' + hash_fn + r'''
 /* An ordinary unit-test stub deliberately makes unequal inputs hash alike. */
 static int force_hash = 1;
 static uint64_t forced_hash = 7;
+/* drv_shared salts the full-byte hash with the bank (h ^ bank << 56); bank_collide undoes that salt (the bank
+   is known by the hashed length: c2 0x968, NVN2 push 0x100, c0 otherwise) so that different banks collide too. */
+static int bank_collide;
 static uint64_t fnv(uint64_t h, const void *p, size_t n) {
-    return force_hash ? forced_hash : production_fnv(h, p, n);
+    uint64_t bank = !bank_collide ? 0 : n == 0x968 ? 2 : n == 0x100 ? 24 : 0;
+    return force_hash ? forced_hash ^ bank << 56 : production_fnv(h, p, n);
 }
-''' + function(source, 'static uint64_t c2_handle(') + function(source, 'static void drv_segment(') + r'''
+''' + function(source, 'static uint64_t c2_handle(') + function(source, 'static void drv_segment(') + graphics_key + r'''
 #define memcmp compare_bytes
 ''' + function(source, 'static void drv_shared(') + r'''
 #undef memcmp
@@ -114,7 +128,7 @@ static void clean(void) {
     for (size_t i = 0; i < nbuffer; i++) { free(buffers[i]->memory); free(buffers[i]); }
     free(slot.blk); memset(&slot, 0, sizeof slot); nbuffer = metadata_size = 0;
     memset(&S, 0, sizeof S); memset(g_dispatch, 0, sizeof g_dispatch); g_draw_binst = 0;
-    forbidden_compare = NULL; comparisons = 0; expected_compare = 0; g_x_nodrvc = 0; force_hash = 1; forced_hash = 7; g_set_epoch++;
+    forbidden_compare = NULL; comparisons = 0; expected_compare = 0; g_x_nodrvc = 0; force_hash = 1; forced_hash = 7; ounce = 0; bank_collide = 0; g_set_epoch++;
 }
 static VkDeviceSize used(void) {
     VkDeviceSize total = 0; for (int i = 0; i < slot.nblk; i++) total += slot.blk[i].used; return total;
@@ -132,8 +146,10 @@ static void changed(unsigned which) {
     if (which >= 3 && which <= 9) st = 5;
     if (which >= 10) bank = 2;
     if (which >= 14) dyn = 1;
+    if (which == 18) { st = 5; bank = 0; dyn = 0; ounce = 1; }
+    if (which == 19) { st = 0; bank = 24; dyn = 0; }
     uint8_t before[0x1000] = {0}, after[0x1000];
-    if (!bank && st != 5) word32(before, 0x610, 0x44ffe000); /* 2047.0f */
+    if (!bank && st != 5) word32(before, DMSH_C0_POINT_SIZE, 0x44ffe000); /* 2047.0f */
     memcpy(after, before, sizeof after);
     ref first = get(st, bank, dyn); assert(!memcmp(bytes(first), before, sizeof before));
     VkDeviceSize allocated = used(); ref equal = get(st, bank, dyn);
@@ -157,6 +173,8 @@ static void changed(unsigned which) {
     case 15: S.samp[0][127] = 15u << 20; word32(after, 0x960, 127u << 20); break;
     case 16: S.img[0][7] = 16; word32(after, 0x158, 16); break;
     case 17: S.tex[0][255] = 17; word32(after, 0x560, 127); break;
+    case 18: g_dispatch[0] = 3; word32(after, 0x200, 3); word32(after, DMSH_C0_DISPATCH_NVN2, 3); break;
+    case 19: S.push[0][255] = 0x81; after[255] = 0x81; break;
     default: abort();
     }
     ref second = get(st, bank, dyn);
@@ -170,9 +188,9 @@ static void changed(unsigned which) {
     assert(same(third, get(st, bank, dyn)) && used() == allocated + 0x2000);
 }
 static void banks(void) {
-    clean(); ref zero = get(5, 0, 0); uint8_t expected[0x1000] = {0};
+    clean(); bank_collide = 1; ref zero = get(5, 0, 0); uint8_t expected[0x1000] = {0};
     assert(!memcmp(bytes(zero), expected, sizeof expected));
-    /* Both hash prefixes share a cache: the only changed byte is past c0's 0x648 limit. */
+    /* Both hash prefixes share a cache: the only changed byte is past c0's live prefix (0x870, through the mesh table). */
     S.samp[5][127] = 3u << 20; word64(expected, 0x960, 3u << 20);
     ref c2 = get(5, 2, 0); assert(!same(zero, c2));
     assert(!memcmp(bytes(c2), expected, sizeof expected));
@@ -224,7 +242,7 @@ static void growth(void) {
 static void live_range(void) {
     for (int bank=0;bank<=2;bank+=2) {
         clean(); ref first = get(5,bank,0); VkDeviceSize n=used();
-        expected_compare=bank ? 0x968 : 0x648;
+        expected_compare=bank ? 0x968 : DMSH_C0_SSBO_MS + 16 * DMSH_C0_SSBO_SLOTS;   /* through the mesh stage table */
         assert(same(first,get(5,bank,0)) && used()==n && comparisons==1);
     }
 }
@@ -239,10 +257,11 @@ static void ordinary(void) {
 int main(int argc, char **argv) {
     (void)compare_bytes; assert(argc == 2); V.props.limits.minUniformBufferOffsetAlignment = 256;
     switch (atoi(argv[1])) {
-    case 0: for (unsigned i = 0; i < 3; i++) changed(i); break;
-    case 1: for (unsigned i = 3; i < 10; i++) changed(i); break;
+    case 0: for (g_drv_compact = 1; g_drv_compact >= 0; g_drv_compact--) for (unsigned i = 0; i < 3; i++) changed(i); /* compact keys, then full bytes */
+            g_drv_compact = 1; break;
+    case 1: for (unsigned i = 3; i < 10; i++) changed(i); changed(18); break;
     case 2: for (unsigned i = 10; i < 14; i++) changed(i); break;
-    case 3: for (unsigned i = 14; i < 18; i++) changed(i); break;
+    case 3: for (unsigned i = 14; i < 18; i++) changed(i); changed(19); break;
     case 4: banks(); break;
     case 5: epochs(); break;
     case 6: disabled(); break;
@@ -266,7 +285,7 @@ class DriverCache(unittest.TestCase):
         cls.exe = Path(cls.temp.name) / 'driver'
         cfile.write_text(harness(), encoding='utf-8')
         subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers',
-                        '-I' + str(DM / 'third_party/vulkan-headers/include'),
+                        '-I' + str(DM / 'third_party/vulkan-headers/include'), '-I' + str(DM / 'gfx/nvn'),
                         str(cfile), '-o', str(cls.exe)], check=True)
 
     def check_case(self, case):

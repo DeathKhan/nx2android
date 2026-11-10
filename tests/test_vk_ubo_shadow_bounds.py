@@ -28,16 +28,18 @@ typedef struct {VkBuffer buffer; VkDeviceSize offset,range;} VkDescriptorBufferI
 typedef struct {uint64_t addr,size;} p_bind_buf;
 typedef struct {int reg;} dmsv_bind;
 typedef struct {uint32_t ubo_extent[16];} vkshader_t;
-typedef struct {uint64_t lo,hi,end; VkBuffer buf;} vkpool_t;
+typedef struct {uint64_t lo,hi,end; VkBuffer buf; VkDeviceSize boff;} vkpool_t;   // boff: where the pool starts in its buffer
 static struct {p_bind_buf ubo[6][16];} S;
 static struct {struct {struct {uint64_t minUniformBufferOffsetAlignment;} limits;} props;} V;
 static int g_var_now,g_ubo_bounds=1,g_spv_alt;
 static uint64_t g_set_epoch=1,g_ubd_gen=1;
 static vkpool_t pool;
+static const char *vk_pool_tag;   // what vk_pool_of's caller looks up (its diagnostics)
 static uint64_t shadow_request,copy_request;
 static int shadow_present,cross_count,shadow_calls;
 static uint8_t scratch[65536];
 static vkpool_t *vk_pool_of(uint64_t a,uint64_t n) {
+ assert(vk_pool_tag && !strcmp(vk_pool_tag,"uniform"));
  return a>=pool.lo && a<pool.hi && n<=pool.hi-a ? &pool : NULL;
 }
 static VkBuffer vk_zero_buffer(void) {return 1;}
@@ -58,7 +60,7 @@ static int vk_ubd_shadow(uint64_t a,uint64_t n,VkBuffer *b,VkDeviceSize *o) {
 """ + body + r"""
 static void reset(vkshader_t *s) {
  memset(&S,0,sizeof S);memset(s,0,sizeof *s);
- pool=(vkpool_t){0x100000,0x120000,0x120000,5};
+ pool=(vkpool_t){0x100000,0x120000,0x120000,5,0};
  for(int st=0;st<6;st++)S.ubo[st][5]=(p_bind_buf){pool.lo+256,64960};
  s->ubo_extent[5]=2192;V.props.limits.minUniformBufferOffsetAlignment=256;
  g_var_now=g_spv_alt=0;g_ubo_bounds=1;shadow_present=1;
@@ -82,6 +84,8 @@ int main(void) {
  assert(shadow_request==1024 && d.range==1024);
  reset(&s);shadow_present=0;cbuf_desc(1,&s,&b,&d);
  assert(shadow_request==2192 && d.buffer==5 && d.range==64960 && d.offset==256);
+ reset(&s);shadow_present=0;pool.boff=4096;cbuf_desc(1,&s,&b,&d);   // the pool's buffer starts boff before it
+ assert(d.buffer==5 && d.range==64960 && d.offset==4096+256);
  reset(&s);S.ubo[1][5].addr=0;cbuf_desc(1,&s,&b,&d);
  assert(shadow_calls==0 && d.buffer==1 && d.range==65536);
  reset(&s);pool.hi=pool.lo+4096;S.ubo[1][5]=(p_bind_buf){pool.hi-128,1024};
