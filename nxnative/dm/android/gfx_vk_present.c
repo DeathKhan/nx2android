@@ -1290,7 +1290,9 @@ static void present_perf_end(double period) {
     vk_perf_frame_seal(frame);   // Includes any screenshot submission; presentation blits have their own queue fences.
     dm_perf_frame_id(frame, period);
 }   // perf_android.c
+extern _Atomic uint64_t dm_present_ns; uint64_t now_ns(void);   // hle_thread.c: when the last present was made (DM_HITCH_DUMP: no present for that long dumps the threads)
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
+    atomic_store(&dm_present_ns, now_ns());   // (as nvn_mtl.m present_enqueue; without it the hitch dump never fired on Android)
     vk_init();
     { uint64_t vk_replay_ns(void); double vk_gpu_ms_recent(void);   // what else the frame costs: its replay and its GPU time
       static uint64_t last_exec; uint64_t ex = vk_replay_ns(), rp = ex - last_exec; last_exec = ex; double g = vk_gpu_ms_recent(); int64_t gn = g > 0 ? (int64_t)(g * 1e6) : 0;
