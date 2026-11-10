@@ -100,6 +100,8 @@ static int mtl_wait(uint64_t f,uint64_t timeout) {
 }
 uint64_t mtl_present(const tex_t *t,double period,const int crop[4]) { (void)period;(void)crop;present_tex=t->serial;return 77; }
 void mtl_present_wait(uint64_t t) { assert(t==77); }
+// hle_nvn.c expands a compact record (nxnative f02d0474c); this scheduler test records canonical ones only, so an expansion would be a harness error
+static size_t rec_expand(const uint8_t *rec,uint8_t *out) { (void)rec;(void)out; fprintf(stderr,"unexpected compact record\n"); abort(); }
 #include "nvn_queue.inc"
 
 HOST_SIGNAL
@@ -111,7 +113,8 @@ static void emit(commands *c,unsigned op,const void *data,size_t n) {
 }
 static void mark(commands *c,int x) { p_clear_color v={.rgba={(float)x,0,0,1}};emit(c,OP_CLEAR_COLOR,&v,sizeof v); }
 static void event(commands *c,unsigned op,volatile uint32_t *p,unsigned v) { struct { volatile uint32_t *p;unsigned mode,value; } a={p,0,v};emit(c,op,&a,sizeof a); }
-static void submit(queue_t *q,commands *c,sync_t *s) { emit(c,OP_END,NULL,0);uint64_t h=(uintptr_t)c->bytes;nvn_queue_submit(q,1,&h);if(s)nvn_queue_fence(q,s); }
+// A handle is the recording's control list (nvn_obj.h ctl_e, nxnative f02d0474c): here one piece, its records with no END (the list's CTL_LAST ends it)
+static void submit(queue_t *q,commands *c,sync_t *s) { assert(c->n);uint64_t list=ctl_e(CTL_CHUNK,c->bytes,c->n)|CTL_LAST,h=(uintptr_t)&list;nvn_queue_submit(q,1,&h);if(s)nvn_queue_fence(q,s); }
 static void finish(sync_t *s) { assert(nvn_sync_wait(s,2000000000ull));nvn_sync_release(s); }
 static void wait_published(sync_t *s) {
  uint64_t start=now_ns();for(;;) { pthread_mutex_lock(&nq_mu);int p=s->fenced==3&&((nq_receipt*)(uintptr_t)s->fence)->published;pthread_mutex_unlock(&nq_mu);
@@ -137,9 +140,9 @@ int main(void) {
  nvn_queue_test_hold(1);word=0;commands first={0},nested={0},producer={0};
  prog_t prog={.serial=81,.nstage=1};tex_t tex={.serial=91};
  p_bind_program bp={.prog=&prog};p_set_rt rt={.n=1};rt.color[0]=&tex;
- emit(&nested,OP_BIND_PROGRAM,&bp,sizeof bp);emit(&nested,OP_SET_RT,&rt,sizeof rt);mark(&nested,10);emit(&nested,OP_END,NULL,0);
- event(&first,OP_WAIT_EVENT,&word,1);uint64_t ptr=(uintptr_t)nested.bytes;emit(&first,OP_CALL,&ptr,8);
- sync_t sa={0},sb={0};submit(&a,&first,&sa);prog.serial=82;tex.serial=92;memset(nested.bytes,0xcc,sizeof nested.bytes);
+ emit(&nested,OP_BIND_PROGRAM,&bp,sizeof bp);emit(&nested,OP_SET_RT,&rt,sizeof rt);mark(&nested,10);
+ event(&first,OP_WAIT_EVENT,&word,1);memcpy(first.bytes+first.n,nested.bytes,nested.n);first.n+=nested.n;   // a call is copied in when it is recorded (f02d0474c), so the nested records are the recording's own
+ sync_t sa={0},sb={0};submit(&a,&first,&sa);prog.serial=82;tex.serial=92;memset(nested.bytes,0xcc,sizeof nested.bytes);memset(first.bytes,0xcc,sizeof first.bytes);   // (the submitted recording itself: the queue must have copied it)
  mark(&producer,20);event(&producer,OP_SIGNAL_EVENT,&word,1);submit(&b,&producer,&sb);
  nvn_queue_test_hold(0);finish(&sa);finish(&sb);retired();
  assert(nmarkers==2&&markers[0]==20&&markers[1]==10);assert(seen_prog==81&&seen_tex==91);
