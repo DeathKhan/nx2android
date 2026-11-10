@@ -1712,21 +1712,65 @@ typedef struct imgblk { VkDeviceMemory m; uint32_t type, cls, nslot, nfree; uint
 typedef struct { imgblk *b; uint32_t slot; } imgsub;
 static imgblk *g_imgblk[IMG_CLASSES]; static pthread_mutex_t g_imgblk_mu = PTHREAD_MUTEX_INITIALIZER;
 static VkDeviceSize img_class_size(int c) { return (c & 1 ? 6144ull : 4096ull) << (c >> 1); }   // 4K, 6K, 8K, 12K, 16K, 24K, ... 2M
+static imgblk *img_block_new(int c, uint32_t type) {   // a block of the class, every slot free (not in the list yet); NULL: no memory
+    imgblk *b = calloc(1, sizeof *b); b->type = type; b->cls = (uint32_t)c; VkDeviceSize bs = img_class_size(c) * 64; if (bs < (2 << 20)) bs = 2 << 20; if (bs > IMG_BLOCK) bs = IMG_BLOCK; b->nslot = (uint32_t)(bs / img_class_size(c));   // 64 slots, 2 MB to 32 MB
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, (VkDeviceSize)b->nslot * img_class_size(c), type};
+    vk_mem_tag = "image-block"; VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &b->m); vk_mem_tag = NULL; if (r) { free(b); return NULL; }
+    for (uint32_t i = 0; i < b->nslot; i++) b->bits[i >> 6] |= 1ull << (i & 63);
+    b->nfree = b->nslot; return b;
+}
+// Soft requests (the pool-texture prefetch, gfx_vk_exec.c pool_prefetch). The kernel gives GPU memory page by page inside vkAllocateMemory: about 0.2 to 0.5 ms a MB on the Odin 3
+// (kgsl over shmem; a 32 MB block up to 16 ms, and several blocks in one frame add up), which a frame of a 60 fps title screen cannot take on the replay thread. A soft request takes memory that is there (a free slot,
+// a spare of its size); otherwise a helper thread allocates it (one allocation at a time) and the request fails for now: the prefetch asks again when the helper is done.
+// Memory of its own waits as a spare (IMG_SPARES of them; the oldest is freed for a new one), which any request of the same size and type takes
+enum { IMG_SPARES = 4 };
+static struct { VkDeviceMemory m; VkDeviceSize size; uint32_t type; } g_img_spare[IMG_SPARES]; static int g_img_spare_next;   // (under g_imgblk_mu)
+static struct { int state, cls, failed, thread; uint32_t type; VkDeviceSize size; } g_ia;   // state 1: the helper has a request
+static pthread_mutex_t g_ia_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ia_cv = PTHREAD_COND_INITIALIZER;
+static __thread int t_img_soft, t_img_soft_failed;
+void vk_image_memory_soft(int on) { t_img_soft = on; t_img_soft_failed = 0; }
+int vk_image_memory_soft_failed(void) { return t_img_soft_failed; }
+int vk_image_memory_busy(void) { return __atomic_load_n(&g_ia.state, __ATOMIC_ACQUIRE); }
+static void *img_alloc_main(void *arg) { (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_ia_mu); while (g_ia.state != 1) pthread_cond_wait(&g_ia_cv, &g_ia_mu); int c = g_ia.cls; uint32_t type = g_ia.type; VkDeviceSize size = g_ia.size; pthread_mutex_unlock(&g_ia_mu);
+        int ok = 0; VkDeviceMemory old = VK_NULL_HANDLE;
+        if (c >= 0) { imgblk *b = img_block_new(c, type); if (b) { pthread_mutex_lock(&g_imgblk_mu); b->next = g_imgblk[c]; g_imgblk[c] = b; pthread_mutex_unlock(&g_imgblk_mu); ok = 1; } }
+        else { VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, size, type}; VkDeviceMemory m;
+            vk_mem_tag = "image"; VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &m); vk_mem_tag = NULL;
+            if (!r) { pthread_mutex_lock(&g_imgblk_mu); int i = 0; while (i < IMG_SPARES && g_img_spare[i].m) i++;
+                if (i == IMG_SPARES) { i = g_img_spare_next; g_img_spare_next = (i + 1) % IMG_SPARES; old = g_img_spare[i].m; }
+                g_img_spare[i].m = m; g_img_spare[i].size = size; g_img_spare[i].type = type; pthread_mutex_unlock(&g_imgblk_mu); ok = 1; } }
+        if (old) vkFreeMemory(V.dev, old, NULL);   // (never bound)
+        if (!ok) VKLOG("image memory helper: an allocation failed (%s); soft requests fail from now on", c >= 0 ? "block" : "memory of its own");
+        pthread_mutex_lock(&g_ia_mu); if (!ok) g_ia.failed = 1; __atomic_store_n(&g_ia.state, 0, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_ia_mu);
+    }
+    return NULL;
+}
+static VkDeviceMemory img_soft_request(int c, uint32_t type, VkDeviceSize size) {   // the helper allocates it (when it is free); fails for now
+    pthread_mutex_lock(&g_ia_mu);
+    if (!g_ia.thread) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); if (pthread_create(&t, &a, img_alloc_main, NULL)) g_ia.failed = 1; else g_ia.thread = 1; pthread_attr_destroy(&a); }
+    if (g_ia.failed) t_img_soft_failed = 2;
+    else { t_img_soft_failed = 1; if (!g_ia.state) { g_ia.cls = c; g_ia.type = type; g_ia.size = size; __atomic_store_n(&g_ia.state, 1, __ATOMIC_RELEASE); pthread_cond_signal(&g_ia_cv); } }
+    pthread_mutex_unlock(&g_ia_mu); return VK_NULL_HANDLE;
+}
 VkDeviceMemory vk_image_memory(const VkMemoryRequirements *req, uint32_t type, VkDeviceSize *off, void **sub) {
-    *off = 0; *sub = NULL;
+    *off = 0; *sub = NULL; t_img_soft_failed = 0;
     int c = 0; while (c < IMG_CLASSES && img_class_size(c) < req->size) c++;
     if (c == IMG_CLASSES || req->size > IMG_SLOT_MAX || req->alignment > 4096) {   // memory of its own
-        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req->size, type}; VkDeviceMemory m;
+        VkDeviceMemory m = VK_NULL_HANDLE;
+        pthread_mutex_lock(&g_imgblk_mu); for (int i = 0; i < IMG_SPARES; i++) if (g_img_spare[i].m && g_img_spare[i].size == req->size && g_img_spare[i].type == type) { m = g_img_spare[i].m; g_img_spare[i].m = VK_NULL_HANDLE; break; }
+        pthread_mutex_unlock(&g_imgblk_mu); if (m) return m;
+        if (t_img_soft) return img_soft_request(-1, type, req->size);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req->size, type};
         vk_mem_tag = "image"; VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &m); vk_mem_tag = NULL; return r ? VK_NULL_HANDLE : m;
     }
     pthread_mutex_lock(&g_imgblk_mu);
     imgblk *b = g_imgblk[c]; while (b && (b->type != type || !b->nfree)) b = b->next;
+    if (!b && t_img_soft) { pthread_mutex_unlock(&g_imgblk_mu); return img_soft_request(c, type, 0); }
     if (!b) {
-        b = calloc(1, sizeof *b); b->type = type; b->cls = (uint32_t)c; VkDeviceSize bs = img_class_size(c) * 64; if (bs < (2 << 20)) bs = 2 << 20; if (bs > IMG_BLOCK) bs = IMG_BLOCK; b->nslot = (uint32_t)(bs / img_class_size(c));   // 64 slots, 2 MB to 32 MB
-        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, (VkDeviceSize)b->nslot * img_class_size(c), type};
-        vk_mem_tag = "image-block"; VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &b->m); vk_mem_tag = NULL; if (r) { pthread_mutex_unlock(&g_imgblk_mu); free(b); return VK_NULL_HANDLE; }
-        for (uint32_t i = 0; i < b->nslot; i++) b->bits[i >> 6] |= 1ull << (i & 63);
-        b->nfree = b->nslot; b->next = g_imgblk[c]; g_imgblk[c] = b;
+        b = img_block_new(c, type); if (!b) { pthread_mutex_unlock(&g_imgblk_mu); return VK_NULL_HANDLE; }
+        b->next = g_imgblk[c]; g_imgblk[c] = b;
     }
     uint32_t i = 0; while (!b->bits[i >> 6]) i += 64; i += (uint32_t)__builtin_ctzll(b->bits[i >> 6]);
     b->bits[i >> 6] &= ~(1ull << (i & 63)); b->nfree--;

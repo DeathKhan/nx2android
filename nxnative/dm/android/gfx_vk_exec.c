@@ -3283,6 +3283,45 @@ static int ring_entry(int st, ring_slot *r, int ps, int k, VkDescriptorImageInfo
     if (!d->imageView) { *d = dummy; return 1; }   // (no image yet: waits like one without contents)
     ring_img(r, g_desc_im, k + g_pool_tex_base); return 0;
 }
+// The pool-texture prefetch (profile env DM_VK_POOL_PREFETCH=1). The tables' fills give a registered texture its first use lazily, 64 a fill, and nothing does before a
+// shader reads the tables: Ocarina of Time registers about 3,010 textures (1,015 MB) 3 s after its start and draws its title and file select without the tables for
+// 30 s more, so the first frame of the world took them all at once: 36 table builds at one fence, 2,196 first uploads, 742 MB of image memory from the kernel, one frame
+// of 2.7 to 3.0 s (Odin 3, 2026-11-10). The prefetch makes those first uses ahead, a few a frame: once a present, from any draw, it walks PF_IDS registered IDs on from a
+// cursor and gives the ones the tables would take (ring_entry's kinds, vk_tex_pool_ok 1) their first use once they have waited PF_AGE presents, within PF_N textures,
+// PF_B bytes and PF_NS a frame. Their image memory is asked softly (vk_image_memory_soft): the kernel's allocation runs on a helper thread and the texture waits for it.
+// Not past 80% of the texture budget: what the budget drops is ready again, and the prefetch would bring it straight back.
+// A cycle that finds nothing to do slows the walk to PF_IDLE_IDS a present
+static void pool_prefetch(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_POOL_PREFETCH"); on = e && atoi(e); if (on) VKLOG("pool prefetch: on (DM_VK_POOL_PREFETCH)"); }
+    static uint64_t last = ~0ull; if (!on || g_tex_frame == last) return; last = g_tex_frame;
+    if (vk_image_memory_busy()) return;
+    enum { PF_IDS = 256, PF_IDLE_IDS = 16, PF_AGE = 30, PF_N = 16 }; const uint64_t PF_B = 4u << 20, PF_NS = 1500000;
+    static uint32_t *seen; static int cap, cur = 1, idle, work; static uint64_t done_n, done_b, logged_n;
+    int hi = vk_tex_id_max(); if (hi < 1) return;
+    if (hi >= cap) { int nc = hi + 4096; uint32_t *p = realloc(seen, (size_t)nc * sizeof *p); if (!p) return; memset(p + cap, 0, (size_t)(nc - cap) * sizeof *p); seen = p; cap = nc; }
+    uint64_t bu, ev, evb, sw; vk_img_budget_stats(&bu, &ev, &evb, &sw); if (bu && vk_img_vkbytes() > bu / 10 * 8) return;
+    uint64_t t0 = tick(), bytes = 0; int n = 0; uint32_t now = (uint32_t)g_tex_frame + 1;
+    vk_tex_pool_fill(1); vk_image_memory_soft(1);
+    for (int i = idle ? PF_IDLE_IDS : PF_IDS; i > 0; i--) {
+        if (cur > hi) { cur = 1;   // a cycle is over
+            if (!work && !idle && done_n != logged_n) { logged_n = done_n; VKLOG("pool prefetch: %llu first uses made ahead so far (%.0f MB of storage); nothing waits at present %llu", (unsigned long long)done_n, done_b / 1048576.0, (unsigned long long)g_tex_frame); }
+            idle = !work; work = 0; }
+        int id = cur; const view_t *v = NULL; const tex_t *t = NULL;
+        if (seen[id] == ~0u && vk_tex_by_id(id, &v, &t) && t) { cur++; continue; }   // (had no image: left to a real bind)
+        if (!vk_tex_by_id(id, &v, &t) || !t) { seen[id] = 0; cur++; continue; }
+        int target = v && v->set_target ? v->target : t->d.target;
+        if (!(target == 1 || target == 2 || target == 4 || target == 8 || target == 9) || view_num(t, v) || vk_tex_pool_ok(t) != 1) { seen[id] = 0; cur++; continue; }
+        work = 1; idle = 0;
+        if (!seen[id]) seen[id] = now;
+        if (now - seen[id] < PF_AGE) { cur++; continue; }
+        uint64_t size = t->L.size; vkimg_t *im = vk_tex(t);
+        if (!im) { int sf = vk_image_memory_soft_failed(); if (sf == 2) on = 0; if (sf) break;   // its memory is on its way: this one again when the helper is done
+            seen[id] = ~0u; cur++; continue; }
+        seen[id] = 0; cur++; n++; bytes += size; done_n++; done_b += size;
+        if (n >= PF_N || bytes >= PF_B || tick() - t0 >= PF_NS) break;
+    }
+    vk_image_memory_soft(0); vk_tex_pool_fill(0);
+}
 static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
     // Global sampler generations describe the newest registration, while queued jobs
     // resolve IDs at their own enqueue snapshot. Never reuse historical contents
@@ -3733,6 +3772,7 @@ static int prepare_draw(int prim, int indexed) {
         g_coll_st = -1; if (g_set_memo != m0) g_stn[st] = n0;
         if (S.sh[st]->ntbl && !ts) { ts = S.sh[st]; tst = st; } poolmask |= tbl_kinds(S.sh[st]) >> TBL_SLOTS; }   // (two stages with tables of different sources: the first stage's; not seen)
     g_fs_buffer_collect = 0;
+    pool_prefetch();
     if (ts || poolmask) tbl = tbl_set(ts ? tst : 0, ts, poolmask);   // set 0: the handle source and the union of every active stage's pool kinds
     if (g_order_check) {   // the order-only barrier before this draw (see g_order_keep): kept, or the pass ends here with it
         g_order_check = 0; vkshader_t *fs = k.raster_discard ? NULL : S.sh[1];
