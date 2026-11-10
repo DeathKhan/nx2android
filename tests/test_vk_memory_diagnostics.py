@@ -68,6 +68,9 @@ int main(void) {
             self.skipTest('NDK Vulkan headers are required')
         src = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text()
         helpers = src[src.index('// DM_VK_MEM_DIAG'):src.index('\nuint32_t vk_mem_type')]
+        # pool_zero_copy takes a slab slot and, failing that, a kept buffer of the same size (the zcf cache): both, beside the logging
+        helpers += src[src.index('typedef struct { AHardwareBuffer *ahb; VkBuffer buf; VkDeviceMemory mem; uint64_t size, fence; } zcfree_t;'):src.index('// Small pools take a slot of a slab')]
+        helpers += src[src.index('#define SLAB_POOL_MAX'):src.index('// Zero copy: the pages of')]
         start = src.index('static int pool_zero_copy(')
         function = src[start:src.index('\n}\n', start) + 3]
         harness = r'''
@@ -84,14 +87,11 @@ struct ANativeWindow;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
-// Only the socketpair mock sees this Linux-only flag on macOS.
-#ifndef SOCK_CLOEXEC
-#define SOCK_CLOEXEC (1 << 24)
-#endif
 typedef struct AHardwareBuffer { int dummy; } AHardwareBuffer;
 typedef struct { uint32_t width, height, layers, format; uint64_t usage; uint32_t stride, rfu0; uint64_t rfu1; } AHardwareBuffer_Desc;
 #define AHARDWAREBUFFER_FORMAT_BLOB 33
@@ -99,16 +99,11 @@ typedef struct { uint32_t width, height, layers, format; uint64_t usage; uint32_
 #define AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN 48
 #define AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER 16777216
 #define POOL_USAGE VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-typedef struct { uint64_t slot_bytes; uint8_t *map; int fd; VkBuffer buf; } slab_t;
-typedef struct { AHardwareBuffer *ahb; VkBuffer buf; VkDeviceMemory mem; } zcfree_t;
-typedef struct { VkBuffer buf; VkDeviceMemory mem; AHardwareBuffer *ahb; int zero_copy;
-    uint64_t boff; slab_t *slab; uint32_t slot; } vkpool_t;
-// Force cache misses so each allocation/import stage below is fault-injected.
-static int slab_take(uint64_t size, slab_t **sl, uint32_t *slot) { (void)size; (void)sl; (void)slot; return 0; }
-static void slab_give(slab_t *sl, uint32_t slot, uint64_t fence) { (void)sl; (void)slot; (void)fence; assert(0); }
-static int zcf_take(uint64_t size, zcfree_t *out) { (void)size; (void)out; return 0; }
-static void zcf_free_now(const zcfree_t *entry) { (void)entry; assert(0); }
+struct slab_t;   // SLABS below defines it
+typedef struct { VkBuffer buf; VkDeviceMemory mem; AHardwareBuffer *ahb; int zero_copy; uint64_t boff; struct slab_t *slab; uint32_t slot; } vkpool_t;
 static struct { VkDevice dev; } V;
+static uint64_t vk_fence_done(void) { return 0; }
+uint64_t mtl_last_fence(void) { return 0; }
 static int failure, released, closed, destroyed, messages;
 static char last[1024];
 static uint8_t temporary[64];
@@ -129,7 +124,7 @@ static int AHardwareBuffer_allocate(const AHardwareBuffer_Desc *d, AHardwareBuff
 }
 static void AHardwareBuffer_release(AHardwareBuffer *a) { assert(a); released++; }
 static int mock_socketpair(int family, int type, int protocol, int *sv) {
-    assert(family == AF_UNIX && type == (SOCK_SEQPACKET | SOCK_CLOEXEC) && protocol == 0);
+    (void)type; assert(family == AF_UNIX && protocol == 0);
     if (failure == 2) { errno = EPERM; return -1; } sv[0] = 10; sv[1] = 11; return 0;
 }
 #define socketpair mock_socketpair
@@ -161,6 +156,7 @@ static VkResult vkBindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkD
     (void)d; assert(b && m && off == 0); return failure == 10 ? VK_ERROR_UNKNOWN : VK_SUCCESS;
 }
 static void vkDestroyBuffer(VkDevice d, VkBuffer b, const void *alloc) { (void)d; (void)alloc; assert(b); destroyed++; }
+static void vkFreeMemory(VkDevice d, VkDeviceMemory m, const void *alloc) { (void)d; (void)alloc; assert(m); }
 HELPERS
 FUNCTION
 int main(void) {
@@ -206,7 +202,7 @@ int main(void) {
         with tempfile.TemporaryDirectory(prefix='nx2a-memdiag-test-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
             c.write_text(harness)
-            subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers',
-                            '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
-            for enabled in ('0', '1'):
-                subprocess.run([str(exe)], env=dict(os.environ, DM_VK_MEM_DIAG=enabled), check=True)
+            subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers', '-Wno-unused-function', '-Wno-misleading-indentation',
+                            '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)   # -Wno-unused-function: zcf_put has no caller in this cut; gcc flags the engine's dense one-liners
+            for enabled in ('0', '1'):   # DM_VK_POOL_SLABS=0: the fault table walks the self-buffer path (a small pool would take a slab slot otherwise, and the mocks make no whole-slab buffer)
+                subprocess.run([str(exe)], env=dict(os.environ, DM_VK_MEM_DIAG=enabled, DM_VK_POOL_SLABS='0'), check=True)
