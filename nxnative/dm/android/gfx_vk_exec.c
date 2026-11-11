@@ -5242,6 +5242,42 @@ static int rt_same(const p_set_rt *r) {   // the targets the open pass draws int
     if (r->has_dview != S.rt_has_dview || (r->has_dview && memcmp(&r->dview, &S.rt_dview, sizeof S.rt_dview))) return 0;
     return 1;
 }
+// ---------------- shadows left out, a player's choice (DM_VK_SKIP_SHADOWS=1 with DM_VK_SHADOW_RT=<W>x<H> | square<N>, start-up) ----------------
+// The draws of a pass with no colour target and a depth target of the named shape (<W>x<H>, or square<N>: any square one of N or more) are dropped at replay, before
+// any of their work (pipelines, descriptor sets, the GPU's): no shadows, and a cheaper frame for a GPU-bound scene. The game's own clears of the map still run, so it
+// holds the value the game clears it to and every lookup reads "nothing in front": the scene is lit as if nothing cast a shadow. Decided once per OP_SET_RT, not per draw.
+// To find a game's shadow maps: DM_VK_SHADOW_RT=list logs the first 16 depth-only target shapes the game sets (size, NVN format, serial), and drops nothing.
+// The idea is droidplay-core 648a3758c's (Divinity on a OnePlus Pad 3: the shadow passes were 915 of 2,094 draws and 3.4 of 11.5 ms of pass time on the GPU); here
+// with the shape from the environment only, as our profiles have no vk_shadow_rt key
+static int g_sh_on = -1, g_sh_list, g_sh_rt;   // −1: not looked at yet; list mode; the render targets set now are a shadow map's
+static uint32_t g_sh_w, g_sh_h, g_sh_sq;   // the shadow map's size, or (g_sh_sq) the least side of a square one
+static uint64_t g_sh_skipped, g_sh_sets;   // draws dropped, and the times a shadow map was set as the target
+static void shadow_load(void) {
+    const char *e = getenv("DM_VK_SKIP_SHADOWS"), *r = getenv("DM_VK_SHADOW_RT"); unsigned a, b; char tail;
+    g_sh_on = 0;
+    if (r && !strcmp(r, "list")) { g_sh_list = 1; VKLOG("DM_VK_SHADOW_RT=list: the first 16 depth-only target shapes are logged, nothing is dropped"); return; }
+    if (!(e && *e == '1')) return;
+    if (r && sscanf(r, "square%u%c", &a, &tail) == 1 && a) { g_sh_sq = a; g_sh_w = g_sh_h = 0; }
+    else if (r && sscanf(r, "%ux%u%c", &a, &b, &tail) == 2 && a && b) { g_sh_w = a; g_sh_h = b; g_sh_sq = 0; }
+    else { VKLOG("[RED] DM_VK_SKIP_SHADOWS=1: shadows stay, as DM_VK_SHADOW_RT (%s) is not <W>x<H> or square<N> (DM_VK_SHADOW_RT=list finds the shapes)", r ? r : "not set"); return; }
+    g_sh_on = 1;
+    VKLOG("DM_VK_SKIP_SHADOWS=1: the draws of depth-only passes on %s targets are left out: no shadows", r);
+}
+static int shadow_rt(const p_set_rt *rt) {   // OP_SET_RT: whether the draws under these targets are dropped
+    if (g_sh_on < 0) shadow_load();
+    if ((!g_sh_on && !g_sh_list) || !rt->depth || rt->depth->magic != MAGIC('T', 'E', 'X', 0)) return 0;
+    for (int i = 0; i < rt->n && i < 8; i++) if (rt->color[i]) return 0;
+    const tex_t *d = rt->depth; uint32_t lv = rt->has_dview && rt->dview.set_levels ? rt->dview.base_level : 0, w = d->d.width >> lv ? d->d.width >> lv : 1, h = d->d.height >> lv ? d->d.height >> lv : 1;
+    static struct { uint32_t w, h, f; } seen[16]; static int nseen;   // the shapes met, each logged once
+    int known = 0; for (int i = 0; i < nseen; i++) known |= seen[i].w == w && seen[i].h == h && seen[i].f == (uint32_t)d->d.format;
+    int hit = g_sh_on && (g_sh_sq ? w == h && w >= g_sh_sq : w == g_sh_w && h == g_sh_h);
+    if (!known && nseen < 16 && (g_sh_list || hit)) { seen[nseen].w = w; seen[nseen].h = h; seen[nseen].f = (uint32_t)d->d.format; nseen++;
+        VKLOG("depth-only target %ux%u (NVN format %#x, serial %llu)%s", w, h, (unsigned)d->d.format, (unsigned long long)d->serial, hit ? ": a shadow map, its draws are left out from here on (DM_VK_SKIP_SHADOWS)" : ""); }
+    if (!hit) return 0;
+    uint64_t n = ++g_sh_sets; if (n >= 1024 && !(n & (n - 1))) VKLOG("shadow map draws left out: %llu, in %llu passes (cumulative; DM_VK_SKIP_SHADOWS)", (unsigned long long)g_sh_skipped, (unsigned long long)g_sh_sets);
+    return 1;
+}
+static int shadow_skips(void) { if (!g_sh_rt) return 0; g_sh_skipped++; return 1; }   // a draw record: dropped
 static void set_rt(const p_set_rt *r) {
     if (g_x_tracepass == -2) {   // (DM_VK_TRACE_PASS=-2 lists the render target changes too: each target's serial and memory)
         char t[512]; int o = 0; for (int i = 0; i < r->n && i < 8 && o < 400; i++) { const tex_t *c = r->color[i]; o += snprintf(t + o, sizeof t - (size_t)o, " c%d %s", i, c && c->magic == MAGIC('T', 'E', 'X', 0) ? "" : "-");
@@ -5352,7 +5388,7 @@ static void exec_ops(const uint8_t *p) {
             if (g_x_tracepass == -2 || mdi_log_now()) VKLOG("--- buffer clear %#llx, %llu bytes to %#x, after pass %d", (unsigned long long)c->addr, (unsigned long long)c->size, c->value, g_sub_pass - 1); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); vk_sub_update(d, a + 16, n); if (g_rc_npend) rc_overwrite(d, n);
             if (g_x_tracepass == -2) VKLOG("--- uniform update %#llx, %llu bytes, after pass %d", (unsigned long long)d, (unsigned long long)n, g_sub_pass - 1); break; }
-        case OP_SET_RT: set_rt((const p_set_rt *)a); break;
+        case OP_SET_RT: set_rt((const p_set_rt *)a); g_sh_rt = shadow_rt((const p_set_rt *)a); break;
         case OP_CLEAR_COLOR: if (!g_rc_skip) clear_color((const p_clear_color *)a); break;
         case OP_CLEAR_DS: if (!g_rc_skip) clear_ds((const p_clear_ds *)a); break;
         case OP_VIEWPORTS: { const p_viewports *v = (const p_viewports *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(S.vp[v->first + i], v->v[i], 16); break; }
@@ -5383,7 +5419,7 @@ static void exec_ops(const uint8_t *p) {
         case OP_ALPHA_REF: S.alpha_ref = ((const p_alpha_ref *)a)->ref; break;   // SetAlphaRef: the alpha test's reference (pkey atest / aref)
         case OP_PUSH_CONST: push_constants((const p_push_const *)a); break;
         case OP_MULTI_DRAW: {   // MultiDraw*IndirectCount with more than MDI_INLINE draws: one record (hle_nvn.c); one draw by the GPU's count at the range's first record (mdi_group), as the inline form's group
-            const p_multi_draw *m = (const p_multi_draw *)a; if (g_rc_skip) break;
+            const p_multi_draw *m = (const p_multi_draw *)a; if (g_rc_skip || shadow_skips()) break;
             if (m->itype < 0) { p_draw d = {m->prim, 0, 0, 1, 0, m->ind, m->cnt, 0, m->max, (int)m->stride}; draw(&d); }
             else { p_draw_idx d = {m->prim, m->itype, 0, 0, 0, 1, m->ibuf, m->ind, m->cnt, 0, m->max, (int)m->stride}; draw_idx(&d); }
             break; }
@@ -5401,8 +5437,8 @@ static void exec_ops(const uint8_t *p) {
         case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; break;
         case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; break;
         case OP_PRIM_RESTART: S.prim_restart = ((const p_prim_restart *)a)->on; break;
-        case OP_DRAW: { if (g_rc_skip) break; p_draw t; draw(draw_rec(a, h.size, &t)); break; }
-        case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; draw_idx(draw_idx_rec(a, h.size, &t)); break; }
+        case OP_DRAW: { if (g_rc_skip || shadow_skips()) break; p_draw t; draw(draw_rec(a, h.size, &t)); break; }
+        case OP_DRAW_IDX: { if (g_rc_skip || shadow_skips()) break; p_draw_idx t; draw_idx(draw_idx_rec(a, h.size, &t)); break; }
         case OP_DISPATCH: dispatch((const p_dispatch *)a); break;
         case OP_BARRIER: {   // the pass ends at every barrier: kept across XC3's fragment- and primitive-order barriers (0x1 0x2 0x4) its characters drew torn in some frames
             int32_t bits = *(const int32_t *)a;
