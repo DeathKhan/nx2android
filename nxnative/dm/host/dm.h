@@ -159,6 +159,7 @@ void gate_obs_set(int id, void (*fn)(uint64_t *regs, int param));
 // the game steps by them, hle_nvn.c fps_step_cap); DM_FRAME_CAP_NONE, none of them: the cap is not offered, as presenting a frame-stepped game slower would slow the game down
 enum { DM_FRAME_CAP_NONE, DM_FRAME_CAP_GAME, DM_FRAME_CAP_PACE, DM_FRAME_CAP_STEP };
 int dm_frame_cap_how(void);
+int dm_fps_lock_imported(void);   // hle_fpslock.c: imported FPSLocker rows in use
 int dm_frame_cap(void);
 void dm_frame_cap_set(int fps);
 uint64_t dm_frame_cap_period(uint64_t period);

@@ -364,6 +364,8 @@ static void lock_find(void) {
 // Without one, and without a frame step state page, nothing makes the game follow the cap, so the graphics layer keeps the game's own present interval (hle_nvn.c fps_present_cap):
 // presenting at a cap the game does not step by runs a fixed-step game fast or slow (Tears of the Kingdom 1.4.2 at 2x with DM_FPS_TARGET=60)
 int dm_fps_lock_engine(void) { pthread_once(&g_found, lock_find); return nrow || nier || fb.n || uq.base || g_nimp; }
+// Whether this main runs on imported FPSLocker rows (DM_FPS_LOCKS): such a config carries the game's values at each rate, so the pause menu's cap can pace it (hle_framecap.c)
+int dm_fps_lock_imported(void) { pthread_once(&g_found, lock_find); return g_nimp; }
 int nvn_fps_high_now(void);   // hle_nvn.c
 void dm_fps_lock_tick(void) {
     dynamic_resolution_tick();   // separate from the FPS cap

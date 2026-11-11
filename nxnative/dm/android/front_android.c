@@ -1314,7 +1314,7 @@ static void *host_thread(void *a) {
     LOG("host returned %d", rc);
     _exit(rc);
 }
-// GPU clock floor (env.txt DM_GPU_MIN_FREQ=<Hz>, a profile env row): Adreno's governor parks at 660 MHz under a steady 30 fps load on the AYN Odin 3 (available
+// GPU clock floor (every game by default, floor_default; env.txt DM_GPU_MIN_FREQ=<Hz>, a profile env row, sets another, 0 none): Adreno's governor parks at 660 MHz under a steady 30 fps load on the AYN Odin 3 (available
 // frequencies up to 1.1 GHz), and the game's frame-rate controller then steps its present interval down; the same floor (967 MHz) in the emulator took its cave from 21 to 29 fps,
 // and here p95 frame time 47 → 36 ms. Pokémon Legends: Arceus at 60 fps needs 734 MHz or more: at the 160 MHz floor the governor lowers the clock while the game holds 30,
 // and every trial back to 60 fails (1.2-2.0 vsyncs a frame). The sysfs node is root's. Written first through the firmware's PServerBinder service (AYN's Odin 3 and other
@@ -1325,6 +1325,7 @@ static void *host_thread(void *a) {
 // destroys nothing, so the first PServer write also leaves a root shell that waits for this process to end and then writes the previous floor back. All of it runs on its own
 // thread: the first build that called the service from onCreate sat on the splash screen on the Odin 3 (2026-11-11), and a game must start whatever the service does
 static char g_gpu_floor_prev[32]; static const char *GPU_MIN_FREQ = "/sys/class/kgsl/kgsl-3d0/devfreq/min_freq";
+static int g_gpu_floor_auto;   // no DM_GPU_MIN_FREQ row: the default floor, through PServerBinder only (never a su prompt nobody asked for), three quarters of the top clock
 static long g_gpu_floor_hz; static int g_gpu_floor_via, g_gpu_floor_on;   // the floor asked for (0 = none); 1 PServer, 2 su (0 = neither worked); whether it is in force now
 static int su_run(const char *cmd, char *out, size_t n) {   // su -c <cmd>; out: its first line (optional); 0 on success
     char full[1024]; snprintf(full, sizeof full, "su -c '%s' 2>/dev/null", cmd);
@@ -1387,11 +1388,23 @@ static int floor_set(int via) {
     if (!g_gpu_floor_prev[0]) snprintf(g_gpu_floor_prev, sizeof g_gpu_floor_prev, "%ld", atol(prev));   // the floor before the game, kept across trips to the background
     return 0;
 }
+// The default floor: the lowest available clock at or above three quarters of the highest (AYN Odin 3: 832 MHz of 1.1 GHz, the floor that held Legends: Arceus at 60 and the
+// one Kirby and the Forgotten Land lacked when the governor sat at 342 MHz, 85 % busy, with a 15.6 ms GPU frame); 0 when the service or the list is not there
+static long floor_default(void) {
+    char cmd[160], out[256]; snprintf(cmd, sizeof cmd, "cat %.*s/available_frequencies", (int)(strrchr(GPU_MIN_FREQ, '/') - GPU_MIN_FREQ), GPU_MIN_FREQ);
+    if (pserver_run(g_fl_env, cmd, out, sizeof out)) return 0;
+    long top = 0, pick = 0; char *p = out, *e;
+    for (long v; (v = strtol(p, &e, 10)), e != p; p = e) if (v > top) top = v;
+    for (p = out; ; p = e) { long v = strtol(p, &e, 10); if (e == p) break; if (v >= top / 4 * 3 && (!pick || v < pick)) pick = v; }
+    return pick;
+}
 static void floor_first(void) {
-    for (int via = 1; via <= 2 && !g_gpu_floor_via; via++) {
+    if (g_gpu_floor_auto && !(g_gpu_floor_hz = floor_default())) { LOG("GPU clock floor: none by default on this device (no PServerBinder service or no clock list); DM_GPU_MIN_FREQ=<Hz> in a profile asks for one through su"); return; }
+    for (int via = 1; via <= (g_gpu_floor_auto ? 1 : 2) && !g_gpu_floor_via; via++) {
         LOG("GPU clock floor %ld Hz: trying %s", g_gpu_floor_hz, via == 1 ? "PServerBinder" : "su");
         if (!floor_set(via)) g_gpu_floor_via = via;
     }
+    if (!g_gpu_floor_via && g_gpu_floor_auto) { LOG("GPU clock floor %ld Hz (the default): PServerBinder refused; none set", g_gpu_floor_hz); return; }
     if (!g_gpu_floor_via) { LOG("[RED] GPU clock floor %ld Hz: PServerBinder not there or refused, and su refused (grant the app root in Magisk, or leave DM_GPU_MIN_FREQ out)", g_gpu_floor_hz); return; }
     g_gpu_floor_on = 1;
     LOG("GPU clock floor %ld Hz through %s (was %s; restored in the background and when the game ends)", g_gpu_floor_hz, g_gpu_floor_via == 1 ? "PServerBinder (no root)" : "su", g_gpu_floor_prev);
@@ -1421,9 +1434,9 @@ static void *gpu_floor_thread(void *vm) {
     }
     return NULL;
 }
-static void gpu_floor_apply(void) {   // onCreate: the floor thread, if the profile asks for a floor
-    const char *e = getenv("DM_GPU_MIN_FREQ"); if (!e || atol(e) <= 0 || !g_act) return;
-    g_gpu_floor_hz = atol(e);
+static void gpu_floor_apply(void) {   // onCreate: the floor thread. The profile's floor (DM_GPU_MIN_FREQ=<Hz>; 0: none), else the default one (floor_default)
+    const char *e = getenv("DM_GPU_MIN_FREQ"); if ((e && atol(e) <= 0) || !g_act) return;
+    g_gpu_floor_hz = e ? atol(e) : 0; g_gpu_floor_auto = !e;
     pthread_t t; if (pthread_create(&t, NULL, gpu_floor_thread, g_act->vm)) { LOG("[RED] GPU clock floor: no thread for it"); return; }
     pthread_detach(t); g_fl_started = 1;
 }
