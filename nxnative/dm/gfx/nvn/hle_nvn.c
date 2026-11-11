@@ -142,8 +142,16 @@ HLE_FORCE("nvnBootstrapLoader", "the NVN graphics API is replaced wholesale with
 #ifdef __ANDROID__
 static pthread_once_t g_nq_config_once = PTHREAD_ONCE_INIT;
 static int g_nq_enabled;
+// Android: asynchronous replay (DM_NVN_ASYNC=1) takes the logical queues unless DM_NVN_LOGICAL_QUEUES=0 says otherwise. The older asynchronous path copies
+// each submitted recording itself (sub_copy), and since recordings keep their ends, links and calls in control memory (163a3fbdf) it cannot walk them: every
+// submission copy stopped at its first record and Donkey Kong Bananza drew nothing (0 draws, a red line per submission). The queues flatten recordings themselves
 static void nq_config_init(void) {
     const char *e = getenv("DM_NVN_LOGICAL_QUEUES");
+#ifdef __ANDROID__
+    const char *a = getenv("DM_NVN_ASYNC");
+    if (!e && a && atoi(a)) { g_nq_enabled = NVN_LOGICAL_QUEUES; if (g_nq_enabled) LOG("[nvn] DM_NVN_ASYNC=1: the logical queues replay asynchronously (DM_NVN_LOGICAL_QUEUES=0 turns them off)"); }
+    else
+#endif
     g_nq_enabled = NVN_LOGICAL_QUEUES && e && !strcmp(e, "1");
     if (g_nq_enabled) LOG("[nvn] logical queues enabled: event/sync continuations and retained submission resources");
 }
@@ -1976,7 +1984,7 @@ static size_t sub_flat(const uint8_t *p, uint8_t *out, size_t at, size_t cap, in
         if (hd.op == OP_END) return at;
         if (hd.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
         if (hd.op == OP_CALL && depth < 8) { uint64_t t; memcpy(&t, p + 8, 8); at = sub_flat((const uint8_t *)(uintptr_t)t, out, at, cap, depth + 1); p += hd.size; continue; }
-        if (hd.size < 8 || hd.size & 7) { LOG("[RED] submission copy: a record of size %u (op %u): copied up to it", hd.size, hd.op); return at; }
+        if (hd.size < 8 || hd.size & 7) { static int once; if (!once++) LOG("[RED] submission copy: a record of size %u (op %u): copied up to it (this copy cannot read recordings that keep their links in control memory: leave DM_NVN_LOGICAL_QUEUES unset or 1 with DM_NVN_ASYNC=1)", hd.size, hd.op); return at; }
         if (out) {
             if (at + hd.size > cap) return at;   // (the game changed the records between the two walks)
             uint8_t *d = out + at; memcpy(d, p, hd.size);
