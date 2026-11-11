@@ -946,6 +946,13 @@ VkImageView vk_tex_view_as(const tex_t *t, const view_t *vw, int dim, int arraye
             // Returning a 2D view for a cube shader bypassed tex_desc_for's typed dummy. The saved creation flag also requires a square,
             // single-sample 2D image; having six layers alone is insufficient. Check the selected range before either view cache can keep a wrong type.
             if (!(im->cflags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) || nly < 6 || (want == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && nly % 6)) {
+                // A 2D image of fewer than six layers, never made a cube, is a 2D descriptor in a cube slot, not a lost cube: a uniform-controlled branch leaves the input unused or
+                // reads a placeholder (Welcome Tour binds a 1x1 one-layer texture in a cube slot as the Joy-Con 2 (L) Area loads). The typed dummy, the zero cube, is a defined read where
+                // a 2D view was a type mismatch; informational, as on Metal (nvn_mtl.m tex_fit). A cube-compatible image or a 6-layer array whose range is not whole cubes stays red
+                if (!(im->cflags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && im->layers < 6 && (im->vtype == VK_IMAGE_VIEW_TYPE_2D || im->vtype == VK_IMAGE_VIEW_TYPE_2D_ARRAY)) {
+                    static int noted; if (!noted++) VKLOG("cube binding fallback: a %ux%u 2D image of %u layers has no cube view; zero cube bound (the shader may leave this input unused)", im->w, im->h, im->layers);
+                    return VK_NULL_HANDLE;
+                }
                 VKRED_ONCE(106, "cube view refused: image %ux%ux%u layers %u cflags %#x, levels %u+%u range %u+%u type %d", im->w, im->h, im->d, im->layers, im->cflags, lv0, nlv, ly0, nly, want);
                 return VK_NULL_HANDLE;
             }

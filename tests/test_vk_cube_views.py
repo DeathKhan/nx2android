@@ -149,11 +149,14 @@ int main(int argc, char **argv) {
     }
     // The reported failure: an ordinary 2D view already exists in the cache.
     reset(1,16,16,1,1); assert(vk_tex_view(&texture,NULL,1,0,0,NULL)); rejected(0);
-    assert(red_calls==1 && strstr(last_red,"[RED]") && strstr(last_red,"image 16x16x1") && strstr(last_red,"layers 1") && strstr(last_red,"cflags 0x"));
-    assert(strstr(last_red,"levels 0+3") && strstr(last_red,"range 0+1"));
+    // A 2D image of fewer than six layers in a cube slot (Welcome Tour's 1x1 placeholder) gets the zero cube without a red line, as on Metal
+    assert(red_calls==0);
     reset(4,16,16,5,1); rejected(1);
-    // Valid 2D-array storage with six layers must also have the creation flag.
+    assert(red_calls==0);
+    // Valid 2D-array storage with six layers must also have the creation flag: that refusal is red
     reset(4,16,8,6,1); rejected(0);
+    assert(red_calls==1 && strstr(last_red,"[RED]") && strstr(last_red,"image 16x8x1") && strstr(last_red,"layers 6") && strstr(last_red,"cflags 0x"));
+    assert(strstr(last_red,"levels 0+3") && strstr(last_red,"range 0+6"));
     reset(4,16,16,6,4); rejected(1);
     reset(4,16,16,7,1); rejected(1); // cube-array ranges still require six-face groups
     reset(3,16,6,1,1); rejected(0); // 1D-array, six layers
