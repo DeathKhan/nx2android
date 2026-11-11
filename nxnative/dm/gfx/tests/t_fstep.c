@@ -407,6 +407,31 @@ int main(void) {
         snprintf(b, sizeof b, "hold 3 with an odd heavier frame: a trial to 2 within %d frames, held through 3 slow first frames (k %d, failed %llu)", waited, m.s.k, (unsigned long long)m.s.failed);
         check(at3 && waited >= 0 && waited < 120 && m.s.k == 2 && m.s.failed == 0, b);
     }
+    {   // Hitches at the title (Pokémon Legends: Arceus): late frames that cost 0.3 vsyncs end trials back to 60; the hold-off stays 1 s up to FSTEP_HITCH_MAX of them
+        sim m = {0}; run(&m, 120, 0.2, 1, 3, 0);
+        for (int i = 0; i < 3; i++) m.next = nvn_fstep_next(&m.s, 3.0, 0.3, 1, 3, 0, 0);
+        check(m.s.k == 2 && m.s.hold == FSTEP_HOLD0, "hitches: three late frames of small cost step up to 30");
+        int ok = 1;
+        for (int f = 0; f < FSTEP_HITCH_MAX && ok; f++) {
+            for (int i = 0; i < 400 && !m.s.trial; i++) run(&m, 1, 0.2, 1, 3, 0);
+            ok = m.s.trial && m.s.k == 1; run(&m, 10, 0.2, 1, 3, 0);
+            for (int i = 0; i < 3; i++) m.next = nvn_fstep_next(&m.s, 3.0, 0.3, 1, 3, 0, 0);
+            ok = ok && m.s.k == 2 && m.s.hold == FSTEP_HOLD0;
+        }
+        snprintf(b, sizeof b, "  %d trials failed on hitches alone: the hold-off stays 1 s (hold %.0f, failed %llu)", FSTEP_HITCH_MAX, m.s.hold, (unsigned long long)m.s.failed);
+        check(ok && m.s.failed == FSTEP_HITCH_MAX, b);
+        for (int i = 0; i < 400 && !m.s.trial; i++) run(&m, 1, 0.2, 1, 3, 0);
+        run(&m, 10, 0.2, 1, 3, 0); for (int i = 0; i < 3; i++) m.next = nvn_fstep_next(&m.s, 3.0, 0.3, 1, 3, 0, 0);
+        check(m.s.k == 2 && m.s.hold == 2 * FSTEP_HOLD0, "  one more in a row doubles it, as any failed trial");
+        for (int i = 0; i < 400 && !m.s.trial; i++) run(&m, 1, 0.2, 1, 3, 0);
+        run(&m, 60, 0.2, 1, 3, 0);
+        check(m.s.k == 1 && m.s.hitch_fails == 0, "  a trial that holds forgets the hitches: 60 fps");
+        sim c = {0}; run(&c, 120, 0.2, 1, 3, 0);   // the same trial failing on cost: doubled at once
+        for (int i = 0; i < 3; i++) c.next = nvn_fstep_next(&c.s, 3.0, 0.3, 1, 3, 0, 0);
+        for (int i = 0; i < 400 && !c.s.trial; i++) run(&c, 1, 0.2, 1, 3, 0);
+        run(&c, 10, 0.2, 1, 3, 0); run(&c, 3, 1.5, 1, 3, 0);
+        check(c.s.k == 2 && c.s.hold == 2 * FSTEP_HOLD0, "  a trial failing on its frames' cost doubles the hold-off");
+    }
     printf("== %d checks, %d failed ==\n", checks, fail);
     return fail != 0;
 }
