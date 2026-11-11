@@ -469,8 +469,10 @@ static void thermal_start(void) {
     pthread_t th; if (pthread_create(&th, NULL, thermal_main, NULL)) { LOG("[RED] [perf] thermal status: no thread (%s)", strerror(errno)); return; }
     pthread_setname_np(th, "dm-thermal"); pthread_detach(th);
 }
-int dm_thermal_now(void) {   // (overrides hle_nvn.c's weak -1): the state for the host's gates, -1 unless DM_THERMAL_CAP=1
+__attribute__((weak)) int dm_front_thermal(void) { return -1; }   // front_android.c: the pause menu's Thermal throttle (0 off, 1 on, -1 not chosen)
+int dm_thermal_now(void) {   // (overrides hle_nvn.c's weak -1): the state for the host's gates, -1 unless the pause menu's Thermal throttle is on (or, not chosen there, DM_THERMAL_CAP=1)
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, thermal_start);
     static int gates = -1; if (gates < 0) { const char *e = getenv("DM_THERMAL_CAP"); gates = e && !strcmp(e, "1"); }
-    return gates ? __atomic_load_n(&g_thermal, __ATOMIC_RELAXED) : -1;
+    int f = dm_front_thermal();
+    return (f >= 0 ? f : gates) ? __atomic_load_n(&g_thermal, __ATOMIC_RELAXED) : -1;
 }
