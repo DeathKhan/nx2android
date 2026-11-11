@@ -84,6 +84,10 @@ static _Atomic int g_set_cap;    // the frame cap's index in OVM_CAPS (0 off; se
 static _Atomic int g_set_fpspos;   // the frame rate counter's corner (OVM_FPSPOS_KEYS: 0 top left for every game until the player picks another; settings.txt fpspos=)
 static _Atomic int g_set_thermal = -1;    // the pause menu's Thermal throttle (settings.txt thermal=): -1 until the player chooses there (DM_THERMAL_CAP decides), then 0 off, 1 on
 static _Atomic int g_set_floor = -1;      // the pause menu's GPU clock floor (settings.txt gpufloor=<percent>): -1 until the player chooses there (the profile's DM_GPU_MIN_FREQ, else 75%), then OVM_FLOORS' index
+// The menu button hides while a controller plays once one of its keys has opened the menu (Back, Home or Menu: settings.txt menukey=1): that key is the menu's
+// button from then on, and the pill only covered the game. A touch on the screen shows it again for OV_MENU_PEEK_NS, so the menu is never out of reach
+static _Atomic int g_menu_key; static _Atomic int64_t g_touch_t;
+#define OV_MENU_PEEK_NS 3000000000ll
 static _Atomic int g_set_mouse = -1;      // the pause menu's Joy-Con mouse (settings.txt mouse=): -1 until the player chooses there (DM_MOUSE decides), then 0 off, 1 auto
 static _Atomic int g_set_padlabel = -1;   // the pause menu's Face buttons (settings.txt labels=): -1 until the player chooses there, then 0 by position, 1 by label
 static int fpspos_index(const char *s) { for (int i = 0; i < 4; i++) if (!strncmp(s, OVM_FPSPOS_KEYS[i], 2)) return i; return -1; }
@@ -101,7 +105,7 @@ static void settings_load(void) {
     char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[128];
     if (!f) return;
     g_set_extra[0] = 0;
-    while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_padlabel, v != 0); else if (sscanf(line, "mouse=%d", &v) == 1) atomic_store(&g_set_mouse, v != 0); else if (sscanf(line, "thermal=%d", &v) == 1) atomic_store(&g_set_thermal, v != 0); else if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
+    while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_padlabel, v != 0); else if (sscanf(line, "mouse=%d", &v) == 1) atomic_store(&g_set_mouse, v != 0); else if (sscanf(line, "menukey=%d", &v) == 1) atomic_store(&g_menu_key, v != 0); else if (sscanf(line, "thermal=%d", &v) == 1) atomic_store(&g_set_thermal, v != 0); else if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
         else if (sscanf(line, "temps=%d", &v) == 1) atomic_store(&g_set_temps, v != 0);
         else if (sscanf(line, "docked=%d", &v) == 1) { setenv("DM_OPMODE", v ? "1" : "0", 1); atomic_store(&g_set_res, v ? DM_RES_MAX : DM_RES_BALANCED); }   // over env.txt's: the host reads it once, at its first query
@@ -137,6 +141,7 @@ static void settings_save(void) {
     fprintf(f, "fpspos=%s\n", OVM_FPSPOS_KEYS[atomic_load(&g_set_fpspos) & 3]);
     if (atomic_load(&g_set_padlabel) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_padlabel));
     if (atomic_load(&g_set_mouse) >= 0) fprintf(f, "mouse=%d\n", atomic_load(&g_set_mouse));
+    if (atomic_load(&g_menu_key)) fprintf(f, "menukey=1\n");
     if (atomic_load(&g_set_floor) >= 0) fprintf(f, "gpufloor=%d\n", OVM_FLOORS[atomic_load(&g_set_floor)]);   // (only once chosen: until then the profile, else the default)
     if (atomic_load(&g_set_thermal) >= 0) fprintf(f, "thermal=%d\n", atomic_load(&g_set_thermal));   // (only once chosen: until then env.txt decides)
     fputs(g_set_extra, f);   // the lines settings_load did not know
@@ -318,7 +323,11 @@ static _Atomic int64_t g_press_t[16], g_menu_t, g_stick_t[2];   // when each ove
 static _Atomic uint64_t g_touch_btn;   // the overlay buttons held, cleared by the menu or keyboard
 static int64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
 // A system input device can report itself as an active controller (issues #22, #210). The saved choice must still work, and the menu must stay reachable.
-int dm_overlay_visible(void) { return atomic_load(&g_set_overlay) && atomic_load(&g_overlay) ? 1 : 2; }
+int dm_overlay_visible(void) {
+    if (atomic_load(&g_set_overlay) && atomic_load(&g_overlay)) return 1;
+    if (g_pad_used && atomic_load(&g_menu_key) && !atomic_load(&g_menu) && mono_ns() - atomic_load(&g_touch_t) > OV_MENU_PEEK_NS) return 0;   // the controller's key opens the menu
+    return 2;
+}
 int dm_overlay_layout(void) {   // the phone's layout in a window at least OV_PHONE_ASPECT wide for its height (overlay_layout.h)
     static int last_w = -1, last_h = -1, phone;
     ANativeWindow *w = phone_window(); int ww = w ? ANativeWindow_getWidth(w) : 0, wh = w ? ANativeWindow_getHeight(w) : 0;
@@ -1046,7 +1055,7 @@ static void touch_event(AInputEvent *e) {
     if (act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_POINTER_DOWN) {
         int i = act == AMOTION_EVENT_ACTION_DOWN ? 0 : ai, id = AMotionEvent_getPointerId(e, (size_t)i) & 31;
         int c = ctl_at(AMotionEvent_getX(e, (size_t)i), AMotionEvent_getY(e, (size_t)i), W, H);
-        g_ptr_ctl[id] = c + 1;
+        g_ptr_ctl[id] = c + 1; atomic_store(&g_touch_t, mono_ns());   // (after ctl_at: the touch that brings a hidden menu button back is the game's)
         if (c >= 0 && OV_CTLS[c].kind == OV_MENU) { atomic_store(&g_menu_t, mono_ns()); dm_haptics_android_tap(); menu_grab(id, &OV_CTLS[c], AMotionEvent_getX(e, (size_t)i), AMotionEvent_getY(e, (size_t)i), W, H); }
         if (!atomic_exchange(&g_overlay, 1) && !atomic_load(&g_pads)) dm_haptics_android_device(-1);   // keep vibration on a used controller that is still attached
     }
@@ -1155,6 +1164,7 @@ static int handle_event(AInputEvent *e) {
         if (atomic_load(&g_tx_on)) return tx_key(e);   // the text entry takes every key while it is open
         int32_t k = AKeyEvent_getKeyCode(e), down = AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_DOWN;
         if (k == AKEYCODE_BACK || k == AKEYCODE_BUTTON_MODE || k == AKEYCODE_MENU) {   // the menu, both ways (Back would otherwise finish the activity, and the game with it)
+            if (down && AKeyEvent_getRepeatCount(e) == 0 && g_pad_used && !atomic_exchange(&g_menu_key, 1)) { settings_save(); LOG("[overlay] a controller key opens the menu: the menu button hides while the controller plays (a touch shows it for 3 s)"); }
             if (down && AKeyEvent_getRepeatCount(e) == 0) { if (atomic_load(&g_sp_on)) sp_close_all(); else if (atomic_load(&g_menu)) menu_close(); else menu_open(k == AKEYCODE_BACK ? -1 : 0); }
             return 1;
         }

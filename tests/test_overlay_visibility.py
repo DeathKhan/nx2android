@@ -33,6 +33,11 @@ class OverlayVisibility(unittest.TestCase):
 static _Atomic int g_set_overlay, g_overlay, g_pads, g_edit;
 static _Atomic int g_menu_tab, g_sv_st, g_menu_hi = -1;
 static int layout, saves;
+// the menu button's hiding (front_android.c g_menu_key): its state and the clock, declared before dm_overlay_visible as there
+static int g_pad_used; static _Atomic int g_menu, g_menu_key; static _Atomic int64_t g_touch_t;
+#define OV_MENU_PEEK_NS 3000000000ll
+static int64_t test_now = 1;
+static int64_t mono_ns(void) { return test_now; }
 int dm_overlay_layout(void) { return layout; }
 float dm_overlay_scale(void) { return 1; }
 int dm_overlay_custom(int l, int c, float *x, float *y, float *s) {
@@ -68,14 +73,14 @@ enum { AMOTION_EVENT_AXIS_X, AMOTION_EVENT_AXIS_Y, AMOTION_EVENT_AXIS_Z, AMOTION
        AMOTION_EVENT_AXIS_HAT_Y, AMOTION_EVENT_AXIS_BRAKE, AMOTION_EVENT_AXIS_GAS };
 typedef struct { int source, type, action, key, device; float x, y, axis[10]; } AInputEvent;
 typedef int ANativeWindow;
-static int width, height, window, vibration = -1, touches, menu_opens, pad_publications, g_pad_used;
+static int width, height, window, vibration = -1, touches, menu_opens, pad_publications;
 static uint64_t g_btn, g_touch_btn, touch_buttons;
 static float g_ax[8];
 static int32_t pad_sticks[4];
 static uint64_t pad_buttons;
 static int g_ptr_ctl[32];
 static struct { int id, moved; } g_drag = {-1, 0};
-static _Atomic int g_menu, g_sp_on, g_tx_on, g_pad_in, g_knob[2][2];
+static _Atomic int g_sp_on, g_tx_on, g_pad_in, g_knob[2][2];
 static _Atomic int64_t g_menu_t, g_press_t[16], g_stick_t[2];
 static struct { int sel; } g_tx;
 static int g_tx_mu;
@@ -103,7 +108,6 @@ static int g_tx_mu;
 #define menu_touch(e, W, H) ((void)(e), (void)(W), (void)(H))
 #define tx_touch(e, W, H) ((void)(e), (void)(W), (void)(H))
 static ANativeWindow *phone_window(void) { return &window; }
-static int64_t mono_ns(void) { return 1; }
 static void dm_haptics_android_device(int id) { vibration = id; }
 static void menu_open(int tab) { (void)tab; menu_opens++; }
 static void menu_key(uint64_t bit) { (void)bit; }
@@ -146,6 +150,14 @@ static void input_handoff(int test) {
     assert(handle_event(&pad) == 1);
     assert(g_ax[0] == 0.7f && pad_publications == before + 2 && vibration == 42);
     assert(dm_overlay_visible() == 2); controls(0);
+    // once a controller key has opened the menu, the menu button hides while the controller plays; a touch brings it back for OV_MENU_PEEK_NS
+    atomic_store(&g_menu_key, 1); test_now = 10000000000ll;
+    assert(dm_overlay_visible() == 0);
+    for (int i = 0; i < OV_N; i++) if (OV_CTLS[i].kind == OV_MENU) { float b[4]; ov_box(&OV_CTLS[i], width, height, b); assert(ctl_at(b[0], b[1], width, height) < 0); }
+    atomic_store(&g_menu, 1); assert(dm_overlay_visible() == 2); atomic_store(&g_menu, 0);   // (the open menu draws it: it closes the menu)
+    atomic_store(&g_touch_t, test_now); assert(dm_overlay_visible() == 2);
+    test_now += OV_MENU_PEEK_NS + 1; assert(dm_overlay_visible() == 0);
+    atomic_store(&g_menu_key, 0); test_now = 1; assert(dm_overlay_visible() == 2);
     for (int i = 0; i < OV_N; i++) if (OV_CTLS[i].kind == OV_MENU) {
         float b[4]; ov_box(&OV_CTLS[i], width, height, b);
         tap.x = b[0]; tap.y = b[1];
