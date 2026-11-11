@@ -513,6 +513,10 @@ void vk_init(void) {
     const char *clock_extension = has_ext(ex, ne, "VK_KHR_calibrated_timestamps") ? "VK_KHR_calibrated_timestamps" :
         has_ext(ex, ne, "VK_EXT_calibrated_timestamps") ? "VK_EXT_calibrated_timestamps" : NULL;
     if (clock_extension) on[non++] = clock_extension;
+    // NVN vertex streams step per N instances (gfx_vk_exec.c build_pipeline's divisor state): VK_EXT_vertex_attribute_divisor, or the KHR one (core in Vulkan 1.4, the same
+    // structures and type values) on a device that offers only that (the Mali-G715). Not enabled before, while pipelines chained its state all the same (invalid usage)
+    const char *div_ext = has_ext(ex, ne, "VK_EXT_vertex_attribute_divisor") ? "VK_EXT_vertex_attribute_divisor" : has_ext(ex, ne, "VK_KHR_vertex_attribute_divisor") ? "VK_KHR_vertex_attribute_divisor" : NULL;
+    if (div_ext) on[non++] = div_ext;
     // Catmull-Rom is EXT cubic's default; QCOM selectable weights are not needed.
     V.has_filter_cubic = has_ext(ex, ne, "VK_EXT_filter_cubic");
     if (V.has_filter_cubic) on[non++] = "VK_EXT_filter_cubic";
@@ -580,8 +584,17 @@ void vk_init(void) {
     VkPhysicalDeviceDepthClipControlFeaturesEXT fdc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &fr2};
     VkPhysicalDeviceIndexTypeUint8FeaturesEXT fu8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, &fdc};
     VkPhysicalDeviceTransformFeedbackFeaturesEXT fxf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, &fu8};
-    VkPhysicalDeviceFeatures2 fx = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fxf};
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT fdv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, &fxf};
+    VkPhysicalDeviceFeatures2 fx = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fdv};
     vkGetPhysicalDeviceFeatures2(V.pd, &fx);
+    V.has_divisor = div_ext && fdv.vertexAttributeInstanceRateDivisor;
+    if (!V.has_divisor) VKLOG("no vertexAttributeInstanceRateDivisor (%s): vertex streams stepping per N > 1 instances are read per instance", div_ext ? div_ext : "no vertex attribute divisor extension");
+    else if (div_ext[3] == 'K') {   // the KHR one says whether a draw may start past instance 0 with such a stream (the EXT one always may)
+        VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR dvp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dvp}; vkGetPhysicalDeviceProperties2(V.pd, &p2);
+        VKLOG("%svertex streams stepping per N instances: VK_KHR_vertex_attribute_divisor%s", dvp.supportsNonZeroFirstInstance ? "" : "[RED] ",
+              dvp.supportsNonZeroFirstInstance ? "" : ", without supportsNonZeroFirstInstance: a draw with such a stream past instance 0 reads elements counted from instance 0");
+    }
     // transform feedback (NVN BeginTransformFeedback; gfx_vk_exec.c xfb_*): Xenoblade Chronicles 3 captures particle state with it
     V.has_xfb = fxf.transformFeedback && has_ext(ex, ne, "VK_EXT_transform_feedback"); fxf.geometryStreams = 0;
     fr2.robustBufferAccess2 = 0; fr2.robustImageAccess2 = 0;   // nullDescriptor only: unbound slots read 0 without a dummy
@@ -625,7 +638,8 @@ void vk_init(void) {
     fu8.pNext = V.has_depth_clip_ctl ? (void *)&fdc : fdc.pNext;
     fxf.pNext = &fu8;
     VkBaseOutStructure *t = ff.pNext; while (t->pNext) t = t->pNext;   // the queried chain (core / promoted features), then the extensions'
-    t->pNext = V.has_xfb ? (VkBaseOutStructure *)&fxf : (VkBaseOutStructure *)&fu8;
+    fdv.pNext = V.has_xfb ? (void *)&fxf : (void *)&fu8;
+    t->pNext = V.has_divisor ? (VkBaseOutStructure *)&fdv : V.has_xfb ? (VkBaseOutStructure *)&fxf : (VkBaseOutStructure *)&fu8;
     VkPhysicalDeviceFeatures2 enf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, ff.pNext, en};
     float prio = 1;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, V.qf, 1, &prio};

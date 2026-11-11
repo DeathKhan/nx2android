@@ -57,6 +57,7 @@ typedef struct {
     int has_occ_precise;  // exact samples-passed query counts (used as a ratio by Bananza, not only a visibility Boolean)
     int has_barycentric;   // VK_KHR_fragment_shader_barycentric: per-vertex fragment inputs (Ampere LDTRAM)
     int dyn_ssbo;          // DM_VK_DYN_SSBO=1 at startup: direct graphics storage buffers use dynamic offsets within device limits
+    int has_divisor;       // vertexAttributeInstanceRateDivisor (VK_EXT_vertex_attribute_divisor or the KHR one): streams stepping per N instances (build_pipeline)
     int has_bda;           // bufferDeviceAddress (Vulkan 1.2 or VK_KHR_buffer_device_address): the pools' buffers get GPU addresses for raw global memory (vk_gmem_map)
     float max_aniso;
     // subgroups (vk_init): VkPhysicalDeviceSubgroupProperties' size, stages, operations and quadOperationsInAllStages; VkPhysicalDeviceSubgroupSizeControlProperties'
