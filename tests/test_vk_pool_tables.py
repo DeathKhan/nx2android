@@ -141,9 +141,11 @@ int main(int argc,char **argv){
   dmsv_bind b[2]={{.kind=RK_TEX_UBO,.desc=RD_SAMPLED,.dim=1,.samp=RS_TEX},{.kind=RK_TEX_UBO,.desc=RD_SAMPLED,.dim=1,.flags=1,.samp=RS_TEX}};
   S.ubo[0][0]=(p_bind_buf){1,16};
   vkshader_t s={.ntbl=1,.tbl_reg=0,.tbl_off=0,.nbind=1,.tbl={1},.b=b};
-  VkDescriptorSet a=tbl_set(0,&s,0);assert(view(a,1,0)==vk_dummy_view(0,0,0,0,0));
+  // every slot of a set is filled from the handles, so a shader reading another slot of the same handles takes the same set (one set per handle list:
+  // Welcome Tour's table shaders read 1-3 slots each, and a set per slot combination bound set 0 ~30 times a frame)
+  VkDescriptorSet a=tbl_set(0,&s,0);assert(view(a,1,0)==H(VkImageView,110001));
   s.tbl[0]=2;s.b=&b[1];VkDescriptorSet c=tbl_set(0,&s,0);
-  assert(c!=a&&view(c,1,0)==H(VkImageView,110001));assert(view(a,1,0)==H(VkImageView,999));
+  assert(c==a&&view(c,1,0)==H(VkImageView,110001));
  }else if(mode==5){
   g_tracing=1;
   VkDescriptorSet a=tbl_set(0,NULL,19);uint64_t built=g_tbl_builds;

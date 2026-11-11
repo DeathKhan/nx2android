@@ -3331,9 +3331,12 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
             n = (uint32_t)(bytes / 8); if (n > (uint32_t)N) n = (uint32_t)N; if (n) vk_ubd_read(a, (uint64_t)n * 8, (uint8_t *)words);
             if (bytes > g_tbl_max_bytes || n > g_tbl_max_n) { g_tbl_max_bytes = bytes > g_tbl_max_bytes ? (uint32_t)bytes : g_tbl_max_bytes; g_tbl_max_n = n > g_tbl_max_n ? n : g_tbl_max_n;
                 static int nl; if (nl++ < 12) VKLOG("texture table: stage %d uniform buffer %d +%d bound with %llu bytes: %u handles read (table length %d)", st, s->tbl_reg, s->tbl_off, (unsigned long long)size, n, N); } } }
-    // Pool bindings do not change registry generations. The bases and the handle-table kinds must be part of the identity:
-    // an absent handle kind is filled with dummies, so a later shader using that kind needs a different set even with identical handles.
-    unsigned kinds = (tbl_kinds(s) & ((1u << TBL_SLOTS) - 1)) | (poolmask << TBL_SLOTS);
+    // Pool bindings do not change registry generations: the bases and the pool kinds are part of the identity. The handle-table slots are not: every slot of a set is filled
+    // from its handles (the shader's binding where it has one, the slot's own kind otherwise), so any shader reading the same handles takes the same set. With the slots
+    // the shader used in the identity (8569eeb7b: slots it did not use were left dummies), Nintendo Switch 2 Welcome Tour's ~420 table shaders, which read 1-3 slots of
+    // the same handle list, built a set per combination and draws alternated between them: set 0 was bound ~25-36 times a frame instead of about once, and the Adreno
+    // driver copies a bound set into command memory each time (GPU 11 -> 23 ms a frame in the Joy-Con 2 (L) Area)
+    unsigned kinds = poolmask << TBL_SLOTS;
     uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)n ^ (uint64_t)kinds << 32;
     h = (h ^ (uint32_t)g_pool_tex_base) * 0x100000001b3ull;
     h = (h ^ (uint32_t)g_pool_samp_base) * 0x100000001b3ull;
@@ -3421,14 +3424,14 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
         const dmsv_bind *b = NULL; for (int i = 0; i < s->nbind && i < 96; i++) if (s->tbl[i] == 1 + slot) b = &s->b[i];
         dmsv_bind vb = b ? *b : (dmsv_bind){.kind = RK_TEX_UBO, .desc = RD_SAMPLED, .dim = (uint8_t)(slot == 2 ? 3 : 1), .flags = (uint8_t)(slot == 1 ? 1 : 0), .samp = RS_TEX, .reg = (int16_t)s->tbl_reg, .off = s->tbl_off};
         VkDescriptorImageInfo dummy = {vk_dummy_sampler(), vk_dummy_view(vb.dim, vb.flags & 1, 0, 0, 0), VK_IMAGE_LAYOUT_GENERAL}, *d = ii + (size_t)slot * (size_t)N;
-        for (uint32_t k = 0; k < n && b; k++) {
+        for (uint32_t k = 0; k < n; k++) {
             uint64_t hh = mem_handle(words[2 * k]); int tid = (int)(hh & 0xfffff); const view_t *v = NULL; const tex_t *t = NULL; int fits = 0;
             if (tid && vk_tex_by_id(tid, &v, &t) && t) { int target = v && v->set_target ? v->target : t->d.target;
                 fits = vb.dim == 3 ? (t->d.width == t->d.height && (target == 8 || target == 9 || (target == 4 && t->d.depth >= 6))) : (target == 1 || target == 4 || target == 8 || target == 9);
                 if (fits && view_num(t, v)) fits = 0; }   // (the arrays declare floating-point texels)
             if (fits) { tex_desc_for(st, &vb, hh, &d[k], 0); if (!d[k].imageView) d[k] = dummy; } else d[k] = dummy;
         }
-        for (uint32_t k = b ? n : 0; k < (uint32_t)N; k++) d[k] = dummy;
+        for (uint32_t k = n; k < (uint32_t)N; k++) d[k] = dummy;
         w[nwr++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)slot, 0, (uint32_t)N, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d, NULL, NULL};
     }
     if (nwr) vkUpdateDescriptorSets(V.dev, nwr, w, 0, NULL);

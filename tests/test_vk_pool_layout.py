@@ -35,9 +35,9 @@ enum { TBL_SLOTS=3, POOL_TEX_SLOTS=4, POOL_B0=3, POOL_SAMP_B=7, SET0_BINDINGS=8 
 SCAN
 static struct { struct { VkPhysicalDeviceLimits limits; } props; } V;
 static pthread_mutex_t g_sh_mu=PTHREAD_MUTEX_INITIALIZER;
-static unsigned bundle_opens, layout_calls, desired_mask=3;
+static unsigned bundle_opens, layout_calls, desired_mask=3; static int desired_samp;
 static VkDescriptorSetLayoutBinding captured[8];
-static void bundle_auto(void){bundle_opens++;g_pool_kinds=desired_mask;}
+static void bundle_auto(void){bundle_opens++;g_pool_kinds=desired_mask;g_pool_samp_seen=desired_samp;}
 static int vk_tbl_n(void){return 2048;}
 #define VKLOG(...) ((void)0)
 static VkDescriptorSetLayout shader_layout(const VkDescriptorSetLayoutBinding *b,uint32_t n){
@@ -103,7 +103,8 @@ int main(int argc,char **argv){
  V.props.limits.maxDescriptorSetSamplers=1000000;
  setenv("DM_VK_POOL_N","65536",1);
  if(mode==1){desired_mask=15;V.props.limits.maxDescriptorSetSampledImages=200000;}
- if(mode==2)desired_mask=0;
+ if(mode==2)desired_mask=0;   // no pool shader in the bundle: one element per pool binding, samplers too
+ if(mode==8){desired_mask=0;desired_samp=1;}   // sampler pools only: the full layout
  if(mode==3)setenv("DM_VK_POOL_N","0",1);
  if(mode==4||mode==5)V.props.limits.maxPerStageDescriptorSampledImages=131074+6144+256-(mode==5);
  if(mode==6)V.props.limits.maxDescriptorSetSamplers=6144+256;
@@ -111,8 +112,9 @@ int main(int argc,char **argv){
  pthread_t threads[8];for(int i=0;i<8;i++)assert(!pthread_create(&threads[i],NULL,get_layout,NULL));
  for(int i=0;i<8;i++)assert(!pthread_join(threads[i],NULL));
  assert(bundle_opens==1&&layout_calls==1);
- unsigned np=mode==3||mode==6?1:mode==5?65280:mode==1?48384:65536;
- assert(vk_pool_n()==(mode==3||mode==6?0:(int)np));
+ int none=mode==2||mode==3||mode==6;
+ unsigned np=none?1:mode==5?65280:mode==1?48384:65536;
+ assert(vk_pool_n()==(none?0:(int)np));
  unsigned total=0;
  for(unsigned i=0;i<8;i++){
   assert(captured[i].binding==i&&captured[i].stageFlags==VK_SHADER_STAGE_ALL_GRAPHICS);
@@ -120,7 +122,7 @@ int main(int argc,char **argv){
   else if(i<7){
    assert(captured[i].descriptorType==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
    assert(captured[i].descriptorCount==((desired_mask&(1u<<(i-3)))?np:1));total+=captured[i].descriptorCount;
-  }else assert(captured[i].descriptorType==VK_DESCRIPTOR_TYPE_SAMPLER&&captured[i].descriptorCount==(mode==3||mode==6?1:4096));
+  }else assert(captured[i].descriptorType==VK_DESCRIPTOR_TYPE_SAMPLER&&captured[i].descriptorCount==(none?1:4096));
  }
  if(mode==0||mode==4)assert(total==131074); // Former layout reserved262144.
  if(mode==2)assert(total==4);
@@ -145,7 +147,7 @@ class PoolLayout(unittest.TestCase):
                             "-Wno-misleading-indentation", "-fsanitize=address,undefined", "-pthread",
                             "-I" + str(ROOT / "nxnative/dm/third_party/vulkan-headers/include"),
                             str(source), "-o", str(exe)], check=True)
-            for mode in range(8):
+            for mode in range(9):
                 subprocess.run([str(exe), str(mode)], check=True, timeout=15)
 
 

@@ -23,8 +23,10 @@ static const uint8_t *g_bundle; static uint32_t g_nent; static const bent *g_ent
 // use the union of the entire bundle, never the first program or the currently active stages.
 // Unknown reflection keeps the old full layout; an absent kind retains one compatible descriptor.
 static unsigned g_pool_kinds = (1u << POOL_TEX_SLOTS) - 1;
+static int g_pool_samp_seen;   // a shader of the bundle reads the sampler pool (bundle_pool_kinds)
 static unsigned bundle_pool_kinds(const uint8_t *b, uint64_t size) {
     const unsigned all = (1u << POOL_TEX_SLOTS) - 1; uint32_t version, count;
+    g_pool_samp_seen = 0;
     if (!b || size < 12 || memcmp(b, "DMSV", 4)) return all;
     memcpy(&version, b + 4, 4); memcpy(&count, b + 8, 4);
     if (version < 1 || version > 2 || !count || 12 + (uint64_t)count * sizeof(bent) > size) return all;
@@ -38,7 +40,7 @@ static unsigned bundle_pool_kinds(const uint8_t *b, uint64_t size) {
         for (uint32_t j = 0; j < h[0]; j++) {
             dmsv_bind r; memcpy(&r, b + e.refl_off + 20 + (uint64_t)j * sizeof(r), sizeof(r));
             if (r.kind > RK_SAMPP || r.desc > RD_SAMPLER) return all;
-            if (r.kind == RK_SAMPP) { if (r.desc != RD_SAMPLER || r.flags || !r.count) return all; continue; }
+            if (r.kind == RK_SAMPP) { if (r.desc != RD_SAMPLER || r.flags || !r.count) return all; g_pool_samp_seen = 1; continue; }
             if (r.kind != RK_TEXP) continue;
             if (r.desc != RD_IMAGE || (r.flags & ~1u) || !r.count) return all;
             int slot = r.dim == 1 ? (r.flags & 1) : r.dim == 3 ? 2 : r.dim == 2 ? 3 : -1;
@@ -312,6 +314,7 @@ static void pool_lengths_init(void) {
     if (n && active && (long)n * active + spare > limi) n = limi > spare ? (int)((limi - spare) / active) & ~255 : 0;
     if (n && !active && limi < spare) n = 0;
     if (s && (long)s > lims) s = lims > 0 ? (int)lims & ~255 : 0;
+    if (!g_pool_kinds && !g_pool_samp_seen) n = s = 0;   // no shader of the bundle reads a pool: set 0 keeps one element per pool binding (4096 samplers made every set Welcome Tour binds larger for nothing)
     if (!n || !s) n = s = 0;
     VKLOG("texture pool tables: %d textures x %d kinds (bundle mask %#x, %d unused bindings of one), %d samplers (DM_VK_POOL_N %s; the device binds %u sampled images and %u samplers a stage, %u and %u a set)", n, active, g_pool_kinds, spare, s, e ? e : "unset",
           V.props.limits.maxPerStageDescriptorSampledImages, V.props.limits.maxPerStageDescriptorSamplers, V.props.limits.maxDescriptorSetSampledImages, V.props.limits.maxDescriptorSetSamplers);
