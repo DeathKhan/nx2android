@@ -130,11 +130,12 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
 // rows (OVM_TAB_ITEMS). front_android.c keeps each row's value (dm_menu_value) and changes it (menu_set); gfx_vk_present.c draws a row by its kind.
 // A new choice row (one that cycles through values with left and right, "< value >"): an OVM_* item, its OVM_ROW entry, its place in a tab, and its value
 // in front_android.c dm_menu_value and menu_set ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_ACCENT, OVM_FRAMECAP, OVM_FPSPOS, OVM_PADLABEL, OVM_TEMPS, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_ACCENT, OVM_FRAMECAP, OVM_FPSPOS, OVM_PADLABEL, OVM_TEMPS, OVM_MOUSE, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
             // OVM_EDIT: the layout editor; OVM_MODE: Resolution, the level (host/dm.h DM_RES_*: Max is docked, the others handheld; a game without its own
             // dynamic-resolution settings has two, Balanced = handheld and Max = docked); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
             // OVM_ACCENT: the menu's highlight colour (OVM_ACCENTS); OVM_FRAMECAP: the frame cap (Off, 60, 30 fps: OVM_CAPS; host/hle_framecap.c);
-            // OVM_FPSPOS: the frame rate counter's corner (OVM_FPSPOS_KEYS); OVM_PADLABEL: a controller's face buttons by position or by label (front_android.c pad_labels)
+            // OVM_FPSPOS: the frame rate counter's corner (OVM_FPSPOS_KEYS); OVM_PADLABEL: a controller's face buttons by position or by label (front_android.c pad_labels);
+            // OVM_MOUSE: the Joy-Con 2 mouse, Auto (on once the game reads one: host/hle_hid.c) or Off
 enum { OVR_TOGGLE, OVR_SLIDER, OVR_CHOICE, OVR_ACTION, OVR_TABS, OVR_RESUME };   // a switch; a slider (Opacity); values cycled with left and right; a button
                                                                                  // (its word: button); the tabs; Resume
 typedef struct { int kind; const char *label, *sub; const char *const *choices; int n; const char *button; const unsigned *swatches; const char *na; } ov_mrow;
@@ -149,6 +150,7 @@ static const char *const OVM_CAP_NAMES[OVM_NCAPS] = {"Off", "60 fps", "30 fps"};
 static const char *const OVM_FPSPOS_NAMES[4] = {"Top left", "Top right", "Bottom left", "Bottom right"};
 static const char *const OVM_FPSPOS_KEYS[4] = {"tl", "tr", "bl", "br"};
 static const char *const OVM_PADLABEL_NAMES[2] = {"Position", "Label"};
+static const char *const OVM_MOUSE_NAMES[2] = {"Off", "Auto"};
 int dm_overlay_fps_pos(void);   // front_android.c: the counter's corner, 0..3
 // the highlight colours (settings.txt accent=RRGGBB; another value is kept and shown as Custom). OVM_ACCENT_DEFAULT (Orange) is the colour of a settings.txt
 // without accent= (Neon pink, the first, was the menu's colour before there was a choice and stays one)
@@ -169,13 +171,14 @@ static const ov_mrow OVM_ROW[OVM_N] = {
     [OVM_ACCENT]  = {OVR_CHOICE, "Highlight colour", NULL, OVM_ACCENT_NAMES, OVM_ACCENTS_N, NULL, OVM_ACCENTS},
     [OVM_FPSPOS]  = {OVR_CHOICE, "FPS position", "Corner of the FPS and temperatures", OVM_FPSPOS_NAMES, 4},
     [OVM_PADLABEL] = {OVR_CHOICE, "Face buttons", "A, B, X and Y by place or by their letters", OVM_PADLABEL_NAMES, 2},
+    [OVM_MOUSE]   = {OVR_CHOICE, "Joy-Con mouse", "Right stick and touch move it when the game asks", OVM_MOUSE_NAMES, 2},
     [OVM_FRAMECAP] = {OVR_CHOICE, "Frame cap", "Hold the game to a steady rate", OVM_CAP_NAMES, OVM_NCAPS, NULL, NULL, "Not for this game"},
     [OVM_RESUME]  = {OVR_RESUME, "Resume"},
     [OVM_TAB]     = {OVR_TABS, ""},
 };
 #define OVM_TABS 3
 #define OVM_PER_TAB 5   // the most rows a tab has (every tab's panel is as tall); -1: no row there (up and down skip it)
-static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_FPS, OVM_TEMPS, OVM_FRAMECAP, OVM_MODE, -1}, {OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PADLABEL},
+static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_FPS, OVM_TEMPS, OVM_FRAMECAP, OVM_MODE, OVM_MOUSE}, {OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PADLABEL},
                                                          {OVM_ACCENT, OVM_FPSPOS, OVM_EXPORT, OVM_IMPORT, -1}};
 static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Game", "Controls", "System"};
 #define OVM_ROWS (OVM_PER_TAB + 2)   // the tabs, a tab's rows, Resume

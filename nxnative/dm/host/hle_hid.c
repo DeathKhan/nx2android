@@ -901,7 +901,7 @@ HLE_FORCE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-ax
 // GetNmouseState on the chosen one (the merged handle 0 with a single handle and a handheld or full-key controller) gives the buttons (+0x28, the game takes their press and
 // release edges) and attributes (+0x2c: bit 1 connected, which the game can require before the pointer moves). An NmouseState is MouseState's fields after a 16-byte header
 // (sampling number, time stamp): x, y, dx, dy, wheel dx, dy, buttons, attributes.
-// DM_MOUSE=1 (a profile env row; off by default): player 1's right Joy-Con 2 is a mouse from the first time the game reads one (GetJcmsState(s), GetNmouseHandles,
+// DM_MOUSE=1 (the default on Android; =0 turns it off): player 1's right Joy-Con 2 is a mouse from the first time the game reads one (GetJcmsState(s), GetNmouseHandles,
 // GetNmouseState(s)); a game that never does keeps its right stick as it was. The right stick moves it (relative, DM_MOUSE_SPEED pixels per second at full tilt, default 1200, with a
 // squared response for fine aim), a finger on the touchscreen drags it (relative in the sensor's deltas; the pointer position Nmouse reports jumps to the finger), R is the left
 // button and ZR the right one. The stick and the buttons still reach the npad (on a Joy-Con 2 the mouse's left button is the R button); DM_MOUSE=2 keeps the right stick from the npad
@@ -927,20 +927,30 @@ static int g_touch_was; static float g_touch_px, g_touch_py;   // the finger at 
 static int32_t g_nm_dx, g_nm_dy; static uint64_t g_nm_frame, g_nm_latched;   // deltas since the last Nmouse read; presses latched for the frame g_nm_frame
 static int g_nmouse_range[2];
 static void mouse_env(void) {
-    const char *e = getenv("DM_MOUSE"); g_mouse_mode = e ? atoi(e) : 0;
+#ifdef __ANDROID__
+    const char *e = getenv("DM_MOUSE"); g_mouse_mode = e ? atoi(e) : 1;   // Android has no Joy-Con 2 sensors to report: on unless turned off, as a game that asks for the mouse waits for one (Donkey Kong Bananza's Joy-Con 2 tutorial)
+#else
+    const char *e = getenv("DM_MOUSE"); g_mouse_mode = e ? atoi(e) : 0;   // a real Joy-Con 2 reports its own sensor (dm_joy_mouse)
+#endif
     if ((e = getenv("DM_MOUSE_SPEED")) && atof(e) > 0) g_mouse_speed = (float)atof(e);
     g_mouse_log = (e = getenv("DM_MOUSE_LOG")) && atoi(e);
 }
-static int mouse_mode(void) { pthread_once(&g_mouse_once, mouse_env); return g_mouse_mode; }
-// A mouse call of the game: from now on player 1's right stick and touches move the mouse
+__attribute__((weak)) int dm_front_mouse(void) { return -1; }   // front_android.c: the pause menu's Joy-Con mouse (0 off, 1 auto, -1 not chosen)
+static int mouse_mode(void) { pthread_once(&g_mouse_once, mouse_env); return dm_front_mouse() == 0 ? 0 : g_mouse_mode ? g_mouse_mode : dm_front_mouse() > 0; }
+// A mouse call of the game: from now on player 1's right stick and touches move the mouse. They still reach the game as a stick and touches (DM_MOUSE=1), and the mouse only
+// moves while the game reads it, so there is nothing to end. DM_MOUSE=2 takes the right stick from the npad, and only while the game is reading the mouse: within
+// MOUSE_IDLE_NS of a read (a game polls it every frame while it uses it)
+#define MOUSE_IDLE_NS 1000000000ull
+static _Atomic uint64_t g_mouse_read_ns;
 static int mouse_query(void) {
     if (!mouse_mode()) return 0;
+    atomic_store_explicit(&g_mouse_read_ns, now_ns(), memory_order_relaxed);
     if (!atomic_exchange(&g_mouse_live, 1))
         LOG("hid: the game reads the Joy-Con 2 mouse: player 1's right Joy-Con 2 is one (right stick and touchscreen move it, R / ZR click; DM_MOUSE=%d%s)", g_mouse_mode,
             g_mouse_mode == 2 ? ", the right stick no longer reaches the npad" : "");
     return 1;
 }
-static int mouse_steals_stick(void) { return g_mouse_mode == 2 && atomic_load_explicit(&g_mouse_live, memory_order_relaxed); }
+static int mouse_steals_stick(void) { return g_mouse_mode == 2 && atomic_load_explicit(&g_mouse_live, memory_order_relaxed) && now_ns() - atomic_load_explicit(&g_mouse_read_ns, memory_order_relaxed) < MOUSE_IDLE_NS; }
 static void mouse_latch(uint64_t pressed) { if (pressed & (DM_BTN_R | DM_BTN_ZR)) atomic_fetch_or(&g_mouse_latch, pressed & (DM_BTN_R | DM_BTN_ZR)); }
 static int mouse_npad(uint32_t id) { return player_of(id) == 0; }
 static void mouse_range(float *w, float *h) {
@@ -1023,7 +1033,7 @@ static bool nmouse_state(NmouseState *s, uint64_t h) {
 // Merged mouse pointer (Nmouse, Switch 2 SDKs; Pokemon Pokopia, main+0x11251dc). The SDK opens the hid service itself in InitializeNmouse, which the host does not serve (abort 0xe15). No device
 // reports here: GetNmouseHandles finds none and the merged handle, which exists without a device on the console, has no states. The game skips its mouse code on those answers (main+0x112638c, +0x11262b4)
 static _Atomic uint32_t g_jcms_wanted;   // the game reads the mouse sensors (dm_joy_mouse_wanted, with InitializeJcms below)
-HLE_FORCE("_ZN2nn3hid14FinalizeNmouseEv", "merged mouse: nothing to release", void, h_hid_NmouseFini, void) { atomic_fetch_and(&g_jcms_wanted, ~2u); }
+HLE_FORCE("_ZN2nn3hid14FinalizeNmouseEv", "merged mouse: nothing to release", void, h_hid_NmouseFini, void) { atomic_fetch_and(&g_jcms_wanted, ~2u); LOG("hid: the game finalizes the Joy-Con mouse pointer (FinalizeNmouse)"); }
 HLE_FORCE("_ZN2nn3hid26SetMergedNmouseSourceTypesENS_4util10BitFlagSetILi32ENS0_10NmouseTypeEEE", "merged mouse sources: no device", void, h_hid_NmouseSources, uint32_t types) { (void)types; }
 HLE_FORCE("_ZN2nn3hid21GetMergedNmouseHandleEPNS0_12NmouseHandleE", "merged mouse handle: 0, with no states", int, h_hid_NmouseMerged, uint64_t *out) { *out = 0; return 1; }
 HLE_FORCE("_ZN2nn3hid16GetNmouseTypeSetEPNS_4util10BitFlagSetILi32ENS0_10NmouseTypeEEENS0_12NmouseHandleE", "mouse types: none (DM_MOUSE: the right Joy-Con 2's)", int, h_hid_NmouseTypes, uint32_t *out, uint64_t h) {
@@ -1036,8 +1046,8 @@ HLE_FORCE("_ZN2nn3hid15GetNmouseStatesEPiPNS0_11NmouseStateEiNS0_12NmouseHandleE
 // of the host has the sensor
 // Whether the game reads the mouse sensors (bit 0: InitializeJcms, bit 1: InitializeNmouse, each until its Finalize): a front end turns a Joy-Con's sensor on only then (dm_joy_mouse_wanted)
 int dm_joy_mouse_wanted(void) { return atomic_load(&g_jcms_wanted) != 0; }
-HLE_FORCE("_ZN2nn3hid14InitializeJcmsEPvm", "Joy-Con mouse sensor: no hid service; front ends may turn the sensors on", void, h_hid_JcmsInit, void *work, uint64_t size) { (void)work; (void)size; atomic_fetch_or(&g_jcms_wanted, 1u); }
-HLE_FORCE("_ZN2nn3hid12FinalizeJcmsEv", "Joy-Con mouse sensor: nothing to release", void, h_hid_JcmsFini, void) { atomic_fetch_and(&g_jcms_wanted, ~1u); }
+HLE_FORCE("_ZN2nn3hid14InitializeJcmsEPvm", "Joy-Con mouse sensor: no hid service; front ends may turn the sensors on", void, h_hid_JcmsInit, void *work, uint64_t size) { (void)work; (void)size; atomic_fetch_or(&g_jcms_wanted, 1u); LOG("hid: the game initializes the Joy-Con mouse sensors (InitializeJcms)"); }
+HLE_FORCE("_ZN2nn3hid12FinalizeJcmsEv", "Joy-Con mouse sensor: nothing to release", void, h_hid_JcmsFini, void) { atomic_fetch_and(&g_jcms_wanted, ~1u); LOG("hid: the game finalizes the Joy-Con mouse sensors (FinalizeJcms)"); }
 HLE_FORCE("_ZN2nn3hid13GetJcmsHandleERKjRKNS0_8JcmsTypeE", "Joy-Con mouse sensor handle: npad id | type << 8, as the SDK makes it",
           uint32_t, h_hid_JcmsHandle, const uint32_t *id, const uint32_t *type) { return (*id & 0xff) | (*type & 0xff) << 8; }
 // The sensor's states, from a front end that reads Joy-Con mouse sensors (dm_joy_mouse): a ring of 16 per player and Joy-Con. A JcmsState as Nintendo Switch 2 Welcome Tour reads it
@@ -1116,7 +1126,7 @@ HLE_FORCE("_ZN2nn3hid24GetGlGrButtonConfigStateEPbS1_j", "GL / GR button configu
 HLE_FORCE("_ZN2nn3hid23SetSceneIdForPrivateAppEi", "scene id for a private app: nothing to tell on the host", void, h_hid_SceneId, int id) { (void)id; }
 // The Switch 2's pointer on top of those sensors (Nmouse; Fire Emblem Fortune's Weave initializes it at boot with the 1920x1080 screen it maps the pointer to, main+0x650a24). InitializeNmouse opens the
 // hid service as InitializeJcms does (its Result aborts: sdk+0x6d5340). No controller of the host has the sensor, so there are no handles, and the calls on a handle have nothing to do
-HLE_FORCE("_ZN2nn3hid16InitializeNmouseEPvmii", "Joy-Con mouse pointer: no hid service; front ends may turn the sensors on", void, h_hid_NmouseInit, void *work, uint64_t size, int w, int h) { (void)work; (void)size; (void)w; (void)h; atomic_fetch_or(&g_jcms_wanted, 2u); }
+HLE_FORCE("_ZN2nn3hid16InitializeNmouseEPvmii", "Joy-Con mouse pointer: no hid service; front ends may turn the sensors on", void, h_hid_NmouseInit, void *work, uint64_t size, int w, int h) { (void)work; (void)size; atomic_fetch_or(&g_jcms_wanted, 2u); LOG("hid: the game initializes the Joy-Con mouse pointer (InitializeNmouse, %d x %d)", w, h); }
 // A Joy-Con whose sensor reports (dm_joy_mouse) has a pointer handle on its npad: NMOUSE_TAG | npad id << 8 | side (the merged handle 0 stays the one without a device)
 #define NMOUSE_TAG 0x4e4d0000ull
 static int nmouse_of(uint64_t h, int *side) {
@@ -1142,7 +1152,7 @@ HLE_FORCE("_ZN2nn3hid33SetNmouseButtonConfigJoyRightJcmsERKNS0_30NmouseButtonCon
 // device to apply them to. The calls on a handle return the SDK's bool (its Result is success: SDK 22.2.0 sdk+0x6d5510 and +0x6d5530): the merged handle 0 above is known, and with no device
 // its pointer takes the settings and reports nothing (no state, no controller); the standard mouse has no handle, as no USB mouse is connected
 HLE_FORCE("_ZN2nn3hid16InitializeNmouseEPvmiiNS0_17NmousePointerTypeE", "Joy-Con mouse pointer (with a pointer type): no hid service; no sensor on the host", void, h_hid_NmouseInitT,
-          void *work, uint64_t size, int w, int h, int type) { (void)work; (void)size; (void)type; g_nmouse_range[0] = w; g_nmouse_range[1] = h; atomic_fetch_or(&g_jcms_wanted, 2u); }
+          void *work, uint64_t size, int w, int h, int type) { (void)work; (void)size; g_nmouse_range[0] = w; g_nmouse_range[1] = h; atomic_fetch_or(&g_jcms_wanted, 2u); LOG("hid: the game initializes the Joy-Con mouse pointer (InitializeNmouse, %d x %d, pointer type %d)", w, h, type); }
 HLE_FORCE("_ZN2nn3hid22SetNmousePointerRangesEii", "Joy-Con mouse pointer range: kept", void, h_hid_NmouseSetRange, int w, int h) { g_nmouse_range[0] = w; g_nmouse_range[1] = h; }
 HLE_FORCE("_ZN2nn3hid22GetNmousePointerRangesEPiS1_", "Joy-Con mouse pointer range: the one set", void, h_hid_NmouseGetRange, int *w, int *h) { *w = g_nmouse_range[0]; *h = g_nmouse_range[1]; }
 HLE_FORCE("_ZN2nn3hid28SetNmousePointerMovementAreaEiiii", "Joy-Con mouse pointer area: no device to apply it to", void, h_hid_NmouseArea, int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }

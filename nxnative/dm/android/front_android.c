@@ -82,6 +82,7 @@ static _Atomic int g_set_res = DM_RES_BALANCED;   // the Resolution level (DM_RE
 static const char *const RES_KEYS[DM_RES_N] = {"performance", "balanced", "quality", "max"};
 static _Atomic int g_set_cap;    // the frame cap's index in OVM_CAPS (0 off; settings.txt fpscap= in fps; hle_framecap.c holds the game to it)
 static _Atomic int g_set_fpspos;   // the frame rate counter's corner (OVM_FPSPOS_KEYS: 0 top left for every game until the player picks another; settings.txt fpspos=)
+static _Atomic int g_set_mouse = -1;      // the pause menu's Joy-Con mouse (settings.txt mouse=): -1 until the player chooses there (DM_MOUSE decides), then 0 off, 1 auto
 static _Atomic int g_set_padlabel = -1;   // the pause menu's Face buttons (settings.txt labels=): -1 until the player chooses there, then 0 by position, 1 by label
 static int fpspos_index(const char *s) { for (int i = 0; i < 4; i++) if (!strncmp(s, OVM_FPSPOS_KEYS[i], 2)) return i; return -1; }
 int dm_overlay_fps_pos(void) { return atomic_load(&g_set_fpspos); }
@@ -98,7 +99,7 @@ static void settings_load(void) {
     char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[128];
     if (!f) return;
     g_set_extra[0] = 0;
-    while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_padlabel, v != 0); else if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
+    while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_padlabel, v != 0); else if (sscanf(line, "mouse=%d", &v) == 1) atomic_store(&g_set_mouse, v != 0); else if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
         else if (sscanf(line, "temps=%d", &v) == 1) atomic_store(&g_set_temps, v != 0);
         else if (sscanf(line, "docked=%d", &v) == 1) { setenv("DM_OPMODE", v ? "1" : "0", 1); atomic_store(&g_set_res, v ? DM_RES_MAX : DM_RES_BALANCED); }   // over env.txt's: the host reads it once, at its first query
@@ -131,7 +132,8 @@ static void settings_save(void) {
             atomic_load(&g_set_accent) & 0xffffff);
     if (atomic_load(&g_set_temps) >= 0) fprintf(f, "temps=%d\n", atomic_load(&g_set_temps));   // (only once chosen)
     fprintf(f, "fpspos=%s\n", OVM_FPSPOS_KEYS[atomic_load(&g_set_fpspos) & 3]);
-    if (atomic_load(&g_set_padlabel) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_padlabel));   // (only once chosen: until then env.txt decides)
+    if (atomic_load(&g_set_padlabel) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_padlabel));
+    if (atomic_load(&g_set_mouse) >= 0) fprintf(f, "mouse=%d\n", atomic_load(&g_set_mouse));   // (only once chosen: until then env.txt decides)
     fputs(g_set_extra, f);   // the lines settings_load did not know
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
@@ -270,7 +272,9 @@ static int pad_labels(void) {   // read at every key: a change in the menu appli
                                          for (int i = 0; i < 3; i++) { const char *e = getenv(n[i]); if (e && atoi(e) > 0) env = 1; } }
     return env;
 }
-int dm_pad_labels(void) { return pad_labels(); }   // (gfx_vk_present.c: the menu's key hints name the buttons as labelled)
+int dm_pad_labels(void) { return pad_labels(); }
+// host/hle_hid.c: the pause menu's Joy-Con mouse, read at every mouse call (a change applies at once): 0 off, 1 auto, -1 not chosen (DM_MOUSE decides, on by default)
+int dm_front_mouse(void) { int v = atomic_load(&g_set_mouse); if (v >= 0) return v; const char *e = getenv("DM_MOUSE"); return e && !atoi(e) ? 0 : e ? 1 : -1; }   // (gfx_vk_present.c: the menu's key hints name the buttons as labelled)
 static uint64_t key_bit(int32_t k) {
     switch (k) {
     case AKEYCODE_BUTTON_A: return pad_labels() ? DM_BTN_A : DM_BTN_B; case AKEYCODE_BUTTON_B: return pad_labels() ? DM_BTN_B : DM_BTN_A;
@@ -518,6 +522,7 @@ int dm_menu_value(int item) {
     case OVM_ACCENT: return accent_index(atomic_load(&g_set_accent));
     case OVM_FPSPOS: return dm_overlay_fps_pos();
     case OVM_PADLABEL: return pad_labels();
+    case OVM_MOUSE: return dm_front_mouse() != 0;
     case OVM_FRAMECAP: return dm_frame_cap_how() == DM_FRAME_CAP_NONE ? OVM_NA : atomic_load(&g_set_cap);
     default: return 0;
     }
@@ -548,6 +553,7 @@ static void menu_set(int item, int v) {   // a row's new value (a switch, a choi
         if (OVM_CAPS[v]) LOG("[menu] frame cap %d", OVM_CAPS[v]); else LOG("[menu] frame cap off");
     }
     else if (item == OVM_ACCENT && v >= 0 && v < OVM_ACCENTS_N) atomic_store(&g_set_accent, OVM_ACCENTS[v]);
+    else if (item == OVM_MOUSE && v >= 0 && v < 2) { atomic_store(&g_set_mouse, v); LOG("[menu] Joy-Con mouse %s", v ? "auto" : "off"); }
     else if (item == OVM_PADLABEL && v >= 0 && v < 2) { atomic_store(&g_set_padlabel, v); LOG("[menu] face buttons by %s", v ? "label" : "position"); }
     else if (item == OVM_OPACITY) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
     else return;

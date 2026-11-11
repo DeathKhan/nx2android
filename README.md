@@ -25,7 +25,7 @@ Screenshots from the Odin 3 (the game's own picture, overlay off); frame rates a
 | Game | State on the Odin 3 |
 |---|---|
 | Donkey Kong Bananza (with its DLC) | Plays. A smooth 60 fps in play, the movies at their own 30; handheld mode by default |
-| Nintendo Switch 2 Welcome Tour | Plays. Intro video and expo hall at 60 fps; mouse exhibits open with `DM_MOUSE=1` (the right stick or the touchscreen is the Joy-Con 2 mouse, R / ZR its buttons) |
+| Nintendo Switch 2 Welcome Tour | Plays. Intro video and expo hall at 60 fps; mouse exhibits open (the right stick or the touchscreen is the Joy-Con 2 mouse, R / ZR its buttons) |
 | The Legend of Zelda: Ocarina of Time | Work in progress. Loads a save and plays in Kokiri Forest at 30 fps (GPU about 20 ms a frame, mesh shaders run as compute); the lighting matches the Mac (the bloom is fixed) |
 | Pokémon Legends: Arceus (Switch) | Plays at 60 fps: the game's time follows the host's frame step, so 60 runs at the right speed; the pause menu's Frame cap picks 60 or 30 |
 
