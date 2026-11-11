@@ -260,7 +260,8 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f, VkImageUsageFlags extr
         VKLOG("target %ux%u format %d%s: %llu bytes", im->w, im->h, f->vk, im->fixed_fmt ? " (format-listed)" : "", (unsigned long long)req.size); }
     VkDeviceSize moff;
     if (!(im->mem = vk_image_memory(&req, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT), &moff, &im->sub))) {
-        VKRED_ONCE(11, "image memory allocation failed (%llu bytes)", (unsigned long long)req.size); vkDestroyImage(V.dev, im->img, NULL); free(im); return NULL; }
+        if (!vk_image_memory_soft_failed()) VKRED_ONCE(11, "image memory allocation failed (%llu bytes)", (unsigned long long)req.size);   // (the prefetch's memory is on its way: it asks again)
+        vkDestroyImage(V.dev, im->img, NULL); free(im); return NULL; }
     VKCHK(vkBindImageMemory(V.dev, im->img, im->mem, moff));
     im->layout = VK_IMAGE_LAYOUT_UNDEFINED; im->vkbytes = req.size;
     return im;
@@ -546,8 +547,11 @@ static vkimg_t *vk_tex_(const tex_t *t) {
                 // it on shared pages, and an upload would put the CPU's bytes over the GPU's. Monster Hunter Rise's spot light profiles (512x1x64 R16F, written by a compute
                 // shader into memory the game had zeroed) were uploaded again as zeros at presents 60 and 1079: every spot light's profile read 0 and the faces lit only by
                 // those lights (the character maker, cutscenes) came out black
-                if (im->gpu_w && pkg_hash(t->mem, t->L.size) == im->pkg_hash) { nvn_dirty_protect(t->mem, t->L.size); im->pkg_stamp = nvn_dirty_now(); im->pkg_released = 0;
-                    static int nl; if (nl++ < 16) VKLOG("texture %ux%u nvn format %#x at %p: its pages were written, its bytes are as uploaded and the GPU wrote it: kept", t->d.width, t->d.height, t->d.format, (const void *)t->mem); }
+                // The same holds without a GPU write: the image has the upload's bytes and so has the storage (a write beside it on a shared page, or its protection was
+                // given up while it was idle: vk_tex_sweep). Zelda Ocarina of Time uploaded about 1,570 textures (455 MB) again with unchanged bytes entering the world
+                if (pkg_hash(t->mem, t->L.size) == im->pkg_hash) { nvn_dirty_protect(t->mem, t->L.size); im->pkg_stamp = nvn_dirty_now(); im->pkg_released = 0;
+                    static uint64_t nk; if (!im->gpu_w) { nk++; if (!(nk & (nk - 1))) VKLOG("packaged textures whose pages read as written with their bytes as uploaded: %llu kept without an upload so far", (unsigned long long)nk); }
+                    else { static int nl; if (nl++ < 16) VKLOG("texture %ux%u nvn format %#x at %p: its pages were written, its bytes are as uploaded and the GPU wrote it: kept", t->d.width, t->d.height, t->d.format, (const void *)t->mem); } }
                 else pkg_upload(im, t, f);
             }
             im->pkg_seen = now;

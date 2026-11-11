@@ -37,3 +37,6 @@ env	DM_VK_UPSCALER_SQUARE_CS=fa3033d05c0a41d6
 # The image budget. Kokiri Forest holds about 2.96 GB of images on the Odin 3 (5,500 packaged textures, 1.9 GB) once render targets the game has reused are
 # dropped (gfx_vk_tex.c rt_stale), so the budget sits above that and no sweep runs there (2026-11-10: 0 sweeps, the process alive).
 env	DM_VK_IMAGE_BUDGET_MB=3072
+# The pool-texture prefetch (gfx_vk_exec.c pool_prefetch): the world's first frame gave about 2,200 registered textures their first use at once, one frame of 2.7 to 3.0 s
+# and the SoC at 102 °C (Odin 3, 2026-11-10). They are registered 3 s after the start and wait through the title and file select: with this their first uses are made there
+env	DM_VK_POOL_PREFETCH=1

@@ -12,10 +12,10 @@
 #include "movie_fill_comp.spv.h"
 
 typedef struct { uint32_t w, h, word0, flags; } mf_pc;   // the shader's push constants (movie_fill.comp)
-typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; uint32_t w, h; } mf_image;
+typedef struct { VkImage img; VkDeviceMemory mem; VkImageView view; uint32_t w, h; int srgb; } mf_image;
 static struct {
     VkShaderModule mod; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe; int failed;
-    mf_image stage, scaled;   // matrix-converted picture and, only for a raw sRGB copy, its output-sized UNORM image
+    mf_image stage, scaled;   // matrix-converted picture and, only for a raw sRGB copy where the stage cannot be an sRGB image (direct_ok), its output-sized UNORM image
     uint64_t gen;             // picture generation converted into stage (0: none)
 } g;
 
@@ -42,10 +42,11 @@ static int pipeline_get(void) {
 }
 // Reuse intermediate images on the one graphics queue. Replacement allocations and views are deferred through the
 // current submission, so previously recorded conversions/copies keep their images. A failed allocation leaves the old one intact.
-static int image_get(VkCommandBuffer cb, mf_image *image, uint32_t w, uint32_t h, int storage) {
-    if (image->img && image->w == w && image->h == h) return 1;
-    mf_image fresh = {.w = w, .h = h};
-    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+// srgb: the image's own format is sRGB and the shader stores through a UNORM view (direct_ok)
+static int image_get(VkCommandBuffer cb, mf_image *image, uint32_t w, uint32_t h, int storage, int srgb) {
+    if (image->img && image->w == w && image->h == h && image->srgb == srgb) return 1;
+    mf_image fresh = {.w = w, .h = h, .srgb = srgb};
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, srgb ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT : 0, VK_IMAGE_TYPE_2D, srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_TRANSFER_DST_BIT), VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     VkResult r = vkCreateImage(V.dev, &ci, NULL, &fresh.img);
     if (r) goto fail;
@@ -68,6 +69,19 @@ fail:
     if (fresh.img) vkDestroyImage(V.dev, fresh.img, NULL);
     if (fresh.mem) vkFreeMemory(V.dev, fresh.mem, NULL);
     return 0;
+}
+// A raw sRGB copy without the copy: the stage image is sRGB with a UNORM view for the shader's stores (the same bytes), and one blit from it to the sRGB output decodes,
+// filters and encodes again, so the output holds the stored bytes. vkCmdCopyImage from a UNORM image into the sRGB output took Adreno 830's driver 15 s of CPU in 37 s
+// of the intro movie, on the replay thread, in pages it allocated and cleared for every copy: the movie ran at 30 fps (Odin 3, 2026-11-10).
+static int direct_ok(void) {
+    static int ok = -1; if (ok >= 0) return ok;
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, VK_FORMAT_R8G8B8A8_SRGB, &fp); VkImageFormatProperties ip;
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    ok = !getenv("DM_VK_MOVIE_FILL_COPY") && (fp.optimalTilingFeatures & need) == need &&
+         !vkGetPhysicalDeviceImageFormatProperties(V.pd, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                                                  VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, &ip);
+    VKLOG("movie fill: a raw sRGB output is %s", ok ? "blitted from an sRGB stage image" : "copied from a scaled UNORM image");
+    return ok;
 }
 // Image-store output uses the selected view's encoding. Only the observed compatible RGBA8 pair can be copied raw:
 // matrix conversion produces encoded RGB bytes in UNORM; a direct blit into native sRGB would encode them a second time.
@@ -92,7 +106,8 @@ int vk_movie_fill(vkimg_t *out, uint32_t view_format, uint32_t level, uint32_t l
     int convert = g.gen != gen || !g.stage.img || g.stage.w != w || g.stage.h != h;
     if (convert && ((len + 3) & ~(VkDeviceSize)3) > V.props.limits.maxStorageBufferRange) return 0;
     // Format capability queries only when the actual blit destination changes. A raw copy has no sRGB conversion.
-    VkFormat blit_format = raw_srgb ? VK_FORMAT_R8G8B8A8_UNORM : out->fmt;
+    int direct = raw_srgb && direct_ok(), scaled = raw_srgb && !direct;
+    VkFormat blit_format = scaled ? VK_FORMAT_R8G8B8A8_UNORM : out->fmt;
     static VkFormat last_out = VK_FORMAT_UNDEFINED; static int formats_ok;
     if (blit_format != last_out) {
         VkFormatProperties src, dst; last_out = blit_format;
@@ -105,8 +120,8 @@ int vk_movie_fill(vkimg_t *out, uint32_t view_format, uint32_t level, uint32_t l
     if (!pipeline_get()) return 0;
     vk_end_pass_land(); VkCommandBuffer cb = vk_cmd();
     vk_tex_prepare(cb, out); vk_img_barrier_all(cb);
-    if (g.stage.w != w || g.stage.h != h) g.gen = 0;
-    if (!image_get(cb, &g.stage, w, h, 1) || (raw_srgb && !image_get(cb, &g.scaled, ow, oh, 0))) return 0;
+    if (g.stage.w != w || g.stage.h != h || g.stage.srgb != direct) g.gen = 0;
+    if (!image_get(cb, &g.stage, w, h, 1, direct) || (scaled && !image_get(cb, &g.scaled, ow, oh, 0, 0))) return 0;
     if (g.gen != gen) {
         // A codec image pool is ordinary CPU memory, not necessarily a registered NVN pool. When it has no GPU buffer,
         // snapshot this selected generation into completion-owned scratch once; later stages reuse the converted image.
@@ -142,9 +157,9 @@ int vk_movie_fill(vkimg_t *out, uint32_t view_format, uint32_t level, uint32_t l
         static int n; if (n++ < 3) VKLOG("movie fill: picture %ux%u at %#llx (%s, %s range) converted (generation %llu)", w, h, (unsigned long long)addr, cs & DM_CODEC_CS_BT709 ? "BT.709" : "BT.601", cs & DM_CODEC_CS_FULL ? "full" : "limited", (unsigned long long)gen);
     }
     VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
-                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, raw_srgb ? 0 : level, raw_srgb ? 0 : layer, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)ow, (int32_t)oh, 1}}};
-    vkCmdBlitImage(cb, g.stage.img, VK_IMAGE_LAYOUT_GENERAL, raw_srgb ? g.scaled.img : out->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
-    if (raw_srgb) {
+                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, scaled ? 0 : level, scaled ? 0 : layer, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)ow, (int32_t)oh, 1}}};
+    vkCmdBlitImage(cb, g.stage.img, VK_IMAGE_LAYOUT_GENERAL, scaled ? g.scaled.img : out->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+    if (scaled) {
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},

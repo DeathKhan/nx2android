@@ -2093,7 +2093,7 @@ static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h, uint64_t f
     // The Vulkan replay walks records (gfx_vk_exec.c). The replay thread's handles are copies that end in OP_END (sub_copy); a submission replayed on the game's thread is
     // walked where it was recorded, piece by piece of its control list (sub_inplace), as before recordings kept their ends in control memory: copying every submission
     // first (0e4717c75) was two walks, a malloc and a copy of each frame's records on the game's thread
-    if (nvn_async() || g_rec_compact) for (int i = 0; i < n; i++) mtl_exec((const uint8_t *)h[i]);
+    if (nvn_async() || g_rec_compact) for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
     else for (int i = 0; i < n; i++) sub_inplace(h[i]);
 #else
     for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
