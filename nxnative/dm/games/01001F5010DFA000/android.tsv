@@ -15,4 +15,4 @@ orientation	landscape
 # follows the host's frame step, and the pause menu frame cap (hle_framecap.c) sets its hold: Off / 60 one vsync, 30 two
 # 60 fps on the Odin 3 (2026-11-11) needs a GPU clock floor of 734 MHz or more: at the 160 MHz floor the Adreno governor lowers the clock while the game holds 30, and every
 # trial back to 60 fails (1.2-2.0 vsyncs a frame). 832 MHz held it; set without root through the firmware PServerBinder service, else su (front_android.c gpu_floor_apply)
-env	DM_GPU_MIN_FREQ=832000000
+# (no env row for it any more: 832 MHz is the default floor's clock on the Odin 3, three quarters of the top one, and the pause menu's GPU clock floor row changes it)
