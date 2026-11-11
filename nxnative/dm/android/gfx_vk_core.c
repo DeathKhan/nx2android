@@ -2567,6 +2567,9 @@ uint64_t mtl_sub_commit(void) {
       uint64_t now = kgsl_mapped(); if (cap && now > g_sub0.kgsl + (uint64_t)cap) {
           struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); mtl_wait(f, ~0ull);
           VKCHK(vkResetCommandPool(V.dev, s->pool, VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT)); clock_gettime(CLOCK_MONOTONIC, &t1);
+          // the reading the next submissions compare with is taken again here: it is otherwise sampled every 64th submission only (vk_begin), and growth that was not command
+          // memory (Welcome Tour's scene load: 1.1 GB of textures, 2110 MB mapped before and after the reset) made each of the up to 63 submissions after it wait for the GPU as well
+          g_sub0.kgsl = kgsl_mapped();
           static int nl; if (nl++ < 12) VKLOG("command memory: submission %llu mapped %.0f MB of GPU memory; waited %.1f ms for it and released its slot's command pool: %.0f MB mapped now (was %.0f)", (unsigned long long)f, (now - g_sub0.kgsl) / 1048576.0, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, kgsl_mapped() / 1048576.0, now / 1048576.0); } }
     s->npost = 0; g_cur = -1;
     pthread_mutex_unlock(&g_sub_lock);

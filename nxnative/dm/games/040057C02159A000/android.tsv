@@ -19,6 +19,11 @@ env	DM_GPU_MIN_FREQ=967000000
 # 40 fps presentation it cannot name ran it in slow motion. With it off the frames stay on screen exactly the interval the game set
 env	DM_ADAPTIVE_FPS=0
 
+# The replay on a thread of its own (hle_nvn.c nvn_async). 2026-11-11, Odin 3 at thermal status 3: the zoomed-out map of the Joy-Con 2 (L) area (3,400-3,800 draws, replay 14-15 ms)
+# frame time p50 23.5 → 22.3 ms (42 → 45 fps); the walking view (1,960 draws) holds 60 fps either way, with NVN submit+present at 7-8 ms of the frame. The map stays under 60: the game
+# waits for each frame's GPU work before the next ([timeline]: game 11 ms, queue 3, GPU tail 8), and the GPU alone is busy 16.8 ms there
+env	DM_NVN_ASYNC=1
+
 # The Joy-Con 2 mouse (hle_hid.c): the mouse exhibits ("This exhibit requires mouse controls") read player 1's right Joy-Con 2 as one; the right stick and the touchscreen move it, R clicks
 env	DM_MOUSE=1
 
