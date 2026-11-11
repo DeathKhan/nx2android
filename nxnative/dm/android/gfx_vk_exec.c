@@ -1722,6 +1722,7 @@ static int clear_masked(const p_clear_color *c, VkRect2D r) {   // 1 = done
     if (c->index != 0 || (f && f->is_int)) return 0;
     VkPipeline p = mc_pipeline(c->mask); if (!p) return 0;
     if (!pass_commit()) return 1;
+    if (P_ri.layerCount > 1) VKRED_ONCE(344, "masked clear in a pass of %u layers: a draw of layer 0, the other layers are not cleared", P_ri.layerCount);   // (droidplay-core eb02ed3d5's red line 171)
     VkCommandBuffer cb = vk_cmd();
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); S.bound_pipe = VK_NULL_HANDLE;
     VkViewport vp = {0, 0, (float)S.pass_w, (float)S.pass_h, 0, 1}; vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &r);
@@ -1737,6 +1738,9 @@ static void clear_color(const p_clear_color *c) {
     if (c->index < 0 || c->index >= S.ncol) return;
     p_clear_color mapped=*c;mapped.index=P_alias[c->index];c=&mapped;
     if (S.cfmt[c->index] == VK_FORMAT_UNDEFINED || !c->mask) return;
+    // a target whose view has more layers than the pass (another of its targets has fewer): the clear reaches the pass's layers only (droidplay-core eb02ed3d5's red line 172)
+    if (P_att[c->index].im && P_att[c->index].layers > (P_ri.layerCount ? P_ri.layerCount : 1))
+        VKRED_ONCE(345, "clear of colour slot %d in a pass of %u layers, its view %u: the layers past the pass are not cleared", c->index, P_ri.layerCount, P_att[c->index].layers);
     if ((c->mask & 0xf) != 0xf) { VkRect2D r = scissor_rect(); if (!r.extent.width || !r.extent.height) return;
         if (clear_masked(c, r)) return;
         VKRED_ONCE(31, "partial channel clear mask %#x cleared in full", c->mask); }
@@ -1760,6 +1764,7 @@ static void clear_ds(const p_clear_ds *c) {
     as &= S.daspect; if (!as) return;
     VkClearAttachment a = {as, 0, {.depthStencil = {c->depth, (uint32_t)c->stencil}}};
     VkClearRect r = {scissor_rect(), 0, P_ri.layerCount ? P_ri.layerCount : 1};   // every layer (clear_color)
+    if (P_att[8].im && P_att[8].layers > r.layerCount) VKRED_ONCE(346, "depth-stencil clear in a pass of %u layers, its view %u: the layers past the pass are not cleared", r.layerCount, P_att[8].layers);
     if (g_x_tracepass == -2) VKLOG("--- depth-stencil clear: depth %g (mask %d), stencil %d (mask %#x), %ux%u at %d,%d, in pass %d%s", c->depth, (int)c->depth_mask, (int)c->stencil, (unsigned)c->stencil_mask,
         r.rect.extent.width, r.rect.extent.height, r.rect.offset.x, r.rect.offset.y, g_sub_pass - 1 + (S.pass_open == 2), S.pass_open == 2 ? " (before its first draw)" : "");
     if (S.pass_open == 2 && pass_whole(r.rect) && (!(as & VK_IMAGE_ASPECT_STENCIL_BIT) || (c->stencil_mask & 0xff) == 0xff)) {   // into the load ops
