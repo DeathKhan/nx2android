@@ -421,6 +421,11 @@ def build_nx_extract(repo, work, logs, env):
     return nx
 
 
+def require_64bit(exefs, what):   # a 32-bit (AArch32) game stops here: the rewriter, the host and every module tool read only 64-bit (AArch64) code (Rune Factory 4 Special, issue #161)
+    if pg.is_64bit(Path(exefs) / 'main.npdm') is False:
+        raise BuildError(f'{what} is a 32-bit (AArch32) Switch game: nx2android runs only 64-bit (AArch64) games, so it cannot be ported')
+
+
 def swap_in(tmp, dst):   # swap the new output in as a whole (the old one is untouched on failure)
     rmtree(dst)
     # Windows refuses to rename a folder while a file inside is still open, and a virus scanner opens freshly written files for a moment ("[WinError 5] Access is
@@ -910,6 +915,7 @@ def survey(nsp_dir, app, fam, keys, repo, py, env):
     if files: say(f'  {survey_nup(nup, upd or fam["base"], fam["base"], tmp) if nup else survey_dump(upd or fam["base"], tmp):,} RomFS files listed')
     else: run([nx, keys, fam['base'], upd or '-', tmp, '--manifest'] + extract_flags(app), logs / 'extract.log')
     swap_in(tmp, ex)
+    require_64bit(ex / 'ExeFS', f'{nacp.name(ex / "control.nacp") or "the game"} ({app:016X})')
     PROG.stage('survey: code modules', step='reading')
     dv = nacp.version(ex / 'control.nacp') if files else (m.group(1) if (m := re.search(r'display version (\S+)', (logs / 'extract.log').read_text(errors='replace'))) else '')
     title = nacp.name(ex / 'control.nacp') or (nsp_dir.name if dump else '')   # a dump has no control data: its folder names the game

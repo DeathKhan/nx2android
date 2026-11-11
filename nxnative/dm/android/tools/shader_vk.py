@@ -38,7 +38,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent.parent / 'gfx/tools'
 sys.path[:0] = [str(TOOLS), str(HERE)]
-import dmsh_facts, dmsh_chain, dmsv   # noqa: E402  (DM_GAME picks the profile)
+import dmsh_facts, dmsh_chain, dmsv, shader_products   # noqa: E402  (DM_GAME picks the profile)
 import dmsh_abi as abi              # noqa: E402  the shader library ABI (dm/gfx/nvn/dmsh_abi.h): the raw global memory slot
 import dmsh_ampere, dmsh_meshstage    # noqa: E402  NVN2 (Switch 2) control sections and task / mesh stage memory, the Mac chain's own modules (backend-neutral)
 import shader_pvgs                    # noqa: E402  the pass-through geometry shader of a fragment shader with per-vertex inputs (per_vertex = gs)
@@ -51,6 +51,7 @@ ap.add_argument('pkg'); ap.add_argument('out')
 ap.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
 ap.add_argument('--keys', default='')
 ap.add_argument('--dotnet', default=os.environ.get('DOTNET', 'dotnet'))
+ap.add_argument('--report', help='write the expected and omitted shader inventory as JSON')
 ap.add_argument('--capture', help='a folder of shaders captured at run time on the device (<key>.bin)')
 ap.add_argument('--zstd', type=int, default=dmsv.LEVEL, help=f'zstd level of the SPIR-V in the bundle (default {dmsv.LEVEL}); 0: version 1, uncompressed')
 ap.add_argument('--xlate', help="the translator (dmsh_xlate.dll) to run (default: the iOS chain's dm/gfx/tools/dmsh_xlate_bin; the porter builds one from the in-repo source)")
@@ -195,7 +196,7 @@ def job_for(key, stage, rec, w):   # dmsh_build.py job_for; transform feedback i
     elif code[:4] == bytes.fromhex('79563412'): code = code[0x100:]
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
     xfb = xfb_layout(key, rec[ci:]) if stage in ('vs', 'gs') else None   # a geometry shader captures what it emits (Xenoblade Chronicles 3's particle update, 293ecebc0136519b)
-    j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'debug': False, 'uniform_bounds': False, 'reduced': True, 'sb_align': SB_ALIGN, 'subgroup': SUBGROUP, 'hmma_shuffle': HMMA_SHUFFLE, 'gather_bias': GATHER_BIAS, 'gs_passthrough': False, **({'xfb': xfb} if xfb else {})}
+    j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), 'debug': False, 'uniform_bounds': False, 'reduced': True, 'sb_align': SB_ALIGN, 'subgroup': SUBGROUP, 'hmma_shuffle': HMMA_SHUFFLE, 'gather_bias': GATHER_BIAS, 'gs_passthrough': False, 'draw_parameters': True, **({'xfb': xfb} if xfb else {})}
     if stage == 'cs':   # Runtime captures have no facts-table row; their control section still declares the workgroup.
         x, y, z, shared = struct.unpack_from('<4I', rec, ci + 0x748)
         j.update(local=[x, y, z], shared=(shared + 15) // 16 * 16)
@@ -495,7 +496,7 @@ def main():
                 key, source, target, sites = line.split()
                 handle_remaps[key] = int(source, 0), int(target, 0), int(sites)
     pc, loc = {}, {}
-    for ln in open(MAP, encoding='utf-8'):
+    for ln in Path(MAP).read_text(encoding='utf-8').splitlines():
         c = ln.rstrip('\n').split('\t')
         if len(c) > 4 and c[0].endswith('.bin'): loc.setdefault(c[3], (c[0], int(c[1])))
     cap = {k: v for k, v in captured(a.capture).items() if k not in loc}
@@ -508,7 +509,7 @@ def main():
         if k in cap: stages[k], rec = cap[k]
         else:
             name, idx = loc[k]
-            if name not in packs: packs[name] = records(open(os.path.join(a.pkg, name), 'rb').read())
+            if name not in packs: packs[name] = records((Path(a.pkg) / name).read_bytes())
             stages[k], rec = name[:2], packs[name][idx]
         jobs[k], c1s[k] = job_for(k, stages[k], rec, w)
     # A geometry shader's input primitive is the draw's (Maxwell's shader header doesn't say it; Ryujinx asks the GPU state): one translation for each kind, as the Mac
@@ -519,69 +520,109 @@ def main():
         for t in (0, 1, 2, 4):
             vk_ = f'{k}_t{t}'; jobs[vk_] = {**jobs[k], 'key': vk_, 'gs_input': t}; c1s[vk_] = c1s[k]; stages[vk_] = 'gs'; gs_var[vk_] = gs_variant_key(int(k, 16), t)
     keys = keys + sorted(gs_var)
-    chunks = [keys[i::a.jobs] for i in range(a.jobs) if keys[i::a.jobs]]
+    if not keys: raise ValueError('no shaders selected for export')
+    if a.report and os.path.abspath(a.report) == os.path.abspath(a.out): raise ValueError('shader report must not overwrite the bundle')
+    batch_errors, failures, rs = {}, {}, []
     def xl(ch):
-        jp = os.path.join(w, f'job_{abs(hash(ch[0]))}.json'); json.dump([jobs[k] for k in ch], open(jp, 'w'))
-        return subprocess.run([a.dotnet, XLATE_DLL, jp, w], capture_output=True, text=True, errors='replace')
-    print(f'translating {len(keys)} shaders in {len(chunks)} batches ...', flush=True)
-    with cf.ThreadPoolExecutor(len(chunks)) as ex: rs = list(ex.map(xl, chunks))
+        result = None
+        try:
+            jp = os.path.join(w, f'job_{abs(hash(ch[0]))}.json'); Path(jp).write_text(json.dumps([jobs[k] for k in ch]), encoding='utf-8')
+            result = subprocess.run([a.dotnet, XLATE_DLL, jp, w], capture_output=True, text=True, errors='replace')
+            shader_products.check_batch(result, len(ch))
+            return result, None
+        except Exception as e:
+            return result, str(e)
+    def translate(selected):
+        chunks = [selected[i::a.jobs] for i in range(a.jobs) if selected[i::a.jobs]]
+        with cf.ThreadPoolExecutor(len(chunks)) as ex:
+            for ch, (result, error) in zip(chunks, ex.map(xl, chunks)):
+                if result is not None: rs.append(result)
+                # A failed process may have written valid products before it stopped.
+                # Keep its diagnostic for keys with no output, and validate each product.
+                batch_errors.update(dict.fromkeys(ch, error))
+    print(f'translating {len(keys)} shaders in {min(a.jobs, len(keys))} batches ...', flush=True)
+    translate(keys)
     # second pass (as the Mac chain's dmsh_build.py finish): vertex shaders with inputs used only as integers, translated again with those inputs reported as uint (int_inputs)
     again = []
     for k in keys:
-        p = os.path.join(w, k + '.spv')
-        if stages[k] != 'vs' or not os.path.exists(p): continue
-        extra = {l: t for l, t in int_inputs(open(p, 'rb').read()).items() if l not in jobs[k]['attr']}
-        if extra: jobs[k]['attr'].update(extra); again.append(k)
+        if stages[k] != 'vs' or k in failures: continue
+        try:
+            product = shader_products.output(w, k, STAGES[stages[k]])
+            if product is None: continue
+            extra = {l: t for l, t in int_inputs(product[0]).items() if l not in jobs[k]['attr']}
+            if extra:
+                jobs[k]['attr'].update(extra)
+                # A failed retry must not retain the first pass's incompatible input interface.
+                for suffix in ('.spv', '.res.json'): os.unlink(os.path.join(w, k + suffix))
+                again.append(k)
+        except Exception as e: failures[k] = str(e)
     if again:
         print(f'translating {len(again)} vertex shaders again with their integer inputs ...', flush=True)
-        ch2 = [again[i::a.jobs] for i in range(a.jobs) if again[i::a.jobs]]
-        with cf.ThreadPoolExecutor(len(ch2)) as ex: rs += list(ex.map(xl, ch2))
+        translate(again)
     errs = collections.Counter()
     for r in rs:
         for ln in r.stderr.splitlines():
             if ln.strip(): errs[ln.strip()[:120]] += 1
-    entries, fails, pooled = [], collections.Counter(), collections.Counter()   # pooled: shaders per stage whose texture and sampler pool arrays go to the backend's pool tables
+    entries, fails, failed, pooled = [], collections.Counter(), [], collections.Counter()   # pooled: shaders per stage whose texture and sampler pool arrays go to the backend's pool tables
     padded = {}   # key → shader_padwave.pad's account of a compute kernel padded from PAD_WAVE to 2 * PAD_WAVE lanes
     pv_fs = {}   # fragment shaders whose per-vertex reads became flat inputs (per_vertex = gs): their SPIR-V and the flat locations, for the geometry shaders below
+    # the report's inventory (shader_products.check_bundle): every key asked for, then the shaders generated beside them as they are made (a mesh shader's
+    # pass-through vertex shader, the geometry shaders of fragment shaders with per-vertex inputs)
+    expected = [[f'{gs_var[k] if k in gs_var else int(k, 16):016x}', STAGES[stages[k]]] for k in keys]
+    if len({k for k, _ in expected}) != len(expected): raise ValueError('shader keys collide with geometry variants')
     for k in keys:
-        spv_p, res_p = os.path.join(w, k + '.spv'), os.path.join(w, k + '.res.json')
-        if not os.path.exists(spv_p): fails['no output'] += 1; continue
-        spv = open(spv_p, 'rb').read(); res = json.load(open(res_p)) if os.path.exists(res_p) else {}
-        mesh_vs = None
-        if k in mesh_jobs:   # a task or mesh kernel: wrapped for the compute emulation, and a mesh shader's pass-through vertex shader beside it (shader_meshwrap.py)
-            mi, mlay, msize = mesh_jobs[k]
-            try: spv = shader_meshwrap.wrap(spv, mi, mlay, msize); mesh_vs = shader_meshwrap.vertex_shader(mi) if mi['kind'] == 'ms' else None
-            except ValueError as e: fails['mesh: ' + str(e)] += 1; print(f'[RED] {k} ({stages[k]}): not drawn: {e}', flush=True); continue
-        if PAD_WAVE and stages[k] == 'cs' and k not in mesh_jobs and shader_padwave.wants_pad(spv, PAD_WAVE):   # (before the reflection: the bundle header carries the padded local size)
-            try: spv, pst = shader_padwave.pad(spv, 2 * PAD_WAVE); padded[k] = pst
-            except ValueError as e: fails['pad_wave: ' + str(e)] += 1; print(f'[RED] {k} (cs): not padded to {2 * PAD_WAVE} lanes, left at {PAD_WAVE}: {e}', flush=True)
-        binds, local, io = spirv_bindings(spv)
-        if k in handle_remaps:
-            spv = remap_handles(spv, *handle_remaps[k])
-        st = stages[k]
-        if any(b['binding'] > 0xffff or b['count'] > 0xffff for b in binds):
-            # The translator could not trace a handle to a constant-buffer word and indexed the texture and sampler pools (classify's pools: 2^20 textures, 4096 samplers): the arrays
-            # and the bindings past them do not fit refl_bin's 16-bit fields. In a graphics stage the bindings are renumbered densely (compact_bindings) and the pool arrays' counts
-            # saturate (the backend reads their lengths from the SPIR-V and cuts them to its tables', gfx_vk_shader.c); the pools are bound from set 0, the texture table set. A compute,
-            # task or mesh kernel's set 0 is its own (gfx_vk_shader.c set_of; Welcome Tour's two Ampere compute shaders that index their textures at run time): left out, counted apart
-            why = None
-            if st not in ('vs', 'ps', 'gs', 'hs', 'ds'): why = 'bindless arrays (a compute, task or mesh kernel: no pool table set for compute)'
-            elif not any(pool_array(b) for b in binds) or any(b['count'] > 0xffff and not pool_array(b) for b in binds): why = 'bindless arrays (reflection past 16 bits)'
-            if why: fails[why] += 1; print(f'[RED] {k} ({st}): bindless texture arrays, left out of the bundle ({why})', flush=True); continue
-            spv = compact_bindings(spv, binds)
-            for b in binds:
-                if pool_array(b): b['count'] = min(b['count'], 0xffff)
-            pooled[st] += 1
-        cl = [classify(st, b, res) for b in binds]
-        for e in cl: kinds_all[e['kind']] += 1
-        # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
-        hdr3 = shader_meshwrap.facts(mesh_jobs[k][0]) if k in mesh_jobs else (local or jobs[k].get('local') or [1, 1, 1]) if st == 'cs' else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
-        if st == 'ps' and k not in mesh_jobs: hdr3 = ps_omap_words(hdr3, jobs[k].get('code'))
-        entries.append((gs_var[k] if k in gs_var else int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3)))
-        if mesh_vs:
-            vb, _, vio = spirv_bindings(mesh_vs); entries.append((shader_meshwrap.mesh_vs_key(int(k, 16)), STAGES['vs'], mesh_vs, refl_bin([classify('vs', b, {}) for b in vb], b'', vio[1])))
-            nvn2_notes['mesh shaders with a pass-through vertex shader'] += 1
-        if st == 'ps' and res.get('per_vertex_gs'): pv_fs[k] = (spv, res['per_vertex_gs'])
+        try:
+            if k in failures: raise ValueError(failures[k])
+            if k in mesh_jobs:   # a task or mesh kernel: no ordinary stage's product (shader_products.output); its wrap below checks it
+                spv_p, res_p = os.path.join(w, k + '.spv'), os.path.join(w, k + '.res.json')
+                if not os.path.exists(spv_p): raise ValueError(batch_errors.get(k) or 'no output')
+                spv = open(spv_p, 'rb').read(); res = json.load(open(res_p)) if os.path.exists(res_p) else {}
+            else:
+                product = shader_products.output(w, k, STAGES[stages[k]])
+                if product is None: raise ValueError(batch_errors.get(k) or 'no output')
+                spv, res = product
+            mesh_vs = None
+            if k in mesh_jobs:   # a task or mesh kernel: wrapped for the compute emulation, and a mesh shader's pass-through vertex shader beside it (shader_meshwrap.py)
+                mi, mlay, msize = mesh_jobs[k]
+                try: spv = shader_meshwrap.wrap(spv, mi, mlay, msize); mesh_vs = shader_meshwrap.vertex_shader(mi) if mi['kind'] == 'ms' else None
+                except ValueError as e: raise ValueError(f'{stages[k]} kernel not drawn: mesh: {e}') from e
+            if PAD_WAVE and stages[k] == 'cs' and k not in mesh_jobs and shader_padwave.wants_pad(spv, PAD_WAVE):   # (before the reflection: the bundle header carries the padded local size)
+                try: spv, pst = shader_padwave.pad(spv, 2 * PAD_WAVE); padded[k] = pst
+                except ValueError as e: fails['pad_wave: ' + str(e)] += 1; print(f'[RED] {k} (cs): not padded to {2 * PAD_WAVE} lanes, left at {PAD_WAVE}: {e}', flush=True)
+            binds, local, io = spirv_bindings(spv)
+            if k not in mesh_jobs: shader_products.validate_bindings(binds, res)
+            if k in handle_remaps:
+                spv = remap_handles(spv, *handle_remaps[k])
+            st = stages[k]
+            if any(b['binding'] > 0xffff or b['count'] > 0xffff for b in binds):
+                # The translator could not trace a handle to a constant-buffer word and indexed the texture and sampler pools (classify's pools: 2^20 textures, 4096 samplers): the arrays
+                # and the bindings past them do not fit refl_bin's 16-bit fields. In a graphics stage the bindings are renumbered densely (compact_bindings) and the pool arrays' counts
+                # saturate (the backend reads their lengths from the SPIR-V and cuts them to its tables', gfx_vk_shader.c); the pools are bound from set 0, the texture table set. A compute,
+                # task or mesh kernel's set 0 is its own (gfx_vk_shader.c set_of; Welcome Tour's two Ampere compute shaders that index their textures at run time): left out, counted apart
+                why = None
+                if st not in ('vs', 'ps', 'gs', 'hs', 'ds'): why = 'bindless arrays (a compute, task or mesh kernel: no pool table set for compute)'
+                elif not any(pool_array(b) for b in binds) or any(b['count'] > 0xffff and not pool_array(b) for b in binds): why = 'bindless arrays (reflection past 16 bits)'
+                if why: raise ValueError(f'{st}: bindless texture arrays, left out of the bundle ({why})')
+                spv = compact_bindings(spv, binds)
+                for b in binds:
+                    if pool_array(b): b['count'] = min(b['count'], 0xffff)
+                pooled[st] += 1
+            cl = [classify(st, b, res) for b in binds]
+            for e in cl: kinds_all[e['kind']] += 1
+            # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
+            hdr3 = shader_meshwrap.facts(mesh_jobs[k][0]) if k in mesh_jobs else (local or jobs[k].get('local') or [1, 1, 1]) if st == 'cs' else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
+            if st == 'ps' and k not in mesh_jobs: hdr3 = ps_omap_words(hdr3, jobs[k].get('code'))
+            entries.append((gs_var[k] if k in gs_var else int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3)))
+            if mesh_vs:
+                vb, _, vio = spirv_bindings(mesh_vs); entries.append((shader_meshwrap.mesh_vs_key(int(k, 16)), STAGES['vs'], mesh_vs, refl_bin([classify('vs', b, {}) for b in vb], b'', vio[1])))
+                expected.append([f'{shader_meshwrap.mesh_vs_key(int(k, 16)):016x}', STAGES['vs']])
+                nvn2_notes['mesh shaders with a pass-through vertex shader'] += 1
+            if st == 'ps' and res.get('per_vertex_gs'): pv_fs[k] = (spv, res['per_vertex_gs'])
+        except Exception as e:
+            reason = str(e)
+            failed.append([f'{gs_var[k] if k in gs_var else int(k, 16):016x}', reason])
+            fails[reason] += 1
+            print(f'[RED] {failed[-1][0]}: {reason}', flush=True)
     # the pass-through geometry shaders of the fragment shaders with per-vertex inputs (see the header): triangles under pv_gs_key, the other input primitives under
     # gs_variant_key of it, chosen by the draw's topology as a game's own (gfx_vk_shader.c vk_shader_gs_topo). No bindings, no c1: the reflection is empty
     pv_gs, pv_bad = 0, 0
@@ -589,12 +630,16 @@ def main():
         gk = shader_pvgs.pv_gs_key(int(k, 16))
         try: made = {t: shader_pvgs.pv_geometry(spv, pvmap, t) for t in (0, 1, 2, 3, 4)}
         except ValueError as e: pv_bad += 1; print(f'[RED] {k} (ps): reads inputs per vertex, but no pass-through geometry shader could be made: {e}; its per-vertex inputs go unwritten', flush=True); continue
-        for t, g in made.items(): entries.append((gk if t == 3 else gs_variant_key(gk, t), STAGES['gs'], g, refl_bin([], b'', [0, 0, 0])))
+        for t, g in made.items():
+            entries.append((gk if t == 3 else gs_variant_key(gk, t), STAGES['gs'], g, refl_bin([], b'', [0, 0, 0])))
+            expected.append([f'{gk if t == 3 else gs_variant_key(gk, t):016x}', STAGES['gs']])
         pv_gs += 1
     if pv_fs: print(f'{len(pv_fs)} fragment shaders read inputs per vertex (per_vertex gs): pass-through geometry shaders generated for {pv_gs}, {pv_bad} failed '
                     f'(flat locations {sorted({t for _, m in pv_fs.values() for v in m.values() for t in v})})', flush=True)
     if a.zstd: print(f'compressing {len(entries)} shaders (zstd level {a.zstd}, {a.jobs} threads) ...', flush=True)
     ver, raw, stored = dmsv.write(a.out, entries, level=a.zstd, jobs=a.jobs)
+    if a.report:
+        with open(a.report, 'w', encoding='utf-8') as f: json.dump(dict(schema=1, expected=expected, failed=failed), f)
     print(f'{len(entries)} of {len(keys) + 5 * pv_gs + nvn2_notes["mesh shaders with a pass-through vertex shader"]} shaders → {a.out} ({os.path.getsize(a.out) / 2**20:.1f} MB, version {ver}: SPIR-V {raw / 2**20:.1f} MB'
           f'{f", {stored / 2**20:.1f} MB compressed" if ver > 1 else ""}); failed: {dict(fails)}; binding kinds: {dict(kinds_all)}')
     for e, n in errs.most_common(8): print(f'  translator: {n:5d}  {e}')

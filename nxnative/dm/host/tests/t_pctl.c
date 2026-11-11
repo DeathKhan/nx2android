@@ -7,6 +7,7 @@ void dm_applet_leave(void) {}
 
 static int unexpected, checks, fails;
 void *guest_sym(const char *name) { (void)name; unexpected++; return NULL; }
+int dm_lan_on(void) { return 0; }   // hle_ldn.c: no LAN play (hle_friends.c)
 module_t *module_of(const void *p) { (void)p; unexpected++; return NULL; }
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; unexpected++; }
 // hle_codec_video.c: GameChat's camera images, recorded

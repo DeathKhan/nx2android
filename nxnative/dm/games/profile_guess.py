@@ -83,6 +83,10 @@ def aarch64(path):   # main.npdm's flags (META +0xc) bit 0, Is64BitInstruction; 
     if not Path(path).exists(): return True
     d = Path(path).read_bytes()
     return d[:4] != b'META' or bool(d[0xc] & 1)
+def is_64bit(path):   # main.npdm's Is64BitInstruction flag (META byte 0xC, bit 0); None without the file. A 32-bit game (AArch32: Rune Factory 4 Special, issue #161) has ELF32 modules the tools do not read
+    if not Path(path).exists(): return None
+    d = Path(path).read_bytes()
+    return bool(d[0xC] & 1) if d[:4] == b'META' and len(d) > 0xC else None
 
 
 def facts_of(exefs, romfs):

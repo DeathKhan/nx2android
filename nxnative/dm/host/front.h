@@ -41,6 +41,8 @@ extern void (*front_progress_hook)(const char *title, long done, long total);
 // All text is UTF-8; max_chars is the maximum character count (0 = unlimited, only a hint for the front end; truncation is done uniformly by the caller hle_swkbd.c in UTF-16 units).
 // Confirm returns 1 and writes the result into out (including the terminating 0); cancel returns 0;
 // with no window (front_metal_layer() == NULL) nothing is shown and -1 is returned.
+// Request-local minimum in UTF-16 units; -1 when there is no active swkbd request.
+extern _Thread_local int g_swkbd_min_chars;
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap);
 // Controller applet prompt (hle_hid.c ctrl_support, ctrl_prompt.h; GitHub issue #1640): the game wants min to max players (max <= 0: no maximum) and sees fewer. The main thread shows a
 // prompt over the game while controllers join and the calling thread blocks until it closes. 1: done (A or Return with the minimum in, the maximum in, or nobody left to join);

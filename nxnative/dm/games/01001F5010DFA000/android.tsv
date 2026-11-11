@@ -5,8 +5,12 @@
 # 60 fps (30 on the Switch: patches.py), GPU 11-14.6 ms at the beach; a 30-minute soak kept one
 # process at a flat 1,307 MiB footprint with no audio underruns and no red log line. The washed-out picture it first had was the vertex outputs' Maxwell start values
 # (gfx_vk_shader.c spv_vs_init). Local wireless trades stay offline (nn::ldn cut): Trading Post → Local Communication not checked yet.
+# On the AYN Thor (Snapdragon 8 Gen 2, Adreno 740, Android 13, Turnip 27.0.0-R2, 2026-11-11), played by hand from the same save with both builds installed side by side:
+# the build with the cut plays like fast-forward, about twice as fast; this one (no cut) plays at the Switch's pace. The game runs at its own 30.
+# On the Y700 again (2026-11-11, Qualcomm driver, docked): the same 3 s stick hold (DM_CTL LUp~3.0) from the beach's first-control spot walked twice as far with the cut
+# at 60 as with no cut at 30, and the cut pinned at 30 (DM_FPS_PIN=30) walked as far as no cut: the 2026-10-30 record of game time at real time was wrong. No cut: 33.3 ms, no red line.
 status	playable
-tested	v262144 Lenovo Legion Y700 TB322FC (Snapdragon 8 Elite, Adreno 830, Android 16)
+tested	v262144 AYN Thor (Snapdragon 8 Gen 2, Adreno 740, Android 13)
 package	org.nx2a.plarceus
 orientation	landscape
 

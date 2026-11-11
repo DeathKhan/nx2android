@@ -56,7 +56,7 @@ size_t swkbd_u8_to_u16(const char *s, size_t max_units, uint16_t *out, size_t ca
 // hle_charname.c also lets bytes ≥0x80 through (Chinese names), so the rule becomes: English letters or Chinese characters, at most 15 UTF-8 bytes in total (3 bytes per Chinese character, at most 5).
 // While the naming panel is open the front end blocks on the spot by this rule and writes the rule in the dialog. diag.c maintains this flag from UI messages.
 int g_swkbd_name_panel;
-int g_swkbd_min_chars = -1;     // ≥0 = this input needs at least that many characters (ShowKeyboardArg's minimum length; the applet keeps OK disabled until the text is long enough, so the front end's box keeps itself up until then)
+_Thread_local int g_swkbd_min_chars = -1; // request-local UTF-16 minimum for the Android IME
 int g_swkbd_numeric_max = -1;   // ≥0 = this input is a quantity box, value = upper limit (set by dm_textinput.c, read by the front end input box, set back to -1 after use)
 int (*g_swkbd_unfilter)(void);   // registered by the host (dm_charname_unfilter in hle_charname.c; NULL in unit tests): keyboard requests from the naming panel bypass the game's ASCII typing filter
 typedef int (*swkbd_input_fn)(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap);
@@ -78,7 +78,8 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     // Test switch DM_TEST_SWKBD_HOLD_MS=<ms> (with DM_KBD): the keyboard stays up that long before DM_KBD's text is returned, the way a player types into the input box (for reproducing on the Mac what the game's other threads do meanwhile)
     static int hold = -1; if (hold < 0) { const char *h = getenv("DM_TEST_SWKBD_HOLD_MS"); hold = h ? atoi(h) : 0; }
     if (script && hold > 0) usleep((useconds_t)hold * 1000);
-    int r = script ? (snprintf(text, sizeof text, "%s", script), 1) : (g_swkbd_min_chars = minlen > 0 ? minlen : -1, input(title, sub, guide, init, maxlen > 0 ? maxlen : 0, text, sizeof text));
+    g_swkbd_min_chars = minlen > 0 ? minlen : 0;
+    int r = script ? (snprintf(text, sizeof text, "%s", script), 1) : input(title, sub, guide, init, maxlen > 0 ? maxlen : 0, text, sizeof text);
     g_swkbd_numeric_max = -1;   // the numeric box mark applies to this one time only (set by dm_textinput.c before bringing up the keyboard)
     g_swkbd_min_chars = -1;     // the minimum length applies to this one time only
     LOG("swkbd: title '%s' initial '%s' limit %d min %d → %s%s%s", title, init, maxlen, minlen,

@@ -41,7 +41,7 @@
 #        uepak.py job <RomFS> <main NSO> <work dir> [<Mac host> <rewritten modules>]   the shader code archives of every pak, and an Oodle job of their Oodle-compressed shaders (LZ4 ones
 #                                                                       decoded at once); IoStore shader libraries (UE 5.6) decoded at once through the game's Oodle in the host (OodleHost)
 #        uepak.py finish <work dir> <out dir>                           after the host has run the job: the archives with every shader decoded
-import ctypes, json, os, re, struct, sys
+import ctypes, json, os, re, struct, sys, zlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import os, open
 
@@ -160,6 +160,7 @@ class R:
 LEGACY = (4, 8)   # legacy pak versions read (the per-file index); 11 has the encoded one. Version 8 (DRAGON BALL Z: KAKAROT, UE 4.2x) keeps version 4's index with the FPakEntry
 #   compression method as an index (from 1) into the footer's method names, and version 11's footer: key GUID, encrypted flag, magic 0xcc from the end, five 32-byte names after the SHA-1
 LEGACY_METHODS = {1: 'Zlib', 2: 'Gzip', 3: 'LZ5', 4: 'Custom'}   # compression flags of a legacy pak (3: DRAGON QUEST XI S's engine, see the header)
+ZLIB = {'Zlib': lambda b, n: zlib.decompress(b), 'Gzip': lambda b, n: zlib.decompress(b, 31)}   # the methods Pak.read decodes without the game
 
 def magic_back(f):
     """(how far from the end the footer's magic is, the pak version): a legacy footer is the last 0x2d bytes (magic 0x2c from the end); version 11's magic is 0xc8 from the end in
@@ -567,6 +568,17 @@ def unreal_paks(romfs, inline=None, mains=()):
         try: inl = inline_shaders(p, k)
         except (OSError, ValueError, struct.error): continue   # shorter than a footer, or no Unreal pak
         if inline is None or inl == inline: out.append(p)
+    return out
+
+def legacy_decoder_paks(romfs):
+    """The legacy paks under the RomFS whose files need the game's own decoder: a compression method other than zlib or gzip (DRAGON QUEST XI S's LZ5), or an encrypted index, which
+    is not read here. OCTOPATH TRAVELER's are all zlib: Pak.read decodes them and the shader split needs no game"""
+    out = []
+    for p in unreal_paks(romfs, legacy=True):
+        try: pk = Pak(p)
+        except ValueError: out.append(p); continue
+        if any(e['method'] and e['method'] not in ZLIB for e in pk.files.values()): out.append(p)
+        pk.f.close()
     return out
 
 def job(romfs, main_nso, work, decode=None):

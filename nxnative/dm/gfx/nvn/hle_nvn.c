@@ -3194,6 +3194,10 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
     uintptr_t from = (uintptr_t)ph->mem + (uintptr_t)r->poff;
     vm_prot_t cur, max;
     kern_return_t kr = vm_remap(mach_task_self(), &to, r->size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)from, FALSE, &cur, &max, VM_INHERIT_NONE);
+    if (kr == KERN_NOT_SUPPORTED) {   // Android: private memory cannot be aliased (darwin_compat.c vm_remap), so the page table alone, as for an unaligned request above
+        static _Atomic uint64_t n; if (!atomic_fetch_add(&n, 1)) LOG("[nvn] virtual pool %p: the host cannot alias physical pages here: mappings are kept in the page table only (textures read it, the GPU cannot address the pool)", (const void *)v->pool);
+        return 1;
+    }
     if (kr != KERN_SUCCESS || to != (vm_address_t)(v->base + r->voff)) { LOG("[RED] virtual pool remap %#lx → %p (%#llx bytes) failed: %d", (unsigned long)from, (void *)(v->base + r->voff), (unsigned long long)r->size, kr); return 0; }
     mprotect((void *)to, r->size, PROT_READ | PROT_WRITE);   // the source may be write-protected by the dirty tracker at this moment; the alias itself is plain memory
     vrun_set(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size, 1);
@@ -3661,11 +3665,13 @@ int nvn_sparse_alias(uint64_t lo, uint64_t hi) {
 // Textures of a sparse pool, read through its page table (see the sparse pools above): whether a pool is one, a copy of a texture's bytes (unmapped pages read as 0; → bytes not mapped),
 // whether its content may have changed since an upload (a mapping in its range newer than gen, or a physical page behind it written after the dirty-page stamp), and the write
 // protection of the physical pages behind it (taken before an upload, as for any packaged texture)
+// A texture's pool pointer is the game's NVNmemoryPool: after Finalize the game may reuse that memory, so vp is read only from a live virtual pool (magic POOL, flag 0x200)
+static struct vpool *vpool_live(const void *pool) { const pool_t *p = pool; return p && p->magic == MAGIC('P', 'O', 'O', 'L') && (p->flags & 0x200) ? p->vp : NULL; }
 static struct vpool *vpool_at(const void *pool, uint64_t a) {   // caller holds g_vp_mu
-    struct vpool *v = pool ? ((const pool_t *)pool)->vp : NULL;
+    struct vpool *v = vpool_live(pool);
     return v && a >= (uint64_t)(uintptr_t)v->base && a < (uint64_t)(uintptr_t)v->base + v->size ? v : NULL;
 }
-int nvn_sparse_pool(const void *pool) { return pool && ((const pool_t *)pool)->vp; }   // no lock: set at Initialize, cleared at the first mapping (an aliased pool) or Finalize; called per texture lookup
+int nvn_sparse_pool(const void *pool) { return vpool_live(pool) != NULL; }   // no lock: set at Initialize, cleared at the first mapping (an aliased pool) or Finalize; called per texture lookup
 uint64_t nvn_sparse_gen(void) { return atomic_load(&g_vp_gen); }
 uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n) {
     pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a); uint64_t miss = 0;

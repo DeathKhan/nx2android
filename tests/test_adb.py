@@ -1,6 +1,7 @@
 # porter/adb.py without a device: the shell's answers are made up (python -m unittest discover tests).
-import sys, tarfile, tempfile, unittest
+import hashlib, os, shlex, shutil, subprocess, sys, tarfile, tempfile, unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from porter.adb import Adb, AdbError   # noqa: E402
@@ -92,6 +93,197 @@ class PushTars(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             p = Path(t) / 'data' / 'a'; p.parent.mkdir(); p.write_bytes(b'x')
             with self.assertRaisesRegex(AdbError, 'unpacking'): self.FakeAdb(Path(t) / 'dev', 'tar: short read\nrc=1').push_tars(p.parent, '/sdcard/x', [('a', p, 1)])
+
+
+@unittest.skipUnless(os.name == 'posix' and shutil.which('sh'), 'the local device shell harness needs POSIX paths and sh')
+class PushFile(unittest.TestCase):
+    class LocalAdb(Adb):   # actual push_file, remote_md5 and join script; only adb's transport and Android stat/md5 output are substituted
+        def __init__(self, dev):
+            super().__init__('adb', log=lambda s: None)
+            self.dev, self.pushed, self.fail_at, self.hashes, self.fail_join = Path(dev), [], None, True, False
+            self.hash_calls, self.no_printf = [], False
+        def remote_sizes(self, rdir):
+            return {p.name: p.stat().st_size for p in Path(rdir).iterdir() if p.is_file()}
+        def run(self, *a, **kw):
+            if a[:2] != ('push', '-Z'): raise AssertionError(a)
+            dst = Path(a[-1])
+            if dst.name == self.fail_at: raise AdbError('interrupted transfer')
+            shutil.copyfile(a[-2], dst); self.pushed.append(dst.name)
+            return ''
+        def shell(self, script, **kw):
+            if str(self.dev) not in script: raise AssertionError(script)
+            words = shlex.split(script)
+            if words[:3] == ['stat', '-c', '%s']: return str(Path(words[3]).stat().st_size)
+            if 'md5sum' in words:
+                root, start, end = Path(words[1]), words.index('md5sum') + 1, words.index('2>/dev/null;')
+                self.hash_calls.append((words[start:end], kw))
+                if self.hashes == 'timeout': raise AdbError('adb shell: timed out')
+                if not self.hashes: return ''
+                return ''.join(f'{hashlib.md5((root / name).read_bytes()).hexdigest()}  {name}\n' for name in words[start:end] if (root / name).is_file())
+            if words[:2] == ['rm', '-f'] and self.fail_join: raise AdbError('interrupted join')
+            if self.no_printf: script = 'printf() { return 127; }\n' + script
+            r = subprocess.run(['sh', '-c', script], capture_output=True, text=True)
+            if r.returncode: raise AdbError(r.stderr)
+            return r.stdout
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        self.src = Path(tmp.name) / 'source.bin'; self.dev = Path(tmp.name) / 'device'
+        self.dev.mkdir(); self.dst = str(self.dev / "a file's bytes.bin"); self.adb = self.LocalAdb(self.dev)
+
+    def interrupt(self, data, at='00001', chunk=4):
+        self.src.write_bytes(data); self.adb.fail_at = at
+        with self.assertRaisesRegex(AdbError, 'interrupted transfer'): self.adb.push_file(self.src, self.dst, chunk=chunk)
+        self.adb.fail_at = None; self.adb.pushed.clear()
+
+    def test_changed_source_replaces_same_size_piece(self):
+        self.interrupt(b'AAAABBBB'); self.src.write_bytes(b'CCCCDDDD')
+        self.adb.push_file(self.src, self.dst, chunk=4)
+        self.assertEqual(Path(self.dst).read_bytes(), b'CCCCDDDD')
+        self.assertEqual(self.adb.pushed, ['00000', '00001'])
+
+    def test_unchanged_source_keeps_verified_piece(self):
+        self.interrupt(b'AAAABBBB')
+        self.adb.push_file(self.src, self.dst, chunk=4)
+        self.assertEqual(Path(self.dst).read_bytes(), b'AAAABBBB')
+        self.assertEqual(self.adb.pushed, ['00001'])
+
+    def test_missing_hash_replaces_piece(self):
+        self.interrupt(b'AAAABBBB'); self.adb.hashes = False
+        self.adb.push_file(self.src, self.dst, chunk=4)
+        self.assertEqual(Path(self.dst).read_bytes(), b'AAAABBBB')
+        self.assertEqual(self.adb.pushed, ['00000', '00001'])
+
+    def test_hash_timeout_resends_unverified_pieces(self):
+        self.interrupt(b'AAAABBBB')
+        self.adb.hashes = 'timeout'
+        self.adb.push_file(self.src, self.dst, chunk=4)
+        self.assertEqual(Path(self.dst).read_bytes(), b'AAAABBBB')
+        self.assertEqual(self.adb.pushed, ['00000', '00001'])
+        self.assertEqual(len(self.adb.hash_calls), 1)
+        self.assertEqual(self.adb.hash_calls[0][1].get('retries'), 1)
+
+    def test_resume_limits_hash_work_per_shell_call(self):
+        data = bytes(range(40))
+        self.interrupt(data, at='00009')
+        self.adb.push_file(self.src, self.dst, chunk=4)
+        self.assertEqual(Path(self.dst).read_bytes(), data)
+        self.assertEqual(self.adb.pushed, ['00009'])
+        self.assertGreater(len(self.adb.hash_calls), 1)
+        self.assertEqual([name for names, _ in self.adb.hash_calls for name in names],
+                         [f'{i:05d}' for i in range(9)])
+
+    def test_many_pieces_join_in_order_without_printf(self):
+        data = bytes(range(256)) + b'end'
+        self.adb.no_printf = True
+        self.src.write_bytes(data)
+        self.adb.push_file(self.src, self.dst, chunk=1)
+        self.assertEqual(Path(self.dst).read_bytes(), data)
+    def test_shrinking_source_ignores_old_tail(self):
+        self.interrupt(b'AAAABBBBCCCC', at='00002'); self.src.write_bytes(b'DDDD')
+        self.adb.push_file(self.src, self.dst, chunk=4)
+        self.assertEqual(Path(self.dst).read_bytes(), b'DDDD')
+        self.assertEqual(list(self.dev.glob('.dmpart-*')), [])
+
+    def test_changed_chunk_size_ignores_old_tail(self):
+        self.interrupt(b'AAAABBBBCCCCDDDD', at='00003'); self.adb.push_file(self.src, self.dst, chunk=8)
+        self.assertEqual(Path(self.dst).read_bytes(), b'AAAABBBBCCCCDDDD')
+
+    def test_truncated_source_does_not_join(self):
+        self.src.write_bytes(b'AAAABBBB'); Path(self.dst).write_bytes(b'previous complete file')
+        def progress(done, total, note):
+            if done == 4: self.src.write_bytes(b'AAAA')
+        with self.assertRaisesRegex(AdbError, 'changed|short|truncat'): self.adb.push_file(self.src, self.dst, chunk=4, progress=progress)
+        self.assertEqual(Path(self.dst).read_bytes(), b'previous complete file')
+
+    def test_short_read_does_not_upload_incomplete_piece(self):
+        self.src.write_bytes(b'A' * (2 << 20))
+        def progress(done, total, note):
+            if done == 1 << 20:
+                with self.src.open('r+b') as f: f.truncate(1 << 20)
+        with self.assertRaisesRegex(AdbError, 'changed|short|truncat'): self.adb.push_file(self.src, self.dst, chunk=1 << 20, progress=progress)
+        self.assertEqual(self.adb.pushed, ['00000']); self.assertFalse(Path(self.dst).exists())
+
+    def test_empty_source_replaces_previous_pieces(self):
+        self.interrupt(b'AAAABBBBCCCC', at='00002'); self.src.write_bytes(b'')
+        self.adb.push_file(self.src, self.dst, chunk=4)
+        self.assertEqual(Path(self.dst).read_bytes(), b'')
+
+    def test_retry_after_join_failure_reuses_pieces(self):
+        self.src.write_bytes(b'AAAABBBB'); self.adb.fail_join = True
+        with self.assertRaisesRegex(AdbError, 'interrupted join'): self.adb.push_file(self.src, self.dst, chunk=4)
+        self.adb.fail_join = False; self.adb.pushed.clear()
+        self.adb.push_file(self.src, self.dst, chunk=4)
+        self.assertEqual(Path(self.dst).read_bytes(), b'AAAABBBB'); self.assertEqual(self.adb.pushed, [])
+
+
+class LaunchActivity(unittest.TestCase):
+    class FakeAdb(Adb):
+        def __init__(self, activity='android.app.NativeActivity', resolved=None):
+            super().__init__('adb'); self.activity, self.resolved = activity, resolved
+            self.cmds = []; self.started = False
+        def shell(self, script, **kw):
+            self.cmds.append(script)
+            if script.startswith('cmd package resolve-activity'):
+                return self.resolved if self.resolved is not None else f'priority=0 preferredOrder=0 match=0x108000\norg.nx2a.test/{self.activity}\n'
+            if script.startswith('am start'):
+                self.started = f'org.nx2a.test/{self.activity}' in script
+                return ''
+            if script.startswith('[ -d'):
+                return 'yes' if self.started and '.nx2a-old' not in script else ''
+            if script.startswith('cat ') and '/result.txt' in script:
+                return 'request=fixture\nresult=ok\nname=exported\n' if self.started else ''
+            return ''
+
+    def test_prepare_files_resolves_each_packaged_activity(self):
+        for activity in ('android.app.NativeActivity', 'org.nx2a.GameActivity', 'org.nx2a.ExternalActivity', 'org.nx2a.KeyboardExternalActivity'):
+            with self.subTest(activity=activity):
+                adb = self.FakeAdb(activity)
+                self.assertTrue(adb.prepare_app_files('org.nx2a.test', timeout=1))
+                self.assertTrue(adb.started)
+                self.assertTrue(any(c.startswith('cmd package resolve-activity') for c in adb.cmds))
+
+    def test_save_requests_resolve_each_packaged_activity(self):
+        from porter import saves
+        for activity in ('android.app.NativeActivity', 'org.nx2a.GameActivity', 'org.nx2a.ExternalActivity', 'org.nx2a.KeyboardExternalActivity'):
+            with self.subTest(activity=activity), mock.patch.object(saves.secrets, 'token_hex', return_value='fixture'):
+                adb = self.FakeAdb(activity)
+                result = saves._request(adb, 'org.nx2a.test', 'export.txt', ['export'], timeout=0.01)
+                self.assertEqual(result['name'], 'exported')
+                self.assertTrue(any(c.startswith('cmd package resolve-activity') for c in adb.cmds))
+
+    def test_missing_or_foreign_launcher_fails_without_starting(self):
+        for resolved in ('No activity found\n', 'other.package/.Main\n', 'org.nx2a.test/Bad;echo bad\n'):
+            with self.subTest(resolved=resolved):
+                adb = self.FakeAdb(resolved=resolved)
+                with self.assertRaisesRegex(AdbError, 'launcher activity'):
+                    adb.start_app('org.nx2a.test')
+                self.assertFalse(any(c.startswith('am start') for c in adb.cmds))
+
+    def test_start_error_on_stderr_is_reported_immediately(self):
+        def remote_shell(args, **kwargs):
+            if args[1] != 'shell':
+                self.fail(f'unexpected adb command: {args}')
+            script = args[2]
+            if script.startswith('cmd package resolve-activity '):
+                return subprocess.CompletedProcess(args, 0, 'org.nx2a.test/android.app.NativeActivity\n', '')
+            if script in ('am start -W -n org.nx2a.test/android.app.NativeActivity',
+                          'am start -W -n org.nx2a.test/android.app.NativeActivity 2>&1'):
+                error = 'Error type 3\nError: Activity class does not exist.\n'
+                stdout, stderr = (error, '') if script.endswith(' 2>&1') else ('', error)
+                return subprocess.CompletedProcess(args, 0, stdout, stderr)
+            self.fail(f'unexpected shell command: {script}')
+
+        with mock.patch('porter.adb.subprocess.run', side_effect=remote_shell):
+            with self.assertRaisesRegex(AdbError, 'Activity class does not exist'):
+                Adb('adb').start_app('org.nx2a.test')
+
+    def test_failed_save_launch_removes_pending_request(self):
+        from porter import saves
+        adb = self.FakeAdb(resolved='No activity found\n')
+        with self.assertRaisesRegex(AdbError, 'launcher activity'):
+            saves._request(adb, 'org.nx2a.test', 'export.txt', ['export'], timeout=0.01)
+        self.assertTrue(any('rm -f' in c and '/export.txt' in c for c in adb.cmds))
 
 
 if __name__ == '__main__':
