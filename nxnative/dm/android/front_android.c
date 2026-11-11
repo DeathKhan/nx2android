@@ -162,7 +162,8 @@ static void shake_sensor(int on);   // the accelerometer, off in the background 
 static void go_background(void) { if (!atomic_load(&g_running) || atomic_exchange(&g_bg, 1)) return; dm_focus_set(2); dm_focus_set(3);   // through OutOfFocus, as a game sees HOME and then the suspension (front_mac.m does the same)
     hold_sync(); dm_gfx_suspend(1); shake_sensor(0); }
 static void go_foreground(void) { if (!atomic_load(&g_running) || !atomic_exchange(&g_bg, 0)) return; dm_gfx_suspend(0); hold_sync(); dm_focus_set(2); shake_sensor(1); }
-static void on_pause(ANativeActivity *a) { (void)a; go_background(); }
+static void gpu_floor_restore(void), gpu_floor_resume(void), gpu_floor_end(void);   // (GPU clock floor, below)
+static void on_pause(ANativeActivity *a) { (void)a; go_background(); gpu_floor_restore(); }
 // Back in front, the game is out of focus until the window has the input focus again (Android sends it after onResume): without this it stayed OutOfFocus for good,
 // and Blasphemous 2's Unity, which asks for focus notifications, kept its title paused and ignored every press after a trip to another app. A window losing focus while in
 // front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay
@@ -205,9 +206,8 @@ static void act_finish(ANativeActivity *a) {
     if (m) (*E)->CallVoidMethod(E, a->clazz, m);
     if (!m || (*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); LOG("[RED] Activity.finish() failed: the app ends itself"); _exit(0); }
 }
-static void on_resume(ANativeActivity *a) { if (g_quit) { act_finish(a); return; } immersive(a); go_foreground(); }
-static void gpu_floor_restore(void);
-static void on_destroy(ANativeActivity *a) { (void)a; gpu_floor_restore(); _exit(0); }   // one game per process
+static void on_resume(ANativeActivity *a) { if (g_quit) { act_finish(a); return; } immersive(a); gpu_floor_resume(); go_foreground(); }
+static void on_destroy(ANativeActivity *a) { (void)a; gpu_floor_end(); _exit(0); }   // one game per process
 
 // ---- input ----
 static AInputQueue *g_queue; static ALooper *g_ilooper;
@@ -1316,27 +1316,129 @@ static void *host_thread(void *a) {
 }
 // GPU clock floor (env.txt DM_GPU_MIN_FREQ=<Hz>, a profile env row): Adreno's governor parks at 660 MHz under a steady 30 fps load on the AYN Odin 3 (available
 // frequencies up to 1.1 GHz), and the game's frame-rate controller then steps its present interval down; the same floor (967 MHz) in the emulator took its cave from 21 to 29 fps,
-// and here p95 frame time 47 → 36 ms. The sysfs node is root's: written through su (Magisk grants the app once; without a grant the write fails and is logged once). The
-// previous floor is restored when the activity is destroyed
+// and here p95 frame time 47 → 36 ms. Pokémon Legends: Arceus at 60 fps needs 734 MHz or more: at the 160 MHz floor the governor lowers the clock while the game holds 30,
+// and every trial back to 60 fails (1.2-2.0 vsyncs a frame). The sysfs node is root's. Written first through the firmware's PServerBinder service (AYN's Odin 3 and other
+// Android handhelds), which runs a short shell command as root for any app, without a rooted device; then through su (Magisk grants the app once); the line says which worked.
+// The technique is the one PULSE (keiretrogaming/pulse, GPL-2.0) and ClusterTune (AurelioB/ClusterTune, MIT) use; this is our own code: ServiceManager.checkService
+// ("PServerBinder"), transaction 0 with a parcel of an int32 count and that many strings, here the command (at most 255 bytes) and "1" for its output, which comes back as a
+// byte array. The previous floor is restored when the game goes to the background (and set again when it comes back) and when the activity is destroyed; a force-stop
+// destroys nothing, so the first PServer write also leaves a root shell that waits for this process to end and then writes the previous floor back. All of it runs on its own
+// thread: the first build that called the service from onCreate sat on the splash screen on the Odin 3 (2026-11-11), and a game must start whatever the service does
 static char g_gpu_floor_prev[32]; static const char *GPU_MIN_FREQ = "/sys/class/kgsl/kgsl-3d0/devfreq/min_freq";
+static long g_gpu_floor_hz; static int g_gpu_floor_via, g_gpu_floor_on;   // the floor asked for (0 = none); 1 PServer, 2 su (0 = neither worked); whether it is in force now
 static int su_run(const char *cmd, char *out, size_t n) {   // su -c <cmd>; out: its first line (optional); 0 on success
     char full[1024]; snprintf(full, sizeof full, "su -c '%s' 2>/dev/null", cmd);
     FILE *f = popen(full, "r"); if (!f) return -1;
     if (out && n) { out[0] = 0; if (fgets(out, (int)n, f)) out[strcspn(out, "\n")] = 0; }
     int rc = pclose(f); return rc == 0 ? 0 : -1;
 }
-static void gpu_floor_apply(void) {
-    const char *e = getenv("DM_GPU_MIN_FREQ"); if (!e || !atol(e)) return;
-    char cmd[256]; snprintf(cmd, sizeof cmd, "cat %s", GPU_MIN_FREQ);
-    if (su_run(cmd, g_gpu_floor_prev, sizeof g_gpu_floor_prev)) { LOG("[RED] GPU clock floor %s Hz: su refused (grant the app root in Magisk, or leave DM_GPU_MIN_FREQ out)", e); g_gpu_floor_prev[0] = 0; return; }
-    snprintf(cmd, sizeof cmd, "echo %ld > %s", atol(e), GPU_MIN_FREQ);
-    if (su_run(cmd, NULL, 0)) { LOG("[RED] GPU clock floor: writing %s failed", GPU_MIN_FREQ); g_gpu_floor_prev[0] = 0; return; }
-    LOG("GPU clock floor %ld Hz (was %s; restored when the game ends)", atol(e), g_gpu_floor_prev);
+// The command through PServerBinder, on a thread attached to the VM (the floor thread, never the main thread); out: its output's first line (optional).
+// 0 on success, -1 when the service is not there, -2 when the call failed
+static int pserver_run(JNIEnv *E, const char *cmd, char *out, size_t n) {
+    if (out && n) out[0] = 0;
+    if (!E || strlen(cmd) > 255) return -2;
+    int rc = -1; jobject binder = NULL, data = NULL, reply = NULL;
+    if ((*E)->PushLocalFrame(E, 16) != JNI_OK) { (*E)->ExceptionClear(E); return -2; }
+    jclass sm = (*E)->FindClass(E, "android/os/ServiceManager");
+    jmethodID check = sm && !(*E)->ExceptionCheck(E) ? (*E)->GetStaticMethodID(E, sm, "checkService", "(Ljava/lang/String;)Landroid/os/IBinder;") : NULL;
+    if (check && !(*E)->ExceptionCheck(E)) binder = (*E)->CallStaticObjectMethod(E, sm, check, (*E)->NewStringUTF(E, "PServerBinder"));
+    if ((*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); binder = NULL; }
+    if (binder) {
+        rc = -2;
+        jclass pc = (*E)->FindClass(E, "android/os/Parcel"), bc = (*E)->FindClass(E, "android/os/IBinder");
+        jmethodID obtain = pc ? (*E)->GetStaticMethodID(E, pc, "obtain", "()Landroid/os/Parcel;") : NULL, wi = pc ? (*E)->GetMethodID(E, pc, "writeInt", "(I)V") : NULL,
+                  ws = pc ? (*E)->GetMethodID(E, pc, "writeString", "(Ljava/lang/String;)V") : NULL, cb = pc ? (*E)->GetMethodID(E, pc, "createByteArray", "()[B") : NULL,
+                  rec = pc ? (*E)->GetMethodID(E, pc, "recycle", "()V") : NULL, tr = bc ? (*E)->GetMethodID(E, bc, "transact", "(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z") : NULL;
+        if (!(*E)->ExceptionCheck(E) && obtain && wi && ws && cb && rec && tr) {
+            data = (*E)->CallStaticObjectMethod(E, pc, obtain); reply = (*E)->CallStaticObjectMethod(E, pc, obtain);
+            if (data && reply && !(*E)->ExceptionCheck(E)) {
+                (*E)->CallVoidMethod(E, data, wi, (jint)2);
+                (*E)->CallVoidMethod(E, data, ws, (*E)->NewStringUTF(E, cmd));
+                (*E)->CallVoidMethod(E, data, ws, (*E)->NewStringUTF(E, "1"));
+                jboolean ok = !(*E)->ExceptionCheck(E) && (*E)->CallBooleanMethod(E, binder, tr, (jint)0, data, reply, (jint)0);
+                if (ok && !(*E)->ExceptionCheck(E)) {
+                    rc = 0;
+                    jbyteArray b = (jbyteArray)(*E)->CallObjectMethod(E, reply, cb);
+                    if (b && !(*E)->ExceptionCheck(E) && out && n) {
+                        jsize len = (*E)->GetArrayLength(E, b); if ((size_t)len >= n) len = (jsize)n - 1;
+                        (*E)->GetByteArrayRegion(E, b, 0, len, (jbyte *)out); out[len] = 0; out[strcspn(out, "\n")] = 0;
+                        if (!strcmp(out, "null")) out[0] = 0;
+                    }
+                }
+            }
+            if ((*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); rc = -2; }
+            if (data) (*E)->CallVoidMethod(E, data, rec);
+            if (reply) (*E)->CallVoidMethod(E, reply, rec);
+        }
+        if ((*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); rc = -2; }
+    }
+    (*E)->PopLocalFrame(E, NULL);
+    return rc;
 }
-static void gpu_floor_restore(void) {
-    if (!g_gpu_floor_prev[0]) return;
-    char cmd[256]; snprintf(cmd, sizeof cmd, "echo %s > %s", g_gpu_floor_prev, GPU_MIN_FREQ); su_run(cmd, NULL, 0); g_gpu_floor_prev[0] = 0;
+static JNIEnv *g_fl_env;   // the floor thread's (gpu_floor_thread): no PServer call runs on the main thread, so a slow or stuck service never holds up start-up or the lifecycle
+static int floor_run(int via, const char *cmd, char *out, size_t n) { return via == 1 ? pserver_run(g_fl_env, cmd, out, n) : su_run(cmd, out, n); }
+static long floor_read(void) { FILE *f = fopen(GPU_MIN_FREQ, "r"); long v = -1; if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); } return v; }   // -1 when the app may not read it
+// Sets the floor through `via`, the previous value into g_gpu_floor_prev; 0 when the node reads the floor afterwards (or cannot be read by the app but the write ran)
+static int floor_set(int via) {
+    char cmd[256], prev[32] = "";
+    snprintf(cmd, sizeof cmd, "cat %s && echo %ld > %s", GPU_MIN_FREQ, g_gpu_floor_hz, GPU_MIN_FREQ);
+    if (floor_run(via, cmd, prev, sizeof prev) || !atol(prev)) return -1;
+    long now = floor_read(); if (now >= 0 && now != g_gpu_floor_hz) return -1;
+    if (!g_gpu_floor_prev[0]) snprintf(g_gpu_floor_prev, sizeof g_gpu_floor_prev, "%ld", atol(prev));   // the floor before the game, kept across trips to the background
+    return 0;
 }
+static void floor_first(void) {
+    for (int via = 1; via <= 2 && !g_gpu_floor_via; via++) {
+        LOG("GPU clock floor %ld Hz: trying %s", g_gpu_floor_hz, via == 1 ? "PServerBinder" : "su");
+        if (!floor_set(via)) g_gpu_floor_via = via;
+    }
+    if (!g_gpu_floor_via) { LOG("[RED] GPU clock floor %ld Hz: PServerBinder not there or refused, and su refused (grant the app root in Magisk, or leave DM_GPU_MIN_FREQ out)", g_gpu_floor_hz); return; }
+    g_gpu_floor_on = 1;
+    LOG("GPU clock floor %ld Hz through %s (was %s; restored in the background and when the game ends)", g_gpu_floor_hz, g_gpu_floor_via == 1 ? "PServerBinder (no root)" : "su", g_gpu_floor_prev);
+    if (g_gpu_floor_via == 1) {   // the watcher for a force-stop (no onDestroy): a root shell, detached from the service's output, that writes the previous floor back once this process is gone
+        char cmd[256]; snprintf(cmd, sizeof cmd, "(while [ -d /proc/%d ]; do sleep 2; done; echo %s > %s) </dev/null >/dev/null 2>&1 &", (int)getpid(), g_gpu_floor_prev, GPU_MIN_FREQ);
+        if (pserver_run(g_fl_env, cmd, NULL, 0)) LOG("[RED] GPU clock floor: the watcher that restores %s Hz after a force-stop did not start", g_gpu_floor_prev);
+        else LOG("GPU clock floor: a root watcher restores %s Hz if the app is killed", g_gpu_floor_prev);
+    }
+}
+// The main thread only posts what it wants (1 the floor, 0 the previous one); the floor thread does it
+static pthread_mutex_t g_fl_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_fl_cv = PTHREAD_COND_INITIALIZER;
+static int g_fl_want = 1, g_fl_have = -1, g_fl_started;   // asked for; done (-1 = not yet)
+static void *gpu_floor_thread(void *vm) {
+    JavaVM *V = vm; if ((*V)->AttachCurrentThread(V, &g_fl_env, NULL) != JNI_OK) g_fl_env = NULL;
+    floor_first();
+    pthread_mutex_lock(&g_fl_mu); g_fl_have = 1; pthread_cond_broadcast(&g_fl_cv);
+    for (;;) {
+        while (g_fl_want == g_fl_have) pthread_cond_wait(&g_fl_cv, &g_fl_mu);
+        int want = g_fl_want; pthread_mutex_unlock(&g_fl_mu);
+        if (g_gpu_floor_via && want && !g_gpu_floor_on) { if (floor_set(g_gpu_floor_via)) LOG("[RED] GPU clock floor %ld Hz: setting it again after the background failed", g_gpu_floor_hz); else g_gpu_floor_on = 1; }
+        else if (!want && g_gpu_floor_on && g_gpu_floor_prev[0]) {
+            char cmd[128]; snprintf(cmd, sizeof cmd, "echo %s > %s", g_gpu_floor_prev, GPU_MIN_FREQ);
+            if (floor_run(g_gpu_floor_via, cmd, NULL, 0)) LOG("[RED] GPU clock floor: restoring %s Hz failed", g_gpu_floor_prev);
+            g_gpu_floor_on = 0;
+        }
+        pthread_mutex_lock(&g_fl_mu); g_fl_have = want; pthread_cond_broadcast(&g_fl_cv);
+    }
+    return NULL;
+}
+static void gpu_floor_apply(void) {   // onCreate: the floor thread, if the profile asks for a floor
+    const char *e = getenv("DM_GPU_MIN_FREQ"); if (!e || atol(e) <= 0 || !g_act) return;
+    g_gpu_floor_hz = atol(e);
+    pthread_t t; if (pthread_create(&t, NULL, gpu_floor_thread, g_act->vm)) { LOG("[RED] GPU clock floor: no thread for it"); return; }
+    pthread_detach(t); g_fl_started = 1;
+}
+static void floor_post(int want, int wait_ms) {
+    if (!g_fl_started) return;
+    pthread_mutex_lock(&g_fl_mu); g_fl_want = want; pthread_cond_broadcast(&g_fl_cv);
+    if (wait_ms > 0) {   // onDestroy: a short wait for the previous floor, then the process ends whatever the service does
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += (long)wait_ms * 1000000; ts.tv_sec += ts.tv_nsec / 1000000000; ts.tv_nsec %= 1000000000;
+        while (g_fl_have != want) if (pthread_cond_timedwait(&g_fl_cv, &g_fl_mu, &ts)) break;
+    }
+    pthread_mutex_unlock(&g_fl_mu);
+}
+static void gpu_floor_restore(void) { floor_post(0, 0); }   // the background: the previous floor back
+static void gpu_floor_resume(void) { floor_post(1, 0); }    // back in front: the floor again, through the path that worked
+static void gpu_floor_end(void) { floor_post(0, 500); }     // onDestroy
 static void env_file(const char *path) {   // KEY=VALUE per line (# comments): switches without rebuilding, as the iOS app's Documents/env.txt
     FILE *f = fopen(path, "r"); char line[1024];
     if (!f) return;

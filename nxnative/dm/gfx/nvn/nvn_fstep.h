@@ -47,6 +47,21 @@
 // second half cost at most 1 − FSTEP_RAMP of its first half, and had a late frame (a window on time is judged as a trial), starts another, up to FSTEP_PROBE_MAX frames in all
 #define FSTEP_RAMP 0.05       // the fall in cost from one half of a grace window to the next that shows the clock still rising (the per-frame noise of a 25 ms frame is 4%, of 15 frames 1%)
 #define FSTEP_PROBE_MAX 180   // grace frames a probe may take in all (3 s at 60 fps): a clock that keeps rising without reaching the hold is not waited for longer
+// At kmin, late frames step up only when the overrun lasts or is large (lateness by shown and cost; a screen verdict, nvn_mtl.m snapshots, steps up after three as before).
+// Pokémon Legends: Arceus on the Odin 3 at 60 fps: turning the camera costs the CPU 1.18-1.29 vsyncs for a few frames at a time (GPU 0.91-0.93), and three such frames in
+// a row stepped to 30, which the probes took 0.5-3 s to undo: up to 180 frames of every 1,800 at hold 2 while panning, though only one frame in twenty was late. A late frame
+// at kmin is one 33 ms frame on screen, paid back by the step; a step up is 30 fps for a second or more. So at kmin three late frames in a row step up at once only when each
+// took FSTEP_HEAVY vsyncs or more beyond the hold (a scene or a load that does not fit: Ocarina of Time's 1.3-2.1-vsync views, a stall); otherwise FSTEP_WIN_LATE late
+// frames among the last FSTEP_WIN at kmin do, while the frames' time there (a running mean over about FSTEP_WIN_N frames) is FSTEP_OVER or more beyond the hold: under
+// 52 fps for a third of a second. A scripted pan (right stick left and right for 40 s, 2026-11-11) took 1.06-1.15 vsyncs a frame through each turn with a few of 1.27-1.42:
+// about 55 fps shown with a step of 2 every few frames, where the old rule spent 456 frames of 1,800 at 30 fps. Steady 18.7 ms frames (1.12) now stay at hold 1 for the same
+// reason: 53 fps with a payback every eighth frame rather than 30. A burst that ends a trial, a probe or a probe's run at kmin fails it without doubling the hold-off, as a
+// hitch does (FSTEP_HITCH_MAX in a row), unless its late frames came one after another, so the probe after it comes 1 s later
+#define FSTEP_HEAVY 0.3       // vsyncs beyond the hold each of three late frames in a row must take to step up at once at kmin
+#define FSTEP_WIN 60          // frames at kmin whose lateness is counted (1 s at 60 fps; at most 64)
+#define FSTEP_WIN_LATE 20     // late frames among them that step up, with:
+#define FSTEP_OVER 0.15       // the frames' running mean time at kmin at least this many vsyncs beyond the hold (1.15 vsyncs: 19.2 ms, 52 fps)
+#define FSTEP_WIN_N 16        // the frames the running mean weighs (1 / FSTEP_WIN_N each)
 
 typedef struct {
     int k, step;              // vsyncs each frame stays on screen; the step handed to the game for the next frame (k, or k + 1 while paying back)
@@ -70,6 +85,10 @@ typedef struct {
     int mtrial, mfail;        // the trial in progress is one by kheld; such trials failed in a row
     int fit_miss, settle;     // frames of the current fit run that fit k but not k − 1; frames left of a trial's settling (FSTEP_SETTLE)
     double late_cmax; int hitch_fails;   // the highest cost of the current late run; trials back to kmin failed on hitches alone in a row (FSTEP_HITCH_MAX)
+    double late_tmin; uint64_t lwin;     // the shortest max(shown, cost) of the current late run; the late frames among the last FSTEP_WIN at kmin (bit 0 the latest)
+    double cwin;              // the running mean of max(shown, cost) of the frames counted in lwin (0 = none yet)
+    int up_by;                // why the last step up came (for the log): 1 three late frames, 2 three heavy late frames at kmin, 3 late frames within FSTEP_WIN at kmin
+    uint64_t tolerated;       // late frames at kmin that did not step up (statistics)
     uint64_t late, paid, ups, downs, failed, probes; double dropped;   // statistics for the log
 } nvn_fstep;
 
@@ -112,7 +131,14 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         if (!--s->grace && s->ramp && s->plate && s->ptotal + FSTEP_GRACE <= FSTEP_PROBE_MAX && s->pb <= (1 - FSTEP_RAMP) * s->pa) { s->grace = FSTEP_GRACE; s->pa = s->pb = 0; s->plate = 0; }   // still getting cheaper: another window
     }
     int settling = s->settle > 0; if (settling) s->settle--;
-    if (late) { s->late++; s->late_run = grace || settling ? 0 : s->late_run + 1; s->fit_run = s->fit_miss = 0; s->late_cmax = s->late_run <= 1 ? (s->late_run ? cost : 0) : fmax(s->late_cmax, cost); } else { s->late_run = 0; s->late_cmax = 0; }
+    if (late) { s->late++; s->late_run = grace || settling ? 0 : s->late_run + 1; s->fit_run = s->fit_miss = 0; s->late_cmax = s->late_run <= 1 ? (s->late_run ? cost : 0) : fmax(s->late_cmax, cost);
+                s->late_tmin = s->late_run <= 1 ? (s->late_run ? fmax(shown, cost) : 0) : fmin(s->late_tmin, fmax(shown, cost)); }
+    else { s->late_run = 0; s->late_cmax = s->late_tmin = 0; }
+    // At kmin, judged by shown and cost: the late frames among the last FSTEP_WIN (a probe's grace and a trial's settling do not count, as for late_run)
+    int tolerant = held == kmin && !scr;
+    if (tolerant && !grace && !settling) { double t = fmax(shown, cost); s->lwin = (s->lwin << 1 | (uint64_t)late) & ((1ull << FSTEP_WIN) - 1); s->cwin = s->cwin > 0 ? s->cwin + (t - s->cwin) / FSTEP_WIN_N : t; }
+    else s->lwin = 0, s->cwin = 0;
+    int heavy = s->late_run >= 3 && s->late_tmin >= held + FSTEP_HEAVY, burst = late && __builtin_popcountll(s->lwin) >= FSTEP_WIN_LATE && s->cwin >= held + FSTEP_OVER;
     // The cost of the frames on time (a hitch is not what the scene costs): at kmin, and at the longer hold
     if (kmin != s->ckmin) {   // another cap: its run starts over, and what held it before comes back
         if (s->ckmin >= 1 && s->ckmin <= FSTEP_MAX) {
@@ -130,19 +156,22 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         if (held != s->ck) { s->ck = held; s->cn = 0; }
         if (!late && fits) { s->ccur = s->cn ? s->ccur + (cost - s->ccur) / 8 : cost; s->cn++; if (s->cn >= FSTEP_RUN && !grace && held <= FSTEP_MAX) s->kheld[held] = s->ccur; }
     }
-    if (s->late_run >= 3 && s->k < kmax) {   // step up to the cost, at least one vsync
+    if (tolerant && s->late_run && !heavy && !burst && s->k < kmax) s->tolerated++;
+    if (s->k < kmax && (tolerant ? heavy || burst : s->late_run >= 3)) {   // step up to the cost, at least one vsync
+        s->up_by = !tolerant ? 1 : heavy ? 2 : 3;
         int want = (int)ceil(cost - 0.05);
         if (want < s->k + 1) want = s->k + 1;
         if (want > kmax) want = kmax;
         // A trial back to kmin whose late frames all cost what fits kmin failed on hitches (a load, a stall), not on the scene's cost: the hold-off stays as it was, up to
         // FSTEP_HITCH_MAX such failures in a row. Trials to a longer hold, probes and trials by kheld (Ocarina of Time's 20 -> 30 fps) double it as before
-        int hitch = s->trial && !s->probe && !s->mtrial && held == kmin && s->late_cmax <= FSTEP_FIT * held && s->hitch_fails < FSTEP_HITCH_MAX;
+        // A burst at kmin (FSTEP_WIN_LATE late frames, not three heavy ones in a row, nor all in a row) that ends a trial, a probe or a probe's run at kmin counts as one too
+        int hitch = held == kmin && s->hitch_fails < FSTEP_HITCH_MAX && ((s->trial && !s->probe && !s->mtrial && s->late_cmax <= FSTEP_FIT * held) || (s->up_by == 3 && s->late_run < FSTEP_WIN_LATE && (s->trial || (s->probe == 2 && s->since < hold_max))));
         if (hitch) { s->failed++; s->trial = 0; s->hitch_fails++; }
         else if (s->trial || (s->probe == 2 && s->since < hold_max)) { s->failed++; s->trial = 0; s->hold = s->hold * 2 < hold_max ? s->hold * 2 : hold_max; s->hitch_fails = 0;
             if (s->mtrial && ++s->mfail >= 3 && held <= FSTEP_MAX) s->kheld[held] = 0; }   // (three failed trials by kheld: that hold's cost is no longer the scene's)
         else if (s->probe == 2) s->hold = hold0;   // the probe's run at kmin lasted
         if (held == kmin && s->run >= hold_max) s->cref = s->crun;   // kmin held 8 s at this cost
-        s->k = want; s->ups++; s->late_run = s->fit_run = 0; s->since = 0; s->probe = 0; s->mtrial = 0;
+        s->k = want; s->ups++; s->late_run = s->fit_run = 0; s->since = 0; s->probe = 0; s->mtrial = 0; s->lwin = 0; s->cwin = 0;
     } else if (s->trial && !grace && !--s->trial) { if (s->probe) { s->probe = 2; s->since = 0; } else s->hold = hold0; s->mtrial = s->mfail = 0; s->hitch_fails = 0; }   // the trial held (a probe's run at kmin is judged at the next step up)
     if (!late) {
         if (s->k <= kmin) s->fit_run = s->fit_miss = 0;

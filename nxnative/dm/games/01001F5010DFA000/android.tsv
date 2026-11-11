@@ -13,3 +13,6 @@ orientation	landscape
 # The game steps its time by a stored frame period, not by the clock (patches.py "frame_step"): on the Odin 3 (2026-11-10) the 60 fps cut alone ran everything at double
 # speed, and the pause menu's 30 by host pacing (DM_FRAME_CAP_MODE=pace, which this profile had) could not be right at both rates. With game.tsv's fps_target the period
 # follows the host's frame step, and the pause menu frame cap (hle_framecap.c) sets its hold: Off / 60 one vsync, 30 two
+# 60 fps on the Odin 3 (2026-11-11) needs a GPU clock floor of 734 MHz or more: at the 160 MHz floor the Adreno governor lowers the clock while the game holds 30, and every
+# trial back to 60 fails (1.2-2.0 vsyncs a frame). 832 MHz held it; set without root through the firmware PServerBinder service, else su (front_android.c gpu_floor_apply)
+env	DM_GPU_MIN_FREQ=832000000

@@ -19,7 +19,7 @@ env	DM_ADAPTIVE_FPS=0
 # Proposals for an A/B on the device, not set:
 #   env DM_DYNAMIC_RESOLUTION=1   the game's dynamic resolution through upstream's climbing stub (0, the default, holds 1536x864)
 #   env DM_VK_RC_QUEUE=1          render-enable state kept per NVN queue across submissions, as upstream's logical queues do (the queue-ordering fix for its flashes is Apple-only)
-#   env DM_GPU_MIN_FREQ=967000000 the GPU clock floor the other Switch 2 profiles use (through su)
+#   env DM_GPU_MIN_FREQ=967000000 the GPU clock floor the other Switch 2 profiles use (PServerBinder, else su)
 # Movies (2026-11-08, Odin 3): the AV1 movies decode on MediaCodec (c2.qti.av1.decoder; the game reads the pictures on the CPU, so they go through NV12 copies into its linear
 # textures). The NDVE enhancement network the game runs over each decoded picture (Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs, 22 compute shaders of 0.15-1.8 MB of SPIR-V with up to
 # 1,000 subgroup shuffles) does not build on Adreno 830's driver: vkCreateComputePipelines fails on e6be82d835fbe4d3 and throws std::bad_alloc on d15370a382630d4e, which ends the app.

@@ -12,7 +12,7 @@ setting	docked=0
 setting	overlay=1
 setting	rumble=1
 setting	fps=1
-# The Adreno governor parks at 660 MHz under a steady load; the 967 MHz floor (through su, Magisk) cut p95 frame time 47 → 36 ms in the docked tunnel
+# The Adreno governor parks at 660 MHz under a steady load; the 967 MHz floor (through the firmware PServerBinder service, else su) cut p95 frame time 47 → 36 ms in the docked tunnel
 env	DM_GPU_MIN_FREQ=967000000
 
 # The host's adaptive frame rate (60 → 40 → 30 fps steps, perf_android.c) is off: the game paces itself by whole 60 Hz vsyncs (present interval 1, 2, 3) and steps its clock by them, so a
