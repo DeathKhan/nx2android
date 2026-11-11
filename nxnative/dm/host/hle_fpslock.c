@@ -407,7 +407,9 @@ void dm_fps_lock_tick(void) {
         }
     }
     if (fb.n) fb_tick(target, src);
-    if (g_nimp) imp_tick(base, target);   // the imported FPSLocker rows (DM_FPS_LOCKS), when this build has no rows of its own
+    // the imported FPSLocker rows (DM_FPS_LOCKS), when this build has no rows of its own. Under the pause menu's 30 fps cap by host pacing they take their 30 fps values
+    // (Kirby and the Forgotten Land: its dynamic resolution's GPU time bounds follow the frame's length)
+    if (g_nimp) imp_tick(base, dm_frame_cap() == 30 && dm_frame_cap_how() == DM_FRAME_CAP_PACE ? 30 : target);
     if (uq.base) unity_vsync_tick(target, src);
     for (int r = 0; r < nrow; r++) {
         const lock_t *L = rows[r]; uint64_t obj = (uint64_t)(uintptr_t)base;

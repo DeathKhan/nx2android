@@ -11,3 +11,9 @@ tested	v65536 AYN Thor (Snapdragon 8 Gen 2, Adreno 740, Android 13)
 package	org.nx2a.kirbyandtheforgottenland
 orientation	landscape
 requires	bcn
+
+# AYN Odin 3 (Snapdragon 8 Elite, Adreno 830), base v0 with --fps60 (the FPSLocker rows, DM_FPS_LOCKS), 2026-11-11: 60 fps, GPU p50 14.9 ms docked.
+# The 60 fps cut frees the game's interval and its speed follows the clock, so the pause menu's 30 is the host's pacing; the imported rows then take their 30 fps values
+# (hle_fpslock.c). The GPU clock floor is the one that held 60 in Legends: Arceus on this device (PServerBinder, else su)
+env	DM_FRAME_CAP_MODE=pace
+env	DM_GPU_MIN_FREQ=832000000
