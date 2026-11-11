@@ -142,16 +142,8 @@ HLE_FORCE("nvnBootstrapLoader", "the NVN graphics API is replaced wholesale with
 #ifdef __ANDROID__
 static pthread_once_t g_nq_config_once = PTHREAD_ONCE_INIT;
 static int g_nq_enabled;
-// Android: asynchronous replay (DM_NVN_ASYNC=1) takes the logical queues unless DM_NVN_LOGICAL_QUEUES=0 says otherwise. The older asynchronous path copies
-// each submitted recording itself (sub_copy), and since recordings keep their ends, links and calls in control memory (163a3fbdf) it cannot walk them: every
-// submission copy stopped at its first record and Donkey Kong Bananza drew nothing (0 draws, a red line per submission). The queues flatten recordings themselves
 static void nq_config_init(void) {
     const char *e = getenv("DM_NVN_LOGICAL_QUEUES");
-#ifdef __ANDROID__
-    const char *a = getenv("DM_NVN_ASYNC");
-    if (!e && a && atoi(a)) { g_nq_enabled = NVN_LOGICAL_QUEUES; if (g_nq_enabled) LOG("[nvn] DM_NVN_ASYNC=1: the logical queues replay asynchronously (DM_NVN_LOGICAL_QUEUES=0 turns them off)"); }
-    else
-#endif
     g_nq_enabled = NVN_LOGICAL_QUEUES && e && !strcmp(e, "1");
     if (g_nq_enabled) LOG("[nvn] logical queues enabled: event/sync continuations and retained submission resources");
 }
@@ -1976,29 +1968,35 @@ static void nvn_drain(void) {   // FIFO replay only: finish jobs queued before t
 static void replay_lock(void) { if (nvn_async() || nvn_logical_android_on()) pthread_mutex_lock(&g_sub_mu); }
 static void replay_unlock(void) { if (nvn_async() || nvn_logical_android_on()) pthread_mutex_unlock(&g_sub_mu); }
 // Under asynchronous replay the game may record into its command memory again before the replay thread reaches what it submitted (Unicorn Overlord's skipped
-// scenes: the replay read overwritten records, "unknown record op", and drew nothing while the sound went on). So each submitted handle is copied whole when it
-// is submitted: JUMPs followed, CALLs inlined, and the pointers a record keeps to its own texture snapshots (tex_snap) moved with it. out NULL: only the size (sub_copy)
-static size_t sub_flat(const uint8_t *p, uint8_t *out, size_t at, size_t cap, int depth) {
-    for (;;) {
-        op_hdr hd; memcpy(&hd, p, sizeof hd);
-        if (hd.op == OP_END) return at;
-        if (hd.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
-        if (hd.op == OP_CALL && depth < 8) { uint64_t t; memcpy(&t, p + 8, 8); at = sub_flat((const uint8_t *)(uintptr_t)t, out, at, cap, depth + 1); p += hd.size; continue; }
-        if (hd.size < 8 || hd.size & 7) { static int once; if (!once++) LOG("[RED] submission copy: a record of size %u (op %u): copied up to it (this copy cannot read recordings that keep their links in control memory: leave DM_NVN_LOGICAL_QUEUES unset or 1 with DM_NVN_ASYNC=1)", hd.size, hd.op); return at; }
-        if (out) {
-            if (at + hd.size > cap) return at;   // (the game changed the records between the two walks)
-            uint8_t *d = out + at; memcpy(d, p, hd.size);
-            for (uint32_t k = 8; k + 8 <= hd.size; k += 8) { uint64_t v; memcpy(&v, d + k, 8);
-                if (v >= (uintptr_t)p && v < (uintptr_t)p + hd.size) { v += (uintptr_t)d - (uintptr_t)p; memcpy(d + k, &v, 8); } }
+// scenes: the replay read overwritten records, "unknown record op", and drew nothing while the sound went on). So each submitted handle is copied when it is
+// submitted, as the records the Vulkan replay walks (gfx_vk_exec.c mtl_exec: records ending in OP_END): the recording's control list followed (its pieces and
+// links; calls were joined in when they were recorded), compact records expanded (rec_expand, as the queue's flatten does), and the pointers a record keeps to its
+// own texture snapshots (tex_snap) moved with it. Since recordings keep their ends, links and calls in control memory (163a3fbdf) a handle is that list: the copy
+// that read it as records stopped at its first entry, and Donkey Kong Bananza drew nothing. out NULL: only the size (sub_copy)
+static size_t sub_flat(uint64_t h, uint8_t *out, size_t cap) {
+    size_t at = 0; ctl_iter it = { (const uint8_t *)(uintptr_t)h, 0 }; uint64_t v;
+    if (!ctl_handle_ok(h)) return 0;
+    while (ctl_next(&it, &v))
+        for (const uint8_t *p = ctl_addr(v), *pe = p + ctl_chunk_bytes(v); p < pe; ) {
+            op_hdr hd; memcpy(&hd, p, sizeof hd);
+            if (hd.size < 8 || (hd.size & 7) || hd.size > (size_t)(pe - p)) { LOG("[RED] submission copy: a record of size %u (op %u) at %p: copied up to it", hd.size, hd.op, (const void *)p); return at; }
+            uint8_t x[REC_EXPAND_MAX] __attribute__((aligned(8))); const uint8_t *src = p; size_t m = hd.size;
+            if (rec_compact(hd.op)) { m = rec_expand(p, x); src = x; }
+            if (out) {
+                if (at + m > cap) return at;   // (the game changed the records between the two walks)
+                uint8_t *d = out + at; memcpy(d, src, m);
+                if (src == p) for (uint32_t k = 8; k + 8 <= m; k += 8) { uint64_t w; memcpy(&w, d + k, 8);
+                    if (w >= (uintptr_t)p && w < (uintptr_t)p + hd.size) { w += (uintptr_t)d - (uintptr_t)p; memcpy(d + k, &w, 8); } }
+            }
+            at += m; p += hd.size;
         }
-        at += hd.size; p += hd.size;
-    }
+    return at;
 }
 static uint64_t g_flat_bytes;
 static uint64_t sub_copy(uint64_t h) {
-    const uint8_t *p = (const uint8_t *)(uintptr_t)h; size_t n = sub_flat(p, NULL, 0, 0, 0) + 8;
+    size_t n = sub_flat(h, NULL, 0) + 8;
     uint8_t *c = malloc(n); if (!c) die("submission copy: out of memory (%zu bytes)", n);
-    size_t at = sub_flat(p, c, 0, n - 8, 0); op_hdr e = {OP_END, 8}; memcpy(c + at, &e, 8);
+    size_t at = sub_flat(h, c, n - 8); op_hdr e = {OP_END, 8}; memcpy(c + at, &e, 8);
     g_flat_bytes += n; return (uint64_t)(uintptr_t)c;
 }
 // Builds explicitly excluding the logical scheduler retain these physical-fence hooks:
@@ -2025,6 +2023,14 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     if (nvn_async()) { uint64_t *c = malloc(sizeof *c * (size_t)(n > 0 ? n : 1)); for (int i = 0; i < n; i++) c[i] = sub_copy(h[i]); ((queue_t *)q)->submits++;
         static uint64_t ns, last; if (++ns % 600 == 0) { LOG("[nvn] submissions copied for the replay thread: %.2f MB each (last 600)", (g_flat_bytes - last) / 600.0 / 1048576); last = g_flat_bytes; }
         job_push((nvn_job){JOB_SUBMIT, n, c, q}); return; }
+#ifdef __ANDROID__
+    {   // the Vulkan replay walks records (gfx_vk_exec.c mtl_exec), so it is handed the same copies here too, freed once replayed
+        uint64_t c[n > 0 ? n : 1]; for (int i = 0; i < n; i++) c[i] = sub_copy(h[i]);
+        submit_now(q, n, (const NVNcommandHandle *)c, dm_nvn_frame_count());
+        for (int i = 0; i < n; i++) free((void *)(uintptr_t)c[i]);
+        return;
+    }
+#endif
     submit_now(q, n, h, dm_nvn_frame_count());
 }
 static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h, uint64_t frame) {

@@ -31,12 +31,17 @@ class ProgramLifetime(unittest.TestCase):
             'FINALIZE': function(source, 'NVN(nvnProgramFinalize,'),
             'SET': function(source, 'NVN(nvnProgramSetShaders,'),
             'KEY': function(source, 'int prog_key('),
+            'CTLNEXT': function(source, 'static int ctl_next('),
+            'CTLOK': function(source, 'static int ctl_handle_ok('),
             'FLAT': function(source, 'static size_t sub_flat('),
             'COPY': function(source, 'static uint64_t sub_copy('),
         }
         # prog_key tells a live program by nvnProgramInitialize's magic (upstream nx2android e69473622): MAGIC comes from nvn_obj.h
         obj = (ROOT / 'nxnative/dm/gfx/nvn/nvn_obj.h').read_text(encoding='utf-8')
         parts['MAGICDEF'] = next(l for l in obj.splitlines() if l.startswith('#define MAGIC('))
+        # a handle is the recording's control list (nvn_obj.h ctl_e; 163a3fbdf): the copy walks it (hle_nvn.c sub_flat), so the harness takes its helpers
+        parts['CTLDEFS'] = '\n'.join(l for l in obj.splitlines() if l.startswith(('enum { CTL_CHUNK', '#define CTL_', 'static inline uint64_t ctl_e(', 'static inline unsigned ctl_kind(',
+                                                                                  'static inline const uint8_t *ctl_addr(', 'static inline uint64_t ctl_len(', 'static inline size_t ctl_chunk_bytes(')))
         code = r'''
 #include <assert.h>
 #include <stdint.h>
@@ -61,6 +66,10 @@ typedef struct { uint8_t key[6][8],ok; } prog_keys_t;
 typedef struct { const prog_t *prog; int32_t stages; } p_bind_program;
 typedef struct { uint32_t op,size; } op_hdr;
 enum { OP_END,OP_JUMP,OP_CALL,OP_BIND_PROGRAM };
+CTLDEFS
+#define REC_EXPAND_MAX 64
+static int rec_compact(uint32_t op){(void)op;return 0;}
+static size_t rec_expand(const uint8_t *p,uint8_t *x){(void)p;(void)x;abort();}
 static pthread_mutex_t g_sub_mu=PTHREAD_MUTEX_INITIALIZER,g_job_mu=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_jobdone_cv=PTHREAD_COND_INITIALIZER;
 static uint64_t g_job_enq,g_job_done,g_flat_bytes,serial;
@@ -94,6 +103,10 @@ DRAIN
 FINALIZE
 SET
 KEY
+typedef struct { const uint8_t *e; int done; } ctl_iter; /* hle_nvn.c */
+typedef uint64_t NVNcommandHandle;
+CTLNEXT
+CTLOK
 FLAT
 COPY
 static prog_t *program;
@@ -103,8 +116,11 @@ static void wait_blocked(void){while(!atomic_load(&waits))sched_yield();assert(!
 static void *finalize_thread(void *unused){(void)unused;nvnProgramFinalize(program);atomic_store(&finished,1);return NULL;}
 static void *replace_thread(void *unused){(void)unused;assert(nvnProgramSetShaders(program,1,&replacement));atomic_store(&finished,1);return NULL;}
 static void queue_bind(void){
- struct { op_hdr h; p_bind_program p; op_hdr end; } record={{OP_BIND_PROGRAM,sizeof(op_hdr)+sizeof(p_bind_program)},{program,3},{OP_END,8}};
- copied=sub_copy((uintptr_t)&record);
+ static struct { op_hdr h; p_bind_program p; } record; static uint64_t list[1];   // static: below 2^47, as a handle must be (ctl_handle_ok)
+ record.h=(op_hdr){OP_BIND_PROGRAM,sizeof(op_hdr)+sizeof(p_bind_program)};record.p=(p_bind_program){program,3};
+ list[0]=ctl_e(CTL_CHUNK,&record,sizeof record)|CTL_LAST;
+ copied=sub_copy((uintptr_t)list);
+ assert(((const op_hdr *)(uintptr_t)copied)->op==OP_BIND_PROGRAM&&((const op_hdr *)(uintptr_t)(copied+sizeof record))->op==OP_END); // the records, then an END
  p_bind_program *p=(void *)(uintptr_t)(copied+8);assert(p->prog==program); // submitted copies keep the external pointer
  pthread_mutex_lock(&g_job_mu);g_job_enq++;pthread_mutex_unlock(&g_job_mu);
 }
