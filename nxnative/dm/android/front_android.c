@@ -83,6 +83,7 @@ static const char *const RES_KEYS[DM_RES_N] = {"performance", "balanced", "quali
 static _Atomic int g_set_cap;    // the frame cap's index in OVM_CAPS (0 off; settings.txt fpscap= in fps; hle_framecap.c holds the game to it)
 static _Atomic int g_set_fpspos;   // the frame rate counter's corner (OVM_FPSPOS_KEYS: 0 top left for every game until the player picks another; settings.txt fpspos=)
 static _Atomic int g_set_thermal = -1;    // the pause menu's Thermal throttle (settings.txt thermal=): -1 until the player chooses there (DM_THERMAL_CAP decides), then 0 off, 1 on
+static _Atomic int g_set_floor = -1;      // the pause menu's GPU clock floor (settings.txt gpufloor=<percent>): -1 until the player chooses there (the profile's DM_GPU_MIN_FREQ, else 75%), then OVM_FLOORS' index
 static _Atomic int g_set_mouse = -1;      // the pause menu's Joy-Con mouse (settings.txt mouse=): -1 until the player chooses there (DM_MOUSE decides), then 0 off, 1 auto
 static _Atomic int g_set_padlabel = -1;   // the pause menu's Face buttons (settings.txt labels=): -1 until the player chooses there, then 0 by position, 1 by label
 static int fpspos_index(const char *s) { for (int i = 0; i < 4; i++) if (!strncmp(s, OVM_FPSPOS_KEYS[i], 2)) return i; return -1; }
@@ -106,6 +107,7 @@ static void settings_load(void) {
         else if (sscanf(line, "docked=%d", &v) == 1) { setenv("DM_OPMODE", v ? "1" : "0", 1); atomic_store(&g_set_res, v ? DM_RES_MAX : DM_RES_BALANCED); }   // over env.txt's: the host reads it once, at its first query
         else if (!strncmp(line, "res=", 4)) { for (int k = 0; k < DM_RES_N; k++) if (!strncmp(line + 4, RES_KEYS[k], strlen(RES_KEYS[k]))) { atomic_store(&g_set_res, k); setenv("DM_OPMODE", k == DM_RES_MAX ? "1" : "0", 1); } }   // (after docked=)
         else if (sscanf(line, "fpscap=%d", &v) == 1) atomic_store(&g_set_cap, cap_index(v));
+        else if (sscanf(line, "gpufloor=%d", &v) == 1) { for (int k = 0; k < OVM_NFLOORS; k++) if (OVM_FLOORS[k] == v) atomic_store(&g_set_floor, k); }
         else if (!strncmp(line, "fpspos=", 7) && fpspos_index(line + 7) >= 0) atomic_store(&g_set_fpspos, fpspos_index(line + 7));
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
@@ -135,6 +137,7 @@ static void settings_save(void) {
     fprintf(f, "fpspos=%s\n", OVM_FPSPOS_KEYS[atomic_load(&g_set_fpspos) & 3]);
     if (atomic_load(&g_set_padlabel) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_padlabel));
     if (atomic_load(&g_set_mouse) >= 0) fprintf(f, "mouse=%d\n", atomic_load(&g_set_mouse));
+    if (atomic_load(&g_set_floor) >= 0) fprintf(f, "gpufloor=%d\n", OVM_FLOORS[atomic_load(&g_set_floor)]);   // (only once chosen: until then the profile, else the default)
     if (atomic_load(&g_set_thermal) >= 0) fprintf(f, "thermal=%d\n", atomic_load(&g_set_thermal));   // (only once chosen: until then env.txt decides)
     fputs(g_set_extra, f);   // the lines settings_load did not know
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
@@ -515,6 +518,7 @@ int dm_menu_state(void) {
            atomic_load(&g_menu_tab) << 8 | (atomic_load(&g_menu_down) ? OVM_PRESSED : 0) | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24;
 }
 static int accent_index(unsigned c) { for (int i = 0; i < OVM_ACCENTS_N; i++) if (OVM_ACCENTS[i] == c) return i; return -1; }
+static int gpu_floor_choice(void); static void gpu_floor_pick(void);   // below, with the floor thread
 int dm_menu_value(int item) {
     switch (item) {
     case OVM_OVERLAY: return atomic_load(&g_set_overlay);
@@ -528,6 +532,7 @@ int dm_menu_value(int item) {
     case OVM_PADLABEL: return pad_labels();
     case OVM_MOUSE: return dm_front_mouse() != 0;
     case OVM_THERMAL: return dm_front_thermal() > 0;
+    case OVM_GPUFLOOR: return gpu_floor_choice();
     case OVM_FRAMECAP: return dm_frame_cap_how() == DM_FRAME_CAP_NONE ? OVM_NA : atomic_load(&g_set_cap);
     default: return 0;
     }
@@ -558,6 +563,10 @@ static void menu_set(int item, int v) {   // a row's new value (a switch, a choi
         if (OVM_CAPS[v]) LOG("[menu] frame cap %d", OVM_CAPS[v]); else LOG("[menu] frame cap off");
     }
     else if (item == OVM_ACCENT && v >= 0 && v < OVM_ACCENTS_N) atomic_store(&g_set_accent, OVM_ACCENTS[v]);
+    else if (item == OVM_GPUFLOOR && v >= 0 && v < OVM_NFLOORS) {   // applied at once, by the floor thread
+        atomic_store(&g_set_floor, v); gpu_floor_pick();
+        if (OVM_FLOORS[v]) LOG("[menu] GPU clock floor %d%% of the top clock", OVM_FLOORS[v]); else LOG("[menu] GPU clock floor off");
+    }
     else if (item == OVM_THERMAL && v >= 0 && v < 2) { atomic_store(&g_set_thermal, v); LOG("[menu] thermal throttle %s", v ? "on" : "off"); }
     else if (item == OVM_MOUSE && v >= 0 && v < 2) { atomic_store(&g_set_mouse, v); LOG("[menu] Joy-Con mouse %s", v ? "auto" : "off"); }
     else if (item == OVM_PADLABEL && v >= 0 && v < 2) { atomic_store(&g_set_padlabel, v); LOG("[menu] face buttons by %s", v ? "label" : "position"); }
@@ -1314,7 +1323,7 @@ static void *host_thread(void *a) {
     LOG("host returned %d", rc);
     _exit(rc);
 }
-// GPU clock floor (every game by default, floor_default; env.txt DM_GPU_MIN_FREQ=<Hz>, a profile env row, sets another, 0 none): Adreno's governor parks at 660 MHz under a steady 30 fps load on the AYN Odin 3 (available
+// GPU clock floor (every game by default, floor_level; the pause menu's GPU clock floor row chooses another level or none; env.txt DM_GPU_MIN_FREQ=<Hz>, a profile env row, sets another, 0 none): Adreno's governor parks at 660 MHz under a steady 30 fps load on the AYN Odin 3 (available
 // frequencies up to 1.1 GHz), and the game's frame-rate controller then steps its present interval down; the same floor (967 MHz) in the emulator took its cave from 21 to 29 fps,
 // and here p95 frame time 47 → 36 ms. Pokémon Legends: Arceus at 60 fps needs 734 MHz or more: at the 160 MHz floor the governor lowers the clock while the game holds 30,
 // and every trial back to 60 fails (1.2-2.0 vsyncs a frame). The sysfs node is root's. Written first through the firmware's PServerBinder service (AYN's Odin 3 and other
@@ -1325,7 +1334,6 @@ static void *host_thread(void *a) {
 // destroys nothing, so the first PServer write also leaves a root shell that waits for this process to end and then writes the previous floor back. All of it runs on its own
 // thread: the first build that called the service from onCreate sat on the splash screen on the Odin 3 (2026-11-11), and a game must start whatever the service does
 static char g_gpu_floor_prev[32]; static const char *GPU_MIN_FREQ = "/sys/class/kgsl/kgsl-3d0/devfreq/min_freq";
-static int g_gpu_floor_auto;   // no DM_GPU_MIN_FREQ row: the default floor, through PServerBinder only (never a su prompt nobody asked for), three quarters of the top clock
 static long g_gpu_floor_hz; static int g_gpu_floor_via, g_gpu_floor_on;   // the floor asked for (0 = none); 1 PServer, 2 su (0 = neither worked); whether it is in force now
 static int su_run(const char *cmd, char *out, size_t n) {   // su -c <cmd>; out: its first line (optional); 0 on success
     char full[1024]; snprintf(full, sizeof full, "su -c '%s' 2>/dev/null", cmd);
@@ -1388,58 +1396,89 @@ static int floor_set(int via) {
     if (!g_gpu_floor_prev[0]) snprintf(g_gpu_floor_prev, sizeof g_gpu_floor_prev, "%ld", atol(prev));   // the floor before the game, kept across trips to the background
     return 0;
 }
-// The default floor: the lowest available clock at or above three quarters of the highest (AYN Odin 3: 832 MHz of 1.1 GHz, the floor that held Legends: Arceus at 60 and the
-// one Kirby and the Forgotten Land lacked when the governor sat at 342 MHz, 85 % busy, with a 15.6 ms GPU frame); 0 when the service or the list is not there
-static long floor_default(void) {
-    char cmd[160], out[256]; snprintf(cmd, sizeof cmd, "cat %.*s/available_frequencies", (int)(strrchr(GPU_MIN_FREQ, '/') - GPU_MIN_FREQ), GPU_MIN_FREQ);
-    if (pserver_run(g_fl_env, cmd, out, sizeof out)) return 0;
-    long top = 0, pick = 0; char *p = out, *e;
-    for (long v; (v = strtol(p, &e, 10)), e != p; p = e) if (v > top) top = v;
-    for (p = out; ; p = e) { long v = strtol(p, &e, 10); if (e == p) break; if (v >= top / 4 * 3 && (!pick || v < pick)) pick = v; }
+// The device's clocks (available_frequencies, through PServerBinder), read once by the floor thread; none: no service or no list, and the menu's row says so
+static long g_fl_clock[32]; static _Atomic int g_fl_nclock;
+static void floor_clocks(void) {
+    char cmd[160], out[512]; snprintf(cmd, sizeof cmd, "cat %.*s/available_frequencies", (int)(strrchr(GPU_MIN_FREQ, '/') - GPU_MIN_FREQ), GPU_MIN_FREQ);
+    if (pserver_run(g_fl_env, cmd, out, sizeof out)) return;
+    int n = 0; char *p = out, *e;
+    for (long v; n < 32 && ((v = strtol(p, &e, 10)), e != p); p = e) if (v > 0) g_fl_clock[n++] = v;
+    atomic_store(&g_fl_nclock, n);
+}
+// A level's floor: the lowest clock at or above pct % of the highest. 75 is the default (AYN Odin 3: 832 MHz of 1.1 GHz, the floor that held Legends: Arceus at 60 and
+// the one Kirby and the Forgotten Land lacked when the governor sat at 342 MHz, 85 % busy, with a 15.6 ms GPU frame); 0 without the list
+static long floor_level(int pct) {
+    long top = 0, pick = 0; int n = atomic_load(&g_fl_nclock);
+    for (int i = 0; i < n; i++) if (g_fl_clock[i] > top) top = g_fl_clock[i];
+    for (int i = 0; i < n; i++) if (g_fl_clock[i] >= top / 100 * pct && (!pick || g_fl_clock[i] < pick)) pick = g_fl_clock[i];
     return pick;
 }
-static void floor_first(void) {
-    if (g_gpu_floor_auto && !(g_gpu_floor_hz = floor_default())) { LOG("GPU clock floor: none by default on this device (no PServerBinder service or no clock list); DM_GPU_MIN_FREQ=<Hz> in a profile asks for one through su"); return; }
-    for (int via = 1; via <= (g_gpu_floor_auto ? 1 : 2) && !g_gpu_floor_via; via++) {
+// The floor wanted now: the menu's choice (settings.txt gpufloor=), else the profile's (DM_GPU_MIN_FREQ=<Hz>; 0: none), else the default level. *by_default: no profile
+// row asked for it, so it goes through PServerBinder only (never a su prompt nobody asked for)
+static long floor_wanted(int *by_default) {
+    int s = atomic_load(&g_set_floor); const char *e = getenv("DM_GPU_MIN_FREQ");
+    *by_default = s >= 0 || !e;
+    if (s >= 0) return OVM_FLOORS[s] ? floor_level(OVM_FLOORS[s]) : 0;
+    return e ? (atol(e) > 0 ? atol(e) : 0) : floor_level(OVM_FLOORS[OVM_FLOOR_DEFAULT]);
+}
+static int gpu_floor_choice(void) {   // the menu's row: the level chosen; before a choice the default level, or Custom for a profile's own clock
+    if (!atomic_load(&g_fl_nclock)) return OVM_NA;
+    int s = atomic_load(&g_set_floor); const char *e = getenv("DM_GPU_MIN_FREQ");
+    return s >= 0 ? s : !e ? OVM_FLOOR_DEFAULT : atol(e) > 0 ? OVM_NFLOORS : 0;
+}
+static void floor_back(void) {   // the previous floor again
+    if (!g_gpu_floor_on || !g_gpu_floor_prev[0]) return;
+    char cmd[128]; snprintf(cmd, sizeof cmd, "echo %s > %s", g_gpu_floor_prev, GPU_MIN_FREQ);
+    if (floor_run(g_gpu_floor_via, cmd, NULL, 0)) LOG("[RED] GPU clock floor: restoring %s Hz failed", g_gpu_floor_prev);
+    g_gpu_floor_on = 0;
+}
+static void floor_change(int first) {   // the floor thread, at its start and after a choice in the menu: the floor wanted, set or taken away
+    int by_default; long hz = floor_wanted(&by_default);
+    if (!hz) {
+        if (first && by_default && atomic_load(&g_set_floor) < 0) LOG("GPU clock floor: none by default on this device (no PServerBinder service or no clock list); DM_GPU_MIN_FREQ=<Hz> in a profile asks for one through su");
+        else if (g_gpu_floor_on) LOG("GPU clock floor off: %s Hz again", g_gpu_floor_prev);
+        floor_back(); g_gpu_floor_hz = 0; return;
+    }
+    if (hz == g_gpu_floor_hz && g_gpu_floor_on) return;
+    g_gpu_floor_hz = hz; int had = g_gpu_floor_via;
+    if (had) { if (floor_set(had)) { LOG("[RED] GPU clock floor %ld Hz: setting it failed", hz); return; } }
+    else for (int via = 1; via <= (by_default ? 1 : 2) && !g_gpu_floor_via; via++) {
         LOG("GPU clock floor %ld Hz: trying %s", g_gpu_floor_hz, via == 1 ? "PServerBinder" : "su");
         if (!floor_set(via)) g_gpu_floor_via = via;
     }
-    if (!g_gpu_floor_via && g_gpu_floor_auto) { LOG("GPU clock floor %ld Hz (the default): PServerBinder refused; none set", g_gpu_floor_hz); return; }
+    if (!g_gpu_floor_via && by_default) { LOG("GPU clock floor %ld Hz (the default): PServerBinder refused; none set", g_gpu_floor_hz); return; }
     if (!g_gpu_floor_via) { LOG("[RED] GPU clock floor %ld Hz: PServerBinder not there or refused, and su refused (grant the app root in Magisk, or leave DM_GPU_MIN_FREQ out)", g_gpu_floor_hz); return; }
     g_gpu_floor_on = 1;
     LOG("GPU clock floor %ld Hz through %s (was %s; restored in the background and when the game ends)", g_gpu_floor_hz, g_gpu_floor_via == 1 ? "PServerBinder (no root)" : "su", g_gpu_floor_prev);
-    if (g_gpu_floor_via == 1) {   // the watcher for a force-stop (no onDestroy): a root shell, detached from the service's output, that writes the previous floor back once this process is gone
+    if (g_gpu_floor_via == 1 && !had) {   // the watcher for a force-stop (no onDestroy): a root shell, detached from the service's output, that writes the previous floor back once this process is gone
         char cmd[256]; snprintf(cmd, sizeof cmd, "(while [ -d /proc/%d ]; do sleep 2; done; echo %s > %s) </dev/null >/dev/null 2>&1 &", (int)getpid(), g_gpu_floor_prev, GPU_MIN_FREQ);
         if (pserver_run(g_fl_env, cmd, NULL, 0)) LOG("[RED] GPU clock floor: the watcher that restores %s Hz after a force-stop did not start", g_gpu_floor_prev);
         else LOG("GPU clock floor: a root watcher restores %s Hz if the app is killed", g_gpu_floor_prev);
     }
 }
-// The main thread only posts what it wants (1 the floor, 0 the previous one); the floor thread does it
+// The main thread only posts what it wants (1 the floor, 0 the previous one; a choice in the menu: g_fl_pick counts them); the floor thread does it
 static pthread_mutex_t g_fl_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_fl_cv = PTHREAD_COND_INITIALIZER;
-static int g_fl_want = 1, g_fl_have = -1, g_fl_started;   // asked for; done (-1 = not yet)
+static int g_fl_want = 1, g_fl_have = -1, g_fl_started, g_fl_pick, g_fl_picked;   // asked for; done (-1 = not yet); the menu's choices, and those taken
 static void *gpu_floor_thread(void *vm) {
     JavaVM *V = vm; if ((*V)->AttachCurrentThread(V, &g_fl_env, NULL) != JNI_OK) g_fl_env = NULL;
-    floor_first();
+    floor_clocks(); floor_change(1);
     pthread_mutex_lock(&g_fl_mu); g_fl_have = 1; pthread_cond_broadcast(&g_fl_cv);
     for (;;) {
-        while (g_fl_want == g_fl_have) pthread_cond_wait(&g_fl_cv, &g_fl_mu);
-        int want = g_fl_want; pthread_mutex_unlock(&g_fl_mu);
-        if (g_gpu_floor_via && want && !g_gpu_floor_on) { if (floor_set(g_gpu_floor_via)) LOG("[RED] GPU clock floor %ld Hz: setting it again after the background failed", g_gpu_floor_hz); else g_gpu_floor_on = 1; }
-        else if (!want && g_gpu_floor_on && g_gpu_floor_prev[0]) {
-            char cmd[128]; snprintf(cmd, sizeof cmd, "echo %s > %s", g_gpu_floor_prev, GPU_MIN_FREQ);
-            if (floor_run(g_gpu_floor_via, cmd, NULL, 0)) LOG("[RED] GPU clock floor: restoring %s Hz failed", g_gpu_floor_prev);
-            g_gpu_floor_on = 0;
-        }
-        pthread_mutex_lock(&g_fl_mu); g_fl_have = want; pthread_cond_broadcast(&g_fl_cv);
+        while (g_fl_want == g_fl_have && g_fl_pick == g_fl_picked) pthread_cond_wait(&g_fl_cv, &g_fl_mu);
+        int want = g_fl_want, pick = g_fl_pick, chose = pick != g_fl_picked; pthread_mutex_unlock(&g_fl_mu);
+        if (chose && want) floor_change(0);
+        if (g_gpu_floor_via && g_gpu_floor_hz && want && !g_gpu_floor_on) { if (floor_set(g_gpu_floor_via)) LOG("[RED] GPU clock floor %ld Hz: setting it again after the background failed", g_gpu_floor_hz); else g_gpu_floor_on = 1; }
+        else if (!want) floor_back();
+        pthread_mutex_lock(&g_fl_mu); g_fl_have = want; g_fl_picked = pick; pthread_cond_broadcast(&g_fl_cv);
     }
     return NULL;
 }
-static void gpu_floor_apply(void) {   // onCreate: the floor thread. The profile's floor (DM_GPU_MIN_FREQ=<Hz>; 0: none), else the default one (floor_default)
-    const char *e = getenv("DM_GPU_MIN_FREQ"); if ((e && atol(e) <= 0) || !g_act) return;
-    g_gpu_floor_hz = e ? atol(e) : 0; g_gpu_floor_auto = !e;
+static void gpu_floor_apply(void) {   // onCreate, after settings.txt is read: the floor thread, which sets the floor wanted (floor_wanted) and takes the menu's choices
+    if (!g_act) return;
     pthread_t t; if (pthread_create(&t, NULL, gpu_floor_thread, g_act->vm)) { LOG("[RED] GPU clock floor: no thread for it"); return; }
     pthread_detach(t); g_fl_started = 1;
 }
+static void gpu_floor_pick(void) { if (!g_fl_started) return; pthread_mutex_lock(&g_fl_mu); g_fl_pick++; pthread_cond_broadcast(&g_fl_cv); pthread_mutex_unlock(&g_fl_mu); }   // the menu chose
 static void floor_post(int want, int wait_ms) {
     if (!g_fl_started) return;
     pthread_mutex_lock(&g_fl_mu); g_fl_want = want; pthread_cond_broadcast(&g_fl_cv);
@@ -1528,7 +1567,6 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
-    gpu_floor_apply();
 #ifdef DM_RELEASE
     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
 #endif
@@ -1536,6 +1574,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
     settings_load(); dm_frame_cap_set(OVM_CAPS[atomic_load(&g_set_cap)]); dm_res_set(atomic_load(&g_set_res)); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act); app_label(act);
+    gpu_floor_apply();   // (after settings.txt: the menu's floor, when the player chose one)
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);
