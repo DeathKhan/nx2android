@@ -3350,7 +3350,10 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
     // the images that went since this set was written: their IDs again, and out of the list before anything reads it (taken before the entries are written: one that
     // goes while they are is found by the next set's take)
     static const void *gone[RING_DROPS]; uint64_t dseq; int ngone = vk_droplog_take(r->dropseq, gone, RING_DROPS, &dseq); if (ngone < 0) full = 1;
-    if (!full && ngone) for (size_t i = 0; i < r->nimg; ) { int hit = 0; for (int q = 0; q < ngone && !hit; q++) hit = r->img[i] == gone[q];
+    // (a bit filter of the dropped pointers first: the set holds thousands of images and render targets drop every present; each against each was 4% of the replay)
+    static uint64_t gbit[256]; if (!full && ngone) { memset(gbit, 0, sizeof gbit); for (int q = 0; q < ngone; q++) { uint64_t h = (uint64_t)(uintptr_t)gone[q] * 0x9E3779B97F4A7C15ull >> 50; gbit[h >> 6] |= 1ull << (h & 63); } }
+    if (!full && ngone) for (size_t i = 0; i < r->nimg; ) { int hit = 0; uint64_t h = (uint64_t)(uintptr_t)r->img[i] * 0x9E3779B97F4A7C15ull >> 50;
+        if (gbit[h >> 6] >> (h & 63) & 1) for (int q = 0; q < ngone && !hit; q++) hit = r->img[i] == gone[q];
         if (!hit) { i++; continue; }
         if (ntid == RING_TIDS + RING_DROPS) { full = 1; break; }
         tids[ntid++] = r->itid[i]; r->nimg--; r->img[i] = r->img[r->nimg]; r->itid[i] = r->itid[r->nimg]; }
@@ -3394,7 +3397,7 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
         ww[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, r->set, POOL_SAMP_B, 0, (uint32_t)NS, VK_DESCRIPTOR_TYPE_SAMPLER, d, NULL, NULL}; }
     if (nw) vkUpdateDescriptorSets(V.dev, nw, ww, 0, NULL);
     r->valid = 1; r->fullgen = fg; r->sampgen = sg; r->sampseq = sampseq; r->poolgen = pg; r->tex_base = g_pool_tex_base; r->samp_base = g_pool_samp_base; r->jobpos = jp; r->logpos = pos; r->fence = f; r->dropseq = dseq; r->firstgen = fu;
-    for (size_t i = 0; i < r->nimg; i++) r->img[i]->last_use = f;   // (full rewrites drop the list; a view drop or orphan forces one before a freed image could be reached)
+    // (the list is for the drop log alone: full rewrites drop it, and a view drop or orphan forces one before a freed image could be reached. Nothing reads an image's last_use here)
     g_ring_cur = pick; g_ring_ns += tick() - t0;
     return r->set;
 }
