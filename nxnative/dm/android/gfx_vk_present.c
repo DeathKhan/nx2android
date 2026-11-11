@@ -1087,7 +1087,34 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
 // slack). The pause menu's redraws carry no time. DM_VK_PACE=0 (live) presents without times
 static uint64_t g_refresh_ns, g_pace_target, g_pace_ideal, g_pace_anchor, g_pace_n, g_pace_resync, g_pace_slip; static uint32_t g_pace_id; static int g_pace_on = 1;
 static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
-static void pace_reset(void) { g_pace_target = g_pace_ideal = g_pace_anchor = g_refresh_ns = 0; }
+// ---- the host's frame starts on the display's vsyncs (DM_VK_VSYNC_GRID=1, start-up; off by default) ----
+// The host paces the game on its own clock (hle_nvn.c: nvn_pace's target, which the next acquire waits for) and the cadence below advances by the game's period, while the
+// panel shows frames on its own vsyncs: where the period is a whole number k of refreshes but the two clocks differ a little (a panel at 59.94 Hz against the host's 30.000
+// fps), the frames' work drifts against the vsyncs, and each time the drift reaches half a refresh a frame is shown a vsync early or late against the cadence, or the cadence
+// restarts (a resync). With the grid on, where the period spans k >= 2 refreshes within an eighth of one (30 fps at 60 or 120 Hz, 60 fps at 120 Hz), the pacer's target is
+// put VS_AFTER past the vsync nearest it (dm_vsync_snap, from hle_nvn.c's present), and the cadence advances by k refreshes on the vsync grid instead of by the period, so
+// the frames' work and their desired present times keep one phase against the panel. At one refresh FIFO already shows a frame each vsync, and a refresh under VS_MIN_R is a
+// variable-rate panel's vsync timeline (the Pixel 9 Pro XL reports 4.17 ms), so neither is touched. The idea is droidplay-core 898ac92fb's (its OnePlus Pad 3 at 60 Hz:
+// Divinity's 30 fps showed 4 off-beat frames of 1,003 against 57 of 1,006), on our own cadence (pace_desired) and pacer
+#define VS_AFTER 1000000ull   // ns past a vsync the frame's work starts at
+#define VS_MIN_R 8000000ull
+static _Atomic uint64_t g_vs_r, g_vs_v;   // the refresh period and a vsync the swapchain reported (CLOCK_MONOTONIC ns; 0 = not known), for the game thread (dm_vsync_snap)
+static int vs_grid_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_VSYNC_GRID"); v = e && atoi(e) > 0; if (v) VKLOG("[perf] DM_VK_VSYNC_GRID=1: frames that span 2 or more whole refreshes start on the display's vsyncs"); } return v; }
+static uint64_t vs_k(uint64_t T, uint64_t R) {   // the refreshes a frame of period T spans, when a whole number of 2 or more (else 0)
+    if (!R || !T || R < VS_MIN_R) return 0;
+    uint64_t k = (T + R / 2) / R, off = T > k * R ? T - k * R : k * R - T;
+    return k >= 2 && off <= R / 8 ? k : 0;
+}
+// hle_nvn.c's present (the game's thread): its pacer's target t for the frame period T moved to VS_AFTER past the vsync nearest it; 1 when moved
+int dm_vsync_snap(uint64_t *t, uint64_t T) {
+    if (!vs_grid_on() || !*t) return 0;
+    uint64_t R = atomic_load_explicit(&g_vs_r, memory_order_relaxed), V = atomic_load_explicit(&g_vs_v, memory_order_relaxed);
+    if (!V || !vs_k(T, R)) return 0;
+    int64_t m = llround(((double)((int64_t)(*t - VS_AFTER) - (int64_t)V)) / (double)R);
+    *t = (uint64_t)((int64_t)V + m * (int64_t)R) + VS_AFTER;
+    return 1;
+}
+static void pace_reset(void) { g_pace_target = g_pace_ideal = g_pace_anchor = g_refresh_ns = 0; atomic_store(&g_vs_r, 0); atomic_store(&g_vs_v, 0); }
 static uint64_t pace_snap(uint64_t t) {   // the first vsync at or after t on the grid through the anchor
     uint64_t r = g_refresh_ns, a = g_pace_anchor;
     if (t <= a) return a - (a - t) / r * r;
@@ -1108,6 +1135,7 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
             if (pt[i].actualPresentTime > g_pace_anchor) g_pace_anchor = pt[i].actualPresentTime;
             if (pt[i].desiredPresentTime && pt[i].actualPresentTime > pt[i].desiredPresentTime + g_refresh_ns) g_pace_slip++;   // went out a vsync or more after its own
         }
+    if (g_refresh_ns && g_pace_anchor) { atomic_store_explicit(&g_vs_r, g_refresh_ns, memory_order_relaxed); atomic_store_explicit(&g_vs_v, g_pace_anchor, memory_order_relaxed); }
     g_pace_n++;
     if (g_pace_n % 600 == 0) VKLOG("[perf] display timing: %llu frames, %llu resyncs, %llu shown a vsync or more after their time (cumulative)%s",
                                    (unsigned long long)g_pace_n, (unsigned long long)g_pace_resync, (unsigned long long)g_pace_slip, g_pace_on ? "" : "; off (DM_VK_PACE=0)");
@@ -1118,8 +1146,13 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
     double vk_gpu_ms_recent(void); double g = vk_gpu_ms_recent(); uint64_t gpu = (uint64_t)((g > 4 ? g : 4) * 1e6) + 3000000;
     // The cadence advances unsnapped (g_pace_ideal) and only the frame's vsync is snapped: snapping each target and adding the period to it lost the fraction,
     // so a period that is not a whole number of vsyncs always rounded up (40 fps on a 60 Hz panel: 25 ms came out as 2 vsyncs every frame, 30 fps, on a Retroid Pocket 5)
-    uint64_t now = mono_ns(), t = 0;
-    if (g_pace_target) { g_pace_ideal += (uint64_t)(period * 1e9); t = pace_snap(g_pace_ideal - g_refresh_ns / 2); }
+    // With the vsync grid (DM_VK_VSYNC_GRID=1, above) a period of k whole refreshes advances the cadence by k refreshes on the grid (the vsync nearest ideal + k refreshes):
+    // the frames' work starts on that grid too, so the two keep one phase
+    uint64_t now = mono_ns(), t = 0, T = (uint64_t)(period * 1e9), k = vs_grid_on() ? vs_k(T, g_refresh_ns) : 0;
+    { static uint64_t was = ~0ull; if (vs_grid_on() && k != was) { was = k;
+        if (k) VKLOG("[perf] display timing: frames start on the display's vsyncs, %llu refreshes apart (period %.3f ms, refresh %.3f ms; DM_VK_VSYNC_GRID)", (unsigned long long)k, T / 1e6, g_refresh_ns / 1e6);
+        else VKLOG("[perf] display timing: frames paced on the host's clock (period %.3f ms against a refresh of %.3f ms: not 2 or more whole refreshes, or a variable-rate panel)", T / 1e6, g_refresh_ns / 1e6); } }
+    if (g_pace_target) { if (k) g_pace_ideal = pace_snap(g_pace_ideal + k * g_refresh_ns - g_refresh_ns / 2); else g_pace_ideal += T; t = pace_snap(g_pace_ideal - g_refresh_ns / 2); }
     if (t < now + gpu + g_refresh_ns) { if (g_pace_target) g_pace_resync++; t = pace_snap(now + gpu + g_refresh_ns * 3 / 2); g_pace_ideal = t; }
     g_pace_target = t;
     return t - g_refresh_ns / 2;

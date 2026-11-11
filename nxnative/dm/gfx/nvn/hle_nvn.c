@@ -2146,6 +2146,7 @@ __attribute__((weak)) void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns)
 __attribute__((weak)) void dm_perf_frame_start_id(uint64_t frame, uint64_t pace_ns, uint64_t pq_ns) { (void)frame; dm_perf_frame_start(pace_ns, pq_ns); }   // Android (perf_android.c): a frame's work starts, for the CPU performance hint
 __attribute__((weak)) uint64_t dm_present_period_adapt(uint64_t period) { return period; }   // Android (perf_android.c): a longer period the frames can hold steadily
 __attribute__((weak)) uint64_t dm_frame_cap_period(uint64_t period) { return period; }   // the pause menu's frame cap for a game paced by the host (hle_framecap.c); graphics unit tests have none
+__attribute__((weak)) int dm_vsync_snap(uint64_t *t, uint64_t period) { (void)t; (void)period; return 0; }   // Android (gfx_vk_present.c, DM_VK_VSYNC_GRID=1): the pacer's target on the display's vsyncs
 int mtl_probe_ramp_on(void);   // nvn_mtl.m: DM_FSTEP_PROBE_RAMP (default on; ab with DM_AB)
 __attribute__((weak)) void dm_yield_top(char *out, size_t n) { if (n) snprintf(out, n, "-"); }   // hle_thread.c: the threads that yielded most since the last call; none in graphics unit tests
 __attribute__((weak)) void dm_thread_cpu(char *out, size_t n, double secs) { (void)secs; if (n) snprintf(out, n, "-"); }   // hle_thread.c: guest-thread CPU by Switch priority band since the last call
@@ -2946,6 +2947,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     g_hold_ring[o->presents % 16] = (uint8_t)present_itv(o);
     nvn_pacer pc = {o->pace};
     uint64_t slot = now + nvn_pace(&pc, now, period);
+    if (period && !dm_detclock_enabled() && dm_vsync_snap(&pc.target, period)) slot = pc.target;   // the next frame starts just past a vsync (gfx_vk_present.c; off unless DM_VK_VSYNC_GRID=1)
     o->pace = pc.target;
     if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
     static uint64_t prev_slot; if (prev_slot && period) trow(f, "@display_ms", (slot - prev_slot) / 1e6); prev_slot = slot;   // display interval between two adjacent frames on screen (this is the one to look at for dropped frames)
