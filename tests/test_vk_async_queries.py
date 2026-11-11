@@ -73,6 +73,10 @@ static void log_ignore(const char *fmt,...){(void)fmt;}
 #define VKLOG(...) log_ignore(__VA_ARGS__)
 static void *async_pipe_thread(void *arg){(void)arg;abort();}
 static int fail_create(pthread_t *t,const pthread_attr_t *a,void *(*f)(void *),void *arg){(void)t;(void)a;(void)f;(void)arg;creates++;return EAGAIN;}
+static uint64_t g_tex_frame,g_sync_pipes,g_sync_pipe_ns;
+static int occ_reset_next(void){return 0;} // no reset is proven ahead: a counted draw waits
+static int shader_wmem(vkshader_t *s){(void)s;return 0;}
+static void pipe_sibling(const pkey *k){(void)k;}
 COMPLETE
 SHADER
 #define pthread_create fail_create
@@ -124,7 +128,7 @@ int main(void){
             'GETTER': function(core, 'int vk_occ_counting('),
             'COMPLETE': function(source, 'static void async_pipe_complete('),
             'SHADER': function(source, 'static int async_shader_writes('),
-            'ASYNC': function(source, 'static int async_pipe('),
+            'ASYNC': function(source, 'static int pipe_must_draw(') + '\n' + function(source, 'static int apq_push(') + '\n' + function(source, 'static int async_pipe('),
             'GRAPHICS': function(source, 'static VkPipeline graphics_pipeline('),
         }
         for marker, text in pieces.items():

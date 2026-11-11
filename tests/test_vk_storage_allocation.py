@@ -57,6 +57,7 @@ static VkResult vkCreateImage(VkDevice d,const VkImageCreateInfo *ci,const void 
 static void vkGetImageMemoryRequirements(VkDevice d,VkImage image,VkMemoryRequirements *r){(void)d;(void)image;*r=(VkMemoryRequirements){256,16,1};}
 static int vk_mem_type(uint32_t mask,VkMemoryPropertyFlags flags,VkMemoryPropertyFlags avoid){(void)mask;(void)flags;(void)avoid;return 0;}
 static VkDeviceMemory vk_image_memory(const VkMemoryRequirements *r,int type,VkDeviceSize *off,void **sub){(void)r;(void)type;*off=0;*sub=NULL;return 42;}
+static int vk_image_memory_soft_failed(void){return 0;}
 static VkResult vkBindImageMemory(VkDevice d,VkImage i,VkDeviceMemory m,VkDeviceSize o){(void)d;(void)i;(void)m;(void)o;return VK_SUCCESS;}
 static void vkDestroyImage(VkDevice d,VkImage i,const void *a){(void)d;(void)i;(void)a;}
 HELPERS

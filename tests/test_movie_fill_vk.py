@@ -104,6 +104,9 @@ static void copy(VkCommandBuffer cb,VkImage src,VkImageLayout sl,VkImage dst,VkI
  (void)cb;(void)sl;(void)dl;assert(n==1&&src==blit_dst&&image_format[(uintptr_t)src]==VK_FORMAT_R8G8B8A8_UNORM&&image_format[(uintptr_t)dst]==VK_FORMAT_R8G8B8A8_SRGB);
  copies++;last_copy=*r;copy_src=src;copy_dst=dst;
 }
+static VkResult image_format_props(VkPhysicalDevice d,VkFormat f,VkImageType t,VkImageTiling ti,VkImageUsageFlags u,VkImageCreateFlags c,VkImageFormatProperties *p){
+ (void)d;(void)f;(void)t;(void)ti;(void)u;(void)c;memset(p,0,sizeof *p);return VK_SUCCESS;
+}
 #define vkCreateShaderModule create_module
 #define vkCreateDescriptorSetLayout create_dsl
 #define vkCreatePipelineLayout create_pl
@@ -118,6 +121,7 @@ static void copy(VkCommandBuffer cb,VkImage src,VkImageLayout sl,VkImage dst,VkI
 #define vkFreeMemory free_mem
 #define vkCmdPipelineBarrier mock_barrier
 #define vkGetPhysicalDeviceFormatProperties format_props
+#define vkGetPhysicalDeviceImageFormatProperties image_format_props
 #define vkUpdateDescriptorSets update_sets
 #define vkCmdBindPipeline bind_pipe
 #define vkCmdBindDescriptorSets bind_sets
@@ -127,6 +131,7 @@ static void copy(VkCommandBuffer cb,VkImage src,VkImageLayout sl,VkImage dst,VkI
 #define vkCmdCopyImage copy
 SOURCE
 int main(void){
+ setenv("DM_VK_MOVIE_FILL_COPY","1",1); // the scaled UNORM image and its raw copy, which a device without the sRGB stage image's formats takes (direct_ok)
  V.dev=H(VkDevice,1);V.props.limits.minStorageBufferOffsetAlignment=256;V.props.limits.maxStorageBufferRange=128u<<20;
  vkimg_t out={.img=H(VkImage,500),.fmt=VK_FORMAT_R8G8B8A8_SRGB,.aspect=VK_IMAGE_ASPECT_COLOR_BIT,.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT,
  .vtype=VK_IMAGE_VIEW_TYPE_2D_ARRAY,.w=2560,.h=1440,.d=1,.levels=3,.layers=2,.samples=1};

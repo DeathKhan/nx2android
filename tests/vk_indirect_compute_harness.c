@@ -106,6 +106,12 @@ int vk_pool_n(void) { return 0; } int vk_pool_samp_n(void) { return 0; } unsigne
 VkDescriptorSetLayout vk_tbl_dsl(void) UNEXPECTED
 int vk_tex_id_max(void) { return 0; } int vk_samp_id_max(void) { return 0; }
 void vk_tex_pool_fill(int on) UNEXPECTED
+// the pool-texture prefetch (DM_VK_POOL_PREFETCH, off here) and the deferred free of an image's own memory
+void vk_image_memory_soft(int on) UNEXPECTED
+int vk_image_memory_soft_failed(void) { return 0; } int vk_image_memory_busy(void) { return 0; }
+uint64_t vk_img_vkbytes(void) { return 0; }
+void vk_img_budget_stats(uint64_t *budget, uint64_t *evicted, uint64_t *evicted_bytes, uint64_t *sweeps) { *budget = *evicted = *evicted_bytes = *sweeps = 0; }
+void img_own_free_(VkDeviceMemory m) UNEXPECTED
 int vk_tex_pool_ok(const tex_t *t) UNEXPECTED
 int vk_registry_snapshot(uint64_t *textures, uint64_t *samplers) { return 0; }
 uint64_t vk_reglog_visible_end(uint64_t before) { return 0; } uint64_t vk_reglog_head(void) { return 0; } int vk_reglog_pending(uint64_t p, uint64_t before) { return 0; }

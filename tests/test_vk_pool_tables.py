@@ -22,6 +22,7 @@ def fixture(source):
     start = source.index("static struct { uint64_t h, epoch, tex, samp;")
     cache = source[start:source.index("// ---------------- the pool tables' ring", start)]
     cache += "\nstatic VkDescriptorSet tbl_ring(int st,unsigned mask){(void)st;(void)mask;return VK_NULL_HANDLE;}\n"
+    cache += "static void pool_prefetch(void){}\n"   # (prepare_draw's once-a-present prefetch of pool images: DM_VK_POOL_PREFETCH, off here)
     kinds = function(source, "static unsigned tbl_kinds(") if "static unsigned tbl_kinds(" in source else ""
     draw = function(source, "static int prepare_draw(")
     start = draw.index("    vkshader_t *ts = NULL;")
@@ -282,6 +283,7 @@ def ring_fixture(source):
     defs = header[header.index("enum { RK_SUPPORT"):header.index("_Static_assert(sizeof(dmsv_bind)")]
     start = source.index("// ---------------- the pool tables' ring")
     ring = source[start:source.index("static VkDescriptorSet tbl_set", start)]
+    ring = ring.replace(function(source, "static void pool_prefetch(void) {"), "")   # (the prefetch walks the texture registry, not the ring)
     return r"""
 #include <vulkan/vulkan_core.h>
 #include <assert.h>

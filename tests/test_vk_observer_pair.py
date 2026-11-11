@@ -78,7 +78,7 @@ int main(int argc,char**argv){
   e=(ROOT/"nxnative/dm/android/gfx_vk_exec.c").read_text(encoding='utf-8')
   alt=extract(s,"static VkShaderModule alt_module(")
   self.assertIn('return s->mod; // the observer pair',alt)
-  self.assertIn('k->alt == 2',extract(e,"static int async_pipe("))
+  self.assertIn('k->alt == 2',extract(e,"static int pipe_must_draw("))
   self.assertIn('k->alt || k->flat',extract(e,"static void pipe_record(const pkey *k) {"))
   build=extract(e,"static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg_in")
   self.assertIn('k->alt==2&&!vk_shader_observer_pair',build)

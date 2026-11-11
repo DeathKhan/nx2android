@@ -272,7 +272,7 @@ int main(void){
   self.assertLess(mesh.index('mrt_after_draw('),mesh.index('if(g_mrt_active)mrt_abort();'))
   self.assertIn('k.alt=2;',prepare)
   self.assertIn('mrt_abort();return prepare_draw(prim,indexed);',prepare)
-  self.assertIn('k->alt == 2',extract(s,'static int async_pipe('))
+  self.assertIn('k->alt == 2',extract(s,'static int pipe_must_draw('))
   self.assertIn('k->alt || k->flat',extract(s,'static void pipe_record(const pkey *k) {'))
 
 if __name__=='__main__':unittest.main()

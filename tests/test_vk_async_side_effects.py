@@ -21,8 +21,8 @@ class AsyncSideEffects(unittest.TestCase):
         declarations.append(next(line for line in header.splitlines()
                                  if line.startswith('typedef struct ') and line.endswith(' dmsv_bind;')))
         start = source.index('static int async_shader_writes(')
-        helper = source[start:source.index('static int async_pipe(', start)]
-        start = source.index('static int async_pipe(')
+        helper = source[start:source.index('\n', start) + 1]   # (one line: transform feedback, or shader_wmem's SPIR-V answer)
+        start = source.index('static int pipe_must_draw(')
         # Run the real early eligibility guards. Attachment age and queue state
         # are deliberately treated as eligible, so they cannot hide a lost write.
         gate = source[source.index('\n', start):source.index('    for (int i = 0; i < S.ncol', start)]
@@ -31,16 +31,19 @@ class AsyncSideEffects(unittest.TestCase):
 #include <stdint.h>
 #include <stddef.h>
 DECLARATIONS
-typedef struct { int xfb, nbind; const dmsv_bind *b; } vkshader_t;
+typedef struct { int xfb, wmem, nbind; const dmsv_bind *b; } vkshader_t;
 typedef struct { int alt, raster_discard; } pkey;
 static int g_async_pipe = 1, counting;
 static int vk_occ_counting(void) { return counting; }
+static int occ_reset_next(void) { return 0; }   // no reset is proven ahead: a counted draw is kept
+static int shader_wmem(vkshader_t *s) { return s && s->wmem == 1; }   // gfx_vk_exec.c: spv_wmem's cached answer (1 writes, 2 does not)
 static struct { vkshader_t *sh[5]; } S;
 HELPER
-static int otherwise_eligible(const pkey *k) {
+static int must_draw(const pkey *k) {
 GATE
-    return 1;
+    return 0;
 }
+static int otherwise_eligible(const pkey *k) { return !must_draw(k); }
 int main(void) {
     pkey k = {0};
     vkshader_t empty = {0};
@@ -52,54 +55,26 @@ int main(void) {
     // The validated observer pair (pkey.alt 2) is built at once; a generic alternate-code key (alt 1) is not held back.
     k.alt = 2; assert(!otherwise_eligible(&k)); k.alt = 1; assert(otherwise_eligible(&k)); k.alt = 0;
 
-    // Reflection values from shipped Bananza terrain GS 5d537f7630ec3671:
-    // both storage bindings have flags=0 despite OpAtomicIAdd and
-    // OpAtomicCompareExchange. No game binary is needed for this regression.
-    const dmsv_bind terrain[] = {
-        {.kind=RK_SUPPORT,.desc=RD_UBO,.binding=0,.count=1,.reg=-1},
-        {.kind=RK_DRV,.desc=RD_UBO,.binding=1,.count=1,.reg=0},
-        {.kind=RK_CBUF,.desc=RD_UBO,.binding=4,.count=1,.reg=0},
-        {.kind=RK_SBUF,.desc=RD_SSBO,.binding=2,.count=1,.reg=0},
-        {.kind=RK_SBUF,.desc=RD_SSBO,.binding=3,.count=1,.reg=1}
-    };
-    vkshader_t terrain_shader = {.nbind=5,.b=terrain};
-    assert(async_shader_writes(&terrain_shader));
-    // A writer in any graphics stage must prevent asynchronous draw skipping.
+    // A shader that writes memory (shader_wmem: stores and atomics found in its SPIR-V, as Bananza's terrain GS 5d537f7630ec3671 has
+    // behind bindings whose reflection flags say nothing) in any graphics stage must prevent asynchronous draw skipping.
+    vkshader_t writer = {.wmem=1};
+    assert(async_shader_writes(&writer));
     for (unsigned st=0; st<5; st++) {
-        S.sh[st] = &terrain_shader;
+        S.sh[st] = &writer;
         assert(!otherwise_eligible(&k));
         S.sh[st] = NULL;
     }
-
-    const dmsv_bind writes[] = {
-        {.kind=RK_SBUF,.desc=RD_SSBO},
-        {.kind=RK_SBUF_UBO,.desc=RD_SSBO},
-        {.kind=RK_GMEM_MAP,.desc=RD_SSBO},
-        {.kind=RK_GMEM_MAP,.desc=RD_SSBO,.flags=4},
-        {.kind=RK_IMG,.desc=RD_STORAGE},
-        {.kind=RK_IMG_UBO,.desc=RD_STORAGE},
-        {.kind=RK_IMG_TBUF,.desc=RD_STORAGE_TBUF},
-        {.kind=RK_UNKNOWN,.desc=RD_SSBO},
-        {.kind=RK_UNKNOWN,.desc=RD_UBO,.flags=4}
-    };
-    for (unsigned i=0; i<sizeof writes/sizeof *writes; i++) {
-        vkshader_t shader = {.nbind=1,.b=&writes[i]};
-        assert(async_shader_writes(&shader));
-    }
-    vkshader_t xfb = {.xfb=1};
+    vkshader_t xfb = {.xfb=1,.wmem=2};
     assert(async_shader_writes(&xfb));
     S.sh[0] = &xfb; assert(!otherwise_eligible(&k)); S.sh[0] = NULL;
 
-    // Ordinary uniforms, sampled textures and samplers retain eligibility;
-    // array/multisample flags must not be confused with the write flag.
+    // A shader that writes nothing keeps eligibility, whatever its bindings are.
     const dmsv_bind reads[] = {
         {.kind=RK_CBUF,.desc=RD_UBO},
         {.kind=RK_TEX,.desc=RD_SAMPLED,.flags=3},
-        {.kind=RK_TBUF,.desc=RD_TBUF},
-        {.kind=RK_TEXD,.desc=RD_IMAGE},
-        {.kind=RK_SAMPD,.desc=RD_SAMPLER}
+        {.kind=RK_SBUF,.desc=RD_SSBO}
     };
-    vkshader_t readonly = {.nbind=sizeof reads/sizeof *reads,.b=reads};
+    vkshader_t readonly = {.wmem=2,.nbind=sizeof reads/sizeof *reads,.b=reads};
     assert(!async_shader_writes(&readonly));
     for (unsigned st=0; st<5; st++) S.sh[st] = &readonly;
     assert(otherwise_eligible(&k));
