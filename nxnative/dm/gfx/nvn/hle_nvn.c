@@ -1068,10 +1068,21 @@ static void cs_dump(void) {   // Called once per frame (at present)
 }
 static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, size}; memcpy(p, &h, sizeof h); if (op) cs_op(op, size); }
 static void ctl_chunk_close(cmd_t *o);
+// Memory the host lends for command or control memory. A control entry holds an address in 44 bits (nvn_obj.h ctl_e: below 2^47), so it comes from mmap, not malloc: Android's
+// allocator (Scudo, apps targeting API 30 and later) tags heap pointers in the top byte (0xb4), and ctl_e shifted that tag into the entry's length. Pokémon Legends: Arceus,
+// whose recordings overflow into host-lent segments thousands of times a minute, then had pieces 0xb4000 bytes too long (1920 bytes of records said 739,200) and the replay read
+// the segment's unwritten tail as records of size 0
+static uint8_t *host_block(size_t n, const char *what) {
+    void *m = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) return NULL;
+    if ((uintptr_t)m >> 47) die("NVN %s: the host's block at %p is above 2^47, which a control entry cannot name", what, m);
+    return m;
+}
 // New segment: the records the recording in progress has in the old segment become one piece of its control list (written at its next record: ctl_push), and its next record
 // opens a piece in the new one
 static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
     uint8_t *start = align8(mem), *end = mem + n;
+    if ((uintptr_t)mem >> 47) die("NVN command memory at %p: above 2^47 (a tagged pointer?), which a control entry cannot name", (void *)mem);
     if (o->recording == 1 && o->cur && cs_on() && o->end > o->cur) { pthread_mutex_lock(&g_cs_mu); g_cs.waste += (uint64_t)(o->end - o->cur); pthread_mutex_unlock(&g_cs_mu); }
     if (o->recording) ctl_chunk_close(o);
     o->cur = start; o->end = end;
@@ -1114,7 +1125,7 @@ static uint8_t *hostseg_take(const cmd_t *o, size_t n) {
     if (!in_seg && o && o->recording && o->cur) { lo = o->recording == 1 && o->begin && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : cur; hi = cur > lo ? cur : lo + 1; }
     for (int i = 0; i < g_nhostseg && !m; i++)
         if (!g_hostseg[i].busy && g_hostseg[i].n == n) { g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, n, f, 1, lo, hi }; m = g_hostseg[i].mem; }
-    if (!m && g_hostseg_bytes + n <= HOSTSEG_CAP && (m = malloc(n))) {
+    if (!m && g_hostseg_bytes + n <= HOSTSEG_CAP && (m = host_block(n, "command memory"))) {
         if (g_nhostseg == g_caphostseg) { g_caphostseg = g_caphostseg ? g_caphostseg * 2 : 64; g_hostseg = realloc(g_hostseg, sizeof *g_hostseg * (size_t)g_caphostseg); }
         g_hostseg[g_nhostseg++] = (hostseg_t){ m, n, f, 1, lo, hi }; g_hostseg_bytes += n;
     }
@@ -1146,6 +1157,7 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
 static void ctl_set(cmd_t *o, uint8_t *m, size_t n) {
     uint8_t *a = m ? align8(m) : NULL; size_t pad = (size_t)(a - m); n = a && n > pad ? (n - pad) & ~(size_t)7 : 0;
     if (n > 0xfffffff8u) n = 0xfffffff8u;
+    if ((uintptr_t)a >> 47) die("NVN control memory at %p: above 2^47 (a tagged pointer?), which a control entry cannot name", (void *)a);
     if (o->ctl_list && o->ctl_mem) {
         if (n < 8) return;   // nothing to link to: the list goes on in the old block's reserved bytes, and the next entry asks for memory again
         uint64_t e = ctl_e(CTL_LINK, a, 0); memcpy(o->ctl_mem + o->ctl_used, &e, 8);
@@ -1159,7 +1171,7 @@ static uint8_t *ctlseg_take(void) {
     static uint64_t bytes; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mu); uint64_t b = bytes += CTLSEG_SZ; pthread_mutex_unlock(&mu);
     if (b > (256u << 20)) die("NVN control memory: the game gives none and host-lent control memory reached 256 MB");
-    uint8_t *m = malloc(CTLSEG_SZ); if (!m) die("NVN control memory: cannot lend a block");
+    uint8_t *m = host_block(CTLSEG_SZ, "control memory"); if (!m) die("NVN control memory: cannot lend a block");
     if (b == CTLSEG_SZ || b % (16u << 20) == 0) LOG("[nvn] the game gave no control memory when asked, the host lends a block (%llu KB so far)", (unsigned long long)(b >> 10));
     return m;
 }
