@@ -2548,6 +2548,8 @@ __attribute__((weak)) int dm_movie_playing(void) { return 0; }   // hle_movie.c:
 // Thermal cap (iOS): while the device is thermally serious or worse (NSProcessInfo thermalState >= 2) the frame step holds 30 fps, and it goes back to the cap after the device
 // has been fair or better for THERMAL_CALM_NS, so it does not flap. At "serious" iOS caps the GPU clock to about a third: Breath of the Wild's vistas (about 3,000 G-buffer draws)
 // then took 17-26 ms a frame and dropped a frame in most windows; a steady 30 instead also lets the device cool. DM_THERMAL_CAP=0 turns it off; the Mac reports no thermal state
+// (Android: perf_android.c gives its AThermal state to this cap and to the frame step's slowed-clock gates with DM_THERMAL_CAP=1 only; the Odin 3 reports critical at its usual
+// 100 °C, and with the gates on the cap held Welcome Tour and Arceus at 30 fps)
 #define THERMAL_CALM_NS 30000000000ull
 static int thermal_capped(void) {
     // Acquire, present and the display-link configuration can ask on different

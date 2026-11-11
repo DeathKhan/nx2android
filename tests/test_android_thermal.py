@@ -1,4 +1,5 @@
-"""perf_android.c's dm_thermal_now: AThermal's status on the host's 0..3 thermal scale, read off the frame's threads, and DM_THERMAL_CAP=0 leaving it at -1."""
+"""perf_android.c's dm_thermal_now: AThermal's status on the host's 0..3 thermal scale, read off the frame's threads; the gates see it with DM_THERMAL_CAP=1 only (unset: read and
+logged, -1 to the gates), DM_THERMAL_CAP=0 does not read it."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -53,6 +54,10 @@ int main(int argc, char **argv) {
     } else if (mode == 1) {   // read on a thread of its own, then the value every caller sees
         status = 3; assert(wait_for(2)); assert(!pthread_equal(status_thread, main_thread) && opens == 1 && acquires == 1);
         status = 1; assert(wait_for(1)); assert(acquires == 1);
+    } else if (mode == 4) {   // DM_THERMAL_CAP unset: read on its thread and logged, -1 to the host's gates (the Odin 3 reports CRITICAL at its usual 100 °C)
+        status = 4; assert(dm_thermal_now() == -1);
+        for (int i = 0; i < 300 && __atomic_load_n(&g_thermal, __ATOMIC_RELAXED) != 3; i++) usleep(10000);
+        assert(__atomic_load_n(&g_thermal, __ATOMIC_RELAXED) == 3 && statuses && strstr(last, "state 3") && dm_thermal_now() == -1);
     } else if (mode == 2) {   // DM_THERMAL_CAP=0: -1 as before, nothing opened
         assert(dm_thermal_now() == -1); usleep(50000); assert(dm_thermal_now() == -1 && !opens && !statuses && strstr(last, "DM_THERMAL_CAP=0"));
     } else {   // no AThermal: -1, said once
@@ -73,7 +78,7 @@ class AndroidThermal(unittest.TestCase):
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
             c.write_text(HARNESS.replace('BLOCK', src[start:end]), encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-pthread', str(c), '-o', str(exe)], check=True)
-            for mode, env in (('0', {}), ('1', {}), ('2', {'DM_THERMAL_CAP': '0'}), ('3', {'NO_ATHERMAL': '1'})):
+            for mode, env in (('0', {}), ('1', {'DM_THERMAL_CAP': '1'}), ('2', {'DM_THERMAL_CAP': '0'}), ('3', {'NO_ATHERMAL': '1'}), ('4', {})):
                 with self.subTest(mode=mode):
                     e = {k: v for k, v in __import__('os').environ.items() if k not in ('DM_THERMAL_CAP', 'NO_ATHERMAL')}
                     out = subprocess.run([str(exe), mode], capture_output=True, text=True, env={**e, **env}, timeout=60)
