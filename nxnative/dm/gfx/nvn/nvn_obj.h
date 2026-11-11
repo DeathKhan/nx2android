@@ -273,6 +273,7 @@ typedef struct { int32_t prim, pad; uint64_t ctl; } p_draw_tf;   // DrawTransfor
 
 // Entry point of the Metal replay layer (nvn_mtl.m): replays a set of command handles into the current submission
 void mtl_exec(const uint8_t *handle);
+void mtl_exec_span(const uint8_t *p, const uint8_t *end);   // (Vulkan) the records from p up to end, with no OP_END (hle_nvn.c sub_inplace)
 void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value);   // in-order buffer fill within the submission (OP_CLEAR_BUF)
 void mtl_exec_rest(const uint64_t *handles, int n);   // Tells which handles in this submission still follow the current handle (used by the pass lookahead across handles)
 // Present: draw the swapchain texture to the front-end CAMetalLayer (only counts when there is no window)

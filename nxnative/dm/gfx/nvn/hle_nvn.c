@@ -2025,6 +2025,21 @@ static size_t sub_flat(uint64_t h, uint8_t *out, size_t cap) {
         }
     return at;
 }
+#ifdef __ANDROID__
+// The recording replayed where the game recorded it: each piece of its control list handed to the Vulkan replay (canonical records only: g_rec_compact is 0 here).
+// A piece's records are checked as sub_flat checks them, so a record that does not fit its piece ends the replay of that piece with a red line
+static void sub_inplace(uint64_t h) {
+    ctl_iter it = { (const uint8_t *)(uintptr_t)h, 0 }; uint64_t v;
+    if (!ctl_handle_ok(h)) return;
+    while (ctl_next(&it, &v)) {
+        const uint8_t *p0 = ctl_addr(v), *pe = p0 + ctl_chunk_bytes(v), *p = p0;
+        while (p < pe) { op_hdr hd; memcpy(&hd, p, sizeof hd);
+            if (hd.size < 8 || (hd.size & 7) || hd.size > (size_t)(pe - p)) { LOG("[RED] submission: a record of size %u (op %u) at %p: replayed up to it", hd.size, hd.op, (const void *)p); break; }
+            p += hd.size; }
+        if (p > p0) mtl_exec_span(p0, p);
+    }
+}
+#endif
 static uint64_t g_flat_bytes;
 static uint64_t sub_copy(uint64_t h) {
     size_t n = sub_flat(h, NULL, 0) + 8;
@@ -2056,15 +2071,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     if (nvn_async()) { uint64_t *c = malloc(sizeof *c * (size_t)(n > 0 ? n : 1)); for (int i = 0; i < n; i++) c[i] = sub_copy(h[i]); ((queue_t *)q)->submits++;
         static uint64_t ns, last; if (++ns % 600 == 0) { LOG("[nvn] submissions copied for the replay thread: %.2f MB each (last 600)", (g_flat_bytes - last) / 600.0 / 1048576); last = g_flat_bytes; }
         job_push((nvn_job){JOB_SUBMIT, n, c, q}); return; }
-#ifdef __ANDROID__
-    {   // the Vulkan replay walks records (gfx_vk_exec.c mtl_exec), so it is handed the same copies here too, freed once replayed
-        uint64_t c[n > 0 ? n : 1]; for (int i = 0; i < n; i++) c[i] = sub_copy(h[i]);
-        submit_now(q, n, (const NVNcommandHandle *)c, dm_nvn_frame_count());
-        for (int i = 0; i < n; i++) free((void *)(uintptr_t)c[i]);
-        return;
-    }
-#endif
-    submit_now(q, n, h, dm_nvn_frame_count());
+    submit_now(q, n, h, dm_nvn_frame_count());   // (Android: replayed where it was recorded, sub_inplace)
 }
 static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h, uint64_t frame) {
     SEQ("submit %d handles", n);
@@ -2082,7 +2089,15 @@ static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h, uint64_t f
     mtl_sub_begin(); ft_del_drain();
     nvn_ft_poll();
     mtl_sub_index((const uint64_t *)h, n);
+#ifdef __ANDROID__
+    // The Vulkan replay walks records (gfx_vk_exec.c). The replay thread's handles are copies that end in OP_END (sub_copy); a submission replayed on the game's thread is
+    // walked where it was recorded, piece by piece of its control list (sub_inplace), as before recordings kept their ends in control memory: copying every submission
+    // first (0e4717c75) was two walks, a malloc and a copy of each frame's records on the game's thread
+    if (nvn_async() || g_rec_compact) for (int i = 0; i < n; i++) mtl_exec((const uint8_t *)h[i]);
+    else for (int i = 0; i < n; i++) sub_inplace(h[i]);
+#else
     for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
+#endif
     mtl_exec_rest(NULL, 0);
     mtl_sub_commit();
     pthread_mutex_unlock(&g_sub_mu);
@@ -2792,7 +2807,7 @@ static void fstep_tick(const win_t *o, int c) {
         if (nvn_fstep_same(&g_fs)) snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
         if (g_fs.k > k0 && g_fs.cref > 0) snprintf(held, sizeof held, "; hold %d held at %.2f", kmin, g_fs.cref);   // what a probe compares the longer hold's cost with
         LOG("[nvn] frame step: hold %d → %d %s at present %llu (%s; cost %.2f, GPU %.2f%s)%s", k0, g_fs.k, fps_high() ? "ticks of 1/120 s" : "vsyncs", (unsigned long long)o->presents,
-            fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? "3 late frames" : g_fs.probes != probes0 ? why : "trial", cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");
+            fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? (g_fs.up_by == 2 ? "3 heavy late frames" : g_fs.up_by == 3 ? "late frames within 1 s" : "3 late frames") : g_fs.probes != probes0 ? why : "trial", cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");
     }
     if (probe0 == 1 && g_fs.probe != 1 && !fixed && nlog < 40)   // whether the controller raised the clock for the shorter deadline
         LOG("[nvn] frame step: the probe %s at present %llu (CPU %d%% on performance cores)%s", g_fs.probe == 2 ? "held" : "failed", (unsigned long long)o->presents, g_fs_pshare, ++nlog == 40 ? "; further changes only counted below" : "");
@@ -2802,9 +2817,9 @@ static void fstep_tick(const win_t *o, int c) {
         if (o->presents % 1800 == 0) { LOG("[nvn] 120 fps: held 1 / 2 ticks %llu / %llu frames, %llu late, %llu up / %llu down (%llu probes, %llu failed trials)", (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)g_fs.late, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed); memset(held, 0, sizeof held); }
     } else if (o->presents % 1800 == 0) {   // game time against real time (1.000 = normal speed; lower when a device cannot hold 20 fps or after long stalls)
         uint64_t vs = __atomic_load_n((uint64_t *)(dm_fps_state + 0x30), __ATOMIC_RELAXED) + fixed_sum, t = now_ns();
-        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late, %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials)",
+        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late (%llu of them isolated at the cap's hold), %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials)",
                     (vs - v0) / 60.0, (t - t0) / 1e9, (vs - v0) / 60.0 / ((t - t0) / 1e9), (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3],
-                    (unsigned long long)g_fs.late, (unsigned long long)g_fs.paid, g_fs.dropped, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed);
+                    (unsigned long long)g_fs.late, (unsigned long long)g_fs.tolerated, (unsigned long long)g_fs.paid, g_fs.dropped, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed);
         t0 = t; v0 = vs; memset(held, 0, sizeof held);
     }
 }
