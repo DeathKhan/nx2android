@@ -4836,6 +4836,10 @@ static void dispatch(const p_dispatch *d) {
         VkBuffer b = indirect_c0.buffer; VkDeviceSize o = indirect_c0.offset + 0x200;
         if (!b) vk_scratch(12, 4, &b, &o);   // the shader does not read c0; the dispatch still needs one contiguous GPU record
         for (int i = 0; i < nspans; i++) { spans[i].dstOffset += o; vkCmdCopyBuffer(cb, src[i], b, 1, &spans[i]); }
+        // NVN2 compute reads the counts at c0 + 4 too (DMSH_C0_DISPATCH_NVN2, where drv_segment puts a direct dispatch's): the GPU-written ones go there as well, as nvn_mtl.m's
+        // indirect dispatch copies them, or such a shader reads the CPU's numbers (Ocarina of Time's fog divides by x * y * 32 * 32: at 0 its froxel volumes filled with NaN)
+        if (indirect_c0.buffer && dm_sdk_ounce())
+            for (int i = 0; i < nspans; i++) { VkBufferCopy c4 = spans[i]; c4.dstOffset = c4.dstOffset - o + indirect_c0.offset + DMSH_C0_DISPATCH_NVN2; vkCmdCopyBuffer(cb, src[i], b, 1, &c4); }
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
                               VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
