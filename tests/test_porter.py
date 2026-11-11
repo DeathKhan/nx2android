@@ -164,6 +164,14 @@ class DataPack(unittest.TestCase):
             shutil.rmtree(t, ignore_errors=True)
 
     @unittest.skipUnless(any(Path(p).is_file() for p in pipeline.LETTER_FONTS), 'no letter font on this machine')
+    def test_pack_key_names_android_profile(self):   # an edit to android.tsv's rows makes the data pack again (its env.txt is written from them)
+        from types import SimpleNamespace as NS
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d); (d / 'game.tsv').write_text('x'); (d / 'android.tsv').write_text('status\tboots\n')
+            port = NS(g=NS(dir=d), ap=NS(path=d / 'android.tsv'))
+            got = pipeline.Port.pack_profile_files(port)
+            self.assertEqual(got.count(d / 'android.tsv'), 1); self.assertIn(d / 'game.tsv', got)
+
     def test_button_font(self):   # the Nintendo extension stand-in: made once, in the pack, named in env.txt (Super Mario Bros. Wonder's "Press L+R" drew '?' without it)
         try: from fontTools.ttLib import TTFont
         except ImportError: self.skipTest('no fontTools')

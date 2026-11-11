@@ -902,6 +902,9 @@ class Port:
         return ['--icon', plain, '--icon-fg', fg, '--icon-bg', bg]
 
     # ---- data: the files the app reads from its files folder ----
+    def pack_profile_files(self):   # the profile files the pack is made from: upstream.py takes android.tsv out of profile_files (no shader stage reads it), and the
+        return [p for p in nsp.profile_files(self.g) if p != self.ap.path] + [self.ap.path]   # pack's env.txt and settings come from its rows (Kirby's pack kept two removed rows)
+
     def data(self):
         PROG.stage('data pack', step='button-icon font')
         font_env, font_files = self.button_font()
@@ -915,7 +918,7 @@ class Port:
         # DLC / system data trees and the rows written into it; with the same key and the pack's manifest in place, the pack stands
         kf = dst.with_name(dst.name + '.key')
         stamps = [Path(str(self.patched) + '.key'), self.dmsv.with_name(self.dmsv.name + '.key'), self.game / 'RomFS.img.inputs.json', Path(__file__).with_name('datapack.py')]
-        key = nsp.fingerprint(('files', stamps + sorted(files.values())), ('files', nsp.profile_files(self.g)), ('tree', self.aoc) if self.aoc else 'no aoc', ('tree', self.sysdata) if self.sysdata else 'no sysdata',
+        key = nsp.fingerprint(('files', stamps + sorted(files.values())), ('files', self.pack_profile_files()), ('tree', self.aoc) if self.aoc else 'no aoc', ('tree', self.sysdata) if self.sysdata else 'no sysdata',
                               (self.pkg_ver, self.display, self.lang, self.package, list(env), TOUCH_SETTINGS if self.o.touch else None, sorted(files)))
         if (dst / datapack.MANIFEST).is_file() and nsp.reused(kf, key) is not None:
             man = datapack.read_manifest(dst); self.data_path = dst; self.result['data'] = str(dst)
