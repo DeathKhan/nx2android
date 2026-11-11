@@ -33,11 +33,9 @@ class OverlayVisibility(unittest.TestCase):
 static _Atomic int g_set_overlay, g_overlay, g_pads, g_edit;
 static _Atomic int g_menu_tab, g_sv_st, g_menu_hi = -1;
 static int layout, saves;
-// the menu button's hiding (front_android.c g_menu_key): its state and the clock, declared before dm_overlay_visible as there
-static int g_pad_used; static _Atomic int g_menu, g_menu_key; static _Atomic int64_t g_touch_t;
-#define OV_MENU_PEEK_NS 3000000000ll
-static int64_t test_now = 1;
-static int64_t mono_ns(void) { return test_now; }
+// the menu button's hiding (front_android.c g_pad_menukey, pad_watch's answer), declared before dm_overlay_visible as there
+static int g_pad_used; static _Atomic int g_menu, g_pad_menukey;
+static int64_t mono_ns(void) { return 1; }
 int dm_overlay_layout(void) { return layout; }
 float dm_overlay_scale(void) { return 1; }
 int dm_overlay_custom(int l, int c, float *x, float *y, float *s) {
@@ -150,14 +148,12 @@ static void input_handoff(int test) {
     assert(handle_event(&pad) == 1);
     assert(g_ax[0] == 0.7f && pad_publications == before + 2 && vibration == 42);
     assert(dm_overlay_visible() == 2); controls(0);
-    // once a controller key has opened the menu, the menu button hides while the controller plays; a touch brings it back for OV_MENU_PEEK_NS
-    atomic_store(&g_menu_key, 1); test_now = 10000000000ll;
+    // a controller in use with a key for the menu (pad_watch: InputDevice.hasKeys) hides the menu button; one with none keeps it
+    atomic_store(&g_pad_menukey, 1);
     assert(dm_overlay_visible() == 0);
     for (int i = 0; i < OV_N; i++) if (OV_CTLS[i].kind == OV_MENU) { float b[4]; ov_box(&OV_CTLS[i], width, height, b); assert(ctl_at(b[0], b[1], width, height) < 0); }
     atomic_store(&g_menu, 1); assert(dm_overlay_visible() == 2); atomic_store(&g_menu, 0);   // (the open menu draws it: it closes the menu)
-    atomic_store(&g_touch_t, test_now); assert(dm_overlay_visible() == 2);
-    test_now += OV_MENU_PEEK_NS + 1; assert(dm_overlay_visible() == 0);
-    atomic_store(&g_menu_key, 0); test_now = 1; assert(dm_overlay_visible() == 2);
+    atomic_store(&g_pad_menukey, 0); assert(dm_overlay_visible() == 2);
     for (int i = 0; i < OV_N; i++) if (OV_CTLS[i].kind == OV_MENU) {
         float b[4]; ov_box(&OV_CTLS[i], width, height, b);
         tap.x = b[0]; tap.y = b[1];
