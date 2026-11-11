@@ -9,6 +9,7 @@
 #include <media/NdkImage.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "movie_yuv_comp.spv.h"
 
 zc_frame *zc_frame_new(void);   // movie_zc.c
@@ -16,7 +17,7 @@ uint64_t mtl_last_fence(void);  // gfx_vk_core.c: the last committed submission'
 extern uint64_t g_tex_frame;    // gfx_vk_tex.c: presents so far (the import cache's age)
 #define ZC_SETS 64   // descriptor sets in a ring: one per dispatch, reused 64 dispatches later (the GPU is long done with it)
 
-struct zc_reader { AImageReader *rd; ANativeWindow *win; int refs, w, h, max; pthread_mutex_t mu; };
+struct zc_reader { AImageReader *rd; ANativeWindow *win; int refs, w, h, max; pthread_mutex_t mu; int64_t full_ns; int full_red; };   // full_ns: since when every image is out (0: not)
 static pthread_mutex_t g_rd_mu = PTHREAD_MUTEX_INITIALIZER;   // readers' reference counts
 
 static int zc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_MOVIE_ZEROCOPY"); v = !e || atoi(e) != 0; } return v; }
@@ -56,10 +57,15 @@ void *zc_reader_window(zc_reader *r) { return r ? r->win : NULL; }
 zc_frame *zc_reader_acquire(zc_reader *r) {
     AImage *img = NULL;
     pthread_mutex_lock(&r->mu); media_status_t st = AImageReader_acquireNextImage(r->rd, &img); pthread_mutex_unlock(&r->mu);
-    if (st != AMEDIA_OK || !img) {
-        if (st == AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED) { static int n; if (n++ < 4) LOG("[RED] [movie] zero-copy: every one of the reader's %d images is out: the codec waits for the game to release pictures", r->max); }
-        return NULL;
-    }
+    // Every image out is the codec's back-pressure, as designed (mavc_set_zero_copy): the codec decodes ahead of the game, the game holds up to 12 pictures (hle_codec_video.c) and
+    // the codec waits for one back. Welcome Tour's 29.97 fps 4K intro reaches it in some runs on the base build too and plays its 660 pictures in the same time either way. Red only
+    // when no image comes back for 2 s: the game holds pictures it does not release
+    if (st == AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now); int64_t ns = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+        if (!r->full_ns) { r->full_ns = ns; static int n; if (!n++) LOG("[movie] zero-copy: every one of the reader's %d images is out: the codec waits for the game to release pictures (its back-pressure)", r->max); }
+        else if (ns - r->full_ns > 2000000000ll && !r->full_red) { r->full_red = 1; LOG("[RED] [movie] zero-copy: every one of the reader's %d images has been out for %.1f s: the game holds pictures it does not release", r->max, (ns - r->full_ns) / 1e9); }
+    } else if (st == AMEDIA_OK && img) r->full_ns = 0;
+    if (st != AMEDIA_OK || !img) return NULL;
     zc_frame *f = zc_frame_new(); if (!f) { AImage_delete(img); return NULL; }
     AHardwareBuffer *ahb = NULL; AImage_getHardwareBuffer(img, &ahb);
     int32_t w = 0, h = 0; AImage_getWidth(img, &w); AImage_getHeight(img, &h);
