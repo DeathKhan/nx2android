@@ -305,9 +305,9 @@ static void pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
 }
 static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     { static int n; const char *e = getenv("DM_VK_LOG_UPLOADS"); if (e && atoi(e) && n < 60) { n++;   // which packaged textures are (re-)uploaded
-        VKLOG("upload: serial %llu %ux%ux%u nvn format %#x (vk %d) target %d levels %u layers %u flags %#x stride %u size %llu mem %p, tileH*100+pkg_block_h %d%s",
+        VKLOG("upload: serial %llu %ux%ux%u nvn format %#x (vk %d) target %d levels %u layers %u flags %#x stride %u size %llu mem %p, tileH*100+pkg_layout %d%s",
               (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
-              (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_block_h, im->packaged > 1 ? " (again)" : ""); } }
+              (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_layout, im->packaged > 1 ? " (again)" : ""); } }
     if (im->packaged < 100) im->packaged++;
     if (im->promoted) { VKRED_ONCE(171, "a packaged upload of an image promoted for image stores (nvn format %#x, %ux%u): skipped, its texels are not the guest's layout", t->d.format, t->d.width, t->d.height); return; }
     int staged = im->layout != VK_IMAGE_LAYOUT_GENERAL && vk_stage_wanted();   // a first upload with the submission's scratch over its cap: through the bounded staging buffer (gfx_vk_core.c)
@@ -697,6 +697,7 @@ void vk_tex_drop_pool(const void *pool) {   // the pool is finalized: its textur
 // CPU-written textures (WriteTexels / a dirty first use): packaged from now on
 static nvn_hmap g_cpu_written = {.klen = sizeof(uint64_t)}; static pthread_mutex_t g_cw_mu = PTHREAD_MUTEX_INITIALIZER;
 void mtl_tex_cpu_written(const tex_t *t) { if (!t->serial) return; pthread_mutex_lock(&g_cw_mu); nvn_hm_put(&g_cpu_written, &t->serial, (void *)1); pthread_mutex_unlock(&g_cw_mu); }
+void mtl_tex_linear_cpu_written(const tex_t *t) { mtl_tex_cpu_written(t); }   // hle_nvn.c WriteTexels into a linear texture: uploaded again by rows of its stride, as any CPU write
 // Linear textures (LINEAR) in a pool are their storage on the Switch: the CPU writes the pool memory and the GPU reads it (Metal's tex_linear makes them on the pool buffer).
 // Hades II rasterizes its glyphs on the CPU into a 1024x1216 R8 IMAGE|LINEAR atlas (pool CPU_UNCACHED|GPU_CACHED, no flush, no WriteTexels) and decodes its Bink movies
 // into linear planes: as GPU-only images of zeros all text, the title art and the movies were blank. A Vulkan image cannot be bound to the pool's memory (a dedicated

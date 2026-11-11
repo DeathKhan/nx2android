@@ -124,6 +124,7 @@ void mtl_set_origin_lower_left(int on) { (void)on; }
 void mtl_tex_init(const tex_t *t) { (void)t; }
 void mtl_tex_release(tex_t *t) { (void)t; }
 void mtl_tex_cpu_written(const tex_t *t) { (void)t; }
+void mtl_tex_linear_cpu_written(const tex_t *t) { (void)t; }
 void mtl_tex_gpu_written(const tex_t *t) { (void)t; }
 int mtl_tex_cpu_rewritten(const tex_t *t) { (void)t; return MTL_REWRITE_GPU; }   // nothing is drawn
 void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) { (void)tid; (void)t; (void)v; }

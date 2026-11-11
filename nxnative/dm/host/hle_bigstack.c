@@ -111,8 +111,8 @@ static void log_emit(const char *fmt, va_list *ap) {
     flockfile(stderr); vfprintf(stderr, fmt, *ap); fputc('\n', stderr); funlockfile(stderr);
 }
 void log_emit_bs(const char *fmt, va_list *ap);
-__asm__(".text\n.p2align 2\n.globl _log_emit_bs\n.private_extern _log_emit_bs\n_log_emit_bs:\n"
-        "    adrp x16, _log_emit@PAGE\n    add x16, x16, _log_emit@PAGEOFF\n    b _dm_bigstack_enter\n");
+__asm__(".text\n.p2align 2\n.globl " DM_ASM_SYM("log_emit_bs") "\n" DM_ASM_PRIVATE " " DM_ASM_SYM("log_emit_bs") "\n" DM_ASM_SYM("log_emit_bs") ":\n"
+        "    adrp x16, " DM_ASM_PAGE("log_emit") "\n    add x16, x16, " DM_ASM_PAGEOFF("log_emit") "\n    b " DM_ASM_SYM("dm_bigstack_enter") "\n");   // (dm.h DM_ASM_*: Mach-O and ELF)
 void dm_log(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     log_emit_bs(fmt, &ap);
