@@ -2182,7 +2182,7 @@ void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 
 // completion: a queue of committed submissions, each with its CPU-visible effects
-typedef struct cpend { uint64_t fence, frame; post_op *ops; int n; int slot, rslot, occ_parts; int npass; pass_meta pmeta[PASSQ]; uint64_t t_begin, t_commit, part_ns[MAIN_CBS]; int nparts; struct cpend *next; } cpend;
+typedef struct cpend { uint64_t fence, frame; post_op *ops; int n; int slot, rslot, occ_parts; int npass; pass_meta pmeta[PASSQ]; uint64_t t_begin, t_commit, part_ns[MAIN_CBS]; int nparts; uint64_t up_bytes; struct cpend *next; } cpend;   // up_bytes: texture uploads recorded into it (hang_check)
 static cpend *g_ch, *g_ct; static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
 uint64_t guest_ns(void);
 uint64_t guest_ns_at_host_time(uint64_t host_ns);
@@ -2369,8 +2369,14 @@ static void hang_check(const cpend *c, VkResult tr, const uint64_t ts[2]) {
     if (ms <= 0 || logged >= 3 || c->slot < 0) return;
     void vk_crumbs_log(uint64_t fence, const char *why); char why[160];
     if (tr == VK_NOT_READY) snprintf(why, sizeof why, "its end timestamp never written though its fence signalled: the driver's hang recovery cut it short?");
-    else if (tr == VK_SUCCESS && ts[1] > ts[0] && (double)(ts[1] - ts[0]) * V.props.limits.timestampPeriod > ms * 1e6)
-        snprintf(why, sizeof why, "%.0f ms on the GPU, over DM_VK_HANG_MS=%d", (double)(ts[1] - ts[0]) * V.props.limits.timestampPeriod / 1e6, ms);
+    else if (tr == VK_SUCCESS && ts[1] > ts[0] && (double)(ts[1] - ts[0]) * V.props.limits.timestampPeriod > ms * 1e6) {
+        double gms = (double)(ts[1] - ts[0]) * V.props.limits.timestampPeriod / 1e6;
+        // A scene load, not a hang: a submission that completed with its end written and carries 64 MB or more of texture uploads. Welcome Tour's load into the Joy-Con 2 (L) Area
+        // is one submission of 2225 draws and 311 MB of uploads, 540-600 ms on the GPU on the base build as on this one (measured with the same timestamps); a hang is cut short
+        // (its end unwritten, above) or holds no such load
+        if (c->up_bytes >= (64ull << 20)) { static int nscene; if (nscene++ < 3) VKLOG("submission %llu: %.0f ms on the GPU with %.0f MB of texture uploads in it (a scene load, over DM_VK_HANG_MS=%d)", (unsigned long long)c->fence, gms, c->up_bytes / 1048576.0, ms); return; }
+        snprintf(why, sizeof why, "%.0f ms on the GPU, over DM_VK_HANG_MS=%d", gms, ms);
+    }
     else return;
     logged++; VKLOG("[RED] submission %llu: %s", (unsigned long long)c->fence, why); vk_crumbs_log(c->fence, why);
 }
@@ -2484,7 +2490,7 @@ uint64_t mtl_sub_commit(void) {
     s->fence = f;
     cpend *c = calloc(1, sizeof *c); c->fence = f; c->frame = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED); c->n = s->npost; c->rslot = g_cur; c->occ_parts = occ_parts; c->slot = s->no_ts ? -1 : g_cur; s->no_ts = 0;
     c->npass = g_npass[g_cur]; memcpy(c->pmeta, g_pmeta[g_cur], sizeof(pass_meta) * (size_t)c->npass);
-    c->t_begin = s->t_begin; c->t_commit = (uint64_t)t1.tv_sec * 1000000000ull + (uint64_t)t1.tv_nsec; c->nparts = s->nmain_used; memcpy(c->part_ns, s->part_ns, sizeof c->part_ns); for (int i = s->nmain_sent; i < s->nmain_used; i++) c->part_ns[i] = c->t_commit;
+    c->up_bytes = g_pkg_bytes - g_sub0.pkg_bytes; c->t_begin = s->t_begin; c->t_commit = (uint64_t)t1.tv_sec * 1000000000ull + (uint64_t)t1.tv_nsec; c->nparts = s->nmain_used; memcpy(c->part_ns, s->part_ns, sizeof c->part_ns); for (int i = s->nmain_sent; i < s->nmain_used; i++) c->part_ns[i] = c->t_commit;
     cut_stats_report(s, c->frame, c->fence);
     if (s->npost) { c->ops = malloc(s->npost * sizeof *c->ops); memcpy(c->ops, s->post, s->npost * sizeof *c->ops); }
     perf_frame_submit(c->frame, c->fence);

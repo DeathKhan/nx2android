@@ -33,7 +33,7 @@ static void fill(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkDeviceSize n,
 static PFN_vkCmdFillBuffer vkCmdFillBuffer = fill;
 static PFN_vkCreateBuffer vkCreateBuffer; static PFN_vkGetBufferMemoryRequirements vkGetBufferMemoryRequirements; static PFN_vkAllocateMemory vkAllocateMemory;
 static PFN_vkBindBufferMemory vkBindBufferMemory; static PFN_vkMapMemory vkMapMemory;
-typedef struct { uint64_t fence; int slot; } cpend;
+typedef struct { uint64_t fence; int slot; uint64_t up_bytes; } cpend;
 static VkDeviceFaultAddressInfoEXT fake_ad[20]; static int fault_calls;
 static VkResult fake_fault(VkDevice d, VkDeviceFaultCountsEXT *n, VkDeviceFaultInfoEXT *fi) {
     (void)d; fault_calls++;
@@ -74,6 +74,10 @@ int main(void) {
     hang_check(&c, VK_NOT_READY, ts); assert(has("submission 5: its end timestamp never written") && has("[hang] submission 5"));
     nl = 0; hang_check(&c, VK_SUCCESS, ts); assert(has("submission 5: 250 ms on the GPU, over DM_VK_HANG_MS=200"));
     nl = 0; ts[1] = 1000 + 150000000ull; hang_check(&c, VK_SUCCESS, ts); assert(!nl);
+    // a scene load (Welcome Tour's 311 MB, 600 ms): informational, not red, and it leaves the three for hangs
+    nl = 0; ts[1] = 1000 + 600000000ull; c.up_bytes = 311ull << 20; hang_check(&c, VK_SUCCESS, ts);
+    assert(has("submission 5: 600 ms on the GPU with 311 MB of texture uploads in it (a scene load") && !has("[RED]") && !has("[hang]"));
+    nl = 0; c.up_bytes = 0; ts[1] = 1000 + 250000000ull;
     c.slot = -1; hang_check(&c, VK_NOT_READY, ts); assert(!nl);
     c.slot = 0; hang_check(&c, VK_NOT_READY, ts); assert(nl); nl = 0; hang_check(&c, VK_NOT_READY, ts); assert(!nl);
     // a lost device: once, the first submission not completed, then the driver's fault report
