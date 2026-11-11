@@ -1141,11 +1141,32 @@ static void hostseg_release(uintptr_t lo, uintptr_t hi) {
     for (int i = 0; i < g_nhostseg; i++) if (g_hostseg[i].busy && g_hostseg[i].org_hi > lo && g_hostseg[i].org_lo < hi) g_hostseg[i].busy = 0;
     pthread_mutex_unlock(&g_hostseg_mu);
 }
+// Does [lo, hi) hold bytes of the recording in progress? Its piece open in the current segment, and, once it went on in host-lent segments, the guest bytes those hang off
+// (hostseg_take's origin). Nintendo Switch 2 Welcome Tour records each material into a block of command memory sized for the driver's commands (0x180 bytes); our
+// records outgrow it, and its out-of-memory callback adds the same block again: recording on into it wrote over the recording's own first records (a bind's tail and the
+// next ones read as a record of op 0x70000, "submission copy: a record of size 1440", and the rest of the submission was dropped: the Joy-Con area washed out white)
+static int rec_overlaps(const cmd_t *o, uintptr_t lo, uintptr_t hi) {
+    if (!o->recording || !o->cur) return 0;
+    uintptr_t a = (uintptr_t)(o->chunk ? o->chunk : o->cur), b = (uintptr_t)o->cur;
+    if (a < b && lo < b && hi > a) return 1;
+    int hit = 0;
+    pthread_mutex_lock(&g_hostseg_mu);
+    for (int i = 0; i < g_nhostseg && !hit; i++)
+        if (o->cur >= g_hostseg[i].mem && o->cur <= g_hostseg[i].mem + g_hostseg[i].n && o->end == g_hostseg[i].mem + g_hostseg[i].n)
+            hit = g_hostseg[i].org_hi > lo && g_hostseg[i].org_lo < hi;
+    pthread_mutex_unlock(&g_hostseg_mu);
+    return hit;
+}
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p;
     if (pl) __atomic_store_n(&CB(c)->cmd_size, n, __ATOMIC_RELAXED);   // GetCommandMemorySize: the memory the game added, whether the host records into it or into a segment it lends
     if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } size_t sz = hostseg_size(CB(c), !pl, n); cmd_new_segment(CB(c), hostseg_take(CB(c), sz), sz); return; }
     if (!pl->mem) { LOG("[RED] AddCommandMemory: pool has no CPU storage"); return; }
+    if (rec_overlaps(CB(c), (uintptr_t)(pl->mem + off), (uintptr_t)(pl->mem + off + n))) {   // the game gives back memory the recording in progress is in: it goes on in a host-lent segment
+        static uint64_t k; if (k++ % 4096 == 0) LOG("[nvn] AddCommandMemory: the game added command memory the recording in progress is written in (%#zx bytes); the recording goes on in a host-lent segment (%llu times)", n, (unsigned long long)k);
+        if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); }
+        size_t sz = hostseg_size(CB(c), 0, 0); cmd_new_segment(CB(c), hostseg_take(CB(c), sz), sz); return;
+    }
     hostseg_release((uintptr_t)(pl->mem + off), (uintptr_t)(pl->mem + off + n));
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.grants++; g_cs.grant_bytes += n; if (!g_cs.grant_min || n < g_cs.grant_min) g_cs.grant_min = n; if (n > g_cs.grant_max) g_cs.grant_max = n; pthread_mutex_unlock(&g_cs_mu); }
     { static int cblog = -1; if (cblog < 0) cblog = getenv("DM_NVN_CBLOG") != NULL; static uint64_t ng; if (cblog && (++ng <= 60 || ng % 500 == 0)) LOG("[nvn] AddCommandMemory #%llu cmd=%p pool %p +%#lx length %#zx (recording %d)", (unsigned long long)ng, (void *)c, (const void *)pl, (long)off, n, CB(c)->recording); }
