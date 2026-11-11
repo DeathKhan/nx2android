@@ -1095,10 +1095,21 @@ static int jcms_copy(JcmsState *out, int n, uint32_t h) {
     if (jcms_log_due(side)) LOG("hid jcms: handle %#x player %d: %d states, newest #%lld d %d,%d attr %u", h, p + 1, k, k ? (long long)out[0].sampling : 0ll, k ? out[0].dx : 0, k ? out[0].dy : 0, k ? out[0].attributes : 0);
     return k;
 }
-HLE_FORCE("_ZN2nn3hid9StartJcmsERKNS0_10JcmsHandleE", "Joy-Con mouse sensor: no sensor on the host", void, h_hid_JcmsStart, const uint32_t *h) { (void)h; }
-HLE_FORCE("_ZN2nn3hid8StopJcmsERKNS0_10JcmsHandleE", "Joy-Con mouse sensor: no sensor on the host", void, h_hid_JcmsStop, const uint32_t *h) { (void)h; }
+// The game's starts and stops of a Joy-Con's mouse sensor and its first read of each handle, logged: when a game wants the mouse (Donkey Kong Bananza initializes the
+// sensors at boot, and reads them only through GetJcmsStates)
+static void jcms_note(int kind, const uint32_t *h) {   // kind 0 a start, 1 a stop (the first 64 of each), 2 a read (the first for each handle, up to 64 handles)
+    static _Atomic uint32_t read_seen[64]; static _Atomic int read_n, count[2];
+    uint32_t v = h ? *h : 0xffffffffu;
+    if (kind == 2) {
+        int n = atomic_load(&read_n); for (int i = 0; i < n && i < 64; i++) if (atomic_load(&read_seen[i]) == v + 1) return;
+        int i = atomic_fetch_add(&read_n, 1); if (i < 64) atomic_store(&read_seen[i], v + 1); else return;
+    } else if (atomic_fetch_add(&count[kind], 1) >= 64) return;
+    LOG("hid: the game %s the Joy-Con mouse sensor of npad %#x, %s Joy-Con (handle %#x)", kind == 0 ? "starts" : kind == 1 ? "stops" : "first reads", v & 0xff, (v >> 8 & 0xff) ? "right" : "left", v);
+}
+HLE_FORCE("_ZN2nn3hid9StartJcmsERKNS0_10JcmsHandleE", "Joy-Con mouse sensor: no sensor on the host", void, h_hid_JcmsStart, const uint32_t *h) { jcms_note(0, h); }
+HLE_FORCE("_ZN2nn3hid8StopJcmsERKNS0_10JcmsHandleE", "Joy-Con mouse sensor: no sensor on the host", void, h_hid_JcmsStop, const uint32_t *h) { jcms_note(1, h); }
 HLE_FORCE("_ZN2nn3hid13GetJcmsStatesEPNS0_9JcmsStateEiRKNS0_10JcmsHandleE", "Joy-Con mouse sensor states, newest first (none until a front end reports the sensor)",
-          int, h_hid_JcmsStates, void *out, int n, const uint32_t *h) { int k = h ? jcms_copy(out, n, *h) : 0; return k || !h ? k : jcms_states(out, n, *h); }   // (else DM_MOUSE's, ours)
+          int, h_hid_JcmsStates, void *out, int n, const uint32_t *h) { jcms_note(2, h); int k = h ? jcms_copy(out, n, *h) : 0; return k || !h ? k : jcms_states(out, n, *h); }   // (else DM_MOUSE's, ours)
 // The newest state alone (Nintendo Switch 2 Welcome Tour reads it each frame; the SDK's own reads the hid service's ring, which the host does not map: a null read in
 // hid::detail::GetJcmsState): with no sensor, a cleared state (sampling number 0, no movement, attributes 0: not connected)
 HLE_FORCE("_ZN2nn3hid12GetJcmsStateEPNS0_9JcmsStateERKNS0_10JcmsHandleE", "Joy-Con mouse sensor state: the newest (cleared until a front end reports the sensor)",
