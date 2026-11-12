@@ -572,9 +572,10 @@ static void guest_helper(void) {
 }
 static void *init_worker(void *arg) { *(uint64_t *)arg = info(I_AliasAddr); return NULL; }
 // The block: 256 MB in front, the heap region, the stack region, the alias region up to its end. The heap and stack sizes are the profile's, whatever the alias region's size
+static uint64_t heap_region = DM_GAME_MEM_RESERVE - DM_GAME_MEM_ALIAS - DM_GAME_MEM_STACK - 0x10000000;   // --android-heap expects the app pool's
 static void layout_order(void) {
     assert(info(I_HeapAddr) == (uint64_t)(uintptr_t)g_as + 0x10000000);
-    assert(info(I_HeapSize) == DM_GAME_MEM_RESERVE - DM_GAME_MEM_ALIAS - DM_GAME_MEM_STACK - 0x10000000);
+    assert(info(I_HeapSize) == heap_region);
     assert(info(I_StackAddr) == info(I_HeapAddr) + info(I_HeapSize) && info(I_StackSize) == DM_GAME_MEM_STACK);
     assert(info(I_AliasAddr) == info(I_StackAddr) + info(I_StackSize));
     assert(info(I_AliasAddr) + info(I_AliasSize) == info(I_AslrAddr) + info(I_AslrSize));
@@ -588,6 +589,20 @@ int main(int argc, char **argv) {
         assert(resize(0x800000) == LIMIT);
         return 0;
     }
+#ifdef DM_ANDROID
+    if (argc == 2 && !strcmp(argv[1], "--android-heap")) {
+        // t_svc_memory_android: the Android rule with a 23 MB app pool, past the profile's 16 MB heap region. The region becomes the pool in whole 2 MB and the block grows by as much,
+        // so a heap the profile's region refuses opens (droidplay-core#291), and the pool check still bounds it
+        assert(DM_GAME_APP_POOL == 0x1700000);
+        heap_region = 0x1800000; mem_init(); layout_order();
+        assert(g_reserve == 0x10000000 + 0x1800000 + DM_GAME_MEM_STACK + info(I_AliasSize));
+        assert(resize(0x1400000) == 0 && g_heap_cur == 0x1400000);
+        assert(resize(0x1600000) == LIMIT);   // past the pool less the used memory reported
+        assert(resize(0x1a00000) == OOM);     // past the heap region
+        assert(resize(0) == 0);
+        return 0;
+    }
+#endif
     if (argc == 2 && !strcmp(argv[1], "--alias-probe")) {   // DM_ALIAS_SIZE sets the alias region; the heap and stacks stay as the profile has them
         mem_init();
         assert(info(I_AliasSize) == 0x10000000);

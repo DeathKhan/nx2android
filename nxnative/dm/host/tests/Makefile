@@ -329,15 +329,18 @@ $(B)/t_svc_memory_unlimited: $(MEM_DEPS) | $(B)
 	$(CLANG) $(MEM_FLAGS) -fsanitize=undefined -DDM_GAME_MEM_MAP_LIMIT=0 -o $@ t_svc_memory.c
 $(B)/t_svc_memory_16k: $(MEM_DEPS) | $(B)
 	$(CLANG) $(MEM_FLAGS) -fsanitize=address,undefined -DTEST_PAGE_16K -o $@ t_svc_memory.c
+$(B)/t_svc_memory_android: $(MEM_DEPS) | $(B)
+	$(CLANG) $(MEM_FLAGS) -fsanitize=undefined -DDM_ANDROID=1 '-DDM_GAME_APP_POOL=UINT64_C(0x01700000)' -o $@ t_svc_memory.c
 $(B)/t_svc_memory_tsan: $(MEM_DEPS) | $(B)
 	$(CLANG) $(MEM_FLAGS) -fsanitize=thread -o $@ t_svc_memory.c
 $(B)/t_svc_memory_dirty: $(MEM_DEPS) ../../gfx/nvn/nvn_dirty.c ../../gfx/nvn/nvn_dirty.h | $(B)
 	$(CLANG) $(MEM_FLAGS) -DTEST_REAL_DIRTY -o $@ t_svc_memory.c ../../gfx/nvn/nvn_dirty.c
 .PHONY: memory memory-tsan memory-dirty memory-profile
-memory: $(B)/t_svc_memory $(B)/t_svc_memory_unlimited $(B)/t_svc_memory_16k
+memory: $(B)/t_svc_memory $(B)/t_svc_memory_unlimited $(B)/t_svc_memory_16k $(B)/t_svc_memory_android
 	$(B)/t_svc_memory
 	$(B)/t_svc_memory_unlimited
 	$(B)/t_svc_memory_16k
+	$(B)/t_svc_memory_android --android-heap
 memory-tsan: $(B)/t_svc_memory_tsan
 	$(B)/t_svc_memory_tsan
 memory-dirty: $(B)/t_svc_memory_dirty
