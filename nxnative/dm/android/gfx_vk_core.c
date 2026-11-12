@@ -11,7 +11,6 @@
 #include "nvn_queue.h"
 #include "nvn_hmap.h"
 #include "nvn_dirty.h"
-#include "gfx_vk_fileback.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <android/hardware_buffer.h>
@@ -958,11 +957,8 @@ static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size) {
     // copy the pool's current contents into the buffer through a temporary mapping, then put the buffer's pages at the pool's address
     uint8_t *tmp = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fds[0], 0);
     int ok = tmp != MAP_FAILED;
-    // A kept buffer holds its last pool's bytes, and a chunk in the pool file (DM_VK_POOL_FILEBACK) has pages the kernel dropped, which pagemap reports as neither present
-    // nor swapped: copy_resident would leave them as the buffer's zeros. Both copy every page
-    int whole = reuse || vk_fb_has((uintptr_t)mem, (uintptr_t)mem + size);
     if (ok) {
-        if (whole) { memcpy(tmp, mem, size); g_zc_copied += size; } else copy_resident(tmp, mem, size);
+        if (reuse) { memcpy(tmp, mem, size); g_zc_copied += size; } else copy_resident(tmp, mem, size);   // (a kept buffer holds its last pool's bytes: every page, not only the touched ones)
         munmap(tmp, size);
         ok = mmap(mem, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fds[0], 0) == mem;
         if (!ok) mem_diag_zc(6, "mmap-fixed", size, "errno", errno);
@@ -1135,7 +1131,7 @@ static void pool_back_locked(vkpool_t *p, int late) {
         nvn_dirty_hold(mem, size); nvn_dirty_freeze(mem, size); held = 1;
         if (!mprotect(mem, size, PROT_READ)) frozen = 1; else { static int said; if (!said++) VKLOG("[RED] memory pool %p +%#llx: read-only for its late backing refused (errno %d); backed without the wait", (void *)mem, (unsigned long long)size, errno); }
     }
-    if (!zc) { zc = pool_zero_copy(p, mem, size); if (!zc || zc == -2) vk_fb_moved(p->lo, p->hi); }   // (-2: mapped, then not imported) the hardware buffer's pages over it: none of the pool file's
+    if (!zc) zc = pool_zero_copy(p, mem, size);
     if (frozen && zc) mprotect(mem, size, PROT_READ | PROT_WRITE);   // (zero-copy done: the new mapping is writable by itself)
     if (held) { nvn_dirty_unfreeze(); nvn_dirty_unhold(); }
     if (zc) {
@@ -1232,11 +1228,6 @@ void mtl_pool_del(const void *mem) {
         uint64_t t0 = pool_ns();
         { void vk_cpu_storage_gone(uint64_t lo, uint64_t hi); vk_cpu_storage_gone(p.lo, p.hi); }   // its GPU-written spans and taken textures (gfx_vk_tex.c)
         if (p.zero_copy) pool_copy_back(&p);
-        else if (vk_fb_has(p.lo, p.hi)) {   // in the pool file (DM_VK_POOL_FILEBACK): back to anonymous memory with its bytes, the file's blocks given back; writers wait as for a late backing
-            nvn_dirty_hold((void *)(uintptr_t)p.lo, p.hi - p.lo); nvn_dirty_freeze((void *)(uintptr_t)p.lo, p.hi - p.lo);
-            vk_fb_restore(p.lo, p.hi, p.base);
-            nvn_dirty_unfreeze(); nvn_dirty_unhold();
-        }
         if (inner) pthread_mutex_unlock(&g_nest_mu);
         free(p.baseline);
         { void vk_tbuf_drop_pool(uint64_t); vk_tbuf_drop_pool(p.serial); }   // the texel buffer views over its buffer (gfx_vk_tex.c), before the buffer itself goes or is kept
@@ -1301,33 +1292,6 @@ void vk_pool_set_flags(const void *mem, int flags) {
     pthread_rwlock_rdlock(&g_pool_mu);
     for (int i = 0; i < g_npool; i++) if (g_pool[i].base == (uint64_t)(uintptr_t)mem) g_pool[i].flags = flags;   // (every chunk of it)
     pthread_rwlock_unlock(&g_pool_mu);
-}
-// Texture pools backed by a file (DM_VK_POOL_FILEBACK=texture, gfx_vk_fileback.c), from hle_nvn.c's nvnMemoryPoolInitialize after nvn_dirty_add_range: the tracking's fault
-// hook is in place (a write to a frozen range waits in it) and no page of the pool is protected yet. A chunk at a time, under the read lock: lookups go on, a late backing
-// (the write lock) waits, so a chunk not backed now stays so for the swap. Its writers are held as for a late backing (pool_back_locked: nvn_dirty_hold, then the freeze, which
-// one range at a time takes behind the hold). A backed chunk is a hardware buffer's pages, and a chunk over pages of a zero-copy pool's buffer (an inner pool made first) would
-// lose them to the file: both stay as they are. Once shaders use raw global memory new pools are backed at their creation, so this takes the pools made before that
-// (Ocarina of Time's texture pools are made at boot)
-void vk_pool_fileback(const void *mem, uint64_t size, int flags) {
-    if (!vk_fb_on() || !mem || !size || vk_fb_refuse(flags, size)) return;
-    uint64_t base = (uint64_t)(uintptr_t)mem, end = base + size, kept = 0;
-    for (uint64_t a = base; a < end; ) {
-        pthread_rwlock_rdlock(&g_pool_mu);
-        const vkpool_t *c = NULL; int over = 0;
-        for (int i = 0; i < g_npool && !c; i++) if (g_pool[i].base == base && g_pool[i].lo == a) c = &g_pool[i];
-        uint64_t lo = c ? c->lo : 0, hi = c ? c->hi : 0;
-        for (int i = 0; c && i < g_npool && !over; i++) over = g_pool[i].zero_copy && g_pool[i].lo < hi && g_pool[i].hi > lo;
-        if (c && !c->backed && !over) {
-            void *m = (void *)(uintptr_t)lo;
-            nvn_dirty_hold(m, hi - lo); nvn_dirty_freeze(m, hi - lo);
-            vk_fb_take(lo, hi, base, flags);
-            nvn_dirty_unfreeze(); nvn_dirty_unhold();
-        } else if (c) kept += hi - lo;
-        pthread_rwlock_unlock(&g_pool_mu);
-        if (!c) break;
-        a = hi;
-    }
-    static int nl; if (kept && nl++ < 8) VKLOG("pool file: pool %p +%#llx: %.0f MB of it stays as it is (chunks backed already, or over a zero-copy pool's buffer)", mem, (unsigned long long)size, kept / 1048576.0);
 }
 static uint64_t g_sync_bytes, g_sync_full;   // copied pools: bytes copied by the incremental sync, full copies
 // Copied pools: the guest's bytes into the GPU copy. The first sync copies the whole pool; later ones copy only the 64 KB blocks with pages the CPU wrote since the last
