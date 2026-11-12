@@ -2094,6 +2094,8 @@ static void post(post_op o) { vksub_t *s = cur(); if (s->npost == s->cappost) { 
 // lighting visibility ratio. The old 1<<20 placeholder became 64 for 128x128 faces and multiplied the skin's red SSS term.
 enum { OCC_BLOCK = 256 };
 static int g_occ_counting, g_occ_active = -1;   // replay thread, under g_sub_lock; active belongs to the current submission
+static uint32_t g_occ_tag; static int g_occ_solo;   // the active query's probe tag (0: none); a probe's own query, no segment of the game's count
+void (*vk_ls_probe_cb)(uint32_t tag, uint64_t samples, int ok);   // gfx_vk_exec.c vk_ls_probe_done (DM_VK_LOAD_SKIP), set with its first probe
 static uint64_t g_occ_completed;              // completion thread only, across submissions
 static uintptr_t g_occ_first_site, g_occ_last_site;
 static uint32_t g_occ_draw_calls;              // issued calls, not GPU indirect vertex/index counts
@@ -2130,9 +2132,14 @@ void vk_occ_end(void) {
     vkCmdEndQuery(s->main, s->oq[q / OCC_BLOCK], (uint32_t)(q % OCC_BLOCK));
     s->occ[s->nmain_used - 1].ends++;
     // The otherwise unused kind-3 fields retain failure-only draw metadata; no allocation or normal-path logging.
-    post((post_op){.kind = 3, .val = (volatile uint32_t *)g_occ_last_site, .v = (uint32_t)(s->nmain_used - 1),
+    post((post_op){.kind = g_occ_solo ? 5 : 3, .val = (volatile uint32_t *)g_occ_last_site, .mode = g_occ_tag, .v = (uint32_t)(s->nmain_used - 1),
                    .addr = g_occ_first_site, .type = g_occ_draw_calls, .q = q});
-    g_occ_active = -1;
+    g_occ_active = -1; g_occ_tag = 0; g_occ_solo = 0;
+}
+// DM_VK_LOAD_SKIP (gfx_vk_exec.c ls_probe): the next draw's samples in a query of their own, its count handed to vk_ls_probe_cb(tag) at completion (kind 5, mode the tag).
+// With samples-passed counting on, the query is also the game's segment for that draw (kind 3 with the tag): the segments still add up to the game's count
+void vk_occ_probe(uint32_t tag) {
+    vk_occ_end(); g_occ_solo = !g_occ_counting; g_occ_counting = 1; vk_occ_draw(); g_occ_counting = !g_occ_solo; g_occ_tag = tag;
 }
 void vk_occ_reset(void) {
     vk_occ_end();
@@ -2188,6 +2195,8 @@ static void occ_complete(vksub_t *s, const post_op *o, int submitted_parts, uint
     if (o->kind == 4) { g_occ_completed = 0; return; }
     uint64_t samples = 0; int q = o->q;
     VkResult r = vkGetQueryPoolResults(V.dev, s->oq[q / OCC_BLOCK], (uint32_t)(q % OCC_BLOCK), 1, sizeof samples, &samples, sizeof samples, VK_QUERY_RESULT_64_BIT);
+    if (o->mode && vk_ls_probe_cb) vk_ls_probe_cb(o->mode, samples, r == VK_SUCCESS);   // DM_VK_LOAD_SKIP's probe
+    if (o->kind == 5) return;   // (a probe's own query: no part of the game's count)
     // A query whose result never became available (a few per submission part on the Odin 3, Ocarina of Time) counts as visible instead of ending the game: the condition
     // that reads it then draws, as a counter the host does not know does (render_cond). The first failures keep their full diagnostics
     if (r != VK_SUCCESS) { static unsigned failures; if (failures++ < 3) occ_failure(s, o, submitted_parts, frame, fence, r); else if (!(failures & (failures - 1))) VKLOG("[RED] samples query unavailable at completion: %u so far, counted as visible", failures); samples = 1; }
@@ -2633,7 +2642,7 @@ static void *completion_main(void *a) {
         }
         for (int i = 0; i < c->n; i++) {
             post_op *o = &c->ops[i];
-            if (o->kind == 3 || o->kind == 4) { occ_complete(&g_slot[c->rslot], o, c->occ_parts, c->frame, c->fence); continue; }
+            if (o->kind >= 3 && o->kind <= 5) { occ_complete(&g_slot[c->rslot], o, c->occ_parts, c->frame, c->fence); continue; }
             if (o->kind == 1) continue;   // publish after reports and readbacks below
             uint64_t ts = now, tq;
             if (o->q >= 0 && c->slot >= 0 && g_cq && vkGetQueryPoolResults(V.dev, g_cq, (uint32_t)o->q, 1, 8, &tq, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {

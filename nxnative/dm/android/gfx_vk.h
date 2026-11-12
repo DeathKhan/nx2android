@@ -126,6 +126,7 @@ void vk_table_report(void); // per-600-present table build/reuse costs
 int vk_occ_counting(void); // a skipped rasterizing draw may change a later samples-passed report
 void vk_occ_draw(void);   // immediately before an actual guest draw, inside its render pass
 void vk_occ_end(void);    // before ending a render pass (also used by reports/resets inside a pass)
+void vk_occ_probe(uint32_t tag);   // DM_VK_LOAD_SKIP: the next draw's samples counted alone, for gfx_vk_exec.c vk_ls_probe_done
 void vk_occ_reset(void);  // NVN samples-passed ResetCounter, preserving command order
 uint64_t vk_reports_fence_done(void);   // report/readback writes landed, before event release
 uint64_t vk_fence_done(void);   // the highest submission fence the GPU has completed

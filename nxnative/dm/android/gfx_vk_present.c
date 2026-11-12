@@ -1369,6 +1369,10 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         { extern uint64_t g_order_kept, g_order_ended; static uint64_t pk, pn;   // gfx_vk_exec.c g_order_keep
           if (g_order_kept + g_order_ended > pk + pn) VKLOG("order-only barriers per frame (last 600): %.1f kept inside their pass, %.1f ended it", (g_order_kept - pk) / 600.0, (g_order_ended - pn) / 600.0);
           pk = g_order_kept; pn = g_order_ended; }
+        { extern uint64_t g_vk_ls_colour, g_vk_ls_depth, g_vk_ls_probes, g_vk_ls_refused; static uint64_t pc, pd, pp;   // gfx_vk_exec.c DM_VK_LOAD_SKIP
+          if (g_vk_ls_probes > pp) VKLOG("pass loads skipped per frame (last 600): %.1f colour, %.1f depth; first draws counted %.1f; signatures refused %llu in all (DM_VK_LOAD_SKIP)",
+                                         (g_vk_ls_colour - pc) / 600.0, (g_vk_ls_depth - pd) / 600.0, (g_vk_ls_probes - pp) / 600.0, (unsigned long long)g_vk_ls_refused);
+          pc = g_vk_ls_colour; pd = g_vk_ls_depth; pp = g_vk_ls_probes; }
         void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }
