@@ -1018,7 +1018,11 @@ int vk_pool_remap_ro(void *mem, size_t len) {
     pthread_rwlock_rdlock(&g_pool_mu);
     for (int i = 0; i < g_npool && !rc; i++) {
         vkpool_t *p = &g_pool[i]; if (p->base != (uint64_t)(uintptr_t)mem || p->end - p->base != len) continue;
-        if (!p->zero_copy) { if (!p->shadow) { rc = -1; break; } done += p->hi - p->lo; continue; }   // a copied pool: nothing to map again (its protection stays as it is), and done, so defrag stops taking its pages busy
+        // A copied pool, or a chunk not backed yet (lazy backing: still the game's own pages): nothing to map again (its protection stays as it is), and done, so defrag
+        // stops taking its pages busy. A chunk not backed used to fail the whole call after the chunks before it were mapped read-only: Kirby and the Forgotten Land's
+        // resource pool (4 chunks, the last ones never used by the GPU) lost every writable page of its first chunk that way once a movie's uploads brought the pool to
+        // the defragmenting threshold, and the game's next write there was a crash (main+0x772398, at the end of the car cutscene)
+        if (!p->zero_copy) { done += p->hi - p->lo; continue; }
         int own, fd = pool_fd(p, &own); if (fd < 0) { rc = -1; break; }
         for (uint64_t a = p->lo; a < p->hi && !rc; ) {   // [a, lo): the piece up to the next inner pool [lo, hi)
             uint64_t lo = p->hi, hi = p->hi;
