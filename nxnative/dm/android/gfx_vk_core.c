@@ -454,6 +454,10 @@ void vk_init(void) {
     // of the Kingdom 1.4.3 that also replays NVN on Vulkan, measured its Great Sky Island forest at GPU 16-17 ms a frame on Turnip on an Adreno 830 (docs/FPS-2026-10-31.md),
     // against 22-27 ms here on Qualcomm's driver. A driver that does not load, or offers no Vulkan 1.3 GPU, leaves the system's
     const char *drv = getenv("DM_VK_DRIVER"); void *lib = NULL;
+    // Turnip, as every driver libadrenotools loads, drives Qualcomm's kernel GPU driver (KGSL): without its node (a Mali or Xclipse phone) it has nothing to run on, and
+    // libadrenotools.so's constructor would patch the linker for nothing. Only a missing node counts; one SELinux hides from access() is still there (droidplay-core bc35bec8e)
+    if (drv && *drv && access("/dev/kgsl-3d0", F_OK) && errno == ENOENT) {
+        VKLOG("DM_VK_DRIVER %s: not used, this GPU is not an Adreno (no /dev/kgsl-3d0): the system's driver runs", drv); drv = NULL; }
     if (drv && *drv) {
         Dl_info di; char dir[512] = "", dirs[520] = "";   // the APK's extracted libraries (mkapk.py: extractNativeLibs), where adrenotools finds its hooks and the driver
         if (dladdr((void *)vk_init, &di) && di.dli_fname && strrchr(di.dli_fname, '/')) {
