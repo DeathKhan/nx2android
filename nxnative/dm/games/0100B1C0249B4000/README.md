@@ -13,20 +13,20 @@ Update 1.0.1 (v65536) over the base game, SDK **20.5.19** (`nnSdk-20_5_19`, `Nin
 | `sys_resource 0x0`, `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | [`game.tsv`](game.tsv) | no system resource, so no virtual address memory. `main` sets a heap of at most the pool − 64 MB, which the 3.25 GB heap region holds (`heap 3.12 GB (heap region 3.25 GB)` in the log, on the Mac and on Android) |
 | `shader_groups /=romfs` | [`game.tsv`](game.tsv) | every shader is in `common.dat` at the RomFS root. See [Shaders](#shaders) |
 | `zip_store .dat:.metallib` | [`game.tsv`](game.tsv) | the archives' entries are zstd frames and Ogg streams already |
-| `DM_VK_RAW_GMEM=1` | [`android_defaults.txt`](android_defaults.txt) | Android: raw global memory, which every solid and translucent mesh reads (see [Shaders](#shaders)). It's on by default only for Switch 2 games, and Frostpunk is a Switch 1 one |
+| `DM_VK_RAW_GMEM=1` | `android_defaults.txt` | Android: raw global memory, which every solid and translucent mesh reads (see [Shaders](#shaders)). It's on by default only for Switch 2 games, and Frostpunk is a Switch 1 one |
 
 The profile is the provisional one `scripts/build_ipa_from_nsp.py` made from the survey, unchanged but for its comments. Its shader tables come from the Liquid archive reader. `pso_manifest.tsv` is still the empty provisional list.
 
 ## Shaders
 
-- **Where:** 2,550 shaders in `common.dat`, found through `common.idx` and `common.str` by `shader_split.py`'s Liquid archive reader ([Shader files in Liquid Engine archives](../../../docs/reference/shaders.md#shader-files-in-liquid-engine-archives)). They are HLSL compiled for NVN, one stage per file (`shaders/compiled/<technique>/<hash>.<stage>_5_0`): 1,577 pixel, 833 vertex, 75 compute, 32 hull, 32 domain and 1 geometry.
-- **Raw global memory:** all 1,108 shaders of the techniques `meshsolid` and `meshtranslucent` (539 vertex, 569 pixel; exactly those with a 0x88c-byte control section) read through raw global memory: `Global memory operation "Load" traced to no storage buffer: it goes through the memory pool table`. The Mac's `gmem_map` serves them. On Android, raw global memory (enjoyerofslop/droidplay-core#150) does, turned on by [`android_defaults.txt`](android_defaults.txt). See [Android](#android).
+- **Where:** 2,550 shaders in `common.dat`, found through `common.idx` and `common.str` by `shader_split.py`'s Liquid archive reader (Shader files in Liquid Engine archives). They are HLSL compiled for NVN, one stage per file (`shaders/compiled/<technique>/<hash>.<stage>_5_0`): 1,577 pixel, 833 vertex, 75 compute, 32 hull, 32 domain and 1 geometry.
+- **Raw global memory:** all 1,108 shaders of the techniques `meshsolid` and `meshtranslucent` (539 vertex, 569 pixel; exactly those with a 0x88c-byte control section) read through raw global memory: `Global memory operation "Load" traced to no storage buffer: it goes through the memory pool table`. The Mac's `gmem_map` serves them. On Android, raw global memory (enjoyerofslop/droidplay-core#150) does, turned on by `android_defaults.txt`. See [Android](#android).
 - **Mac, current:** 2,548 of 2,550 translate. The two `meshsolid` domain shaders `1ff1e13a5d5f963b` and `529b32dc47755a08` fail Metal's compile: `'attribute' index '30' is used more than once`. At run time, 40 pixel shaders (the SMAA passes among them) log `reflection conversion failed: B binding fp_t_tcb_15A has no resolved slot number` (also `15C`, `15E`): texture handles read from c1 at 0x5A-0x68 that the translator's queries had no answer for. Nothing wrong was seen in the picture.
 - **Android, current:** 2,486 translate, none fail. The 64 hull and domain shaders are not on the Vulkan path yet (draws with them would count as `shader missing`; the city view counted none).
 
 ## Boot
 
-- **Resolved:** the game crashed on its `Renderer` thread about 7 s into loading, before its first frame, on the Mac and on Android: `CRASH sig=11 pc=main+0x1aa90ac lr=main+0x1aa8a70`. Its renderer sizes a 32-slot per-stage binding table to min(device items 0x5E, 0x5F) (`main+0x1aa68d4`) and clears that many slots every frame (`main+0x762f50`). The host answered 0x5F with 4096, so it cleared 128 slots. Fixed by answering 32 ([Separate sampler bindings per stage](../../../docs/reference/nvn-objects.md#separate-sampler-bindings-per-stage)).
+- **Resolved:** the game crashed on its `Renderer` thread about 7 s into loading, before its first frame, on the Mac and on Android: `CRASH sig=11 pc=main+0x1aa90ac lr=main+0x1aa8a70`. Its renderer sizes a 32-slot per-stage binding table to min(device items 0x5E, 0x5F) (`main+0x1aa68d4`) and clears that many slots every frame (`main+0x762f50`). The host answered 0x5F with 4096, so it cleared 128 slots. Fixed by answering 32 (Separate sampler bindings per stage).
 - **Loading:** about 30 s from launch to the title screen on the S25 Edge. After "A New Home", the loading screen shows the controls, then the intro movie plays (B skips it), then the scenario's story screen.
 
 ## Audio
@@ -55,7 +55,7 @@ The profile is the provisional one `scripts/build_ipa_from_nsp.py` made from the
 - **The meshes need raw global memory.** On main without enjoyerofslop/droidplay-core#150, the Generator, the buildings and the wreckage don't draw. The terrain, snow, lights, UI, movies and the Generator's shadow do.
   - `DM_VK_DUMP` of a city frame: the G-buffer passes 10 and 11 hold the `meshsolid` draws (about 120, depth test greater, 5 targets), and they leave colour and depth empty. Pass 12's terrain then covers the crater.
   - **Cause:** these shaders read their per-object data through raw global memory (see [Shaders](#shaders)). Without it, the Vulkan replay binds 16 zero bytes for the raw pool table, so every such load reads 0: `[RED] [vk] storage buffer of shader 7069f9743717cd32 (c255 +0) is not a bound buffer: it reads 0`. It's the same gap as [Ocarina of Time](../0400486024DEC000/README.md)'s black forest on the Switch 2. The shadow pass uses other shaders, which is why the shadow is there.
-  - **Fix:** #150's raw global memory, on by default only for Switch 2 games, is turned on for Frostpunk by [`android_defaults.txt`](android_defaults.txt). On the S25 Edge it takes the AHardwareBuffer route (no `VK_EXT_map_memory_placed` on Samsung's driver).
+  - **Fix:** #150's raw global memory, on by default only for Switch 2 games, is turned on for Frostpunk by `android_defaults.txt`. On the S25 Edge it takes the AHardwareBuffer route (no `VK_EXT_map_memory_placed` on Samsung's driver).
 - **With raw global memory, 2026-11-10 on the S25 Edge:** a Frostpunk-only APK of #150's head merged with main `5736949c`, with the game's `defaults.txt` as the profile writes it. Three scripted runs from the title into the city (5, 5 and 7 minutes); the off run set `DM_VK_RAW_GMEM=0` in `env.txt`:
 
   | City | Generator and wreckage | Frame p50 / p95 | GPU p50 | Replay submit + present p50 | PSS |
@@ -71,8 +71,8 @@ The profile is the provisional one `scripts/build_ipa_from_nsp.py` made from the
 
 ## Found on this game
 
-- [Separate sampler bindings per stage](../../../docs/reference/nvn-objects.md#separate-sampler-bindings-per-stage): the boot crash, item 0x5F of `nvnDeviceGetInteger`.
-- [Shader files in Liquid Engine archives](../../../docs/reference/shaders.md#shader-files-in-liquid-engine-archives).
+- Separate sampler bindings per stage: the boot crash, item 0x5F of `nvnDeviceGetInteger`.
+- Shader files in Liquid Engine archives.
 - `cb_extents` stopped the Android shader build on a Private register's initializer (12 pixel shaders): enjoyerofslop/droidplay-core#139.
 
 ## Open

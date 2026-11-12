@@ -70,6 +70,7 @@ void mtl_tex_snapshot(tex_t *out,const tex_t *p) { *out=*p;mtl_tex_pin(p->serial
 void vk_registry_job_pin(uint64_t id) { assert(id<128 && !active_ids[id]);active_ids[id]=1;registry_pins++; }
 void vk_registry_job_unpin(uint64_t id) { assert(id<128 && active_ids[id]);active_ids[id]=0;registry_pins--; }
 static void nvn_ft_poll(void) {}
+static void ft_del_drain(void) {}   // hle_nvn.c: deferred first-touch deletions (droidplay-core 7d2c4ed7c)
 void nvn_cap_queue(uint64_t s,int w) { (void)s;(void)w; }
 void nvn_cap_submit(int n,const uint64_t *h) { assert(n==1 && *h); }
 void nvn_cap_present(const tex_t *t,const int c[4]) { (void)t;(void)c; }

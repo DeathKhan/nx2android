@@ -56,6 +56,7 @@ static int sync_test(int fd) { syncs++; return fail_sync ? -1 : fsync(fd); }
 #define VKLOG(...) ((void)0)
 #define LOG(format, ...) do { assert(strstr(format,"[RED] [vk] could not create an empty pipeline cache")); reds++; } while (0)
 #define VKCHK(x) assert((x)==VK_SUCCESS)
+static int vk_fp_host(void) { return 1; }   // gfx_vk_core.c: compiles with FPCR 0 (droidplay-core d56aa128f)
 #include "gfx_vk_pipeline_cache.inc"
 static void disk(const void *data,size_t n) { FILE *f=fopen(g_pcache_path,"wb"); assert(f); assert(fwrite(data,1,n,f)==n); assert(!fclose(f)); }
 static void *save_thread(void *unused) { (void)unused; vk_pipeline_cache_save(); return NULL; }
