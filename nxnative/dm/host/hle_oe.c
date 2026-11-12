@@ -303,9 +303,14 @@ HLE_FORCE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", "graphics s
 // The Switch 2 SDK's GPU time of a frame (nn::oe → nn::gs::sdk::QueryApplicationGpuTimeSpan; Nintendo Switch 2 Welcome Tour asks every frame for its dynamic resolution):
 // the SDK's reaches the gs service's session lock through null (sdk+0x151fb0). The host answers its own GPU time of the latest frame when the backend measured one, else 8 ms.
 // TODO(switch2): which frame the two words name, and the span's exact meaning (one frame's GPU busy time is the reading here)
-double mtl_gpu_ms(uint64_t frame);
+// The newest frame whose GPU work has completed, up to 8 frames back, as the frame step reads it (hle_nvn.c fstep_tick): mtl_gpu_ms(0) was frame 0's, gone from the backend's
+// ring after 64 frames, so the answer was 8 ms nearly always (droidplay-core cd1be8307). Weak stand-ins keep host unit tests without a graphics backend linking
+__attribute__((weak)) double mtl_gpu_ms(uint64_t frame) { (void)frame; return -1; }
+__attribute__((weak)) uint64_t dm_nvn_frame_count(void) { return 0; }
 HLE_FORCE("_ZN2nn2oe27QueryApplicationGpuTimeSpanEPNS_8TimeSpanEmm", "GPU time of a frame (Switch 2, gs): the host's measurement, else 8 ms", Result, h_oe_GpuTimeSpan, int64_t *out, uint64_t a, uint64_t b) {
-    (void)a; (void)b; double ms = mtl_gpu_ms(0); if (!(ms > 0 && ms < 1000)) ms = 8; if (out) *out = (int64_t)(ms * 1e6);
+    (void)a; (void)b; double ms = -1; uint64_t n = dm_nvn_frame_count();
+    for (uint64_t f = n; f-- > 0 && n - f <= 8;) if ((ms = mtl_gpu_ms(f)) >= 0) break;
+    if (!(ms > 0 && ms < 1000)) ms = 8; if (out) *out = (int64_t)(ms * 1e6);
     static atomic_int once; if (!atomic_exchange(&once, 1)) LOG("oe::QueryApplicationGpuTimeSpan(%#llx, %#llx): answered from the host's GPU time (%.1f ms now)", (unsigned long long)a, (unsigned long long)b, ms);
     return RES_OK; }
 // Native memory handles of the Switch 2's gs (CreateNativeMemory: a game memory range the graphics system may use; Welcome Tour imports both): the host's graphics layer reads game
