@@ -4211,9 +4211,19 @@ static int mdi_group(uint64_t cnt, uint64_t ind, int i, int max, int stride, int
     { static int n; if (!n++) VKLOG("multi-draw indirect with a count: drawn by the GPU's count (first: max %d, stride %d)", max, stride); }
     return 0;
 }
+// More instances than any Switch game draws (2^24) in a direct draw: the GPU would work through them until the driver's hang recovery cut the submission short, and the
+// game drew no frame after (droidplay-core 6b532db44: Final Fantasy Resonance's first field asked 1 to 3.8 billion of one quad every frame on an Adreno 730, its own count,
+// cause not found). A mitigation: such a draw is skipped, with one red line. An indirect draw's count is in GPU memory and is not checked
+static int huge_instances(const char *kind, uint32_t count, uint64_t instances) {
+    if (instances <= (1u << 24)) return 0;
+    VKRED_ONCE(177, "a %s draw of %llu instances (%#llx) skipped, shaders %016llx %016llx, count %u: more than any Switch game draws; the GPU would run it until its hang recovery (said once; every such draw is skipped)",
+               kind, (unsigned long long)instances, (unsigned long long)instances, S.sh[0] ? (unsigned long long)S.sh[0]->key : 0ull, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull, count);
+    return 1;
+}
 static void draw(const p_draw *d) {
     if (d->prim == DM_PRIM_MESH_TASKS) { mesh_draw(d); return; }
     VkBuffer mcb = VK_NULL_HANDLE; VkDeviceSize mco = 0; if (mdi_group(d->mdi_cnt, d->ind, d->mdi_i, d->mdi_max, d->mdi_stride, 16, &mcb, &mco)) return;
+    if (!d->ind && !d->mdi_cnt && huge_instances("non-indexed", (uint32_t)d->count, (uint64_t)(uint32_t)d->instances)) return;
     int prim = d->prim;
     // before prepare_draw, whose driver segment carries it (c0 + 0x644): set after it, each draw's segment had the draw before's. An indirect draw's is in GPU memory: 0
     g_draw_binst = d->ind ? 0 : (uint32_t)d->base_instance;
@@ -4413,6 +4423,7 @@ static int original_index_replay(const p_draw_idx *d, p_draw_idx *out) {
 static void draw_idx(const p_draw_idx *d) {
     p_draw_idx original; if (g_oi_vs && original_index_replay(d, &original)) d = &original;
     VkBuffer mcb = VK_NULL_HANDLE; VkDeviceSize mco = 0; if (mdi_group(d->mdi_cnt, d->ind, d->mdi_i, d->mdi_max, d->mdi_stride, 20, &mcb, &mco)) return;
+    if (!d->ind && !d->mdi_cnt && huge_instances("indexed", (uint32_t)d->count, (uint64_t)(uint32_t)d->instances)) return;
     int prim = d->prim;
     g_draw_binst = d->ind ? 0 : (uint32_t)d->base_instance;   // before prepare_draw (see draw)
     g_claim_draw = (typeof(g_claim_draw)){(uint32_t)d->count, (uint32_t)d->instances, d->prim, d->ind || d->mdi_cnt};
