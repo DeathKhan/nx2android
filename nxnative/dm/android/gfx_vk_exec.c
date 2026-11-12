@@ -228,23 +228,6 @@ static void list_reads(const char *what) {
     char t[1024]; int k = 0; for (int i = 0; i < g_lst_nrd && k < (int)sizeof t - 24; i++) k += snprintf(t + k, sizeof t - k, " %llx", (unsigned long long)g_lst_rd[i]);
     VKLOG("    %s reads%s", what, t); g_lst_nrd = 0;
 }
-// DM_VK_LOAD_SKIP=1 (live; =2 also depth; default off until measured on a device): a pass does not load a colour attachment its first draw writes everywhere. NVN games
-// almost never discard, so every pass loaded its attachments, which on a tiler is a read of the whole target into tile memory; a pass whose first draw writes every pixel
-// (a full-screen effect) gets nothing from that read. Whether a draw covers the render area is not known on the CPU (its vertex shader places it), so it is measured: the first
-// draw of a pass is counted alone in an occlusion query (vk_occ_probe; with samples-passed counting on, as its own segment of the game's count), and a signature of that pass
-// and draw (attachments, size, shaders, vertex and instance counts, viewport, scissor, raster, depth, blend and write-mask state) whose first draw covered every sample of
-// the render area LS_PROVE times and never fewer begins with DONT_CARE for those attachments. Only where nothing in that first draw can leave a pixel unwritten or read it:
-// fill mode, no blending on the attachment, a write mask with every channel of its format, no alpha test, alpha to coverage, discard, demote or sample mask in the fragment
-// shader, a depth or stencil test only if it is ALWAYS, single-sample and single-layer. The query goes on in every such pass: one count short refuses the signature for good
-// (the frames already recorded keep what they skipped: those pixels are undefined), as does a first draw left undrawn after its loads were skipped. =2: also the depth of a
-// first draw testing ALWAYS with depth writes on (the stencil keeps its load). Precise occlusion queries only. DM_VK_LOAD_SKIP_LOG=1 (live): each signature once, when its
-// loads are first skipped and when it is refused
-enum { LS_N = 1023, LS_PROVE = 4 };
-typedef struct { uint64_t sig, seen, bad_n; uint32_t area, gen; int good, bad, said; } ls_ent;
-static ls_ent g_ls_t[LS_N];
-static int g_ls, g_ls_log, g_ls_draw, g_ls_cur = -1, g_ls_probing, g_ls_skipped;   // switches; the draw a pass is begun for (1 + primitive * 2 + indexed); its signature's slot; a probe active; its loads skipped
-uint64_t g_vk_ls_colour, g_vk_ls_depth, g_vk_ls_probes, g_vk_ls_refused;   // attachments not loaded, first draws counted, signatures refused (gfx_vk_present.c)
-static void ls_decide(void); static void ls_probe(void); static void ls_first_done(void); static void vk_ls_probe_done(uint32_t tag, uint64_t samples, int ok);
 void vk_watch(const vkimg_t *im, const char *what) {
     if (g_x_listpasses && im && what[0] == 's') { uint64_t o = (uint64_t)im->off; int i = 0; while (i < g_lst_nrd && g_lst_rd[i] != o) i++; if (i == g_lst_nrd && i < 48) g_lst_rd[g_lst_nrd++] = o; }
     if (g_coll_st >= 0 && im && what[0] == 's') { if (g_stn[g_coll_st] < 32) g_stimg[g_coll_st][g_stn[g_coll_st]++] = (stimg_t){im->pool, im->off, im->size}; else g_stn[g_coll_st] = 33; }   // 33: too many to keep
@@ -495,7 +478,6 @@ static void x_read(void) { light_diag_poll(); original_index_read(); set_profile
     g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : 1; if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
     g_pace = !((e = getenv("DM_VK_PART_PACE")) && !atoi(e)); g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 0; g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e); g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) && atoi(e);
     g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_vbound = !((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_x_nflat = 0; if ((e = getenv("DM_VK_X_FLAT_VS"))) for (char *q = (char *)e; *q && g_x_nflat < 8; ) { char *nx; uint64_t v = strtoull(q, &nx, 16); if (nx == q) break; int m = 7; if (*nx == ':') m = (int)strtol(nx + 1, &nx, 10); g_x_flat_mode[g_x_nflat] = m; g_x_flat[g_x_nflat++] = v; q = *nx ? nx + 1 : nx; } g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = !((e = getenv("DM_VK_ASYNC_PIPE")) && !atoi(e)); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log; if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } } g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
-    { int on = (e = getenv("DM_VK_LOAD_SKIP")) ? atoi(e) : 0; if (on != g_ls) VKLOG("load skip (DM_VK_LOAD_SKIP): %s", on >= 2 ? "colour and depth" : on ? "colour" : "off"); g_ls = on; g_ls_log = (e = getenv("DM_VK_LOAD_SKIP_LOG")) && atoi(e); }
     g_x_nskipvs = 0; for (const char *q = getenv("DM_VK_X_SKIPVS"); q && *q && g_x_nskipvs < 8;) { char *n; uint64_t v = strtoull(q, &n, 16); if (n == q) break; if (v) g_x_skipvs[g_x_nskipvs++] = v; q = *n ? n + 1 : n; } }
 // ---------------- conditional rendering (profile render_cond) ----------------
 // As nvn_mtl.m (OP_RENDER_COND): SetRenderEnableConditional draws while the 64-bit counters of the reports at addr and addr + 16 are equal / differ, until SetRenderEnable(true).
@@ -706,7 +688,6 @@ void vk_lrz_forget(vkimg_t *im) { if (g_lrz_prev == im) g_lrz_prev = NULL; }   /
 // 0: no pass could be begun (no render pass or framebuffer, and no dynamic rendering to fall back on): the caller records nothing that needs one
 static void pass_journal_pass(const char *event);
 static int pass_commit(void) {
-    if (g_ls_draw) { if (S.pass_open == 2) ls_decide(); g_ls_draw = 0; }   // DM_VK_LOAD_SKIP: begun for a draw (prepare_draw)
     if (S.pass_open != 2) return S.pass_open == 1;
     vkimg_t *dim = S.daspect ? P_att[8].im : NULL;
     if ((g_lrz_touch & LRZ_SWITCH) && dim && g_lrz_prev && g_lrz_prev != dim) lrz_touch(g_lrz_prev, 1);
@@ -1272,7 +1253,6 @@ static void lin_back(void) {
     }
 }
 void vk_end_pass(void) {
-    g_ls_draw = 0; if (g_ls_cur >= 0 || g_ls_probing) ls_first_done();   // DM_VK_LOAD_SKIP: the first draw's count ends here at the latest
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); list_reads("it"); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
     if (S.pass_open == 1) { extern uint32_t g_vk_pass_flags; g_vk_pass_flags = (uint32_t)(S.ncol & 15) | (S.daspect ? 16u : 0) | (S.daspect && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 32u : 0) | (S.ncol && P_ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 64u : 0) | (P_split ? 128u : 0); }
@@ -3873,94 +3853,8 @@ static int order_feedback(int nst) {   // a stage of the draw samples one of the
     }
     return 0;
 }
-// DM_VK_LOAD_SKIP: what a pass's first draw is (ls_decide), and whether it covered the render area (vk_ls_probe_done)
-static int spv_kills(const uint32_t *w, uint32_t n) {   // a fragment can be left out: discard, demote, terminate, or a sample mask written. Without SPIR-V: assumed to
-    if (!w || n < 5 || w[0] != 0x07230203) return 1;
-    for (uint32_t i = 5; i < n;) {
-        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (!wc || i + wc > n) return 1;
-        if (op == 252 || op == 4416 || op == 5380) return 1;   // OpKill, OpTerminateInvocation, OpDemoteToHelperInvocation
-        if (op == 71 && wc >= 4 && w[i + 2] == 11 && w[i + 3] == 20) return 1;   // OpDecorate BuiltIn SampleMask
-        i += wc;
-    }
-    return 0;
-}
-static int shader_kills(vkshader_t *s) {
-    static struct { const vkshader_t *s; int k; } c[256]; unsigned h = (unsigned)((uintptr_t)s >> 4) % 256;
-    if (!s->spv) return 1;   // (not cached: the SPIR-V may come later)
-    if (c[h].s != s) { c[h].s = s; c[h].k = spv_kills(s->spv, s->nspv); }
-    return c[h].k;
-}
-static uint32_t fmt_comps(VkFormat f) {   // the channels a colour format has, as a write mask
-    if ((f >= 9 && f <= 15) || (f >= 70 && f <= 76) || (f >= 98 && f <= 100)) return 1;
-    if ((f >= 16 && f <= 22) || (f >= 77 && f <= 83) || (f >= 101 && f <= 103)) return 3;
-    if ((f >= 23 && f <= 36) || (f >= 84 && f <= 90) || (f >= 104 && f <= 106) || f == 122 || f == 123 || f == 4 || f == 5) return 7;
-    return 15;
-}
-// the pass being begun for a draw (pass_commit, g_ls_draw: 1 + its primitive * 2 + indexed): its signature, and its loads skipped where that signature's first draw
-// covered every sample in LS_PROVE probes and never less
-static void ls_decide(void) {
-    int dk = g_ls_draw - 1; g_ls_draw = 0; g_ls_cur = -1; g_ls_skipped = 0;
-    if (!V.has_occ_precise || g_order_check || g_mrt_active || g_noatt_open || P_split || P_ri.layerCount != 1 || S.samples > 1 || S.rast_discard || !S.sh[1]) return;
-    if (S.poly.mode == 0 || S.poly.mode == 1 || S.ms.a2c || (S.color.alpha_func >= 1 && S.color.alpha_func <= 7) || shader_kills(S.sh[1])) return;   // points or lines; alpha to coverage, alpha test, discard
-    int hd = (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0, hs = (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
-    if ((hd && S.ds.dt && S.ds.df != 8) || (hs && S.ds.st && (S.ds.sf_f != 8 || S.ds.sf_b != 8))) return;   // a depth or stencil test that can fail (NVN ALWAYS is 8)
-    uint32_t cm = 0;
-    for (int i = 0; i < (int)P_ri.colorAttachmentCount && i < 8; i++) {
-        if (P_alias[i] != i) return;   // (one image in two slots: left alone)
-        if (!P_ca[i].imageView || P_ca[i].loadOp != VK_ATTACHMENT_LOAD_OP_LOAD || P_att[i].im == &g_s0_image) continue;   // cleared already, or the slot 0 scratch
-        uint32_t m = (S.chmask.mask >> (4 * i)) & 0xf, need = fmt_comps((VkFormat)P_att[i].fmt);
-        if (S.sh[1]->omap_known) m &= S.sh[1]->omap >> (4 * i) & 0xf;   // (prepare_draw's write mask; narrower than the pipeline's when DM_VK_OMAP=0)
-        if (!((S.color.blend_en >> i) & 1) && (m & need) == need) cm |= 1u << i;
-    }
-    int dskip = g_ls >= 2 && hd && P_ri.pDepthAttachment && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && S.ds.dt && S.ds.dw && S.ds.df == 8;   // depth written everywhere (the stencil keeps its load)
-    if (!cm && !dskip) return;
-    struct { VkImageView v[9]; uint32_t w, h, cm, ds, dk, count, inst, ind; uint64_t sh[3]; float vp[4]; VkRect2D sc; } k; memset(&k, 0, sizeof k);
-    for (int i = 0; i < 8; i++) k.v[i] = i < (int)P_ri.colorAttachmentCount ? P_ca[i].imageView : VK_NULL_HANDLE;
-    k.v[8] = P_ri.pDepthAttachment || P_ri.pStencilAttachment ? P_da.imageView : VK_NULL_HANDLE; k.w = S.pass_w; k.h = S.pass_h; k.cm = cm; k.ds = (uint32_t)dskip; k.dk = (uint32_t)dk;
-    k.count = (uint32_t)g_claim_draw.count; k.inst = (uint32_t)g_claim_draw.instances; k.ind = g_claim_draw.indirect != 0;
-    for (int i = 0; i < 3; i++) k.sh[i] = S.sh[i] ? S.sh[i]->key : 0;
-    memcpy(k.vp, S.vp[0], sizeof k.vp); k.sc = scissor_rect();
-    uint64_t sig = fnv(1469598103934665603ull, &k, sizeof k); sig = fnv(sig, &S.poly, sizeof S.poly); sig = fnv(sig, &S.ds, sizeof S.ds); sig = fnv(sig, &S.color, sizeof S.color); sig = fnv(sig, &S.chmask, sizeof S.chmask);
-    unsigned idx = (unsigned)(sig % LS_N); ls_ent *e = &g_ls_t[idx];
-    if (e->sig != sig) {   // direct-mapped: a slot not seen for two presents is taken over (its probes still in flight are told apart by the generation)
-        if (e->sig && e->seen + 2 > g_tex_frame) return;
-        uint32_t gen = (e->gen + 1) & 0x3fffff; memset(e, 0, sizeof *e); e->sig = sig; e->gen = gen; e->area = S.pass_w * S.pass_h;
-    }
-    e->seen = g_tex_frame;
-    if (__atomic_load_n(&e->bad, __ATOMIC_RELAXED)) {
-        if (g_ls_log && !(e->said & 2)) { e->said |= 2; uint64_t n = __atomic_load_n(&e->bad_n, __ATOMIC_RELAXED);
-            if (n == UINT64_MAX) VKLOG("load skip: %ux%u pass, first draw vs %016llx fs %016llx: refused (it was not drawn)", S.pass_w, S.pass_h, (unsigned long long)k.sh[0], (unsigned long long)k.sh[1]);
-            else VKLOG("load skip: %ux%u pass, first draw vs %016llx fs %016llx: refused (it covered %llu of %u samples)", S.pass_w, S.pass_h, (unsigned long long)k.sh[0], (unsigned long long)k.sh[1], (unsigned long long)n, e->area); }
-        return;
-    }
-    int good = __atomic_load_n(&e->good, __ATOMIC_RELAXED);
-    if (good >= LS_PROVE) {
-        for (int i = 0; i < 8; i++) if (cm >> i & 1) { P_ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; g_vk_ls_colour++; }
-        if (dskip) { P_da.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; g_vk_ls_depth++; }
-        g_ls_skipped = 1;
-        if (g_ls_log && !(e->said & 1)) { e->said |= 1; VKLOG("load skip: %ux%u pass, first draw vs %016llx fs %016llx (%u vertices, %u instances%s): colour slots %#x%s not loaded from now (covered all %u samples %d times)",
-            S.pass_w, S.pass_h, (unsigned long long)k.sh[0], (unsigned long long)k.sh[1], k.count, k.inst, k.ind ? ", indirect" : "", cm, dskip ? " and depth" : "", e->area, good); }
-    }
-    g_ls_cur = (int)idx;
-}
-static void ls_probe(void) {   // prepare_draw done: the first draw's samples counted alone
-    extern void (*vk_ls_probe_cb)(uint32_t, uint64_t, int); vk_ls_probe_cb = vk_ls_probe_done;
-    ls_ent *e = &g_ls_t[g_ls_cur]; vk_occ_probe(e->gen << 10 | (uint32_t)(g_ls_cur + 1)); g_ls_probing = 1; g_ls_cur = -1; g_vk_ls_probes++;
-}
-static void ls_first_done(void) {   // the next draw, or the pass's end: the probe ends; a first draw not drawn after its loads were skipped refuses its signature
-    if (g_ls_probing) { vk_occ_end(); g_ls_probing = 0; }
-    if (g_ls_cur >= 0 && g_ls_skipped) { ls_ent *e = &g_ls_t[g_ls_cur]; __atomic_store_n(&e->bad_n, UINT64_MAX, __ATOMIC_RELAXED); __atomic_store_n(&e->bad, 1, __ATOMIC_RELAXED); g_vk_ls_refused++; }
-    g_ls_cur = -1; g_ls_skipped = 0;
-}
-static void vk_ls_probe_done(uint32_t tag, uint64_t samples, int ok) {   // the completion thread (gfx_vk_core.c occ_complete, vk_ls_probe_cb): a probe's count
-    unsigned idx = (tag & 1023) - 1; if (!ok || idx >= LS_N) return;
-    ls_ent *e = &g_ls_t[idx]; if (e->gen != tag >> 10) return;   // (the slot was taken over since)
-    if (samples == e->area) __atomic_add_fetch(&e->good, 1, __ATOMIC_RELAXED);
-    else if (!__atomic_exchange_n(&e->bad, 1, __ATOMIC_RELAXED)) { __atomic_store_n(&e->bad_n, samples, __ATOMIC_RELAXED); __atomic_add_fetch(&g_vk_ls_refused, 1, __ATOMIC_RELAXED); }
-}
 static int prepare_draw(int prim, int indexed) {
     if (g_mrt_active) mrt_abort(); // a previous selected draw returned before its GPU command
-    g_ls_draw = 0; if (g_ls_cur >= 0 || g_ls_probing) ls_first_done();   // DM_VK_LOAD_SKIP: the pass's first draw is counted alone
     // DM_VK_CB_DRAWS (read every submission, default 128, 0 = never): the replay is cut every that many draws and what is recorded goes to the GPU at once
     // (vk_cmd_split), so the GPU works on the frame while the rest is replayed instead of after all of it: NEO's Scramble Crossing 36.7 → 15.7 ms a frame
     g_cb_draws++;   // the cut itself happens between passes (begin_pass); inside one only with DM_VK_PASS_SPLIT (below): a pass cut in two stores and reloads its attachments
@@ -4006,7 +3900,6 @@ static int prepare_draw(int prim, int indexed) {
             vk_end_pass(); g_psplit_now = 1; } else vk_cmd_split_refused(1); }
     else if (g_psplit > 0 && S.pass_open == 1 && g_pass_draws == (uint64_t)g_psplit && S.daspect && !g_psplit_depth) { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) has depth (format %d): not split", g_sub_pass - 1, S.pass_w, S.pass_h, S.dfmt); }
     for (int st = 0; st < 3; st++) if (!(st == 1 && S.rast_discard)) stage_storage_prepare(st, S.sh[st]);
-    g_ls_draw = g_ls ? 1 + prim * 2 + (indexed != 0) : 0;   // DM_VK_LOAD_SKIP: the pass begun for this draw (pass_commit)
     if (g_order_pending) { g_order_pending = 0; g_order_check = S.pass_open == 1; }   // an order-only barrier kept the pass open: decided below, once the draw's images are known
     if (!begin_pass() || !mrt_prepare(g_claim_draw.count, g_claim_draw.instances, prim, g_claim_draw.indirect, indexed) || !pass_commit()) { g_vkst.skip_rt++; return 0; }
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) g_tracing = 1;
@@ -4208,7 +4101,6 @@ static int prepare_draw(int prim, int indexed) {
         pass_dump_arm_for_draw(S.sh[1]->key, S.pass_w, S.pass_h, S.cfmt[0], P_att[0].im->layers, k.raster_discard);
     if (S.sh[1] && !k.raster_discard) light_diag_note_draw(S.sh[1]->key, g_draw_i);
     (void)indexed;
-    if (g_ls_cur >= 0) ls_probe();   // DM_VK_LOAD_SKIP: the pass's first draw, counted alone
     return 1;
 }
 // quads without an index buffer: one buffer of 0 1 2 0 2 3, 4 5 6 4 6 7, ... for up to QUAD_MAX quads (more are drawn as the first QUAD_MAX)
