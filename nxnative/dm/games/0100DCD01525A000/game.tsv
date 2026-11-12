@@ -1,0 +1,38 @@
+# Game profile of Persona 3 Portable (Switch, update 1.0.2). On Android it plays at 60 fps (as on the Switch) from a new game through the first school days
+# to the first battle on April 9, with saves and Continue working, in handheld and console mode (a Galaxy S25 Edge and a Galaxy Z Flip 7, see README.md); the Mac has not run it yet
+# Format: see dm/games/README.md
+# Atlus's in-house engine with CRI middleware (P4G's), NVN, SDK 14.3.0. The provisional profile the survey made (dm/games/profile_guess.py),
+# unchanged but for these comments. Shaders: 30 BNSH entries under sysdat.cpk, which the split's "other" packages hold (see README.md)
+
+# ---- Identity ----
+title_id	0100DCD01525A000
+program_id	0100DCD01525A000
+
+# ---- App ----
+name	Persona 3 Portable
+ipa	Persona3Portable.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v131072	1.0.2	main=4725d4306cfadaf3a3d3fe7c3671dafc	subsdk0=c781dd63daf0ddcdb9975da50a198f93	sdk=2aef2cffb104ee7c9e212fd2f4c731e9
+package	v131072
+shader_versions	v131072
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	data/umd0.cpk
+zip_store	.cpk:.metallib
+
+# ---- Memory ----
+# main sets a heap of at most the pool − 64 MB − 148 MB of bss (counted as used memory): a 3328 MB heap region
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 0 MB of system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon (Big Brain Academy: Brain vs. Brain sets a heap only then)
+sys_resource	0x0
+
+# ---- Shader split ----
+shader_groups	/data/=data /data_CH/=datach /data_CK/=datack /data_DE/=datade /data_EN/=dataen /data_ES/=dataes /data_FR/=datafr /data_IT/=datait /data_KR/=datakr
+shader_note	Persona 3 Portable shaders
