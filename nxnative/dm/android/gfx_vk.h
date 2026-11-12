@@ -65,6 +65,7 @@ typedef struct {
     uint32_t sg_size, sg_stages, sg_ops, sg_quad_all, sg_min, sg_max, sg_maxwgs, sg_pin_stages; VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg_pin;
 } vkdev_t;
 extern vkdev_t V;
+int vk_fp_host(void);   // gfx_vk_core.c: the driver's compiles run with FPCR 0 (DM_VK_FP_HOST); the pipeline cache's envelope names it (gfx_vk_pipeline_cache.inc)
 const void *vk_sg_pin(VkShaderStageFlagBits stage, const uint32_t *local);   // DM_VK_SUBGROUP_PIN: a game pipeline stage's pNext, NULL when the driver picks its size (local: a compute shader's workgroup size)
 // gfx_vk_subgroup.c (no Vulkan): the module as subgroups of one invocation when it uses a subgroup class not in ops (its stage's; 0 when the device has none there).
 // NULL when there is nothing the stage lacks (why empty) or it uses something not covered (why names it); the module then stays as it is

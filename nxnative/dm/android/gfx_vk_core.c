@@ -428,6 +428,45 @@ static void mem_acct_install(void) {
     real_vkCreateGraphicsPipelines = vkCreateGraphicsPipelines; real_vkCreateComputePipelines = vkCreateComputePipelines; vkCreateGraphicsPipelines = acct_gpipe; vkCreateComputePipelines = acct_cpipe;
     VKLOG("device memory accounting on (DM_VK_MEM_ACCT=0: off): a line at each 512 MB more per tag, each allocation of 64 MB or more, the table at each 512 MB more in all");
 }
+// The floating-point environment of the driver's compiler (droidplay-core d56aa128f). The replay, its recorder and the pipeline threads are started from threads the
+// game's NVN calls run on, and a new thread inherits its creator's FPCR: Ocarina of Time runs with 0x1000000 (flush-to-zero). Qualcomm's compiler runs on the CPU inside
+// vkCreate*Pipelines (Samsung's in vkCreateShaderModule; Turnip's NIR folding too) and folds constants with the caller's FPCR: Swap2-Native measured Ocarina of Time's scene
+// about 2^12 too bright at the bloom pass on driver 891.11, and BananaNative sets FPCR 0 around these calls. So the calls that compile (device, module, pipelines, and a
+// submit, where a driver may compile what it deferred) run with FPCR 0 and give the caller's back after. The pipeline cache's envelope names the mode (pcache_identity),
+// so pipelines compiled under flush-to-zero are not taken from an older file. DM_VK_FP_HOST=0: the caller's FPCR, as before
+#if defined(__aarch64__)
+static int fp_host_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_FP_HOST"); v = !(e && *e == '0'); if (!v) VKLOG("DM_VK_FP_HOST=0: the driver compiles with the calling thread's FPCR"); } return v; }
+static inline uint64_t fp_enter(void) {
+    uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v));
+    if (v && fp_host_on()) {
+        static _Atomic int told; if (!atomic_exchange(&told, 1)) VKLOG("the calling thread's FPCR is %#llx: the driver compiles with FPCR 0 (DM_VK_FP_HOST=0: as it is)", (unsigned long long)v);
+        __asm__ volatile("msr fpcr, %0" :: "r"((uint64_t)0)); return v;
+    }
+    return 0;
+}
+static inline void fp_leave(uint64_t v) { if (v) __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
+int vk_fp_host(void) { return fp_host_on(); }
+#else
+static inline uint64_t fp_enter(void) { return 0; }
+static inline void fp_leave(uint64_t v) { (void)v; }
+int vk_fp_host(void) { return 0; }
+#endif
+static PFN_vkCreateShaderModule fp_d_module; static PFN_vkCreateGraphicsPipelines fp_d_gp; static PFN_vkCreateComputePipelines fp_d_cp; static PFN_vkQueueSubmit fp_d_submit;
+static VKAPI_ATTR VkResult VKAPI_CALL fp_create_module(VkDevice d, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *m) {
+    uint64_t f = fp_enter(); VkResult r = fp_d_module(d, ci, a, m); fp_leave(f); return r; }
+static VKAPI_ATTR VkResult VKAPI_CALL fp_create_gp(VkDevice d, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *p) {
+    uint64_t f = fp_enter(); VkResult r = fp_d_gp(d, c, n, ci, a, p); fp_leave(f); return r; }
+static VKAPI_ATTR VkResult VKAPI_CALL fp_create_cp(VkDevice d, VkPipelineCache c, uint32_t n, const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *p) {
+    uint64_t f = fp_enter(); VkResult r = fp_d_cp(d, c, n, ci, a, p); fp_leave(f); return r; }
+static VKAPI_ATTR VkResult VKAPI_CALL fp_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence fe) {
+    uint64_t f = fp_enter(); VkResult r = fp_d_submit(q, n, si, fe); fp_leave(f); return r; }
+static VkResult fp_create_device(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *d) { uint64_t f = fp_enter(); VkResult r = vkCreateDevice(pd, ci, NULL, d); fp_leave(f); return r; }
+static void fp_install(void) {   // outermost wrapper of the function table's compiling calls (after mem_acct / kt / mr)
+    if (vkCreateShaderModule) { fp_d_module = vkCreateShaderModule; vkCreateShaderModule = fp_create_module; }
+    if (vkCreateGraphicsPipelines) { fp_d_gp = vkCreateGraphicsPipelines; vkCreateGraphicsPipelines = fp_create_gp; }
+    if (vkCreateComputePipelines) { fp_d_cp = vkCreateComputePipelines; vkCreateComputePipelines = fp_create_cp; }
+    if (vkQueueSubmit) { fp_d_submit = vkQueueSubmit; vkQueueSubmit = fp_submit; }
+}
 #include "gfx_vk_memreport.inc"   // DM_VK_MEMREPORT: live memory by object kind, ours and (VK_EXT_device_memory_report) the driver's
 static int drv_has_gpu(PFN_vkGetInstanceProcAddr g) {
     PFN_vkCreateInstance ci = (PFN_vkCreateInstance)g(NULL, "vkCreateInstance"); VkInstance in; int ok = 0;
@@ -653,11 +692,11 @@ void vk_init(void) {
     if (has_ext(ex, ne, "VK_EXT_device_fault")) { VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dfault}; vkGetPhysicalDeviceFeatures2(V.pd, &q); }
     if (dfault.deviceFault) { on[non++] = "VK_EXT_device_fault"; dfault.deviceFaultVendorBinary = VK_FALSE; dfault.pNext = dnext; dnext = &dfault; }
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, dnext, 0, 1, &qci, 0, NULL, non, on, NULL};
-    VKCHK(vkCreateDevice(V.pd, &dci, NULL, &V.dev));
+    VKCHK(fp_create_device(V.pd, &dci, &V.dev));   // with FPCR 0 (fp_enter, above)
     vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)p_vkGetInstanceProcAddr(V.inst, "vkGetDeviceProcAddr");
 #define VK_LOADD(f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f); if (!f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f "KHR"); if (!f) f = (PFN_##f)p_vkGetInstanceProcAddr(V.inst, #f);   // a promoted function by its extension's name (Vulkan 1.1 / 1.2 devices)
     VK_DEV_FNS(VK_LOADD)
-    mem_acct_install(); kt_install(); uab_install(); mr_install();
+    mem_acct_install(); kt_install(); uab_install(); mr_install(); fp_install();
     if (dfault.deviceFault) g_fault_info = (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(V.dev, "vkGetDeviceFaultInfoEXT");
     VKLOG("VK_EXT_device_fault %s", g_fault_info ? "on: a lost device logs what the driver says of it" : "not offered by the driver");   // device memory accounting (DM_VK_MEM_ACCT): every vkAllocateMemory / vkFreeMemory through the function table goes through it
     gpu_clock_init(clock_extension);

@@ -54,7 +54,7 @@ static pcache_header pcache_identity(void) {
     memcpy(h.uuid,V.props.pipelineCacheUUID,sizeof h.uuid);
     memcpy(h.device_uuid,g_pcache_ids.deviceUUID,sizeof h.device_uuid);
     memcpy(h.driver_uuid,g_pcache_ids.driverUUID,sizeof h.driver_uuid);
-    snprintf(h.chain,sizeof h.chain,"%s","nx2android");
+    snprintf(h.chain,sizeof h.chain,"%s",vk_fp_host() ? "nx2android-fp0" : "nx2android");   // compiled with FPCR 0 (gfx_vk_core.c fp_enter): not the flush-to-zero builds of before
     return h;
 }
 static uint32_t pcache_u32(const uint8_t *p) {
