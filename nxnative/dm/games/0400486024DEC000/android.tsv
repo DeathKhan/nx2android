@@ -40,3 +40,7 @@ env	DM_VK_IMAGE_BUDGET_MB=3072
 # The pool-texture prefetch (gfx_vk_exec.c pool_prefetch): the world's first frame gave about 2,200 registered textures their first use at once, one frame of 2.7 to 3.0 s
 # and the SoC at 102 °C (Odin 3, 2026-11-10). They are registered 3 s after the start and wait through the title and file select: with this their first uses are made there
 env	DM_VK_POOL_PREFETCH=1
+# The two-stage replay (gfx_vk_dq.c, DM_VK_MT_REPLAY=2): the recorder thread also ends and submits the command buffers and writes the descriptor sets. Kokiri on the Odin 3
+# (2026-11-12, same walk): the replay thread 18-26 ms of CPU a frame without it, 9.5-11.8 ms with it (the recorder 11-14 ms beside it), GPU time and picture unchanged, no command
+# buffer refused. The game is held by the GPU there (31-38 ms), so the frame rate does not move yet; it keeps the replay under 25 ms (40 fps) once the GPU is
+env	DM_VK_MT_REPLAY=2
