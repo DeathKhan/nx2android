@@ -321,7 +321,17 @@ NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, 
     ft_flush(o->mem + off, n);
 }
 // A GPU address exists only once the driver has given one: here, by a buffer (nvnBufferInitialize) or by a texture (nvnTextureGetTextureAddress). Raw global memory can reach only what these name (mtl_pool_addressed)
-static void pool_mark_addressed(const pool_t *o) { static __thread const uint8_t *last; if (o->mem && o->mem != last) { last = o->mem; mtl_pool_addressed(o->mem, o->size); } }
+// Shader-code pools (NVN_MEMORY_POOL_FLAGS_SHADER_CODE) are not marked: the replay runs translated shaders and reads a program's constants from the offline bundle, and no raw
+// pointer reaches shader code, so once a shader uses raw global memory they are no longer backed for the pool table (Ocarina of Time: 205 of them, 345 MiB of hardware
+// buffers committed for nothing; droidplay-core 96fd82317, after BananaNative). A code pool's buffers bound to a draw are still backed at that first GPU use (vk_pool_of).
+// DM_VK_RAW_GMEM_CODE=1 (start-up): marked as other pools
+static int pool_code_skip(const pool_t *o) {
+    static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_RAW_GMEM_CODE"); v = !(e && *e == '1'); if (!v) LOG("[nvn] DM_VK_RAW_GMEM_CODE=1: shader-code pools are addressed as other pools"); }
+    if (!v || !(o->flags & NVN_MEMORY_POOL_FLAGS_SHADER_CODE)) return 0;
+    static int said; if (!said++) LOG("[nvn] shader-code memory pools are left out of raw global memory (DM_VK_RAW_GMEM_CODE=1: included); the first: %p +%#llx", (const void *)o->mem, (unsigned long long)o->size);
+    return 1;
+}
+static void pool_mark_addressed(const pool_t *o) { static __thread const uint8_t *last; if (o->mem && o->mem != last) { last = o->mem; if (!pool_code_skip(o)) mtl_pool_addressed(o->mem, o->size); } }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { pool_mark_addressed((const pool_t *)p); return (NVNbufferAddress)((const pool_t *)p)->mem; }
 
 // ---------- Descriptor pools ----------
@@ -2559,6 +2569,7 @@ __attribute__((weak)) void dm_fps_lock_tick(void) {}   // hle_fpslock.c: engine 
 static int g_engine_stub = 1;   // the weak dm_fps_lock_engine's answer, for graphics unit tests (t_nvn sets it)
 __attribute__((weak)) int dm_fps_lock_engine(void) { return g_engine_stub; }   // hle_fpslock.c: the host writes fps_target into an engine limiter of this main
 __attribute__((weak)) void dm_ue_cvar_tick(void) {}   // hle_uecvar.c: Unreal's texture streaming pool (profile ue_texture_pool)
+__attribute__((weak)) void dm_ue_dynres_tick(void) {}   // android/ue_dynres_android.c: Unreal's dynamic-resolution frame-time budget (DM_UE_DYNRES_BUDGET)
 __attribute__((weak)) int dm_movie_playing(void) { return 0; }   // hle_movie.c: a movie's pictures are being handed out; graphics unit tests have no movie decoder
 // Thermal cap (iOS): while the device is thermally serious or worse (NSProcessInfo thermalState >= 2) the frame step holds 30 fps, and it goes back to the cap after the device
 // has been fair or better for THERMAL_CALM_NS, so it does not flap. At "serious" iOS caps the GPU clock to about a third: Breath of the Wild's vistas (about 3,000 G-buffer draws)
@@ -2867,6 +2878,7 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++; SEQ("present %d", idx);
     dm_ue_cvar_tick();
+    dm_ue_dynres_tick();
     if (fps_high()) high_cap_tick();
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 4), (uint32_t)dm_movie_playing(), __ATOMIC_RELAXED);   // the stubs' copy of the movie state (hle.h)
     int c = fps_step_cap();
