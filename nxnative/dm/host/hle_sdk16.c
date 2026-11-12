@@ -347,7 +347,9 @@ HLE_FORCE("_ZN2nn4diag6detail7PutImplERKNS0_11LogMetaDataEPKcm", "game log → h
 static void diag_abort(uint32_t res, void *lr) {
     module_t *m = module_of(lr);
     LOG("game called nn::diag abort: Result %#x, call site %s+%#llx", res, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)lr - m->base) : (unsigned long long)(uintptr_t)lr);
-    dm_backtrace((uint64_t)__builtin_frame_address(1));
+    // From the caller's frame on: the first word of this frame's record (x29 → [previous x29, return address]), which is what __builtin_frame_address(1) loads.
+    // Read here, it draws no -Wframe-address warning from the NDK's clang, and dm_backtrace walks the rest of the chain with reads that cannot fault
+    dm_backtrace(*(const uint64_t *)__builtin_frame_address(0));
     die("game aborted");
 }
 HLE_FORCE("_ZN2nn4diag6detail9AbortImplEv", "game aborted", void, h_diag_Abort0, void) { diag_abort(0, __builtin_return_address(0)); }
