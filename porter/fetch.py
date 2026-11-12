@@ -1,6 +1,6 @@
 # Downloading the toolchains a port needs, for a player who has none (`porter tools --download`, the Setup tab's Download button): the Android NDK r27c and
 # platform-tools from Google's SDK repository, the newest .NET SDK 10 from Microsoft's release list. Each archive is checked against the checksum its list gives,
-# then unpacked into the player's nx2android folder (paths.player_tools()), where toolchain.find_* look, and the settings point at it. The tool ships none of them:
+# then unpacked into the player's nup2android folder (paths.player_tools()), where toolchain.find_* look, and the settings point at it. The tool ships none of them:
 # they come from their makers, under their licenses (LICENSES).
 import hashlib, json, os, platform, shutil, stat, sys, tarfile, urllib.request, xml.etree.ElementTree as ET, zipfile
 from dataclasses import dataclass
@@ -34,7 +34,7 @@ class Item:
 
 
 def _get(url, timeout=60):
-    with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'nx2android'}), timeout=timeout) as r: return r.read()
+    with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'nup2android'}), timeout=timeout) as r: return r.read()
 
 
 def _google_os(): return {'win32': 'windows', 'darwin': 'macosx'}.get(sys.platform, 'linux')
@@ -86,13 +86,13 @@ def plan(names=None):
         elif n == '.NET SDK': out.append(_dotnet())
     for it in out:
         if not it.size:
-            with urllib.request.urlopen(urllib.request.Request(it.url, method='HEAD', headers={'User-Agent': 'nx2android'}), timeout=60) as r: it.size = int(r.headers.get('Content-Length') or 0)
+            with urllib.request.urlopen(urllib.request.Request(it.url, method='HEAD', headers={'User-Agent': 'nup2android'}), timeout=60) as r: it.size = int(r.headers.get('Content-Length') or 0)
     return out
 
 
 def _download(it, dest):   # to dest, counting bytes and hashing as it goes; a wrong checksum deletes the file
     h, part = hashlib.new(it.algo), dest.with_suffix(dest.suffix + '.part')
-    with urllib.request.urlopen(urllib.request.Request(it.url, headers={'User-Agent': 'nx2android'}), timeout=120) as r, open(part, 'wb') as f:
+    with urllib.request.urlopen(urllib.request.Request(it.url, headers={'User-Agent': 'nup2android'}), timeout=120) as r, open(part, 'wb') as f:
         total, done = int(r.headers.get('Content-Length') or it.size or 0), 0
         PROG.set(step='downloading', done=0, total=total or None, unit='B')
         while chunk := r.read(1 << 20):

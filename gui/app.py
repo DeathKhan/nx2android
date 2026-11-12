@@ -1,6 +1,6 @@
-# The nx2android desktop app: four tabs over porter.
+# The nup2android desktop app: four tabs over porter.
 #   Port   pick the game folder (porter inspect), options, Port (porter port --progress json): the stage list, the current stage's bar, the log; then open or install the result
-#   Setup  the tools a port needs (porter doctor), downloading the missing ones (porter tools --download), and the saved settings (porter.config): prod.keys, the NDK,
+#   Setup  the tools a port needs (porter doctor), downloading the missing ones (porter tools --download), and the saved settings (porter.config): the NDK,
 #          dotnet, adb, the output folder, the device
 #   Games  the game profiles (porter profiles --all)
 #   Saves  a ported game's save between the device and the PC (porter saves): the save folders on the device, a fresh export to a folder here, an import of a
@@ -55,7 +55,7 @@ class PortTab(QWidget):
         self.porter = Porter(self); self.porter.event.connect(self.on_event); self.porter.finished.connect(self.on_finished)
         v = QVBoxLayout(self)
 
-        self.folder = QLineEdit(); self.folder.setPlaceholderText('the folder with the game\'s NSP / XCI / NSZ / XCZ files (base game, update, DLC)')
+        self.folder = QLineEdit(); self.folder.setPlaceholderText('the folder with the game\'s NUP container (a .nup file: base game, update, DLC)')
         self.folder.editingFinished.connect(self.inspect)
         g = QGroupBox('Game'); gl = QVBoxLayout(g)
         gl.addWidget(path_row(self.folder, self.pick_folder))
@@ -164,7 +164,7 @@ class PortTab(QWidget):
     def on_inspect(self, info, code):
         err = info
         self.info = info = None if info and info.get('error') else info
-        if not info: self.card.setText('<span style="color:#c62828">' + ((err or {}).get('error') or 'No game found in this folder (an NSP, XCI, NSZ or XCZ with a title ID).') + '</span>'); return
+        if not info: self.card.setText('<span style="color:#c62828">' + ((err or {}).get('error') or 'No game found in this folder (a NUP container, a .nup file).') + '</span>'); return
         a = info.get('android') or {}
         st = a.get('status', 'ios only' if info.get('profile') else 'not supported')
         col = STATUS_COLOUR.get(st, '#c62828')
@@ -172,7 +172,6 @@ class PortTab(QWidget):
                 f'<span style="background:{col};color:white;padding:1px 6px">&nbsp;{st}&nbsp;</span>']
         files = [f'base game' ] + [f'update {u["version"]}' for u in info['updates']] + ([f'{len(info["dlc"])} DLC'] if info['dlc'] else [])
         rows.append('In the folder: ' + ', '.join(files) + (f' — packs <b>{info["pack"]}</b>' if info.get('pack') else ''))
-        if info.get('compressed'): rows.append(f'<span style="color:#757575">NSZ / XCZ ({len(info["compressed"])}): decompressed during the port into a temporary folder, deleted once extracted</span>')
         if a.get('tested'): rows.append(f'Tested: {a["tested"]}')
         if info.get('reason'): rows.append(f'<span style="color:{"#ef6c00" if info["supported"] else "#c62828"}">{info["reason"]}</span>')
         self.card.setText('<br>'.join(rows))
@@ -197,9 +196,6 @@ class PortTab(QWidget):
 
     # ---- the port ----
     def start(self):
-        cfg = config.load()
-        if not cfg.get('keys'):
-            QMessageBox.warning(self, 'prod.keys', 'Set the path of your prod.keys on the Setup tab first.'); self.win.tabs.setCurrentIndex(1); return
         args = ['port', self.folder.text().strip(), '--progress', 'json']
         if self.app_name.text().strip(): args += ['--app-name', self.app_name.text().strip()]
         if self.language.currentData(): args += ['--language', self.language.currentData()]
@@ -299,7 +295,7 @@ class PortTab(QWidget):
 
 # ---------------- Setup ----------------
 class SetupTab(QWidget):
-    FIELDS = [('keys', 'prod.keys', 'file'), ('ndk', 'Android NDK folder', 'dir'), ('dotnet', 'dotnet', 'file'), ('adb', 'adb', 'file'),
+    FIELDS = [('ndk', 'Android NDK folder', 'dir'), ('dotnet', 'dotnet', 'file'), ('adb', 'adb', 'file'),
               ('out', 'Default output folder', 'dir'), ('device', 'Device (adb serial)', 'text')]
 
     def __init__(self, win):
@@ -312,8 +308,8 @@ class SetupTab(QWidget):
         hh = self.table.horizontalHeader(); hh.setSectionResizeMode(0, QHeaderView.ResizeToContents); hh.setSectionResizeMode(1, QHeaderView.ResizeToContents); hh.setSectionResizeMode(2, QHeaderView.Stretch)
         gl.addWidget(self.table)
         note = QLabel('A port needs the <b>Android NDK r27c</b>, the <b>.NET SDK 10</b> and, to install from here, Android <b>platform-tools</b>. '
-                      '<b>Download missing tools</b> fetches them from Google and Microsoft (about 1 GB) into your nx2android folder; or install them yourself and set their paths below. '
-                      'Your <b>prod.keys</b> must come from your own Switch. Keys and game files never leave your computer except to your own device.')
+                      '<b>Download missing tools</b> fetches them from Google and Microsoft (about 1 GB) into your nup2android folder; or install them yourself and set their paths below. '
+                      'The game is read from a <b>NUP container</b> of your own game, which holds its files already decrypted: this tool reads no keys and decrypts nothing. Game files never leave your computer except to your own device.')
         note.setWordWrap(True); note.setTextFormat(Qt.RichText); gl.addWidget(note)
         dl = QHBoxLayout(); self.dl_btn = QPushButton('Download missing tools'); self.dl_btn.clicked.connect(self.download)
         self.dl_step = QLabel(''); self.dl_prog = QProgressBar(); self.dl_prog.setRange(0, 1000); self.dl_prog.setVisible(False)
@@ -340,7 +336,7 @@ class SetupTab(QWidget):
         if items is None: QMessageBox.warning(self, 'Download', 'Could not read the download lists from Google and Microsoft. Check the internet connection and try again.'); return
         if not items: QMessageBox.information(self, 'Download', 'Nothing to download: every tool is there.'); return
         rows = ''.join(f'<li><b>{it["name"]}</b> {it["version"]}, {size(it["size"])}, from {it["url"].split("/")[2]} (<a href="{it["license"]}">license</a>)</li>' for it in items)
-        box = QMessageBox(QMessageBox.Question, 'Download missing tools', f'<p>Download and unpack into your nx2android folder:</p><ul>{rows}</ul>'
+        box = QMessageBox(QMessageBox.Question, 'Download missing tools', f'<p>Download and unpack into your nup2android folder:</p><ul>{rows}</ul>'
                           '<p>They come from their makers under their own licenses: downloading them means you accept those.</p>', QMessageBox.Yes | QMessageBox.No, self)
         box.setTextFormat(Qt.RichText)
         if box.exec() != QMessageBox.Yes: return
@@ -508,7 +504,7 @@ class SavesTab(QWidget):
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('nx2android'); self.resize(980, 820)
+        self.setWindowTitle('nup2android'); self.resize(980, 820)
         self.tabs = QTabWidget()
         self.port = PortTab(self); self.setup = SetupTab(self); self.games = GamesTab(); self.saves = SavesTab()
         self.tabs.addTab(self.port, 'Port'); self.tabs.addTab(self.setup, 'Setup'); self.tabs.addTab(self.games, 'Games'); self.tabs.addTab(self.saves, 'Saves')
@@ -521,7 +517,7 @@ class Window(QMainWindow):
 
 
 def main(argv):
-    app = QApplication(argv); app.setApplicationName('nx2android'); app.setStyle('Fusion')
+    app = QApplication(argv); app.setApplicationName('nup2android'); app.setStyle('Fusion')
     app.setWindowIcon(QIcon(str(Path(__file__).parent / 'icon.png')))   # docs/images/icon.svg, rendered by devtools/make_app_icon.py
     w = Window(); w.show()
     return app.exec()

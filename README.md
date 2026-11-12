@@ -1,19 +1,19 @@
 <h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
-    <img alt="nx2android" src="docs/images/logo.svg" height="140">
+    <img alt="nup2android" src="docs/images/logo.svg" height="140">
   </picture>
 </h1>
 
-Port your own Nintendo Switch games to Android, natively: the game's own arm64 code runs on the device, with the Switch's system services stood in for by a host and NVN graphics replayed on Vulkan. Pick the game's folder, click **Port**, and get an APK plus the game's data, installed on your device if you like. Bring your own game files and keys; nothing from any game is in this repository.
+Port your own Nintendo Switch games to Android, natively: the game's own arm64 code runs on the device, with the Switch's system services stood in for by a host and NVN graphics replayed on Vulkan. Pick the game's folder, click **Port**, and get an APK plus the game's data, installed on your device if you like. Bring your own game as a NUP container (game files that are already plain); the tool holds no keys and decrypts nothing, and nothing from any game is in this repository.
 
 This is the Android port of [nxnative](https://github.com/seedds/nxnative), which does the same on iPhone and iPad. Supported games: [Games](#games).
 
 ## This fork: Nintendo Switch 2 games
 
-This fork adds Nintendo Switch 2 games to the porter, tuned on an AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver). It also keeps the vendored nxnative trued up with upstream: nx2android's and nxnative's commits are taken one by one onto the fork's own work, with nxnative's Metal fixes ported to the Vulkan backend where they apply.
+nup2android is a fork of [nx2android](https://github.com/shirai91/nx2android) that reads games only as NUP containers ([Game files](#game-files)). It adds Nintendo Switch 2 games to the porter, tuned on an AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver). It also keeps the vendored nxnative trued up with upstream: nx2android's and nxnative's commits are taken one by one onto the fork's own work, with nxnative's Metal fixes ported to the Vulkan backend where they apply.
 
-**Download:** the porter with the Switch 2 support for Windows, macOS and Linux, from this fork's [Releases](https://github.com/DeathKhan/nx2android/releases) (`switch2-v1.0` and later).
+**Download:** the porter with the Switch 2 support for Windows, macOS and Linux, from this fork's [Releases](https://github.com/DeathKhan/nup2android/releases) (`switch2-v1.0` and later).
 
 Screenshots from the Odin 3 (the game's own picture, overlay off); frame rates as measured there.
 
@@ -69,15 +69,15 @@ These games play on Android. Tested on a Lenovo Legion Y700 (Snapdragon 8 Elite,
 | ![Unpacking](docs/images/unpacking.jpg)<br>Unpacking<br><sub>`v0.1.2` · update 2.01 · 60 fps · played by touch</sub> | ![Untitled Goose Game](docs/images/untitled-goose-game.jpg)<br>Untitled Goose Game<br><sub>`v0.4.0` · update 1.1.2 · 60 fps</sub> |
 | ![Viractal: Will You Trust Your Party?](docs/images/viractal.jpg)<br>Viractal: Will You Trust Your Party?<br><sub>`v0.1.0` · update 1.4.5</sub> | ![Xenoblade Chronicles 3](docs/images/xenoblade-chronicles-3.jpg)<br>Xenoblade Chronicles 3<br><sub>`v0.1.0` · update 2.2.0 · 30 fps · **work in progress**: some effects and models don't draw yet</sub> |
 
-The tag (`v0.1.3`) is the latest nx2android version the game was tested on. Older games are not tested again for each release: if a later version breaks one, a patch release fixes it. A tag newer than the [latest release](https://github.com/shirai91/nx2android/releases/latest) is the next release, and the game needs the development checkout until it ships.
+The tag (`v0.1.3`) is the latest upstream nx2android version the game was tested on. Older games are not tested again for each release: if a later version breaks one, a patch release fixes it. A tag newer than the [latest release](https://github.com/shirai91/nx2android/releases/latest) is the next release, and the game needs the development checkout until it ships.
 
 A game that is not in this table is not supported yet. The games we look at next, and the ones done: [docs/PORT_CHECKLIST.md](docs/PORT_CHECKLIST.md).
 
 ## For players: port a game without programming
 
-1. Download `nx2android-<version>-windows-x64.zip` (Windows), `nx2android-<version>-macos-arm64.zip` (Mac with Apple silicon), `nx2android-<version>-linux-x64.zip` (Linux on a PC) or `nx2android-<version>-linux-arm64.zip` (Linux on ARM) from [Releases](https://github.com/shirai91/nx2android/releases/latest), unzip it and start **nx2android** (on a Mac, see [packaging/INSTALL.md](packaging/INSTALL.md#1-start-the-app) first).
-2. **Setup** tab: click **Download missing tools** (the Android NDK, the .NET SDK and platform-tools, about 1 GB, from Google and Microsoft), then set your **prod.keys**. Every line turns green.
-3. **Port** tab: choose the folder with the game's NSP, XCI, NSZ or XCZ files (base game, update, DLC) and click **Port**.
+1. Download `nup2android-<version>-windows-x64.zip` (Windows), `nup2android-<version>-macos-arm64.zip` (Mac with Apple silicon), `nup2android-<version>-linux-x64.zip` (Linux on a PC) or `nup2android-<version>-linux-arm64.zip` (Linux on ARM) from [Releases](https://github.com/DeathKhan/nup2android/releases), unzip it and start **nup2android** (on a Mac, see [packaging/INSTALL.md](packaging/INSTALL.md#1-start-the-app) first).
+2. **Setup** tab: click **Download missing tools** (the Android NDK, the .NET SDK and platform-tools, about 1 GB, from Google and Microsoft). Every line turns green.
+3. **Port** tab: choose the folder with the game's NUP container (one `.nup` file holding the base game, update and DLC) and click **Port**.
 4. Tick **Install on the device when done** with the device plugged in and USB debugging on, or copy the APK and the data folder yourself.
 
 Pokémon Legends: Arceus and Pokémon Legends: Z-A need the device during the port, even without **Install on the device when done**: their shaders are in Oodle-compressed archives, which the port decodes with the game's own decoder on the device. Have platform-tools (adb) from step 2, and plug in the device with USB debugging on before you click **Port**.
@@ -86,7 +86,7 @@ A game played by touch: tick **Touch game** on the Port tab (`--touch`). The on-
 
 Chinese or Korean text drawn as `???`: choose a TrueType font with those characters as **System font** on the Port tab (`--shared-font`, a single `.ttf`, not a `.ttc`). It goes in the data pack; the tool ships none. The tool's own text entry panel shows those characters in its title and the game's initial text, but its keyboard types only ASCII.
 
-A game that reads system data from the console's firmware (`sysdata` in its profile; Mario Kart 8 Deluxe builds its Mii heads from MiiModel, title 0100000000000802) needs your console's own system content files, which the tool cannot ship. Copy them (`.nca`, for example NAND SYSTEM `Contents/registered` in DBI's MTP mode) to a folder on the PC and give it with `--firmware <folder>` (or `porter config firmware <folder>` once). Without it the host's empty stand-in is used.
+A game that reads system data from the console's firmware (`sysdata` in its profile; Mario Kart 8 Deluxe builds its Mii heads from MiiModel, title 0100000000000802) needs that system data from your own console, which the tool cannot ship and does not decrypt. Put the already-extracted files of each title in a folder named by its title ID (`<folder>/0100000000000802/...`) and give the folder with `--sysdata <folder>` (or `porter config sysdata <folder>` once). Without it the host's empty stand-in is used.
 
 A game slowed by its draw calls in busy scenes: tick **Multithread replay** on the Port tab (`--mt-replay`). The game's Vulkan commands are then recorded on a thread of their own. It stays on until you port the game again without it.
 
@@ -104,7 +104,7 @@ Already have the game on the device for an emulator? The app can read the game's
 
 A game that crashes with "AllocateAddressRegion … refused (0x1803)" in its log needs more address space: port it again with a larger **Extra address space** on the Port tab (`--alias-headroom` on the command line). [packaging/INSTALL.md](packaging/INSTALL.md#when-something-goes-wrong) says more.
 
-The step-by-step guide is [packaging/INSTALL.md](packaging/INSTALL.md). You need your own game files and `prod.keys`, dumped from your own Switch; the tool never ships or downloads either. NSZ and XCZ files are decompressed during the port (into the build folder's `tmp/`, deleted once extracted).
+The step-by-step guide is [packaging/INSTALL.md](packaging/INSTALL.md). You need your own game as a NUP container, made from your own Switch's games; the tool never ships or downloads game files, and it reads no keys.
 
 ## Saves
 
@@ -116,11 +116,11 @@ An import replaces the save the game has; the app exports that one first on the 
 
 Running from the repository, the command line, the repository layout, building the bundle, tests and commit messages: [docs/DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md). How it is put together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Keys and game files
+## Game files
 
-nx2android decrypts your game files with your `prod.keys` while it ports them, as Switch emulators do. This repository and its releases contain no keys, no game files and nothing extracted from them, and the tool never downloads either. Dump both from your own Switch, and don't share them or the APKs and data packs built from them.
+This tool reads one format only: the NUP container, whose game files are already plain. It has no key handling and no decryption code, and it cannot read NSP, XCI, NSZ or XCZ packages. This repository and its releases contain no keys, no game files and nothing extracted from them, and the tool never downloads either. Make the NUP from your own games, and don't share it or the APKs and data packs built from it.
 
-Nintendo's takedown notices so far have gone to whoever hosts a project (13 Switch emulator repositories on GitHub in February 2026), not to players. Whether decrypting your own games for your own use is allowed depends on where you live.
+Nintendo's takedown notices so far have gone to whoever hosts a project (13 Switch emulator repositories on GitHub in February 2026), not to players. Whether making a NUP from your own games for your own use is allowed depends on where you live.
 
 ## License
 

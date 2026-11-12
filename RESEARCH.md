@@ -1,5 +1,7 @@
 # Can NX2Apple's approach bring Switch games to Android?
 
+> **Note (2026-11-11):** these are the original research notes. This fork has since removed the `nx_extract` / LibHac step and every use of keys described below: it reads a game only as a NUP container, whose files are already plain.
+
 *Research notes, 2026-10-24. Based on a read of [LNPANDY/NX2Apple](https://github.com/LNPANDY/NX2Apple) @ `6da7b16` (upstream [seedds/nxnative](https://github.com/seedds/nxnative) @ `ebe75c9`) plus web research. Nothing was built or run on a device.*
 
 ## TL;DR

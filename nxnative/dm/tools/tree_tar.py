@@ -9,7 +9,7 @@
 # unpack takes a lock on the parent folder that pack releases: regress.py's chain builds share a game's compile cache with the NSP script, and neither may pack it under the other.
 import os, shutil, subprocess, time
 try: import fcntl
-except ImportError: fcntl = None   # Windows (the nx2android porter imports the NSP script there): no lock, as on a drive without flock; Xcode never runs there
+except ImportError: fcntl = None   # Windows (the nup2android porter imports the NSP script there): no lock, as on a drive without flock; Xcode never runs there
 from pathlib import Path
 
 QUIET_DAYS, QUIET_MIN_FILES, QUIET_FREE = 14, 100, 20 * 2**30   # pack_quiet

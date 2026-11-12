@@ -222,12 +222,12 @@ class Survey(Base):
     def test_a_nup_without_a_profile_is_surveyed(self):   # it used to stop: the survey that makes a provisional profile read NSPs only
         write_nup(self.path, [(1, NEW, VER, version(tid=NEW), META)], update_flags=pack_nup.STANDALONE)
         seen = {}
-        def survey(nsp_dir, app, fam, keys, repo, py, env):
+        def survey(nsp_dir, app, fam, repo, py, env):
             seen.update(app=app, nup=fam['nup'], base=fam['base']); raise Stop()
-        with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), mock.patch.object(nsp, 'PROD_KEYS', ''), \
+        with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), \
              mock.patch.object(nsp, 'survey', side_effect=survey), mock.patch.object(nsp, 'check_capstone'), mock.patch.object(nsp.shutil, 'which', return_value='/usr/bin/dotnet'), \
-             mock.patch.object(nsp, 'say'), mock.patch.object(nsp, 'build_nx_extract', side_effect=AssertionError('built nx_extract')), \
-             mock.patch.object(nsp, 'ask', side_effect=AssertionError('asked for something')), mock.patch.object(nsp, 'package_reader', side_effect=AssertionError('read a package')):
+             mock.patch.object(nsp, 'say'), \
+             mock.patch.object(nsp, 'ask', side_effect=AssertionError('asked for something')):
             with self.assertRaises(Stop): nsp.main(nsp.parse_args([str(self.path), '--survey-only']))
         self.assertEqual(seen['app'], NEW)
         self.assertIsNone(seen['base'])
@@ -238,9 +238,8 @@ class Survey(Base):
         app, fam = nsp.scan_nup(self.path); self.addCleanup(fam['nup'].close)
         seen, prof = [], mock.Mock(id='P', builds=lambda: {'v0': {'main': 'ab' * 16}})
         games = mock.Mock(by_build=lambda bid: seen.append(bid) or (prof if bid == 'ab' * 16 else None))
-        with mock.patch.dict(sys.modules, {'game': games}), mock.patch.object(nsp, 'PROG', mock.Mock()), \
-             mock.patch.object(nsp, 'build_nx_extract', side_effect=AssertionError('built nx_extract')):
-            self.assertEqual(nsp.same_build(self.dir, app, fam, None, REPO, {}), (prof, 'v0', 'ab' * 16))
+        with mock.patch.dict(sys.modules, {'game': games}), mock.patch.object(nsp, 'PROG', mock.Mock()):
+            self.assertEqual(nsp.same_build(self.dir, app, fam), (prof, 'v0', 'ab' * 16))
         self.assertEqual(seen, ['cd' * 16, 'ab' * 16])
 
 
@@ -505,22 +504,6 @@ class Pack(Base):
         self.assertEqual(sorted(p.name for p in aoc.iterdir()), ['1.img', '1.img.inputs.json'])
         self.assertIn('dlcfile', romfs_image.read_index(aoc / '1.img'))
 
-    def test_nsp_dlc_not_reused_after_nup(self):   # the NUP packs into the aoc/ the NSP extraction keyed: the same NSPs again extract again
-        n = self.open(); app, _, _, dlc = pack_nup.scan(n)
-        work, logs, p = self.out(), self.out() / 'logs', self.dir / 'dlc.nsp'
-        logs.mkdir(parents=True); p.write_bytes(b'nsp')
-        runs = []
-        def extract(argv, log, **kw): runs.append(argv); Path(argv[4]).parent.mkdir(parents=True, exist_ok=True); Path(argv[4]).write_bytes(b'from the NSP')
-        nsp_fam, nup_fam = {'dlc': [(TID + 0x1001, 0, p)]}, {'dlc': [(t, None, k) for t, k in dlc.items()], 'nup': n}
-        with mock.patch.object(nsp, 'run', side_effect=extract):
-            for fam in (nsp_fam, nsp_fam, nup_fam): aoc = nsp.extract_aoc('nx', 'keys', REPO, work, app, fam, logs)
-            self.assertEqual(len(runs), 1)   # reused while the NSPs and aoc/ are unchanged
-            self.assertIn('dlcfile', romfs_image.read_index(aoc / '1.img'))
-            nsp.extract_aoc('nx', 'keys', REPO, work, app, nsp_fam, logs)
-        self.assertEqual(len(runs), 2)
-        self.assertEqual(sorted(f.name for f in aoc.iterdir()), ['1.img'])
-        self.assertEqual((aoc / '1.img').read_bytes(), b'from the NSP')
-
 
 class Stop(Exception): pass
 
@@ -549,10 +532,10 @@ class Main(Base):
         def stop(env, *a):
             seen.update(env)
             if not extract: raise Stop()
-        with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), mock.patch.object(nsp, 'PROD_KEYS', ''), \
+        with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), \
              mock.patch.object(nsp, 'check_prereqs', side_effect=stop), mock.patch.object(nsp, 'say', side_effect=said.append), \
              mock.patch.object(nsp, 'check_versions_aarch64', side_effect=Stop), \
-             mock.patch.object(nsp, 'ask', side_effect=AssertionError('asked for something')), mock.patch.object(nsp, 'package_reader', side_effect=AssertionError('read a package')):
+             mock.patch.object(nsp, 'ask', side_effect=AssertionError('asked for something')):
             with self.assertRaises(Stop): nsp.main(nsp.parse_args([str(target)] + (['--package', package] if package else [])))
         return Path(seen['DM_ROOT']), said
 
@@ -594,7 +577,7 @@ class Main(Base):
             with self.subTest(flags=flags, package=package):
                 write_nup(self.path, packages, update_flags=flags)
                 argv = [str(self.path)] + (['--package', package] if package else [])
-                with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), mock.patch.object(nsp, 'PROD_KEYS', ''), \
+                with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), \
                      mock.patch.object(nsp, 'check_prereqs'), mock.patch.object(nsp, 'say'), mock.patch.object(nsp.PROG, 'say') as red:
                     self.assertEqual(nsp.cli(argv), 1)
                 self.assertRegex(red.call_args.args[0], r'^\[RED\] .*no romfs/')

@@ -13,7 +13,7 @@
 #   extract/v<version>/ExeFS/   the newest version's code modules (APFS clones, or copies on another volume)
 #   extract/v<version>/RomFS.img   its RomFS as one image (dm/tools/romfs_image.py: the host's DM_ROMFS, the IPA's romfs.img)
 #   aoc/<index>.img   each DLC's RomFS (index = DLC title ID − base title ID − 0x1000), the host's DM_AOC_DIR
-# A dump has no control data, so there is no control.nacp or icon.jpg beside them, as there is after nx_extract.
+# A dump has no control data, so there is no control.nacp or icon.jpg beside them, as there is in a NUP container.
 # The title ID is the program ID in main.npdm. A repeat run keeps code modules that are the same and an image whose source tree, packer and image are unchanged (romfs_image.py --reuse).
 # Usage: pack_dump.py <dump folder> [--version N] [--work-dir DIR]   (exit 1 on error)
 import argparse, filecmp, shutil, struct, subprocess, sys

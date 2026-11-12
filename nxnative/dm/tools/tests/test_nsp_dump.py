@@ -147,9 +147,9 @@ class Main(Base):
         args = nsp.parse_args([str(self.dump), *opts])
         seen, said = {}, []
         def stop(env, *a): seen.update(env); raise Stop()
-        with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), mock.patch.object(nsp, 'PROD_KEYS', ''), \
+        with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), \
              mock.patch.object(nsp, 'check_prereqs', side_effect=stop), mock.patch.object(nsp, 'say', side_effect=said.append), \
-             mock.patch.object(nsp, 'ask', side_effect=AssertionError('asked for something')), mock.patch.object(nsp, 'package_reader', side_effect=AssertionError('read a package')):
+             mock.patch.object(nsp, 'ask', side_effect=AssertionError('asked for something')):
             with self.assertRaises(Stop): nsp.main(args)
         return Path(seen['DM_ROOT']), said
 
@@ -171,9 +171,9 @@ class Main(Base):
             nsp.main(nsp.parse_args([str(self.dump), '--title-id', '0100000000010000']))
 
     def surveyed(self, d):   # the real survey on a dump with no profile: this NPDM is a 32-bit program's, which stops it right after the code modules and the manifest
-        with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), mock.patch.object(nsp, 'PROD_KEYS', ''), \
+        with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), \
              mock.patch.object(nsp, 'check_capstone'), mock.patch.object(nsp.shutil, 'which', return_value='/usr/bin/dotnet'), mock.patch.object(nsp, 'say'), \
-             mock.patch.object(nsp, 'build_nx_extract', side_effect=AssertionError('built nx_extract')), mock.patch.object(nsp, 'ask', side_effect=AssertionError('asked for something')), \
+             mock.patch.object(nsp, 'ask', side_effect=AssertionError('asked for something')), \
              self.assertRaisesRegex(nsp.BuildError, rf'{d.name} \(0400000000000000\) is a 32-bit'):
             nsp.main(nsp.parse_args([str(d)]))
         self.assertTrue((d / '0400000000000000_survey/extract/ExeFS/main').is_file())
@@ -212,11 +212,11 @@ class Survey(Base):
         app, fam = nsp.scan_dump(d)
         seen, prof = [], mock.Mock(id='P', builds=lambda: {'v0': {'main': 'ab' * 16}})
         games = mock.Mock(by_build=lambda bid: seen.append(bid) or (prof if bid == 'ab' * 16 else None))
-        with mock.patch.dict(sys.modules, {'game': games}), mock.patch.object(nsp, 'PROG', mock.Mock()), mock.patch.object(nsp, 'build_nx_extract', side_effect=AssertionError('built nx_extract')):
-            self.assertEqual(nsp.same_build(d, app, fam, None, REPO, {}), (prof, 'v0', 'ab' * 16))
+        with mock.patch.dict(sys.modules, {'game': games}), mock.patch.object(nsp, 'PROG', mock.Mock()):
+            self.assertEqual(nsp.same_build(d, app, fam), (prof, 'v0', 'ab' * 16))
             self.assertEqual(seen, ['cd' * 16, 'ab' * 16])
             shutil.rmtree(d / f'updates/{VER}/exefs'); seen.clear()
-            self.assertEqual(nsp.same_build(d, app, fam, None, REPO, {}), (prof, 'v0', 'ab' * 16))
+            self.assertEqual(nsp.same_build(d, app, fam), (prof, 'v0', 'ab' * 16))
             self.assertEqual(seen, ['ab' * 16])
 
 

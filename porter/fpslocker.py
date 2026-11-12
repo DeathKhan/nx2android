@@ -26,7 +26,7 @@ def url(title_id, build_id): return RAW.format(tid=title_id.upper(), bid=build_i
 def fetch(title_id, build_id, timeout=30):
     """The config of this build as text, None when the warehouse has none (HTTP 404). Other errors (no network) raise OSError"""
     try:
-        with urllib.request.urlopen(urllib.request.Request(url(title_id, build_id), headers={'User-Agent': 'nx2android'}), timeout=timeout) as r: return r.read().decode('utf-8-sig')
+        with urllib.request.urlopen(urllib.request.Request(url(title_id, build_id), headers={'User-Agent': 'nup2android'}), timeout=timeout) as r: return r.read().decode('utf-8-sig')
     except urllib.error.HTTPError as e:
         if e.code == 404: return None
         raise
@@ -141,7 +141,7 @@ def convert(text, image, build_id, source=''):
         old = image[off:off + len(new)]
         if old != new: cuts.append((off, old.hex(), new.hex(), f'FPSLocker-Warehouse {what}'))
     if not rows and not cuts: raise Refused('it writes nothing the host would apply')
-    head = [f'# Written by nx2android\'s porter from the FPSLocker-Warehouse config {source} (masagrator and contributors); read by hle_fpslock.c (DM_FPS_LOCKS)',
+    head = [f'# Written by nup2android\'s porter from the FPSLocker-Warehouse config {source} (masagrator and contributors); read by hle_fpslock.c (DM_FPS_LOCKS)',
             '# entry <TAB> value type <TAB> main offsets (all but the last name a pointer) <TAB> values at 30 fps <TAB> at 60 fps <TAB> compare (type, offsets, operator, value; - = always)',
             f'build\t{build_id}']
     return '\n'.join(head + rows) + '\n', cuts
@@ -149,4 +149,4 @@ def convert(text, image, build_id, source=''):
 
 def patches_py(build_id, cuts, source=''):   # the CUTS as a patches file for patch_nso.py (DM_PATCHES_EXTRA)
     body = ''.join(f'    ({o:#x}, {a!r}, {b!r}, {w!r}),\n' for o, a, b, w in cuts)
-    return f'# Written by nx2android\'s porter from the FPSLocker-Warehouse config {source}: its MASTER_WRITE bytes (porter/fpslocker.py)\nCUTS = {{{build_id!r}: [\n{body}]}}\n'
+    return f'# Written by nup2android\'s porter from the FPSLocker-Warehouse config {source}: its MASTER_WRITE bytes (porter/fpslocker.py)\nCUTS = {{{build_id!r}: [\n{body}]}}\n'

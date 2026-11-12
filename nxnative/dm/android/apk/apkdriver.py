@@ -10,7 +10,7 @@ import argparse, json, os, sys, zipfile
 from apksign import build_zip, sign_v2
 
 ABI = 'lib/arm64-v8a/'
-OWN = {'libdmhost.so', 'libadrenotools.so', 'libhook_impl.so', 'libmain_hook.so', 'libfile_redirect_hook.so', 'libgsl_alloc_hook.so'}   # nx2android's own libraries; any other is the driver
+OWN = {'libdmhost.so', 'libadrenotools.so', 'libhook_impl.so', 'libmain_hook.so', 'libfile_redirect_hook.so', 'libgsl_alloc_hook.so'}   # nup2android's own libraries; any other is the driver
 NEEDS = {'libadrenotools.so', 'libhook_impl.so', 'libmain_hook.so', 'libfile_redirect_hook.so', 'libgsl_alloc_hook.so'}   # what loads a driver (porter/pipeline.py ADRENOTOOLS_LIBS)
 
 
@@ -29,7 +29,7 @@ def rebuild(src, driver=KEEP, host=None, assets=None):
     z = zipfile.ZipFile(src)
     if any(i.compress_type != zipfile.ZIP_STORED for i in z.infolist()): raise SystemExit(f'{src}: not an APK made by mkapk.py (a compressed entry)')
     libs = {os.path.basename(i.filename) for i in z.infolist() if i.filename.startswith(ABI)}
-    if 'libdmhost.so' not in libs: raise SystemExit(f'{src}: not an nx2android port (no {ABI}libdmhost.so)')
+    if 'libdmhost.so' not in libs: raise SystemExit(f'{src}: not an nup2android port (no {ABI}libdmhost.so)')
     if driver not in (KEEP, None) and not NEEDS <= libs:
         raise SystemExit(f'{src} has no libadrenotools (it was ported without --vulkan-driver): port the game again with --vulkan-driver once; later driver changes need no game files')
     assets = dict(assets or {}); entries, dropped, kept = [], [], ''
@@ -47,7 +47,7 @@ def rebuild(src, driver=KEEP, host=None, assets=None):
     added = ''
     if driver:
         added = lib_name(driver)
-        if added in OWN: raise SystemExit(f'{driver}: named like one of nx2android\'s own libraries')
+        if added in OWN: raise SystemExit(f'{driver}: named like one of nup2android\'s own libraries')
         at = next(n for n, (e, _, _) in enumerate(entries) if e == ABI + 'libdmhost.so') + 1
         entries.insert(at, (ABI + added, open(driver, 'rb').read(), 16384))
     return entries, dropped, added

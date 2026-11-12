@@ -1,4 +1,4 @@
-# The port: a game folder (NSP / XCI, or NSZ / XCZ: porter.dumps) + prod.keys + the game's profile → <App>.apk and <App>-data/ (docs/ARCHITECTURE.md "The port").
+# The port: a game as one NUP container (already decrypted files: no keys are read and nothing is decrypted) + the game's profile → <App>.apk and <App>-data/ (docs/ARCHITECTURE.md "The port").
 # The steps every platform shares are upstream's (porter.upstream.nsp: scan, extraction, the shader split, stage reuse, progress); the Android ones are here:
 # the rewrite for DM_TARGET=android, the Vulkan shader bundle, the host built with the player's NDK, the APK, the data pack and the install.
 # Work files go where upstream's NSP script puts them, <game folder>/<title ID>_build/ (extract/, aoc/, shader/, logs/ are shared with an iOS build of the same folder),
@@ -7,7 +7,7 @@ import hashlib, importlib.util, json, os, re, shutil, sys, traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from porter import config, datapack, dumps, fpslocker, install, paths, profiles, product_cache, toolchain
+from porter import config, datapack, fpslocker, install, paths, profiles, product_cache, toolchain
 from porter.adb import NO_ADB, Adb, AdbError
 from porter.paths import DM, NXNATIVE
 from porter.upstream import BuildError, PROG, android_profile, game, nacp, nsp, profile_guess, say, trinity, uepak
@@ -27,8 +27,7 @@ LETTER_FONTS = [f'{os.environ.get("WINDIR", "C:/Windows")}/Fonts/{f}' for f in (
 
 @dataclass
 class Options:
-    folder: Path                       # the game's folder: the base game, its updates and DLC
-    keys: Path = None                  # prod.keys
+    folder: Path                       # the game's NUP container (a .nup file: the base game, its updates and DLC), or the folder holding it
     out: Path = None                   # where the APK and the data pack go (default: the game folder)
     version: str = ''                  # v<N> to pack (default: the newest in the folder)
     language: str = ''                 # a code or a name (default: English)
@@ -42,7 +41,7 @@ class Options:
     fps60: bool = False                # 60 fps: the profile's own frame-rate cap, else the build's FPSLocker-Warehouse config (porter/fpslocker.py)
     vulkan_driver: Path = None         # an arm64 Vulkan driver (Mesa's Turnip) packed in the APK and used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c)
     shared_font: Path = None           # a TrueType font packed as the system's shared fonts, instead of the device's Roboto (DM_SHARED_FONT, dm/host/hle_sdk16.c)
-    firmware: Path = None              # the player's system content files (.nca), for the profile's sysdata titles (extract_sysdata; DM_SYSDATA, dm/host/hle_fs.c)
+    sysdata: Path = None               # a folder of the player's system data titles as plain files, <title ID>/..., for the profile's sysdata titles (copy_sysdata; DM_SYSDATA, dm/host/hle_fs.c)
     mt_replay: bool = False            # multithread replay: DM_VK_MT_REPLAY=1 in env.txt (dm/android/gfx_vk_dq.c), after the profile's env rows
     touch: bool = False                # a game played by touch: the on-screen gamepad starts hidden (TOUCH_SETTINGS), so it takes none of the game's touches
     native_keyboard: bool = False      # optional Unicode Android IME (requires SDK/JDK)
@@ -145,22 +144,21 @@ def lost_patches(builds, exefs, mods, table=None):
     return out
 
 
-def scan(folder, keys, env=None, want=None):
-    """The folder's packages grouped by game, as upstream's build_ipa_from_nsp does since its package_reader: every title ID and version comes from the packages' content metas
-    (nx_extract --contents), never from a file name. env must put dotnet on PATH (the Porter's env does; inspect builds one)"""
-    nup = nsp.nup_file(Path(folder))   # a Switch 2 game (or any game) as one NUP container: its packages are read in place, no keys
+def scan(folder, want=None):
+    """The game of a NUP container (the file, or the folder holding it): its packages are read in place. Nothing else is read: encrypted packages (NSP / XCI / NSZ / XCZ)
+    are refused by name, as this tool has no key handling and no decryption"""
+    folder = Path(folder)
+    nup = nsp.nup_file(folder)
     if nup: return nsp.scan_nup(nup, want)
-    if env is None:
-        dotnet = toolchain.find_dotnet(config.load())
-        if not dotnet: raise BuildError('reading the packages needs the .NET SDK: `porter tools --download`')
-        env = dict(os.environ, PATH=os.pathsep.join([str(Path(dotnet).parent), os.environ.get('PATH', '')]), DOTNET_ROOT=str(toolchain.dotnet_root(Path(dotnet))), DOTNET_CLI_TELEMETRY_OPTOUT='1')
-    with nsp.package_reader(NXNATIVE, keys, env) as packages:
-        return nsp.scan_nsps(Path(folder), packages.contents, want)
+    enc = nsp.files_with_suffix(folder, *nsp.PACKAGE_SUFFIXES) if folder.is_dir() else [folder]
+    raise BuildError((f'{enc[0].name}: encrypted packages (NSP / XCI / NSZ / XCZ) are not supported' if enc else f'no NUP container (a .nup file) in {folder}')
+                     + ': nup2android ports a game from one NUP container, which holds its files already decrypted')
+
 
 def unpack_romfs_image(d):
     """nxnative's extraction writes the RomFS as one image (RomFS.img, dm/tools/romfs_image.py: header, the files' bytes, then the index), which its hosts mount in place
     (hle_fs.c). The Android pack, porter install and the device decode of Oodle archives read a RomFS folder (datapack.py, front_android.c DM_ROMFS = files/RomFS), so the image is
-    unpacked into RomFS/ beside the modules and removed; a later run finds the folder (the extract stage's fresh test) and skips nx_extract.
+    unpacked into RomFS/ beside the modules and removed; a later run finds the folder (the extract stage's fresh test) and skips the extraction.
     TODO(upsync): ship the image itself, as iOS does: hle_fs.c mounts a file named by DM_ROMFS, and one 6 GB file pushes faster through the adb shim than 18,000 small ones"""
     import romfs_image
     img, out, tmp = d / 'RomFS.img', d / 'RomFS', d / 'RomFS.unpack'
@@ -184,15 +182,13 @@ def unpack_romfs_image(d):
     PROG.end(f'{len(files):,} files')
 
 
-def inspect(folder, keys=None):
-    """What a game folder holds, without extracting anything: the GUI's game card and `porter inspect`. keys: prod.keys (default: the configured one), which reads the title ID
-    of a dump with neither a ticket nor a [title ID] tag (an untagged cartridge dump) from its NCA headers"""
-    app, fam = scan(folder, keys or config.load().get('keys'))
+def inspect(folder):
+    """What a game's NUP holds, without extracting anything: the GUI's game card and `porter inspect`"""
+    app, fam = scan(folder)
     g, ap = profiles.by_title(app)
-    files = [fam['base'], *(p for _, p in fam['updates']), *(p for _, _, p in fam['dlc'])]
     info = dict(title_id=f'{app:016X}', base=fam['base'].name if fam['base'] is not None else None, nup=fam['nup'].path.name if fam.get('nup') else None, updates=[{'version': f'v{v}' if v is not None else None, 'file': p.name} for v, p in fam['updates']],
                 dlc=[{'title_id': f'{t:016X}', 'file': p.name} for t, _, p in fam['dlc']], profile=None, android=None, versions=[], pack=None, supported=False, reason='',
-                compressed=[p.name for p in files if not fam.get('nup') and dumps.compressed(p)])   # NSZ / XCZ (a NUP's packages are records, not files): decompressed during the port into the build folder's tmp/, deleted once extracted
+                compressed=[])
     info['experimental'] = not (g and ap)   # a port can still be tried: porter port --experimental
     if not g:
         info['reason'] = f'no game profile for {app:016X}: this game is not supported yet (an experimental port surveys it and guesses a profile; it may not start)'
@@ -249,7 +245,6 @@ class Port:
         self.o = opts
         self.cfg = config.load()
         self.result = {}
-        self.unpacked = {}   # NSZ / XCZ → its NSP in <build folder>/tmp/dumps/, while the port needs it
 
     # ---- the whole port ----
     def run(self):
@@ -269,7 +264,7 @@ class Port:
         o = self.o
         o.folder = Path(o.folder).expanduser().resolve()
         if not (o.folder.is_dir() or (o.folder.is_file() and o.folder.suffix.lower() == '.nup')): raise BuildError(f'not a folder or a NUP file: {o.folder}')
-        self.nup = nsp.nup_file(o.folder)   # the game as a NUP container (scripts/pack_nup.py): read in place, so no prod.keys and no nx_extract
+        self.nup = nsp.nup_file(o.folder)   # the game as a NUP container (scripts/pack_nup.py): read in place
         version_code('v0', o.vercode_offset); alias_headroom_gb(o.alias_headroom)   # an offset or headroom out of range fails now, not after the shaders
         if o.vulkan_driver:
             o.vulkan_driver = Path(o.vulkan_driver).expanduser().resolve()
@@ -277,26 +272,21 @@ class Port:
         if o.shared_font:
             o.shared_font = Path(o.shared_font).expanduser().resolve()
             if not o.shared_font.is_file() or o.shared_font.suffix.lower() != '.ttf': raise BuildError(f'--shared-font: not a .ttf font: {o.shared_font}')
-        if fw := o.firmware or self.cfg.get('firmware'):
-            o.firmware = Path(fw).expanduser().resolve()
-            if not o.firmware.is_dir(): raise BuildError(f'--firmware: not a folder: {o.firmware}')
-        keys = o.keys or self.cfg.get('keys')
-        if not keys and not self.nup: raise BuildError('no prod.keys: give -k / --keys, or set it once with `porter config keys <path>`')
-        o.keys = Path(keys).expanduser().resolve() if keys else None
-        try: self.tools = toolchain.require(self.cfg, str(o.keys) if o.keys else None, adb=o.install)
+        if sd := o.sysdata or self.cfg.get('sysdata'):
+            o.sysdata = Path(sd).expanduser().resolve()
+            if not o.sysdata.is_dir(): raise BuildError(f'--sysdata: not a folder: {o.sysdata}')
+        try: self.tools = toolchain.require(self.cfg, adb=o.install)
         except toolchain.ToolError as e: raise BuildError(str(e)) from e
         o.out = Path(o.out or self.cfg.get('out') or (o.folder.parent if o.folder.is_file() else o.folder)).expanduser().resolve()   # (a .nup given in place of its folder: beside it)
         # the chosen dotnet first on PATH, in this process too: Windows finds a program by the parent's PATH, not the one passed to the child (upstream runs `dotnet` by name)
         os.environ['PATH'] = os.pathsep.join([str(self.tools['dotnet'].parent), os.environ.get('PATH', '')])
-        os.environ['DOTNET_ROOT'] = str(toolchain.dotnet_root(self.tools['dotnet']))   # where nx_extract.exe's apphost looks for the runtime (else the system's, which may lack .NET 10)
+        os.environ['DOTNET_ROOT'] = str(toolchain.dotnet_root(self.tools['dotnet']))   # where the shader translator's apphost looks for the runtime (else the system's, which may lack .NET 10)
         # PYTHONUTF8: the engine's tools write their tables with open() and no encoding, which is the ANSI code page on Windows (shader_split.py's "→" failed)
         self.env = dict(os.environ, J=str(o.jobs), PYTHONIOENCODING='utf-8', PYTHONUTF8='1', DOTNET_CLI_TELEMETRY_OPTOUT='1')
 
-        try:
-            self.inputs()
-            PROG.plan((0 if self.fam.get('nup') else 1) + len(self.versions) + bool(self.fam['dlc']) + bool(o.firmware and self.ap.sysdata) + bool(o.fps60) + 6 + bool(o.install))   # nx_extract, the versions, the DLC, the system data, 60 fps, rewrite / split / Vulkan shaders / host / APK / data, install (unpack adds its own)
-            self.extract()
-        finally: self.drop_unpacked()   # a failed run leaves no decompressed dumps behind either
+        self.inputs()
+        PROG.plan(len(self.versions) + bool(self.fam['dlc']) + bool(o.sysdata and self.ap.sysdata) + bool(o.fps60) + 6 + bool(o.install))   # the versions, the DLC, the system data, 60 fps, rewrite / split / Vulkan shaders / host / APK / data, install (unpack adds its own)
+        self.extract()
         self.check_graphics()
         self.fps_unlock()
         self.rewrite()
@@ -320,7 +310,7 @@ class Port:
     def inputs(self):
         o = self.o
         say(f'game folder: {o.folder}')
-        self.app, self.fam = scan(o.folder, o.keys, self.env, getattr(o, 'title_id', None))
+        self.app, self.fam = scan(o.folder, getattr(o, 'title_id', None))
         if o.folder.is_file(): o.folder = o.folder.parent   # a .nup given in place of its folder: the build folder and the output go beside it
         if self.fam.get('nup'):
             say(f'a NUP: {self.nup.name}, {len(self.fam["updates"])} update(s), {len(self.fam["dlc"])} DLC')
@@ -359,11 +349,10 @@ class Port:
 
     def check_space(self):
         """Stop before extracting when the game folder's drive cannot hold the port: a build folder takes about 1 to 2 times the game files (NEO 7.0 GB of 6.8,
-        Viractal 2.7 of 1.4), less what an earlier port left there, plus a margin; an NSZ / XCZ counts as decompressed, and once more for its NSP while it is extracted"""
-        files = [f for f in self.o.folder.iterdir() if f.is_file() and f.suffix.lower()[1:] in dumps.EXTS]
-        game, temp = sum(dumps.size(f) for f in files) + (self.nup.stat().st_size if getattr(self, "nup", None) else 0), sum(dumps.size(f) for f in files if dumps.compressed(f))
+        Viractal 2.7 of 1.4), less what an earlier port left there, plus a margin"""
+        game = self.nup.stat().st_size
         built = sum(f.stat().st_size for f in self.work.rglob('*') if f.is_file()) if self.work.is_dir() else 0
-        need, free = max(0, 2 * game + temp - built) + 2**30, shutil.disk_usage(self.o.folder).free
+        need, free = max(0, 2 * game - built) + 2**30, shutil.disk_usage(self.o.folder).free
         if free < need: raise BuildError(f'not enough disk space on {self.o.folder.anchor}: the port needs about {need / 2**30:.1f} GB more, {free / 2**30:.1f} GB is free')
 
     def use_profile_dir(self, pdir, first):   # every tool finds the game's profile in pdir (game.py DM_GAMES_DIR; first: before dm/games)
@@ -381,12 +370,7 @@ class Port:
                 nsp.require_64bit(self.o.folder / f'{tid}_survey/extract/ExeFS', f'{tid}')   # a provisional profile an older porter wrote for a 32-bit game (issue #161)
                 say(f'no game profile for {tid}: reusing the provisional profile from the last run ({d}; delete it to survey again)')
             else:
-                if self.fam.get('nup'): fam = self.fam   # the survey reads the container's packages in place (survey_nup)
-                else:
-                    ups = [p for _, p in sorted(self.fam['updates'], key=lambda u: u[0] or 0)[-1:]]   # the survey reads the base game and the newest update
-                    m = self.unpack([self.fam['base'], *ups])
-                    fam = dict(self.fam, base=m[self.fam['base']], updates=[(v, m.get(p, p)) for v, p in self.fam['updates']])
-                facts = nsp.survey(self.o.folder, self.app, fam, self.o.keys, NXNATIVE, PY, self.env)
+                facts = nsp.survey(self.o.folder, self.app, self.fam, NXNATIVE, PY, self.env)   # the survey reads the container's packages in place (survey_nup)
                 facts['survey'] = f'<NSP folder>/{tid}_survey/survey.md'
                 nsp.write_profile(d, self.app, facts)
             self.provisional = True
@@ -400,38 +384,21 @@ class Port:
         g = game.load(tid)
         return g, android_profile.AndroidProfile(g)
 
-    # ---- extract: nx_extract, each version the shaders come from, the DLC ----
+    # ---- extract: each version the shaders come from, the DLC ----
     def extract(self):
-        o, g = self.o, self.g
+        g = self.g
         picks = nsp.pick_nsps(self.fam, self.have, self.versions)
         ex = self.work / 'extract'; ex.mkdir(parents=True, exist_ok=True)
-        fresh = lambda v: (ex / v / 'ExeFS/main').exists() and (ex / v / 'RomFS' / g.get('romfs_marker')).exists()   # nsp.extract's reuse test, on the unpacked folder
-        if n := self.fam.get('nup'):
-            need = sum(n.tree_bytes(nsp.pack_nup.romfs_of(u or b, b)) for b, u in picks.values()) * 2 / 2**30 + 6   # the image, then its unpacked folder
-            if nsp.free_gb(self.work) < need and not all(fresh(v) for v in self.versions): raise BuildError(f'less than {need:.0f} GB free on the volume of {self.work}')
-            self.dirs = {ver: ex / ver if fresh(ver) else nsp.extract_nup(ex, ver, picks[ver][1] or picks[ver][0], picks[ver][0], self.app, n) for ver in self.versions}
-            for d in self.dirs.values(): unpack_romfs_image(d)
-            self.extract_checked(picks, nx=None, m={}, zdlc=[], dkf=None, dkey=None, dlc_reused=False); return
-        need = sum(dumps.size(p) * (2 if dumps.compressed(p) else 1) for p in {p for b, u in picks.values() for p in (b, u) if p}) / 2**30 + 6
-        if nsp.free_gb(self.work) < need and not all((ex / v).exists() for v in self.versions): raise BuildError(f'less than {need:.0f} GB free on the volume of {self.work}')
-        # NSZ / XCZ: only what a stage will read is decompressed, all in one stage before nx_extract runs (a version nsp.extract reuses reads nothing)
-        zdlc = [p for _, _, p in self.fam['dlc'] if dumps.compressed(p)]
-        # extract_aoc keys its reuse on the names, sizes and times of the NSPs it reads, decompressed ones here: with NSZ / XCZ DLC, porter keys it on those files instead
-        dkey = nsp.fingerprint(sorted((t, p.name, p.stat().st_size, p.stat().st_mtime_ns) for t, _, p in self.fam['dlc']),
-                               ('files', [NXNATIVE / 'dm/tools/nx_extract' / f for f in ('Program.cs', 'nx_extract.csproj')]))
-        dkf = self.work / 'aoc.dumps.key'
-        dlc_reused = bool(zdlc) and (self.work / 'aoc').is_dir() and nsp.reused(dkf, dkey) is not None
-        m = self.unpack([p for v in self.versions if not fresh(v) for p in picks[v] if p] + ([] if dlc_reused else zdlc))
-        picks = {v: tuple(m.get(p, p) if p else None for p in bu) for v, bu in picks.items()}
-        PROG.stage('build nx_extract')
-        nx = nsp.build_nx_extract(NXNATIVE, self.work, self.logs, self.env)
-        PROG.end()
-        self.dirs = {ver: ex / ver if fresh(ver) else nsp.extract(nx, o.keys, ex, ver, *picks[ver], None, self.logs, g, self.app) for ver in self.versions}   # fresh: unpacked already (below)
+        fresh = lambda v: (ex / v / 'ExeFS/main').exists() and (ex / v / 'RomFS' / g.get('romfs_marker')).exists()   # the reuse test, on the unpacked folder
+        n = self.fam['nup']
+        need = sum(n.tree_bytes(nsp.pack_nup.romfs_of(u or b, b)) for b, u in picks.values()) * 2 / 2**30 + 6   # the image, then its unpacked folder
+        if nsp.free_gb(self.work) < need and not all(fresh(v) for v in self.versions): raise BuildError(f'less than {need:.0f} GB free on the volume of {self.work}')
+        self.dirs = {ver: ex / ver if fresh(ver) else nsp.extract_nup(ex, ver, picks[ver][1] or picks[ver][0], picks[ver][0], self.app, n) for ver in self.versions}
         for d in self.dirs.values(): unpack_romfs_image(d)
         for d in self.dirs.values(): nsp.require_64bit(d / 'ExeFS', f'{g.get("name", g.id)} ({g.id})')
-        self.extract_checked(picks, nx, m, zdlc, dkf, dkey, dlc_reused)
+        self.extract_checked(picks)
 
-    def extract_checked(self, picks, nx, m, zdlc, dkf, dkey, dlc_reused):
+    def extract_checked(self, picks):
         """After the versions are extracted: the modules' build IDs against the profile's (a derived profile otherwise), the version packed, the DLC and the control data"""
         o, g = self.o, self.g
         bad = [] if self.derived else [f'{v}: {x}' for v in self.versions for x in nsp.build_mismatch(self.dirs[v], v, g)]
@@ -458,18 +425,8 @@ class Port:
                          f'profile registers' for x in lost_patches(g.builds(), self.game / 'ExeFS', g.words('modules'))]
             for x in self.lost: say(f'[RED] {x}')
         else: self.mem_profile()
-        if not self.fam['dlc']: self.aoc = None
-        elif self.fam.get('nup'): self.aoc = self.pack_nup_dlc()   # the container's DLC packages → aoc/<index>.img
-        elif dlc_reused:
-            PROG.stage('extract DLC'); self.aoc = self.work / 'aoc'; PROG.end(f'{len(self.fam["dlc"])} DLC, reused (inputs unchanged)')
-        else:
-            self.aoc = nsp.extract_aoc(nx, o.keys, NXNATIVE, self.work, self.app, dict(self.fam, dlc=[(t, v, m.get(p, p)) for t, v, p in self.fam['dlc']]), self.logs)
-            if zdlc: dkf.write_text(f'{dkey}\n')
-            elif dkf: nsp.rmtree(dkf)
-        if nx is None and o.firmware and self.ap.sysdata:   # a NUP needs no nx_extract for the game, but the firmware's system data titles do
-            PROG.stage('build nx_extract'); nx = nsp.build_nx_extract(NXNATIVE, self.work, self.logs, self.env); PROG.end()
-        self.sysdata = self.extract_sysdata(nx)
-        self.drop_unpacked()   # everything that reads them has run, and the shader stages that follow need the room
+        self.aoc = self.pack_nup_dlc() if self.fam['dlc'] else None   # the container's DLC packages → aoc/<index>.img
+        self.sysdata = self.copy_sysdata()
         self.base = next((self.dirs[v] for v in self.versions if picks[v][1] is None), self.dirs[self.versions[0]])
         self.app_name = o.app_name or nacp.name(self.base / 'control.nacp') or self.g.get('name', self.g.id)
         self.display = nacp.version(self.game / 'control.nacp') or nacp.version(self.base / 'control.nacp') or '1.0'
@@ -494,31 +451,11 @@ class Port:
         self.g = game.load(self.g.id); self.ap = android_profile.AndroidProfile(self.g)
         say(f'alias region: mem_alias {grown[0]:#x} → {grown[1]:#x} (+{self.o.alias_headroom} GB, --alias-headroom): {self.g.dir}')
 
-    # ---- NSZ / XCZ: decompressed for the stages that read the game files (porter.dumps) into <build folder>/tmp/dumps/, deleted once extracted ----
-    def unpack(self, paths):
-        """paths' NSZ / XCZ → NSP, in one stage (a file decompressed earlier in this run is kept); returns {path: the file to read}"""
-        todo = [p for p in dict.fromkeys(paths) if dumps.compressed(p) and p not in self.unpacked]
-        if todo:
-            d = self.work / 'tmp/dumps'; d.mkdir(parents=True, exist_ok=True)
-            sizes = {p: dumps.size(p) for p in todo}; total, n = sum(sizes.values()), [0]
-            if nsp.free_gb(d) < total / 2**30 + 1: raise BuildError(f'decompressing {", ".join(p.name for p in todo)} needs {total / 2**30:.1f} GB on the volume of {d}, which has {nsp.free_gb(d):.1f} GB free')
-            PROG.add(1); PROG.stage('decompress NSZ / XCZ', unit='B', total=total)
-            def done(k): n[0] += k; PROG.set(done=n[0])
-            for p in todo:
-                say(f'decompressing {p.name} ({sizes[p] / 2**30:.2f} GB) → {d}')
-                self.unpacked[p] = dumps.decompress(p, d / dumps.unpacked_name(p), done)
-            PROG.end(f'{len(todo)} file{"s" if len(todo) > 1 else ""}, {nsp.amount(total, "B")}, NCAs checked against their SHA-256 (not in ticketless dumps, whose NCA headers were rewritten)')
-        return {p: self.unpacked.get(p, p) for p in paths}
-
-    def drop_unpacked(self):
-        if getattr(self, 'work', None): nsp.rmtree(self.work / 'tmp/dumps')
-        self.unpacked = {}
-
     def pack_nup_dlc(self):
-        """A NUP's DLC packages → <build folder>/aoc/<index>.img, one RomFS image per DLC (index = title ID − base − 0x1000, as nsp.extract_aoc names an NSP's), with
+        """A NUP's DLC packages → <build folder>/aoc/<index>.img, one RomFS image per DLC (index = title ID − base − 0x1000), with
         scripts/pack_nup.py's packer: an image whose stamp says it was made from the container's tree is kept, one from another packer is checked against the container's
         hashes, and images of DLC no longer in the container go (pack_nup.pack_dlc, mirrored here for the per-DLC log lines). The images ship as they are: the host mounts
-        DM_AOC_DIR/<index>.img like a folder (dm/host/hle_fs.c aoc_dir, hle_misc.c aoc_load lists them as owned), as an NSP port's nx_extract images do"""
+        DM_AOC_DIR/<index>.img like a folder (dm/host/hle_fs.c aoc_dir, hle_misc.c aoc_load lists them as owned)"""
         n, aoc = self.fam['nup'], self.work / 'aoc'
         want = {f'{tid - self.app - 0x1000}.img': k for tid, _, k in self.fam['dlc']}
         PROG.stage('pack DLC', step='packing')
@@ -537,22 +474,24 @@ class Port:
         PROG.end(f'{len(want)} DLC' + (f', {kept} reused' if kept else ''))
         return aoc
 
-    def extract_sysdata(self, nx):
-        """The profile's system data titles (android.tsv sysdata), each a RomFS from the player's firmware dump (--firmware) into <work>/sysdata/<title ID>, which the
-        data pack carries and the host mounts (DM_SYSDATA, dm/host/hle_fs.c). Firmware content is never shipped with the tool: without a dump the host's stand-in is used
-        (MiiModel: Mii heads that draw nothing), and the port says so. Returns the folder, or None"""
+    def copy_sysdata(self):
+        """The profile's system data titles (android.tsv sysdata), each copied from the player's folder of them (--sysdata: <title ID, 16 hex digits>/ holding that title's
+        files as plain files) into <work>/sysdata/<title ID>, which the data pack carries and the host mounts (DM_SYSDATA, dm/host/hle_fs.c). System content is never shipped
+        with the tool and never decrypted by it: without the folder the host's stand-in is used (MiiModel: Mii heads that draw nothing), and the port says so.
+        Returns the folder, or None"""
         ids = self.ap.sysdata
         out = self.work / 'sysdata'; nsp.rmtree(out)
         if not ids: return None
         need = ', '.join(f'{t:016x}' for t in ids)
-        if not self.o.firmware:
-            say(f'[RED] {self.g.get("name", self.g.id)} reads system data from the console\'s firmware ({need}); without --firmware <your firmware dump\'s system content '
-                f'folder> the host\'s stand-in is used and those parts draw nothing (MiiModel: the Mii heads)')
+        if not self.o.sysdata:
+            say(f'[RED] {self.g.get("name", self.g.id)} reads system data titles ({need}); without --sysdata <a folder holding each as <title ID>/ with its files> '
+                f'the host\'s stand-in is used and those parts draw nothing (MiiModel: the Mii heads)')
             return None
-        PROG.stage('extract system data')
-        for t in ids:
-            nsp.run([nx, self.o.keys, '--sysdata', self.o.firmware, f'{t:016x}', out / f'{t:016x}'], self.logs / 'sysdata.log', env=self.env)
-        PROG.end(f'{need} from {self.o.firmware}')
+        PROG.stage('copy system data')
+        have = {d.name.lower(): d for d in self.o.sysdata.iterdir() if d.is_dir()}
+        if missing := [f'{t:016x}' for t in ids if f'{t:016x}' not in have]: raise BuildError(f'--sysdata: {self.o.sysdata} has no folder {", ".join(missing)}')
+        for t in ids: shutil.copytree(have[f'{t:016x}'], out / f'{t:016x}')
+        PROG.end(f'{need} from {self.o.sysdata}')
         return out
 
     def check_graphics(self):
@@ -936,7 +875,7 @@ class Port:
         return [a for n, f in ui_font_assets().items() for a in ('--asset', f'{n}={f}')]
 
     def icon(self):
-        """mkapk's icon arguments: the game's icon (nx_extract saves the control data's English one as icon.jpg) as a 256 px PNG, and an adaptive icon's layers
+        """mkapk's icon arguments: the game's icon (the control data's English one, saved as icon.jpg) as a 256 px PNG, and an adaptive icon's layers
         (Android 8+ launchers draw a plain icon small on a white disc): the icon fills the 72 dp the launcher's mask shows, over a blurred copy that fills
         the 108 dp layer. [] without Pillow or an icon"""
         src = next((d / 'icon.jpg' for d in (self.game, self.base) if (d / 'icon.jpg').exists()), None)

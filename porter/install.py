@@ -121,7 +121,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
         missing = other = changed = []; there = {}
         if target:   # what can refuse comes before the APK goes in, so a refused install changes nothing on the device (but a new app's grant: below)
             if not rom: raise BuildError(f'{data} has no RomFS to compare {target} with')
-            if not apk_asks_access(apk): raise BuildError(f'{apk.name} does not ask for All files access, which reading {target} needs (a port made by an earlier nx2android): port the game again')
+            if not apk_asks_access(apk): raise BuildError(f'{apk.name} does not ask for All files access, which reading {target} needs (a port made by an earlier nup2android): port the game again')
             PROG.set(step=f'comparing {target} with the pack\'s RomFS')
             there = adb.remote_sizes(target)
             missing, other, extra = romfs_diff(rom, there)

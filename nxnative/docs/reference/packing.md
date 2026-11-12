@@ -1,5 +1,7 @@
 # Packing
 
+> **This fork (2026-11-11):** `scripts/build_ipa_from_nsp.py` reads a game only as a NUP container or a folder of already-plain files. `dm/tools/nx_extract`, LibHac, NSZ support and every use of `prod.keys` were removed, so what this page says about NSPs, keys and `nx_extract` describes upstream nxnative, not this tree.
+
 ## Game packages
 
 ### PFS0 file-name table missing its final NUL

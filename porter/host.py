@@ -1,4 +1,4 @@
-# A port on the device brought to this nx2android checkout's host (python -m porter host …), without the game's files: libdmhost.so is built again from the repository's
+# A port on the device brought to this nup2android checkout's host (python -m porter host …), without the game's files: libdmhost.so is built again from the repository's
 # profile (dm/android/build.py, as the port's host stage builds it: a debug build for a debuggable app) and put in place of the installed APK's by
 # nxnative/dm/android/apk/apkdriver.py --host (with the overlay's font, assets/font/, which an APK ported before it came lacks), signed with the player's key (the same signer: it installs over the app, its saves stay). The data on the device is not touched.
 # The game's rewritten modules on the device (mods/) must still fit the host: mods/build_src.sha256 holds the hashes of the rewriter and the patch files that made them
@@ -99,7 +99,7 @@ def check_profile(package, manifest, title_id):
         raise BuildError(f'{package}: {ver or "no version"} is not a version the profile of {title_id} registers ({", ".join(builds) or "none"}): the port came from a derived profile '
                          f'with its own alias region; port the game again')
     if not manifest.get('profile_h'):
-        raise BuildError(f'{package}: no profile_h in nx2a-data.json (a data pack made before nx2android recorded the profile the host was built from): port the game again')
+        raise BuildError(f'{package}: no profile_h in nx2a-data.json (a data pack made before nup2android recorded the profile the host was built from): port the game again')
     if manifest['profile_h'] != profile_hash(title_id):
         raise BuildError(f'{package}: the host on the device was built from another profile of {title_id} than this checkout\'s (another layout, --alias-headroom or a derived profile): '
                          f'port the game again')
@@ -112,7 +112,7 @@ def update(adb, package, jobs=os.cpu_count() or 8):
     except ValueError: manifest = {}
     if not isinstance(manifest, dict): manifest = {}
     title_id = manifest.get('title_id', '')
-    if not title_id: raise BuildError(f'{package}: no title ID in {files}/nx2a-data.json (a data pack made before nx2android wrote one): port the game again')
+    if not title_id: raise BuildError(f'{package}: no title ID in {files}/nx2a-data.json (a data pack made before nup2android wrote one): port the game again')
     if not isinstance(title_id, str) or not TITLE_ID.fullmatch(title_id): raise BuildError(f'{package}: {title_id!r} in {files}/nx2a-data.json is not a title ID (16 hexadecimal digits)')
     title_id = title_id.upper()
     if not (DM / 'games' / title_id / 'game.tsv').is_file():

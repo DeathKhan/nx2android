@@ -379,7 +379,7 @@ def parse(argv):
     ap.add_argument('--aoc', help='the DLC RomFS images or folders by index')
     ap.add_argument('--pso', help='the pipeline archive made offline for this Mac (pso_offline.py --platform macos output: <arch>.mtl4a, prebuilt.tsv)')
     ap.add_argument('--pso-pairs', help='pso_pairs.tsv for a profile that has none (the shader split\'s copy)')
-    ap.add_argument('--html', help='the offline HTML pages (nx_extract --html), which go beside the RomFS')
+    ap.add_argument('--html', help='the offline HTML pages (the html folder of the game files), which go beside the RomFS')
     ap.add_argument('--program', action='append', help='another program of a game of several programs: index, rewritten modules, RomFS, Mac shader libraries, tables, offline pages (tab-separated)')
     ap.add_argument('--env-file', help='environment switches baked in (Resources/dm/env.txt)')
     ap.add_argument('--settings', help='the game\'s launcher settings (dm/games/settings.py output; Resources/dm/launcher.json, which the Mac front end reads)')

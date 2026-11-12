@@ -1,6 +1,6 @@
 # Development guide
 
-How to run nx2android from the repository, build the player's bundle and send changes. Players need none of this: the [README](../README.md) and [packaging/INSTALL.md](../packaging/INSTALL.md) cover the app. How the pieces fit together: [ARCHITECTURE.md](ARCHITECTURE.md).
+How to run nup2android from the repository, build the player's bundle and send changes. Players need none of this: the [README](../README.md) and [packaging/INSTALL.md](../packaging/INSTALL.md) cover the app. How the pieces fit together: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Setup from the repository
 
@@ -8,7 +8,7 @@ Install [Python](https://www.python.org) 3.11 or later and `python -m pip instal
 - [Android NDK r27c](https://developer.android.com/ndk/downloads) (only the NDK: no Android Studio, SDK or JDK)
 - [.NET SDK 10](https://dotnet.microsoft.com/download)
 - Android [platform-tools](https://developer.android.com/tools/releases/platform-tools) (adb), to install from the tool
-- your own `prod.keys`, dumped from your Switch
+- your own game as a NUP container (the tool reads no keys and no other format)
 
 ## Port a game
 
@@ -18,13 +18,13 @@ The app:
 python -m gui
 ```
 
-Check the **Setup** tab, choose the game's folder (the base game NSP, XCI, NSZ or XCZ, its update and DLC) on the **Port** tab, and click **Port**.
+Check the **Setup** tab, choose the game's folder (holding its NUP container) on the **Port** tab, and click **Port**.
 
 Or the command line:
 
 ```
 python -m porter doctor
-python -m porter port "D:\Games\NEO" -k "D:\keys\prod.keys" --install
+python -m porter port "D:\Games\NEO" --install
 ```
 
 The APK (`NeoTheWorldEndsWithYou.apk`) and the data pack (`NeoTheWorldEndsWithYou-data/`) appear in the game folder (`-o` picks another). `python -m porter install <App>-data` installs a port made earlier; with `--romfs-at <folder on the device>` the app reads the game's RomFS from a folder already there (an emulator's dump of the same version) instead of a copy in its files folder ([ARCHITECTURE.md](ARCHITECTURE.md#the-port), A RomFS already on the device). The first port takes a while (extraction, rewriting the game's code, translating its shaders); later ones reuse what has not changed. `python -m porter -h` lists the commands.
@@ -74,7 +74,7 @@ It refuses when the game's code on the device was rewritten with other rewriter 
 
 ## Adding a game
 
-Each game is a profile in `nxnative/dm/games/<title ID>/` with an `android.tsv`: [ARCHITECTURE.md](ARCHITECTURE.md#adding-a-game). A finished port updates, in the profile's commit, the games table in the [README](../README.md#games) (its row, with a gameplay frame captured on the device in `docs/images/` and the tag of the nx2android version it was tested on) and [PORT_CHECKLIST.md](PORT_CHECKLIST.md).
+Each game is a profile in `nxnative/dm/games/<title ID>/` with an `android.tsv`: [ARCHITECTURE.md](ARCHITECTURE.md#adding-a-game). A finished port updates, in the profile's commit, the games table in the [README](../README.md#games) (its row, with a gameplay frame captured on the device in `docs/images/` and the tag of the nup2android version it was tested on) and [PORT_CHECKLIST.md](PORT_CHECKLIST.md).
 
 ## Releases and version numbers
 
@@ -90,7 +90,7 @@ python packaging/build_bundle.py
 
 On Windows, `build_bootloader.py` compiles PyInstaller's launcher on this PC (it needs the Microsoft C++ Build Tools), because a few antivirus engines flag the prebuilt one every PyInstaller app shares. Run it again after installing or upgrading PyInstaller.
 
-`dist/nx2android/` and `dist/nx2android-<version>-<os>-<cpu>.zip` (`windows-x64`, `macos-arm64`, `linux-x64`, `linux-arm64`): the app, the committed `nxnative/` and the install guide; no toolchains, keys or game files. Publishing a release builds the macOS, Windows and Linux zips on GitHub's runners and attaches them (`.github/workflows/release-macos.yml`, `release-windows.yml`, `release-linux.yml`, which builds both Linux cpus on Ubuntu 24.04 (`ubuntu-latest` for x64, so the system libraries the bundle carries are never older than glibc 2.39); `--clobber` replaces a zip of the same name, so do not upload them by hand). Run either workflow by hand (Actions → Run workflow) for a test build of a branch, kept as the run's artifact.
+`dist/nup2android/` and `dist/nup2android-<version>-<os>-<cpu>.zip` (`windows-x64`, `macos-arm64`, `linux-x64`, `linux-arm64`): the app, the committed `nxnative/` and the install guide; no toolchains, keys or game files. Publishing a release builds the macOS, Windows and Linux zips on GitHub's runners and attaches them (`.github/workflows/release-macos.yml`, `release-windows.yml`, `release-linux.yml`, which builds both Linux cpus on Ubuntu 24.04 (`ubuntu-latest` for x64, so the system libraries the bundle carries are never older than glibc 2.39); `--clobber` replaces a zip of the same name, so do not upload them by hand). Run either workflow by hand (Actions → Run workflow) for a test build of a branch, kept as the run's artifact.
 
 ## Android motion
 

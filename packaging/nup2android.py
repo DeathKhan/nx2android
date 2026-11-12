@@ -1,7 +1,7 @@
 # The bundle's one executable (packaging/build_bundle.py). With no arguments it is the desktop app; otherwise it is the Python the tool runs its parts with,
 # since a bundle has no python.exe:
-#   nx2android -m porter …        the port process the GUI starts (gui/runner.py)
-#   nx2android <script.py> …      the engine's tools the pipeline runs (patch_nso.py, shader_split.py, dm/android/build.py …), as `python <script.py>`
+#   nup2android -m porter …        the port process the GUI starts (gui/runner.py)
+#   nup2android <script.py> …      the engine's tools the pipeline runs (patch_nso.py, shader_split.py, dm/android/build.py …), as `python <script.py>`
 import multiprocessing, multiprocessing.spawn, os, runpy, sys
 
 

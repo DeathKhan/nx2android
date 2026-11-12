@@ -1,5 +1,7 @@
 # 01 — Extracting an NSP
 
+> **This fork (2026-11-11):** `scripts/build_ipa_from_nsp.py` reads a game only as a NUP container or a folder of already-plain files. `dm/tools/nx_extract`, LibHac, NSZ support and every use of `prod.keys` were removed, so what this page says about NSPs, keys and `nx_extract` describes upstream nxnative, not this tree.
+
 ## Keys
 
 - Needs the user's own `prod.keys` and the title key from the NSP's ticket. Keep both under the work folder, e.g. `$W/build/keys/.switch/{prod,title}.keys`, and run hactool with `HOME` pointed there so it never reads anything else:

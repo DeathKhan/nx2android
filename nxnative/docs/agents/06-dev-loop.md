@@ -1,5 +1,7 @@
 # 06 — The developer loop: which tool when, and before a pull request
 
+> **This fork (2026-11-11):** `scripts/build_ipa_from_nsp.py` reads a game only as a NUP container or a folder of already-plain files. `dm/tools/nx_extract`, LibHac, NSZ support and every use of `prod.keys` were removed, so what this page says about NSPs, keys and `nx_extract` describes upstream nxnative, not this tree.
+
 One page for people and agents: the tools this repository has for building, running, debugging, measuring and checking a change, when to use which, and what a pull request needs. It links to where each tool is described instead of repeating it. Game files, keys, builds and runs stay outside the repository ([AGENTS.md](../../AGENTS.md)).
 
 ## 1. Build and run on the Mac

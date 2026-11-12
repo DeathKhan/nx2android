@@ -23,7 +23,7 @@ static void *lan_thread(void *a) {
     jstring name = (*E)->NewStringUTF(E, "wifi");
     jobject wifi = app ? (*E)->CallObjectMethod(E, app, mSvc, name) : NULL;
     if ((*E)->ExceptionCheck(E) || !wifi) { (*E)->ExceptionClear(E); LOG("[RED] [lan] no WifiManager: broadcasts from other players may not arrive"); goto out; }
-    jstring tag = (*E)->NewStringUTF(E, "nx2android local play");
+    jstring tag = (*E)->NewStringUTF(E, "nup2android local play");
     jobject lock = (*E)->CallObjectMethod(E, wifi, mMake, tag);
     if (!(*E)->ExceptionCheck(E) && lock) { (*E)->CallVoidMethod(E, lock, mRef, JNI_FALSE); (*E)->CallVoidMethod(E, lock, mAcq); }
     if ((*E)->ExceptionCheck(E) || !lock) { (*E)->ExceptionClear(E); LOG("[RED] [lan] the multicast lock was refused: broadcasts from other players may not arrive"); goto out; }

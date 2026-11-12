@@ -1,4 +1,4 @@
-# The desktop app's icon from docs/images/icon.svg: gui/icon.png (the window icon, 256 px) and packaging/nx2android.ico (the Windows exe, 16-256 px).   make_app_icon.py
+# The desktop app's icon from docs/images/icon.svg: gui/icon.png (the window icon, 256 px) and packaging/nup2android.ico (the Windows exe, 16-256 px).   make_app_icon.py
 # Run it again after changing icon.svg. Needs PySide6 (requirements.txt) and Pillow.
 import io, sys
 from pathlib import Path
@@ -21,5 +21,5 @@ def render(px):
 
 big = render(256)
 big.save(ROOT / 'gui/icon.png')
-big.save(ROOT / 'packaging/nx2android.ico', sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
-print(ROOT / 'gui/icon.png', ROOT / 'packaging/nx2android.ico')
+big.save(ROOT / 'packaging/nup2android.ico', sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
+print(ROOT / 'gui/icon.png', ROOT / 'packaging/nup2android.ico')

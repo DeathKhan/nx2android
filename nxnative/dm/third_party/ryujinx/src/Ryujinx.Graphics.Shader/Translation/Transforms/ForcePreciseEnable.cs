@@ -30,7 +30,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Transforms
                 addOp.ForcePrecise = true;
             }
 
-            // nx2android: the depth a fragment shader writes stays exact too. Tears of the Kingdom's light classifier writes a material id as D16 depth and each
+            // nup2android: the depth a fragment shader writes stays exact too. Tears of the Kingdom's light classifier writes a material id as D16 depth and each
             // lighting pass draws a quad at that depth with an EQUAL test: Turnip reassociated the classifier's arithmetic (an ulp apart) and the water's class never
             // met its lighting pass, so lakes were black (TOTKDroid 1ff1c7b4b found the same in its own translator; Qualcomm's driver kept the order)
             if (operation.Inst == Instruction.Store &&

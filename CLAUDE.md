@@ -1,19 +1,19 @@
 # Rules for Claude in this repository
 
-The skills in `.claude/skills/` (nx2android-dev, switch-android-port) hold the full guide. These rules hold in every session, with or without a skill.
+The skills in `.claude/skills/` (nup2android-dev, switch-android-port) hold the full guide. These rules hold in every session, with or without a skill.
 
 ## Game files go only in `.gamedump/`
 
 - Every port, test, check or bundle trial uses `.gamedump/<App>/` in the main checkout (git-ignored; `<App>` is the APK's name, e.g. `HadesII`), also from a worktree. Never make a game, bundle or player folder elsewhere on the PC, and never port into a session's scratchpad (`%TEMP%\claude\...`): `C:\nx2a-test` once kept 263 GB, and old scratchpads 66 GB of ports and pass dumps, that nobody deleted.
 - Debug output too big for a few files (pass dumps, frame shots, screen recordings, a port's output) goes in `.gamedump/<App>/` beside the game, and is deleted with it or when the debugging ends.
-- Fill it with hard links to the downloaded NSP / NSZ / XCI files (`ln`, same drive, no copy). Never write into the download folders; porter decompresses NSZ and XCZ itself.
+- Fill it with a hard link to the game's NUP container (`ln`, same drive, no copy). Never write into the download folders. This fork reads only NUP: it has no key handling, no decryption and no NSP / XCI / NSZ / XCZ reader, and none may be added.
 - Delete `.gamedump/<App>/` when the work is done (port committed, test app uninstalled). First check that each dump file has 2 or more links (`fsutil hardlink list <file>`); a file with one link is the only copy, so ask first. The PC has little disk space.
 - Before ending a session that made a `.gamedump` folder or wrote more than 1 GB anywhere, say which folders are left and why.
 
 ## Worktrees
 
 - Always clean up a worktree after its branch is merged into main: remove the worktree and delete the merged branch (`git branch -d`). A session's own worktree goes when the session is archived; say so before ending the session.
-- `tools/` (the NDK, the .NET SDK, platform-tools and `prod.keys`) exists only in the main checkout. It is git-ignored, and porter's config points to it by absolute path, so a worktree needs no copy of it. Never make a junction or link to it inside a worktree.
+- `tools/` (the NDK, the .NET SDK and platform-tools) exists only in the main checkout. It is git-ignored, and porter's config points to it by absolute path, so a worktree needs no copy of it. Never make a junction or link to it inside a worktree.
 - A link to `tools/` inside a worktree is the main checkout's real folder: a recursive delete of the worktree goes through it and deletes the real files. On 2026-10-31, removing a worktree in Fork deleted the NDK, the .NET SDK and `prod.keys` through a `tools` junction.
 - Before you remove a worktree (with git, Fork or any other tool), list its links (`Get-ChildItem -Force <worktree> -Recurse -Attributes ReparsePoint`) and remove each link alone with `cmd /c rmdir <link>` (no `/s`: that removes only the link). Then remove the worktree.
 

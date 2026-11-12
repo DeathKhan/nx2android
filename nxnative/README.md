@@ -61,21 +61,20 @@ xcodebuild -downloadComponent MetalToolchain
 git clone https://github.com/seedds/nxnative.git && cd nxnative
 brew install xcodegen zstd glslang
 brew install --cask dotnet-sdk
-python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
+python3 -m pip install lz4 "capstone>=5,<6" fonttools zbic "backports.zstd; python_version < '3.14'"
 ```
 
-**2. Put your game in a folder**: the game, plus its update and DLC if you have them (`.nsp`, `.xci`, `.nsz` or `.xcz`):
+**2. Put your game in a folder** as one NUP container (a `.nup` file holding the game, plus its update and DLC if you have them):
 
 ```
 ~/Games/MarioWonder/
-  Super Mario Bros. Wonder [010015100B514000][v0].nsp
-  Super Mario Bros. Wonder [010015100B514800][v327680].nsp
+  MarioWonder.nup
 ```
 
-**3. Build**, with your game folder and your `prod.keys`:
+**3. Build**, with your game's NUP container (this fork reads no NSPs and no keys):
 
 ```
-python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder -k ~/keys/prod.keys
+python3 scripts/build_ipa_from_nsp.py ~/Games/MarioWonder/MarioWonder.nup
 ```
 
 The IPA appears in the game's folder. The first build takes 30–60 minutes and needs free disk space of about twice the game's size plus 10 GB; building again is much faster.
@@ -136,7 +135,6 @@ This project is built on other people's work ([licenses](dm/third_party/README.m
 - **[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)** (MIT) developed this native-execution approach, for Diablo II: Resurrected. nxnative started as a copy of its generic parts: the NSO rewriter, the host that stands in for Horizon, the NVN-on-Metal layer and the iOS app shell. Fixes go both ways.
 - **Ryujinx** (MIT): its shader translator (`Ryujinx.Graphics.Shader`, `Ryujinx.Common` and `Spv.Generator` 1.3.2, in `dm/third_party/ryujinx` with a few fixes listed in [its README](dm/third_party/ryujinx/README.md)) turns the games' shaders into SPIR-V. Its emulation of the kernel and system services is also a reference when the host's behaviour is in doubt.
 - **[Atmosphère](https://github.com/Atmosphere-NX/Atmosphere)**: its kernel, mesosphère, is the reference for Horizon's synchronization semantics (address arbiter, condition variables).
-- **[LibHac](https://github.com/Thealexbarney/LibHac)**: reads NSPs and layers updates over the base game in `dm/tools/nx_extract`.
 - **[SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)**: SPIR-V to Metal Shading Language.
 - **[glslang](https://github.com/KhronosGroup/glslang)** compiles the GLSL of OpenGL games to SPIR-V for it.
 - **[MacNativeGames](https://github.com/ly05010419/MacNativeGames)** (MIT): the GPU widening of 8-bit indices and in-pass clears in `dm/gfx/nvn/nvn_mtl.m`, and the visibility-counter lowering in the shader translator.

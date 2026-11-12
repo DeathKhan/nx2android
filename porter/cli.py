@@ -6,13 +6,11 @@ from pathlib import Path
 def _parser():
     ap = argparse.ArgumentParser(prog='porter', description='Port your own Switch game files to an Android app (docs/ARCHITECTURE.md).')
     sub = ap.add_subparsers(dest='cmd', required=True)
-    d = sub.add_parser('doctor', help='check the tools a port needs'); d.add_argument('--json', action='store_true'); d.add_argument('-k', '--keys')
+    d = sub.add_parser('doctor', help='check the tools a port needs'); d.add_argument('--json', action='store_true')
     p = sub.add_parser('profiles', help='list the games the tool can port'); p.add_argument('--all', action='store_true', help='also the iOS profiles not ported to Android'); p.add_argument('--json', action='store_true')
-    i = sub.add_parser('inspect', help='what a game folder holds and whether it can be ported'); i.add_argument('folder'); i.add_argument('--json', action='store_true')
-    i.add_argument('-k', '--keys', help='prod.keys (default: the configured one): reads the title ID of a dump with no [title ID] in its name')
+    i = sub.add_parser('inspect', help='what a game\'s NUP container holds and whether it can be ported'); i.add_argument('folder'); i.add_argument('--json', action='store_true')
     po = sub.add_parser('port', help='make the APK and the data pack (and install them)')
-    po.add_argument('folder', help='the game\'s folder: its base game NSP / XCI / NSZ / XCZ, updates and DLC')
-    po.add_argument('-k', '--keys', help='prod.keys (default: the configured one)')
+    po.add_argument('folder', help='the game as one NUP container (a .nup file: the base game, its updates and DLC, already decrypted), or the folder holding it')
     po.add_argument('-o', '--out', help='folder for the APK and the data pack (default: the game folder)')
     po.add_argument('-p', '--version', default='', help='version to pack, v<N> (default: the newest in the folder)')
     po.add_argument('-l', '--language', default='', help='game language, a code or a name (default: English)')
@@ -41,8 +39,8 @@ def _parser():
     po.add_argument('--shared-font', default=None, metavar='FILE',
                     help='a TrueType font (.ttf, one font, not a collection) to pack as the system font the game asks for, instead of the device\'s Roboto: one with CJK '
                          'characters shows the Chinese and Korean text of a game that draws it with the system font (DM_SHARED_FONT in env.txt); never shipped with the tool')
-    po.add_argument('--firmware', default=None, metavar='DIR',
-                    help="a folder of your console's system content files (.nca: its firmware dump, NAND SYSTEM Contents/registered) for a game that reads system data "
+    po.add_argument('--sysdata', default=None, metavar='DIR',
+                    help="a folder of your console's system data titles as plain files, <title ID>/ each (extracted with a tool of your own) for a game that reads system data "
                          "(android.tsv sysdata: Mario Kart 8 Deluxe's Mii heads come from MiiModel); never shipped with the tool (default: the configured one)")
     po.add_argument('--vercode-offset', type=int, default=None, metavar='N',
                     help='add N (0-65535) to the APK\'s versionCode, so a rebuild of the same game version installs over a build with a higher one and keeps its saves '
@@ -59,7 +57,7 @@ def _parser():
     _romfs_at(ins)
     dv = sub.add_parser('devices', help='the devices adb sees'); dv.add_argument('--json', action='store_true')
     t = sub.add_parser('tools', help='list, or download, the missing tools (Android NDK, .NET SDK, platform-tools) from Google and Microsoft')
-    t.add_argument('--download', action='store_true', help='download and unpack them into the nx2android folder (you accept their licenses)')
+    t.add_argument('--download', action='store_true', help='download and unpack them into the nup2android folder (you accept their licenses)')
     t.add_argument('--only', default='', help='these instead of the missing ones: ndk, dotnet, adb (comma-separated)'); t.add_argument('--json', action='store_true')
     t.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'))
     c = sub.add_parser('config', help='show or change the saved settings'); c.add_argument('key', nargs='?'); c.add_argument('value', nargs='?')
@@ -101,7 +99,7 @@ def _print_json(obj): print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 def cmd_doctor(a):
     from porter import toolchain
-    rows = toolchain.checks(keys=a.keys)
+    rows = toolchain.checks()
     if a.json: _print_json([r.as_dict() for r in rows])
     else:
         for r in rows: print(f'{"ok " if r.ok else ("!! " if r.required else "-- ")} {r.name:15} {r.detail}' + (f'\n{"":19}→ {r.fix}' if r.fix and not r.ok else ''))
@@ -122,7 +120,7 @@ def cmd_inspect(a):
     from porter.upstream import BuildError
     try:
         with contextlib.redirect_stdout(sys.stderr if a.json else sys.stdout):
-            info = pipeline.inspect(a.folder, a.keys)   # keep JSON stdout one document for the GUI
+            info = pipeline.inspect(a.folder)   # keep JSON stdout one document for the GUI
     except BuildError as e:
         if a.json: _print_json({'error': str(e)})
         else: print(e, file=sys.stderr)
@@ -170,7 +168,7 @@ def cmd_port(a):
     from porter.upstream import BuildError
     try: install.romfs_target(a.romfs_at)   # a folder the app cannot read fails now, not after the shaders
     except BuildError as e: print(e, file=sys.stderr); return 2
-    opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, firmware=Path(a.firmware) if a.firmware else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
+    opts = pipeline.Options(folder=Path(a.folder), sysdata=Path(a.sysdata) if a.sysdata else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
                             app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch, mt_replay=a.mt_replay, vulkan_driver=a.vulkan_driver, shared_font=a.shared_font,
                             vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, external_display=a.external_display, native_keyboard=a.native_keyboard, jobs=a.jobs)
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))

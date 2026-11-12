@@ -1,4 +1,4 @@
-# Compile PyInstaller's bootloader (the launcher nx2android.exe is made from) on this PC and put it in place of the prebuilt one in the installed
+# Compile PyInstaller's bootloader (the launcher nup2android.exe is made from) on this PC and put it in place of the prebuilt one in the installed
 # PyInstaller. A few antivirus engines match the prebuilt launcher, which every PyInstaller app shares, and flag the bundle; a locally compiled one is a
 # different binary (packaging/INSTALL.md). build_bundle.py refuses to build with the prebuilt one.
 #   python packaging/build_bootloader.py      (needs the Microsoft C++ Build Tools: winget install Microsoft.VisualStudio.2022.BuildTools, workload VCTools)
@@ -11,7 +11,7 @@ import PyInstaller
 ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / 'build/bootloader'
 INSTALLED = Path(PyInstaller.__file__).parent / 'bootloader/Windows-64bit-intel'
-MARKER = INSTALLED / 'nx2android-local-build.txt'   # sha256 of each launcher this script installed
+MARKER = INSTALLED / 'nup2android-local-build.txt'   # sha256 of each launcher this script installed
 LAUNCHERS = ('run.exe', 'runw.exe', 'run_d.exe', 'runw_d.exe')
 
 

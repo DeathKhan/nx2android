@@ -1,5 +1,7 @@
 # 02 — Surveying a new title
 
+> **This fork (2026-11-11):** `scripts/build_ipa_from_nsp.py` reads a game only as a NUP container or a folder of already-plain files. `dm/tools/nx_extract`, LibHac, NSZ support and every use of `prod.keys` were removed, so what this page says about NSPs, keys and `nx_extract` describes upstream nxnative, not this tree.
+
 Do this before touching the host. Every item answers "what will break, and how much work is it".
 
 **The first pass is automatic.** Run `scripts/build_ipa_from_nsp.py` on the title's NSP folder. When no game profile (`dm/games/*/game.tsv`) has its title ID, the script does no build. It extracts only the code modules plus a RomFS manifest (`nx_extract --manifest`: path, size and first 32 bytes of every file, with no game files written). It then writes `<NSP folder>/<title ID>_survey/survey.md`, which covers:

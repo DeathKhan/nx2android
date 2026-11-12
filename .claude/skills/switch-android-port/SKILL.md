@@ -1,20 +1,20 @@
 ---
 name: switch-android-port
-description: Track down and fix problems in a Switch game running on an Android device under nx2android - crashes in the app, rendering bugs (flicker, vanishing blocks, upside-down pictures, refused Vulkan submissions, wrong colours), stutter and frame rate, soak tests and play-session checks - with the methods that found NEO - The World Ends with You's bugs (screen recordings, frame shots, pass dumps, live A/B switches, the validation layer). Use when chasing a symptom on the tablet or measuring speed or stability there. For where a change belongs (profile or core), adding a game profile, the port pipeline and the repository's rules, use nx2android-dev; the two are meant to be used together.
+description: Track down and fix problems in a Switch game running on an Android device under nup2android - crashes in the app, rendering bugs (flicker, vanishing blocks, upside-down pictures, refused Vulkan submissions, wrong colours), stutter and frame rate, soak tests and play-session checks - with the methods that found NEO - The World Ends with You's bugs (screen recordings, frame shots, pass dumps, live A/B switches, the validation layer). Use when chasing a symptom on the tablet or measuring speed or stability there. For where a change belongs (profile or core), adding a game profile, the port pipeline and the repository's rules, use nup2android-dev; the two are meant to be used together.
 ---
 
 # Bringing a port up on the device
 
 This skill is about the device side of a port: making a problem on the tablet countable, finding its cause, and proving a fix. It holds the working method and the playbooks from bringing up NEO: The World Ends with You, with the bugs that cost the most time.
 
-**What `nx2android-dev` covers instead:**
+**What `nup2android-dev` covers instead:**
 - deciding profile or core;
 - adding a game profile and the port pipeline;
 - installing and launching (`references/device-loop.md`);
 - repository rules, tests and docs;
 - the Windows environment.
 
-Read it alongside this one. Fixes found with this skill go where `nx2android-dev` says: general rules in the core, per-game facts in the profile.
+Read it alongside this one. Fixes found with this skill go where `nup2android-dev` says: general rules in the core, per-game facts in the profile.
 
 Other references:
 - `references/neo-case-study.md`: what happened with NEO, phase by phase and bug by bug, with numbers and dead ends.
@@ -23,7 +23,7 @@ Other references:
 
 ## Rules for working on the device
 
-These came from mistakes on NEO. `nx2android-dev` has the general rules: ask before installing, keys stay out, commit only when asked.
+These came from mistakes on NEO. `nup2android-dev` has the general rules: ask before installing, keys stay out, commit only when asked.
 - **The device is shared.** Check what is on screen before driving it. If the user is holding it or playing, ask before restarting or pressing anything.
 - **Never press A (confirm) blindly in the user's save.** Blind presses advanced NEO's story. Boot with `scripts/boot_to_gameplay.sh` (it presses only while a detector says "not gameplay yet"), and keep soak tests to the stick and camera (`devtools/soak.sh`).
 - **Stop your own loops.** A soak that a task stop "ended" kept sending stick moves through its child shell and was mistaken for an input bug. Kill the shell process, and check `grep -c 'DM_CTL: press' log.txt` against what you sent.
@@ -32,7 +32,7 @@ These came from mistakes on NEO. `nx2android-dev` has the general rules: ask bef
 
 ## Bring-up phases and what "done" means
 
-The steps for each phase are in `nx2android-dev/references/new-game-profile.md`. These are the device checks that close each phase:
+The steps for each phase are in `nup2android-dev/references/new-game-profile.md`. These are the device checks that close each phase:
 1. **Boot to the frame loop.** Per-frame `timing up to frame` lines appear in `log.txt`. Android-specific causes NEO hit:
    - an alias region whose alignment depended on ASLR (`svcBreak` in nninitStartup);
    - an incomplete RomFS push (a null-pointer crash after a few frames);
@@ -44,7 +44,7 @@ The steps for each phase are in `nx2android-dev/references/new-game-profile.md`.
 
 ## Driving the device
 
-Installing, launching and the basic control-file lines are in `nx2android-dev/references/device-loop.md`. What this skill adds:
+Installing, launching and the basic control-file lines are in `nup2android-dev/references/device-loop.md`. What this skill adds:
 - **`env.txt` versus `ctl.txt`.** `env.txt` switches are read at start, so restart the app after changing them. `ctl.txt` `env KEY=VALUE` lines take effect while the game runs (`references/switches.md` says which switches can).
   - The reader starts at the file's end on launch; it used to replay every old line, which walked menus and pressed A by itself.
   - Release builds ignore `ctl.txt`.

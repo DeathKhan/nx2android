@@ -1,7 +1,7 @@
 # The data pack: everything the app reads from its files folder on the device (/sdcard/Android/data/<package>/files, front_android.c), as a folder beside the APK:
 #   mods/          the rewritten code modules (patch_nso.py's outputs)
 #   RomFS/         the game's files (the packed version's merged RomFS)
-#   aoc/<index>.img  the DLC the player has, one RomFS image per index (nx_extract's from DLC NSPs, pack_nup's from a NUP container); the host mounts an image or a legacy aoc/<index>/ folder (hle_fs.c aoc_dir)
+#   aoc/<index>.img  the DLC the player has, one RomFS image per index (pack_nup's from the NUP container); the host mounts an image or a legacy aoc/<index>/ folder (hle_fs.c aoc_dir)
 #   sysdata/<title ID>/  system data from the player's firmware dump that the game reads (android.tsv sysdata, porter --firmware; env.txt's DM_SYSDATA)
 #   shaders.dmsv   the Vulkan shaders (dm/android/tools/shader_vk.py)
 #   nintendo_ext.ttf  the button-icon font, the stand-in for the Nintendo extension shared font (dm/tools/make_ext_font.py; env.txt's DM_SHARED_FONT_EXT)
@@ -58,7 +58,7 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
         dn, db = link_tree(src, tmp / sub, skip=lambda name: name.endswith('.inputs.json')); n += dn; b += db   # the image packers' reuse stamps (romfs_image.stamp) stay in the build folder
     if shaders: link_or_copy(shaders, tmp / 'shaders.dmsv'); n += 1; b += shaders.stat().st_size   # none for an OpenGL ES game
     for name, src in (files or {}).items(): shutil.copyfile(src, tmp / name); n += 1; b += Path(src).stat().st_size
-    rows = [f'# Written by nx2android\'s porter for {profile.name} ({profile.id}); KEY=VALUE per line, read by the app at launch',
+    rows = [f'# Written by nup2android\'s porter for {profile.name} ({profile.id}); KEY=VALUE per line, read by the app at launch',
             f'DM_LANG={language}']
     if aoc: rows.append(f'DM_AOC_DIR={files_folder(package)}/aoc')
     if sysdata: rows.append(f'DM_SYSDATA={files_folder(package)}/sysdata')

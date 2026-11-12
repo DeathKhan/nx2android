@@ -23,11 +23,11 @@ jobs:
       - run: python -m unittest discover tests
       - run: python packaging/build_bundle.py
       - if: github.event_name == 'release'
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/nx2android-*-macos-*.zip --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/nup2android-*-macos-*.zip --clobber
         env:
           GH_TOKEN: ${{ github.token }}
       - if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
-          name: nx2android-macos
-          path: dist/nx2android-*-macos-*.zip
+          name: nup2android-macos
+          path: dist/nup2android-*-macos-*.zip

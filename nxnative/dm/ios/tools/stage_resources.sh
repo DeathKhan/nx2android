@@ -21,7 +21,7 @@ check_program() {   # RomFS, marker, shader libraries, shader folder
         [ "$4" = "b-$V" ] || die "The prepared shaders are chain $4, the sources are now at b-$V: prepare the game again (build_ipa_from_nsp.py --prepare-xcode)";;
     esac
 }
-# The folders beside a RomFS (nx_extract --html, the NSP script's nn::jit image) into the app folder given, where the host finds them beside its RomFS (hle_web.c, loader.c dm_jit_serve_dir)
+# The folders beside a RomFS (the html folder, the NSP script's nn::jit image) into the app folder given, where the host finds them beside its RomFS (hle_web.c, loader.c dm_jit_serve_dir)
 beside_romfs() {
     for d in html jit; do
         if [ -d "$(dirname "$1")/$d" ]; then mkdir -p "$2/$d"; /usr/bin/rsync -a --delete -- "$(dirname "$1")/$d/" "$2/$d/"; else rm -rf "${2:?}/$d"; fi

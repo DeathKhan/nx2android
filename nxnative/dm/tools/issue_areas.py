@@ -19,7 +19,7 @@ WORDS = {   # area → words in the title (regular expression, any case)
     'opengl': r'\b(opengl|gl)\b',
     'textures': r'\b(BC[1-7]|ASTC|texture (layout|format)s?)\b',
     'rewriter': r'\b(patch_nso|sdk_patches|nso_\w+|rewriter)\b',
-    'packing': r'\b(shader[ _]split|shader extraction|nx_extract|build_ipa\w*|pack_app|NSP script)\b',
+    'packing': r'\b(shader[ _]split|shader extraction|build_ipa\w*|pack_app|NSP script)\b',
     'ios': r'\b(iOS|iPadOS|iPhone\w*|iPad|IPA)\b',
     'mac': r'\b(Mac|macOS|MacBook)\b',
     'tools': r'\b(dm/tools|scripts/|\w+\.py\b)',

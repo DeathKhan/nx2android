@@ -147,7 +147,7 @@ class RomfsAt(unittest.TestCase):
         dev = Device({**{f'{DUMP}/{r}': n for r, n in ROM.items()}, f'{DUMP}/other.bin': 1})   # files that are not the game's: refused with --romfs-push too, nothing deleted
         with self.assertRaisesRegex(BuildError, 'never deletes'): self.run_on(dev, romfs_at=DUMP, romfs_push=True)
         self.assertIn(f'{DUMP}/other.bin', dev.fs); self.assertEqual(dev.step('install'), -1)
-        with self.assertRaisesRegex(BuildError, 'earlier nx2android'): apk_file(self.apk, access=False); self.run_on(Device({f'{DUMP}/{r}': n for r, n in ROM.items()}), romfs_at=DUMP)
+        with self.assertRaisesRegex(BuildError, 'earlier nup2android'): apk_file(self.apk, access=False); self.run_on(Device({f'{DUMP}/{r}': n for r, n in ROM.items()}), romfs_at=DUMP)
 
     def test_access_refused(self):   # the device does not grant it: a clear error, and no data pushed
         dev = Device({f'{DUMP}/{r}': n for r, n in ROM.items()}, grants=False)

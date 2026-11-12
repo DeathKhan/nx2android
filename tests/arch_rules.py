@@ -118,7 +118,7 @@ check('porter imports upstream build_ipa_from_nsp (not a copy)', any('build_ipa_
 ship = [f for f in files if re.search(r'(^|/)(android-ndk|platform-tools|dotnet)(/|$)', f) or f.startswith('tools/')]
 check('no toolchain committed', not ship, ', '.join(ship[:5]))
 tc = (R / 'porter/toolchain.py').read_text(encoding='utf-8')
-check('doctor checks NDK, .NET, adb, keys', all(w in tc for w in ('ndk', 'dotnet', 'adb', 'keys')))
+check('doctor checks NDK, .NET, adb', all(w in tc for w in ('ndk', 'dotnet', 'adb')))
 
 # 9. Keys and game files never in the repository
 leak = [f for f in files if re.search(r'\.(nsp|nsz|xci|nca|keys)$|prod\.keys|title\.keys|signing-key', f, re.I)]
@@ -127,16 +127,16 @@ gen = [f for f in files if Path(f).name in ('game_profile.h', 'android_profile.h
 check('generated profile headers not committed', not gen, ', '.join(gen))
 
 # 10. Repository layout
-for d in ('docs/ARCHITECTURE.md', 'porter', 'gui', 'devtools', 'packaging/build_bundle.py', 'packaging/nx2android.spec', 'packaging/nx2android.py', 'packaging/INSTALL.md', 'tests', 'requirements.txt', 'probes', 'nxnative', 'RESEARCH.md'):
+for d in ('docs/ARCHITECTURE.md', 'porter', 'gui', 'devtools', 'packaging/build_bundle.py', 'packaging/nup2android.spec', 'packaging/nup2android.py', 'packaging/INSTALL.md', 'tests', 'requirements.txt', 'probes', 'nxnative', 'RESEARCH.md'):
     if not (R / d).exists(): check(f'layout: {d}', False)
-check('repository layout as documented', all((R / d).exists() for d in ('docs/ARCHITECTURE.md', 'porter', 'gui', 'devtools', 'packaging/build_bundle.py', 'packaging/nx2android.spec', 'packaging/nx2android.py', 'packaging/INSTALL.md', 'tests', 'requirements.txt', 'probes', 'nxnative', 'RESEARCH.md')))
+check('repository layout as documented', all((R / d).exists() for d in ('docs/ARCHITECTURE.md', 'porter', 'gui', 'devtools', 'packaging/build_bundle.py', 'packaging/nup2android.spec', 'packaging/nup2android.py', 'packaging/INSTALL.md', 'tests', 'requirements.txt', 'probes', 'nxnative', 'RESEARCH.md')))
 check('no scripts/ folder left at the root', not any(f.startswith('scripts/') for f in files))
 req = (R / 'requirements.txt').read_text(encoding='utf-8').lower()
 check('requirements.txt has lz4, capstone, pillow, PySide6', all(m in req for m in ('lz4', 'capstone', 'pillow', 'pyside6')))
 
 # 10b. Distribution: the launcher only dispatches (to the GUI, `-m porter`, or a tool's script), and the bundle takes only committed nxnative files
-launcher = (R / 'packaging/nx2android.py').read_text(encoding='utf-8')
-check('packaging/nx2android.py only dispatches', not ({i.split('.')[0] for i in imports('packaging/nx2android.py')} - {'multiprocessing', 'os', 'runpy', 'sys', 'ctypes', 'gui'}))
+launcher = (R / 'packaging/nup2android.py').read_text(encoding='utf-8')
+check('packaging/nup2android.py only dispatches', not ({i.split('.')[0] for i in imports('packaging/nup2android.py')} - {'multiprocessing', 'os', 'runpy', 'sys', 'ctypes', 'gui'}))
 check('the bundle copies only committed nxnative files', "tracked('nxnative')" in (R / 'packaging/build_bundle.py').read_text(encoding='utf-8'))
 check('frozen porter finds nxnative beside the executable', "frozen" in (R / 'porter/paths.py').read_text(encoding='utf-8'))
 

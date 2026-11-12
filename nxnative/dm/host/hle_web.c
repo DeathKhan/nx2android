@@ -1,9 +1,9 @@
-// nn::web offline HTML pages: the pages a game ships in its HtmlDocument NCA (nx_extract --html), shown by the web applet over the game. On the host a web view of the front end
+// nn::web offline HTML pages: the pages a game ships in its HtmlDocument NCA (the html folder of the game's files), shown by the web applet over the game. On the host a web view of the front end
 // (web_apple.m: WKWebView on the Mac and the iPhone) shows them over the game picture, with the Switch browser's JavaScript extension (window.nx: content messages both ways, the
 // footer's buttons) and the controller as the page reads it (navigator.getGamepads and key events). The page ends when it goes to its callback URL (http://localhost/ by default:
 // exit reason 3 with that URL as the last URL), when the default B goes back from its first page (reason 1), when it calls nx.endApplet (reason 0) or when the game asks (reason 2).
 // While a page is shown it holds the input (dm_input_hold): the game reads nothing, as an application out of focus.
-// Pages: in DM_HTML (default: the folder "html" beside the RomFS folder), in its html-document folder or in html<n>/html-document (one folder per HtmlDocument NCA, as nx_extract
+// Pages: in DM_HTML (default: the folder "html" beside the RomFS folder), in its html-document folder or in html<n>/html-document (one folder per HtmlDocument NCA, as the extraction
 // writes them). Without the page, or without a web view (a windowless run), the stand-in of before answers: the page loads at once, sends one empty content message and closes when
 // it appears (exit reason 0, no last URL).
 // ShowOfflineHtmlPageArg (0x2000 bytes): u16 entry count at +0, entries from +8, each {u16 type, u16 size, u32 0} and its data. OfflineHtmlPageReturnValue: u64 exit reason at +0,
