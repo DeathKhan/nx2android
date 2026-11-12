@@ -43,6 +43,7 @@
 import json, os, re, struct, sys, zlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import os, open
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import ext
 
 PAK_MAGIC, ARCHIVE_VERSION = 0x5A6F12E1, 2
 JOB_MAGIC, OUT_MAGIC = 0x4a4f4d44, 0x524f4d44   # "DMOJ", "DMOR" (hle_oodle.c)
@@ -185,11 +186,17 @@ def encrypted(path):
         with open(path, 'rb') as f: return bool(footer(f)[0])
     except (OSError, ValueError, struct.error): return False
 
+def keys(mains):
+    """An external add-on's key source for a game's mains (ext.py: pak_keys), or None: nup2android has none of its own. Called with a pak path it gives what Pak and Toc take as key"""
+    h = ext.hook('pak_keys')
+    return h(list(mains)) if h and mains else None
+
 class Pak:
-    def __init__(self, path):
-        self.path = path; self.f = open(path, 'rb')
+    def __init__(self, path, key=None):
+        """key: what an external add-on gave for a pak with an encrypted index (keys); without one such a pak is refused (Encrypted)"""
+        self.path, self.key = path, key; self.f = open(path, 'rb')
         enc, ioff, isz, self.methods, self.version = footer(self.f)
-        if enc: raise Encrypted(f'{path}: the index is encrypted, and nup2android has no decryption code')
+        if enc and key is None: raise Encrypted(f'{path}: the index is encrypted, and nup2android has no decryption code')
         r = R(self.read_at(ioff, isz, enc), what=f'{path}: the index')
         self.mount = r.fstr(); self.count = r.take('<i')
         if self.version in LEGACY:   # one FPakEntry per file, kept as parsed
@@ -213,7 +220,8 @@ class Pak:
             dn = d.fstr()
             for _ in range(d.take('<i')): fn = d.fstr(); self.files[(dn + fn).lstrip('/')] = d.take('<i')
     def read_at(self, off, n, enc):
-        if enc: raise Encrypted(f'{self.path}: {n:#x} encrypted bytes at {off:#x}, and nup2android has no decryption code')
+        if enc and self.key is None: raise Encrypted(f'{self.path}: {n:#x} encrypted bytes at {off:#x}, and nup2android has no decryption code')
+        if enc: return ext.hook('pak_read')(self.key, read_range(self.f, off, (n + 15) & ~15, self.path))[:n]   # an external add-on's reader
         return read_range(self.f, off, n, self.path)
     def entry(self, path):
         if self.version in LEGACY: return self.files[path]
@@ -310,10 +318,10 @@ class Toc:
     directory index size, partition count, u64 container ID, encryption key GUID (16), u8 flags (1 compressed, 2 encrypted, 4 signed, 8 indexed), u8, u16, u32 perfect hash seed count,
     u64 partition size, u32 count of chunks without a perfect hash, then reserved words. After it: chunk IDs (12 bytes: u64 hash, u16 index, u8, u8 type), offsets and lengths
     (5 + 5 bytes, big-endian), the perfect hash seeds and overflow list (u32 each), the blocks (5-byte offset, 3-byte stored size, 3-byte raw size, u8 method; little-endian), the method names"""
-    def __init__(self, path):
+    def __init__(self, path, key=None):
         b = open(path, 'rb').read()
         if b[:16] != TOC_MAGIC: raise ValueError(f'{path}: not an IoStore TOC')
-        self.path, self.version = path, b[16]
+        self.path, self.key, self.version = path, key, b[16]   # key: an external add-on's, for an encrypted container (keys); None otherwise
         hsz, n, nblk, bsz, nmeth, mlen, self.block_size, dsz, nparts = struct.unpack_from('<9I', b, 20)
         if bsz != 12: raise ValueError(f'{path}: compression block entries of {bsz} bytes')
         self.encrypted, self.parts = b[80] >> 1 & 1, nparts
@@ -331,7 +339,7 @@ class Toc:
         o += mlen * nmeth
         # the directory index follows unless a signature comes first (flag 4); an encrypted container's (flag 2; DRAGON BALL Sparking! ZERO) is not read: b''
         d = b[o:o + dsz] if b[80] & 8 and not b[80] & 4 else b''
-        self.dir_index = b'' if self.encrypted else d
+        self.dir_index = (ext.hook('pak_read')(key, d + bytes(-len(d) % 16))[:len(d)] if key is not None else b'') if d and self.encrypted else d
         self.index = {c: i for i, c in enumerate(self.ids)}; self.files = {}
     def of_type(self, t):
         """Indices of the chunks of one EIoChunkType (Unreal Engine 5 numbering: TOC version 4 and later)"""
@@ -364,11 +372,11 @@ class Toc:
     def read(self, i, decode=None):
         """Chunk i's bytes; Oodle blocks need decode(block bytes, raw length) → bytes (the game's own decoder, OodleHost)"""
         # TOC metadata is unencrypted. Check the selected chunk here: a patch can replace an encrypted library or refer to an encrypted group-only container.
-        if self.encrypted: raise Encrypted(f'{self.path}: the container is encrypted, and nup2android has no decryption code')
+        if self.encrypted and self.key is None: raise Encrypted(f'{self.path}: the container is encrypted, and nup2android has no decryption code')
         off, ln = self.ranges[i]; first = off // self.block_size; out = []
         for k in range(first, (off + ln - 1) // self.block_size + 1 if ln else first):
             at, size, raw, m = self.blocks[k]; f = self.ucas(at // self.part_size); f.seek(at % self.part_size)
-            d = f.read(size)
+            d = f.read(size) if not self.encrypted else ext.hook('pak_read')(self.key, f.read((size + 15) & ~15))[:size]
             meth = self.methods[m - 1] if m else ''
             if not meth: out.append(d[:raw])
             elif meth == 'Oodle':
@@ -465,7 +473,7 @@ def inline_in_containers(path):
     tocs = [t for t in io_tocs(folder) if os.path.dirname(t.path) == folder]
     return any(t.export_bundles() for t in tocs) and not any(t.of_type(IO_SHADER_LIBRARY) for t in tocs)
 
-def inline_shaders(path):
+def inline_shaders(path, key=None):
     """Whether a pak keeps its shaders inline in its cooked packages rather than in shader code archives: every legacy pak (DRAGON QUEST XI S), and a version 11 pak whose directory index
     names no .ushaderbytecode and either cooked packages (.uexp; OCTOPATH TRAVELER II: bShareMaterialShaderCode off) or the global shader cache with the cooked packages in the containers beside the pak
     (inline_in_containers; Mario & Luigi: Brothership and Yoshi and the Mysterious Book: the same setting with IoStore on). FINAL FANTASY RESONANCE's pak names the global shader cache too, but its
@@ -474,8 +482,9 @@ def inline_shaders(path):
     with open(path, 'rb') as f:
         enc, ioff, isz, _, ver = footer(f)
         if ver in LEGACY: return True
-        if enc: return None
-        def at(off, n): return read_range(f, off, n, path)
+        if enc and key is None: return None
+        def at(off, n):   # key: an external add-on's (keys)
+            return ext.hook('pak_read')(key, read_range(f, off, (n + 15) & ~15, path))[:n] if enc else read_range(f, off, n, path)
         r = R(at(ioff, isz), what=f'{path}: the index'); r.fstr(); count, _ = r.take('<iQ')
         if not count: return None
         if r.take('<i'): r.take('<QQ'); r.raw(20)
@@ -483,13 +492,15 @@ def inline_shaders(path):
         doff, dsz = r.take('<QQ'); d = at(doff, dsz)
     return b'.ushaderbytecode\0' not in d and (b'.uexp\0' in d or (b'GlobalShaderCache-' in d and inline_in_containers(path)))
 
-def unreal_paks(romfs, inline=None):
+def unreal_paks(romfs, inline=None, mains=()):
     """The paks under the RomFS that Unreal wrote (its magic in the footer; inline None = any, True = those whose shaders are inline in the cooked packages, False = those with shader code
     archives, inline_shaders; a pak that names no file is neither): the NSP script decodes the shader code archives (decode_ue_shaders); shader_split.py reads the inline ones file by file
     (ue_legacy_jobs). A pak whose index is encrypted is neither: it is not read"""
-    out = []
+    out, key_of = [], keys(mains)   # None without an external add-on
     for p in paks(romfs):
-        try: inl = inline_shaders(p)
+        try: k = key_of(p) if key_of else None
+        except (OSError, ValueError, struct.error): k = None
+        try: inl = inline_shaders(p, k)
         except (OSError, ValueError, struct.error): continue   # shorter than a footer, or no Unreal pak
         if inline is None or inl == inline: out.append(p)
     return out
@@ -510,7 +521,7 @@ def job(romfs, main_nso, work, decode=None):
     The shader libraries of IoStore containers (Unreal Engine 5.6, FINAL FANTASY RESONANCE: no archive in the pak) go there already decoded: their container blocks and shader groups are
     Oodle-compressed, two layers, so they need decode (OodleHost: the game's decoder over a pipe) rather than the job"""
     os.makedirs(os.path.join(work, 'archives'), exist_ok=True)
-    listing, recs = [], []   # main_nso is not read: no key is looked for (the callers still name it)
+    listing, recs, key_of = [], [], keys([main_nso])   # nup2android does not read main_nso and looks for no key; an external add-on may (keys)
     tocs = io_tocs(romfs)
     libs = [t for t in tocs if t.of_type(IO_SHADER_LIBRARY)]
     if libs and not decode: raise ValueError(f'{libs[0].path}: IoStore shader libraries need the game\'s decoder (decode)')
@@ -527,8 +538,8 @@ def job(romfs, main_nso, work, decode=None):
             name = io_library_name(t, i, names) + '.ushaderbytecode'; b = io_archive(t, i, decode, chunk.get)
             open(os.path.join(work, 'archives', name), 'wb').write(b)
             listing.append(dict(name=name, pak=os.path.relpath(t.path, romfs), path=f'chunk {t.ids[i].hex()}', shaders=len(archive(b)['shaders']), compressed=0, compression='IoStore, decoded'))
-    for pak in unreal_paks(romfs, inline=False):
-        p = Pak(pak)
+    for pak in unreal_paks(romfs, inline=False, mains=[main_nso]):
+        p = Pak(pak, key_of(pak) if key_of else None)
         for path in sorted(x for x in p.files if x.endswith('.ushaderbytecode')):
             b = p.read(path); a = archive(b, f'{pak}: {path}'); name = os.path.basename(path)
             comp = [i for i, (_, size, raw, _) in enumerate(a['shaders']) if size != raw]

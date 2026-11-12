@@ -22,6 +22,7 @@
 import os, struct, sys, re
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import open
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import ext
 
 MAGIC, ENCRYPTED, RSC5, RSC85, ZSTD = b'RPF6', 0xfffffffd, b'RSC\x05', b'RSC\x85', b'\x28\xb5\x2f\xfd'
 
@@ -45,14 +46,16 @@ def header(path):
     return n, names * 8, tag == ENCRYPTED
 
 class Rpf:
-    def __init__(self, path):
+    def __init__(self, path, key=None):
+        """key: what an external add-on's rpf_key returned for an archive with encrypted tables (ext.py); nup2android itself has none and refuses such an archive"""
         h = header(path)
         if h is None: raise ValueError(f'{path}: no RPF6 archive')
-        self.path, (n, names_at, enc) = path, h
-        if enc: raise ValueError(f'{path}: the entry and name tables are encrypted, and nup2android has no decryption code')
+        self.path, self.key, (n, names_at, enc) = path, key, h
+        if enc and key is None: raise ValueError(f'{path}: the entry and name tables are encrypted, and nup2android has no decryption code')
         with open(path, 'rb') as f:
             f.seek(16); t = f.read((n * 20 + 15) // 16 * 16)
             f.seek(names_at); nt = f.read()
+        if enc: t, nt = (ext.hook('rpf_read')(key, x) for x in (t, nt))
         if not is_root(t): raise ValueError(f'{path}: the first entry is no root directory')
         self.raw = [struct.unpack_from('>5I', t, 20 * i) for i in range(n)]
         names = {joaat(s.decode()): s.decode() for s in re.findall(rb'[\x20-\x7e]{1,255}(?=\0)', nt)}
@@ -83,6 +86,8 @@ class Rpf:
             try: u = zlib.decompressobj(-15).decompress(d)
             except zlib.error: u = None
             if u is not None and len(u) != size: u = None
+        if u is None and getattr(self, 'key', None) is not None:   # only with an external add-on's key (ext.py)
+            u = unpack(ext.hook('rpf_read')(self.key, d) + d[len(d) // 16 * 16:], zstd)
         if u is None:
             if not comp: return d   # a resource stored as is
             raise ValueError(f'{self.path}/{name}: compressed, but neither a zstd frame nor a zlib stream (an encrypted script is not read)')

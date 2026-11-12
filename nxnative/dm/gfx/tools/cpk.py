@@ -8,10 +8,12 @@ import re, struct, sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import open
 from pathlib import Path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import ext
 
 def utf_at(d, o, n):
-    """The @UTF table of n bytes at d[o:]; ValueError for one stored masked, which is not read (nup2android has no de-obfuscation code)"""
+    """The @UTF table of n bytes at d[o:]; ValueError for one stored masked, which is not read (nup2android has no de-obfuscation code; an external add-on may read it: ext.py)"""
     t = d[o:o + n]
+    if t[:4] != b'@UTF' and (h := ext.hook('cpk_utf')): t = h(t)
     if t[:4] != b'@UTF': raise ValueError('its @UTF table is stored masked, and nup2android has no de-obfuscation code')
     return t
 
