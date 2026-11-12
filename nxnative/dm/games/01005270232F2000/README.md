@@ -47,9 +47,9 @@ No `pad_layout` key: the iPhone gamepad starts in the 2D layout ([README](../../
 ## Files
 
 - Everything is in one pak, `Octopath_Traveler0/Content/Paks/pakchunk0-Switch.pak` (1.5 GB, 159,757 files; the profile's `romfs_marker`), next to loose CRIWARE `.awb` sound banks and one `.usm` movie.
-- A version 11 pak: its footer is the last 0xdd bytes (encryption key GUID, encrypted-index flag, magic `0x5A6F12E1`, version, index offset and size, SHA-1, five compression method names), its magic 0xc8 bytes from the end. The index is AES-256 (ECB) encrypted: mount point, entry count, path hash seed, path hash index, full directory index (a second encrypted block) and the encoded entries (one bit-packed u32 per file).
-- The key is in `main`: the one 32-byte window of its read-only or data segment that decrypts the index start to the mount point `../../../` (`main+0x57c7f70`, found among 116,287 candidates in under a second). Never print it.
-- Most files are Oodle-compressed in 64 KB blocks; the two shader code archives are stored. `dm/gfx/tools/uepak.py` reads all of this (AES through macOS CommonCrypto) and lists a pak (`uepak.py list <pak> <main NSO> <out tsv>`). Details: [01, Compressed RomFS content](../../../docs/agents/01-extract.md#compressed-romfs-content).
+- A version 11 pak: its footer is the last 0xdd bytes (encryption key GUID, encrypted-index flag, magic `0x5A6F12E1`, version, index offset and size, SHA-1, five compression method names), its magic 0xc8 bytes from the end. The index is encrypted: mount point, entry count, path hash seed, path hash index, full directory index (a second encrypted block) and the encoded entries (one bit-packed u32 per file).
+- **Not read by this fork:** nup2android has no decryption or de-obfuscation code, so this pak stays closed and the game's shaders are not extracted.
+- Most files are Oodle-compressed in 64 KB blocks; the two shader code archives are stored. `dm/gfx/tools/uepak.py` reads and lists paks that are not encrypted (`uepak.py list <pak> <out tsv>`). Details: [01, Compressed RomFS content](../../../docs/agents/01-extract.md#compressed-romfs-content).
 
 ## Rewriter
 

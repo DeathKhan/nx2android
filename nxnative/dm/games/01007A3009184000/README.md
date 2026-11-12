@@ -16,7 +16,7 @@ No rewriter cuts and no `patches.py`.
 
 ## Files and shaders
 
-The pak is a version 11 pak with an encrypted index; `uepak.py` finds its key in `main` (103,924 files, Oodle, Zlib and uncompressed). Beside it, 8 `.mp4` movies in the RomFS. The shaders are in two `SF_GLSL_SWITCH` shader code archives in the pak, LZ4-compressed: 56,594 distinct shaders (10,068 vertex, 45,424 pixel, 1,021 compute, 81 geometry), all of which build for the Mac. A first Mac build compiles them in about 2 h 45 min on an M6, and the pipeline prebuild of 10,068 pairs takes 10 minutes more.
+The pak is a version 11 pak with an encrypted index, which this fork does not read: nup2android has no decryption or de-obfuscation code (103,924 files, Oodle, Zlib and uncompressed). The figures below are from before that. Beside it, 8 `.mp4` movies in the RomFS. The shaders are in two `SF_GLSL_SWITCH` shader code archives in the pak, LZ4-compressed: 56,594 distinct shaders (10,068 vertex, 45,424 pixel, 1,021 compute, 81 geometry), all of which build for the Mac. A first Mac build compiles them in about 2 h 45 min on an M6, and the pipeline prebuild of 10,068 pairs takes 10 minutes more.
 
 ## Frame rate
 

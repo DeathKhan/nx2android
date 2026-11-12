@@ -7,13 +7,17 @@
 
 Port your own Nintendo Switch games to Android, natively: the game's own arm64 code runs on the device, with the Switch's system services stood in for by a host and NVN graphics replayed on Vulkan. Pick the game's folder, click **Port**, and get an APK plus the game's data, installed on your device if you like. Bring your own game as a NUP container (game files that are already plain); the tool holds no keys and decrypts nothing, and nothing from any game is in this repository.
 
+> **No decryption and no de-obfuscation happen anywhere in this codebase.** nup2android has no key handling, no key search, no AES or other cipher run over game content, and no code that unscrambles or unmasks a game's files. It reads one input, a NUP container whose files are already plain, and it cannot open NSP, XCI, NSZ or XCZ packages. Where a game's own archives are encrypted or scrambled (some Unreal paks and IoStore containers, RAGE RPF6 archives, masked CRI CPK tables, and the like), the tool reports them and leaves them closed, and that game is simply not supported. No keys, no game files and nothing taken from a game are in this repository or its releases.
+>
+> **nup2android is an independent hard fork.** It started from [nx2android](https://github.com/shirai91/nx2android) and [nxnative](https://github.com/seedds/nxnative) (MIT, with thanks to their authors), and is now its own project in its own repository with its own history: it is not part of their fork network on GitHub and does not depend on those repositories existing. What other projects ship or do is not a statement about this one.
+
 This is the Android port of [nxnative](https://github.com/seedds/nxnative), which does the same on iPhone and iPad. Supported games: [Games](#games).
 
 ## This fork: Nintendo Switch 2 games
 
-nup2android is a fork of [nx2android](https://github.com/shirai91/nx2android) that reads games only as NUP containers ([Game files](#game-files)). It adds Nintendo Switch 2 games to the porter, tuned on an AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver). It also keeps the vendored nxnative trued up with upstream: nx2android's and nxnative's commits are taken one by one onto the fork's own work, with nxnative's Metal fixes ported to the Vulkan backend where they apply.
+nup2android is a hard fork of [nx2android](https://github.com/shirai91/nx2android) that reads games only as NUP containers ([Game files](#game-files)) and has had every decryption and de-obfuscation path removed. It adds Nintendo Switch 2 games to the porter, tuned on an AYN Odin 3 (Snapdragon 8 Elite, Adreno 830, stock driver). It also keeps the vendored nxnative trued up with upstream: nx2android's and nxnative's commits are taken one by one onto the fork's own work, with nxnative's Metal fixes ported to the Vulkan backend where they apply.
 
-**Download:** the porter with the Switch 2 support for Windows, macOS and Linux, from this fork's [Releases](https://github.com/DeathKhan/nup2android/releases) (`switch2-v1.0` and later).
+**Download:** builds of the porter for Windows, macOS and Linux are published on this repository's [Releases](https://github.com/DeathKhan/nup2android/releases) page.
 
 Screenshots from the Odin 3 (the game's own picture, overlay off); frame rates as measured there.
 
@@ -118,7 +122,7 @@ Running from the repository, the command line, the repository layout, building t
 
 ## Game files
 
-This tool reads one format only: the NUP container, whose game files are already plain. It has no key handling and no decryption code, and it cannot read NSP, XCI, NSZ or XCZ packages. This repository and its releases contain no keys, no game files and nothing extracted from them, and the tool never downloads either. Make the NUP from your own games, and don't share it or the APKs and data packs built from it.
+This tool reads one format only: the NUP container, whose game files are already plain. It has no key handling, no decryption code and no de-obfuscation code, and it cannot read NSP, XCI, NSZ or XCZ packages. A game whose own archives are encrypted or scrambled inside the NUP is not read past that point. This repository and its releases contain no keys, no game files and nothing extracted from them, and the tool never downloads either. Make the NUP from your own games, and don't share it or the APKs and data packs built from it.
 
 Nintendo's takedown notices so far have gone to whoever hosts a project (13 Switch emulator repositories on GitHub in February 2026), not to players. Whether making a NUP from your own games for your own use is allowed depends on where you live.
 

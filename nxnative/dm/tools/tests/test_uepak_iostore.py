@@ -85,23 +85,15 @@ def pak11(path, names):
     path.write_bytes(d + index + bytes(16) + b'\0' + struct.pack('<IIQQ', uepak.PAK_MAGIC, 11, len(d), len(index)) + bytes(20) + bytes(32 * 5))
 
 
-def aes_encrypt(key, data):
-    import ctypes
-    cc = ctypes.CDLL('/usr/lib/libSystem.B.dylib').CCCrypt
-    out = ctypes.create_string_buffer(len(data)); moved = ctypes.c_size_t()
-    assert cc(0, 0, 2, key, len(key), None, data, len(data), out, len(data), ctypes.byref(moved)) == 0
-    return out.raw[:moved.value]
-
-
 def pad16(b):
     return b + bytes(-len(b) % 16)
 
 
-def pak11_encrypted(path, names, key, mount='../../../'):
-    """pak11 with its index and directory index encrypted (DRAGON BALL Sparking! ZERO); no names: the empty pak beside a container, mount point "/\""""
+def pak11_encrypted(path, names, mount='../../../'):
+    """pak11 whose footer says the index is encrypted (DRAGON BALL Sparking! ZERO); the index and directory index are random bytes here, as nothing may read them"""
     d = pad16(b''.join(n.encode() + b'\0' for n in names))
     index = pad16(fstr(mount) + struct.pack('<iQ', len(names), 0) + struct.pack('<i', 0) + struct.pack('<iQQ', 1, 0, len(d)) + bytes(20))
-    path.write_bytes(aes_encrypt(key, d) + aes_encrypt(key, index) + bytes(16) + b'\1' + struct.pack('<IIQQ', uepak.PAK_MAGIC, 11, len(d), len(index)) + bytes(20) + bytes(32 * 5))
+    path.write_bytes(os.urandom(len(d)) + os.urandom(len(index)) + bytes(16) + b'\1' + struct.pack('<IIQQ', uepak.PAK_MAGIC, 11, len(d), len(index)) + bytes(20) + bytes(32 * 5))
 
 
 class IoStore(unittest.TestCase):
@@ -112,7 +104,7 @@ class IoStore(unittest.TestCase):
 
     def run_job(self, decode=None):
         # The NSO and pak paths are outside this test's scope; TOC parsing, resolution and archive writing are real.
-        with patch.object(uepak, 'nso_image', return_value=(b'', 0, 0)), patch.object(uepak, 'unreal_paks', return_value=[]):
+        with patch.object(uepak, 'unreal_paks', return_value=[]):
             return uepak.job(str(self.romfs), 'unused-main', str(self.work), decode=decode or (lambda data, size: data))
 
     def shaders(self, entry):
@@ -178,15 +170,13 @@ class IoStore(unittest.TestCase):
         raw = b'LSLG-encrypted'
         container(self.romfs, 'Game.utoc', [(GROUP, raw)], encrypted=True)
         container(self.romfs, 'Game_0_P.utoc', [(LIB, library([(GROUP, raw, raw)]))])
-        with patch.object(uepak, 'aes_decrypt', side_effect=AssertionError('must not decrypt with a dummy key')) as aes:
-            with self.assertRaisesRegex(ValueError, 'Game.utoc:.*encrypted.*no key'):
-                self.run_job()
-            aes.assert_not_called()
+        with self.assertRaisesRegex(uepak.Encrypted, 'Game.utoc:.*encrypted.*no decryption code'):
+            self.run_job()
 
     def test_encrypted_library_is_detected_but_refused_on_read(self):
         container(self.romfs, 'Game.utoc', [(LIB, library([]))], encrypted=True)
         self.assertEqual(uepak.io_shader_tocs(str(self.romfs)), [str(self.romfs / 'Game.utoc')])
-        with self.assertRaisesRegex(ValueError, 'Game.utoc:.*encrypted.*no key'):
+        with self.assertRaisesRegex(uepak.Encrypted, 'Game.utoc:.*encrypted.*no decryption code'):
             self.run_job()
 
     def test_superseded_encrypted_library_is_not_read(self):
@@ -288,48 +278,30 @@ class IoStore(unittest.TestCase):
         self.assertFalse(uepak.inline_shaders(self.inline_pak(('Engine/GlobalShaderCache-X.bin', 'ShaderArchive-Global-X.ushaderbytecode'))))
         self.assertFalse(uepak.inline_shaders(self.inline_pak(('Engine/Config/a.ini',))))
 
-    KEY = bytes(range(40, 72))
-
     def sparking_zero(self):
-        """DRAGON BALL Sparking! ZERO's layout: pakchunk0's encrypted index names the global shader cache, its encrypted container holds the export bundles (data and directory index encrypted),
-        and pakchunk1's pak is empty (mount point "/") beside a container of its own"""
-        k = self.KEY
+        """DRAGON BALL Sparking! ZERO's layout: pakchunk0's pak and container are encrypted, and pakchunk1's pak is empty (mount point "/") beside a container of its own"""
         p0, p1 = self.romfs / 'pakchunk0-Switch.pak', self.romfs / 'pakchunk1-Switch.pak'
-        pak11_encrypted(p0, ['Engine/GlobalShaderCache-SP_GLSL_SWITCH.bin'], k); pak11_encrypted(p1, [], k, mount='/')
-        raw = b'scanned bundle..' * 2
-        toc = container(self.romfs, 'pakchunk0-Switch.utoc', [(chunk_id(1, uepak.IO_EXPORT_BUNDLE), raw), (chunk_id(2, 6), b'header' + bytes(10))], encrypted=True, version=5,
-                        directory=aes_encrypt(k, pad16(directory({0: 'Game/M_A.uasset'}))))
-        ucas = toc.with_suffix('.ucas'); ucas.write_bytes(aes_encrypt(k, ucas.read_bytes()))   # each block a multiple of 16 bytes, so ECB over the file is ECB per block
-        container(self.romfs, 'pakchunk1-Switch.utoc', [(chunk_id(3, uepak.IO_EXPORT_BUNDLE), bytes(16))], encrypted=True, version=5)
-        img = bytes(0x1000) + os.urandom(64) + k + os.urandom(64)   # main: the key in its read-only data, after a text of 0x1000 bytes
-        return str(p0), str(p1), toc, raw, (img, 0x1000, len(img))
+        pak11_encrypted(p0, ['Engine/GlobalShaderCache-SP_GLSL_SWITCH.bin']); pak11_encrypted(p1, [], mount='/')
+        toc = container(self.romfs, 'pakchunk0-Switch.utoc', [(chunk_id(1, uepak.IO_EXPORT_BUNDLE), bytes(32))], encrypted=True, version=5)
+        return str(p0), str(p1), toc
 
-    def test_an_encrypted_index_is_read_with_mains_key(self):
-        p0, p1, _, _, img = self.sparking_zero()
-        self.assertTrue(uepak.inline_shaders(p0, self.KEY))
-        self.assertFalse(uepak.inline_shaders(p0))   # no key: counted as one with shader code archives (Octopath Traveler 0), as before
-        self.assertIsNone(uepak.inline_shaders(p1, self.KEY))   # names no file: neither kind
-        with patch.object(uepak, 'nso_image', return_value=img):
-            self.assertEqual(uepak.unreal_paks(str(self.romfs), inline=True, mains=['main']), [p0])
-            self.assertEqual(uepak.unreal_paks(str(self.romfs), inline=False, mains=['main']), [])   # no decode step
-            self.assertEqual(len(uepak.unreal_paks(str(self.romfs), mains=['main'])), 2)
+    def test_an_encrypted_index_is_not_read(self):
+        p0, p1, toc = self.sparking_zero()
+        self.assertTrue(uepak.encrypted(p0)); self.assertFalse(uepak.encrypted(str(toc)))
+        self.assertIsNone(uepak.inline_shaders(p0))   # neither kind: no shader split job and no decode step
+        self.assertEqual(uepak.unreal_paks(str(self.romfs), inline=True), [])
+        self.assertEqual(uepak.unreal_paks(str(self.romfs), inline=False), [])
+        self.assertEqual(len(uepak.unreal_paks(str(self.romfs))), 2)
+        with self.assertRaisesRegex(uepak.Encrypted, 'the index is encrypted, and nup2android has no decryption code'): uepak.Pak(p0)
 
-    def test_split_reads_an_encrypted_container_with_the_key_of_the_pak_beside_it(self):
-        p0, _, toc, raw, img = self.sparking_zero()
-        with patch.object(uepak, 'nso_image', return_value=img), patch.object(uepak, 'Pak') as pk:
-            pk.return_value.mount, pk.return_value.files = '../../../', {}
-            files = [(str(f), f.name) for f in sorted(self.romfs.iterdir())]
-            jobs, taken = ss.ue_legacy_jobs(files, mains=['main'])
-        io = [(Path(p).name, a) for p, _, a in jobs if a[0] == ss.UE_IO]
-        # every container in the inline pak's folder is scanned, pakchunk1's too (its empty pak names nothing; the engine mounts all of them), each with the key
-        self.assertEqual(io, [('pakchunk0-Switch.utoc', (ss.UE_IO, (0,), self.KEY)), ('pakchunk1-Switch.utoc', (ss.UE_IO, (0,), self.KEY))])
-        self.assertIn(str(toc), taken)
-        self.assertEqual(uepak.Toc(str(toc)).names(), {})   # without the key the directory index is not read
-        seen = []
-        ss._PAKS.pop(str(toc), None); self.addCleanup(ss._PAKS.pop, str(toc), None)
-        with patch.object(ss, 'ue_inline_shaders', side_effect=lambda d, label, out: seen.append((d, label))):
-            ss.ue_io_shaders(str(toc), 'pakchunk0-Switch.utoc', (0,), [], self.KEY)
-        self.assertEqual(seen, [(raw, '/pakchunk0-Switch.utoc#Game/M_A.uasset')])
+    def test_split_leaves_encrypted_paks_and_containers_out(self):
+        p0, p1, toc = self.sparking_zero()
+        files = [(str(f), f.name) for f in sorted(self.romfs.iterdir())]; said = io.StringIO()
+        with contextlib.redirect_stdout(said): jobs, taken = ss.ue_legacy_jobs(files)
+        self.assertEqual(jobs, []); self.assertEqual(taken, {p0, p1})
+        self.assertIn("[RED] /pakchunk0-Switch.pak: the pak's index is encrypted, and nup2android has no decryption code; its shaders are left out", said.getvalue())
+        t = uepak.Toc(str(toc)); self.assertTrue(t.encrypted); self.assertEqual(t.names(), {})   # the directory index is not read
+        with self.assertRaisesRegex(uepak.Encrypted, 'the container is encrypted'): t.read(0)
 
     def split_jobs(self, tocs):
         with patch.object(uepak, 'Pak') as pk:

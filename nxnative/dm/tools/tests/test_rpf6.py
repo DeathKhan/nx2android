@@ -1,6 +1,5 @@
-"""rpf6.py: Rockstar RPF6 archives (Red Dead Redemption). No game files: a synthetic archive (header, entry table, name table) encrypted with a made-up key, and a synthetic
-key setup function for key_from_setup, both laid out as the module's comment describes."""
-import ctypes
+"""rpf6.py: Rockstar RPF6 archives (Red Dead Redemption). No game files: a synthetic archive (header, entry table, name table) laid out as the module's comment describes,
+stored in the clear, and one whose header says its tables are encrypted, which is refused (no decryption code)."""
 import os
 import struct
 import sys
@@ -13,26 +12,8 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / 'dm/gfx/tools'))
 import rpf6
 
-KEY = bytes(range(0x40, 0x60))   # made up: 32 distinct bytes
 
-
-def aes_encrypt(key, data):
-    """AES-256 ECB encryption through CommonCrypto, the counterpart of uepak.aes_decrypt"""
-    cc = ctypes.CDLL('/usr/lib/libSystem.B.dylib').CCCrypt
-    cc.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
-                   ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-    out, moved = ctypes.create_string_buffer(len(data)), ctypes.c_size_t()
-    if cc(0, 0, 2, key, len(key), None, data, len(data), out, len(data), ctypes.byref(moved)): raise ValueError('CCCrypt failed')   # encrypt, AES, ECB
-    return out.raw
-
-
-def encrypt(key, data):
-    """RPF6's table encryption run backwards: 16 rounds of AES-256 ECB"""
-    for _ in range(rpf6.ROUNDS): data = aes_encrypt(key, data)
-    return data
-
-
-def archive(path, key=KEY, encrypted=True):
+def archive(path, encrypted=False):
     """root/ {a.txt (plain), dir/ {b.bin (zlib, compressed bit), r.wtx (an RSC5 resource)}}: entries 0 root, 1 a.txt, 2 dir, 3 b.bin, 4 r.wtx"""
     plain, packed = b'plain text', zlib.compress(b'x' * 300)
     res_flags = 0x80000000 | 0x40000000 | 0x123
@@ -51,7 +32,7 @@ def archive(path, key=KEY, encrypted=True):
     names = b'\0\0\0\0a.txt\0dir\0b.bin\0r.wtx\0'
     names += bytes(-len(names) % 16)
     names_at = 0x10 + len(table)
-    if encrypted: table, names = encrypt(key, table), encrypt(key, names)
+    if encrypted: table, names = os.urandom(len(table)), os.urandom(len(names))   # nothing may read them
     d = bytearray(data_at + 0x1000)
     d[:16] = rpf6.MAGIC + struct.pack('>3I', len(entries), names_at // 8, rpf6.ENCRYPTED if encrypted else 0)
     d[0x10:0x10 + len(table)] = table
@@ -83,101 +64,40 @@ class Archive(unittest.TestCase):
 
     def test_header(self):
         archive(self.path)
+        self.assertEqual(rpf6.header(self.path), (5, 0x10 + 0x70, False))
+        archive(self.path, encrypted=True)
         self.assertEqual(rpf6.header(self.path), (5, 0x10 + 0x70, True))
         Path(self.path).write_bytes(b'RPF7' + bytes(12))
         self.assertIsNone(rpf6.header(self.path))
         Path(self.path).write_bytes(b'RPF6')
         self.assertIsNone(rpf6.header(self.path))   # shorter than a header
 
-    def test_decrypt_round_trip(self):
-        blk = struct.pack('>4I', 0, 0, 0x80000001, 2)
-        self.assertTrue(rpf6.is_root(rpf6.decrypt(KEY, encrypt(KEY, blk))))
-        self.assertFalse(rpf6.is_root(rpf6.decrypt(bytes(range(32)), encrypt(KEY, blk))))
-        self.assertEqual(len(rpf6.decrypt(KEY, bytes(40))), 32)   # whole blocks only
-
     def test_entry_table_and_names(self):
-        for encrypted in (True, False):
-            with self.subTest(encrypted=encrypted):
-                archive(self.path, encrypted=encrypted)
-                r = rpf6.Rpf(self.path, KEY)
-                files = {e[0]: e for e in r.files}
-                self.assertEqual(sorted(files), ['a.txt', 'dir/b.bin', 'dir/r.wtx'])
-                self.assertEqual(files['a.txt'][1:5], (0x800, 10, 10, False))
-                self.assertEqual(files['dir/b.bin'][3:5], (300, True))
-                self.assertEqual(files['dir/r.wtx'][1], 0x1000)   # the resource type byte is not part of the offset
-                self.assertIsNone(files['dir/r.wtx'][3])
-                with open(self.path, 'rb') as f:
-                    self.assertEqual(r.read(f, files['a.txt'], Zlib), b'plain text')
-                    self.assertEqual(r.read(f, files['dir/b.bin'], Zlib), b'x' * 300)
-                    self.assertEqual(r.read(f, files['dir/r.wtx'], Zlib), b'resource data')
-
-    def test_wrong_key_is_an_error(self):
         archive(self.path)
-        with self.assertRaisesRegex(ValueError, 'no root directory'):
-            rpf6.Rpf(self.path, bytes(range(32)))
+        r = rpf6.Rpf(self.path)
+        files = {e[0]: e for e in r.files}
+        self.assertEqual(sorted(files), ['a.txt', 'dir/b.bin', 'dir/r.wtx'])
+        self.assertEqual(files['a.txt'][1:5], (0x800, 10, 10, False))
+        self.assertEqual(files['dir/b.bin'][3:5], (300, True))
+        self.assertEqual(files['dir/r.wtx'][1], 0x1000)   # the resource type byte is not part of the offset
+        self.assertIsNone(files['dir/r.wtx'][3])
+        with open(self.path, 'rb') as f:
+            self.assertEqual(r.read(f, files['a.txt'], Zlib), b'plain text')
+            self.assertEqual(r.read(f, files['dir/b.bin'], Zlib), b'x' * 300)
+            self.assertEqual(r.read(f, files['dir/r.wtx'], Zlib), b'resource data')
+
+    def test_encrypted_tables_are_refused(self):
+        archive(self.path, encrypted=True)
+        with self.assertRaisesRegex(ValueError, 'tables are encrypted, and nup2android has no decryption code'):
+            rpf6.Rpf(self.path)
 
     def test_directory_past_the_table_is_an_error(self):
-        archive(self.path, encrypted=False)
+        archive(self.path)
         d = bytearray(Path(self.path).read_bytes())
         struct.pack_into('>I', d, 0x10 + 2 * 20 + 12, 9)   # dir claims 9 children
         Path(self.path).write_bytes(bytes(d))
         with self.assertRaisesRegex(ValueError, 'runs past the table'):
-            rpf6.Rpf(self.path, KEY)
+            rpf6.Rpf(self.path)
 
 
-def adrp(a, rd, target):
-    imm = ((target & ~0xfff) - (a & ~0xfff)) >> 12
-    return 0x90000000 | (imm & 3) << 29 | ((imm >> 2) & 0x7ffff) << 5 | rd
-
-
-def ldr_q(rt, rn, off): return 0x3dc00000 | (off // 16) << 10 | rn << 5 | rt
-def stp_q(rt, rt2, rn, off): return 0xad000000 | ((off // 16) & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt
-def add_x(rd, rn, imm): return 0x91000000 | imm << 10 | rn << 5 | rd
-
-
-def setup_image(words, setups=1):
-    """A code segment with the key setup's first instructions, its b.ne, then: adrp x9; ldr q0-q3 from four 16-byte constants; add x8, x0, #8; stp q0, q1, [x8]; stp q2, q3, [x8, #32]; b.
-    The constants hold the eight words, each zero-extended to 64 bits (little-endian in memory)"""
-    img = bytearray(0x2000)
-    consts = 0x1000
-    img[consts:consts + 64] = struct.pack('<8Q', *words)
-    for n in range(setups):
-        at = 0x100 + n * 0x100
-        img[at:at + len(rpf6.SETUP)] = rpf6.SETUP
-        a = at + len(rpf6.SETUP)
-        code = [0x54000001]   # b.ne
-        code.append(adrp(a + 4, 9, consts))
-        code += [ldr_q(i, 9, i * 16) for i in range(4)]
-        code += [add_x(8, 0, 8), stp_q(0, 1, 8, 0), stp_q(2, 3, 8, 32), 0x14000000]
-        for i, w in enumerate(code): struct.pack_into('<I', img, a + 4 * i, w)
-    return bytes(img), (0, 0x1000)
-
-
-class KeyFromSetup(unittest.TestCase):
-    def test_eight_big_endian_words(self):
-        words = [0x11223344 + i * 0x01010101 for i in range(8)]
-        img, text = setup_image(words)
-        self.assertEqual(list(rpf6.key_from_setup(img, text)), [struct.pack('>8I', *words)])
-
-    def test_every_setup_gives_a_candidate(self):
-        img, text = setup_image(list(range(1, 9)), setups=2)
-        self.assertEqual(len(list(rpf6.key_from_setup(img, text))), 2)
-
-    def test_words_wider_than_32_bits_give_none(self):
-        img, text = setup_image([1 << 32] + list(range(7)))
-        self.assertEqual(list(rpf6.key_from_setup(img, text)), [])
-
-    def test_no_setup_outside_the_code_segment(self):
-        img, _ = setup_image(list(range(8)))
-        self.assertEqual(list(rpf6.key_from_setup(img, (0x400, 0x400))), [])   # the setup at 0x100 is outside
-
-    def test_setup_that_stores_too_little_gives_none(self):
-        img, text = setup_image(list(range(8)))
-        img = bytearray(img)
-        at = 0x100 + len(rpf6.SETUP) + 4 * 8   # the second stp
-        struct.pack_into('<I', img, at, 0x14000000)
-        self.assertEqual(list(rpf6.key_from_setup(bytes(img), text)), [])
-
-
-if __name__ == '__main__':
-    unittest.main()
+if __name__ == '__main__': unittest.main()

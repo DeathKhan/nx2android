@@ -32,8 +32,8 @@ Status: brought up on the Mac on 2026-10-31: the logos and the opening movie, th
 ## Files and shaders
 
 - **Resolved: offline depth metadata.** Update 1.1.2 selects near-zero NVN depth in `run/final.log` (through frame 4,500), with no later GL switch. A short isolated boot reproduced the call with matching registered module IDs; evidence is in `01003E601E324000-work/depth-mode-audit/boot-20261031/` beside the NSPs. The profile now declares `depth_mode zero` for the [shared archive mechanism](../../../docs/reference/shaders.md#offline-pipeline-archive-and-profile-depth-disagree). This confirms the input; rebuilt archive acceptance and performance were not retested.
-- One pak, `Nicola/Content/Paks/Nicola-Switch_0_P.pak` (7.4 GB, 172,665 files, version 11 with the magic 0xcc from the end, Oodle and Zlib blocks; the profile's `romfs_marker`): the cooked packages, CRIWARE `.awb` banks (BGM, English and Japanese voices) and `.usm` movies, and the two shader code archives. The index is AES-256 encrypted, and so are 41 config files.
-- **Resolved: no window of `main` holds the pak key.** The callback that hands the key to the engine loads two 16-byte literals from separate places and stores them as one; `uepak.py` now reads such keys from the code: [An Unreal pak key split into two 16-byte literals](../../../docs/reference/shaders.md#an-unreal-pak-key-split-into-two-16-byte-literals).
+- One pak, `Nicola/Content/Paks/Nicola-Switch_0_P.pak` (7.4 GB, 172,665 files, version 11 with the magic 0xcc from the end, Oodle and Zlib blocks; the profile's `romfs_marker`): the cooked packages, CRIWARE `.awb` banks (BGM, English and Japanese voices) and `.usm` movies, and the two shader code archives. The index is encrypted, and so are 41 config files; this fork does not read it (nup2android has no decryption or de-obfuscation code).
+- **The pak's index is encrypted**, and this fork does not read it: [Encrypted Unreal paks and containers](../../../docs/reference/shaders.md#encrypted-unreal-paks-and-containers).
 - Shaders: `ShaderArchive-Global-SF_GLSL_SWITCH.ushaderbytecode` (1,554 shaders) and `ShaderArchive-Nicola-SF_GLSL_SWITCH.ushaderbytecode` (46,743), stored in the pak, every shader an LZ4 block (`uepak.py` `lz4_shaders`, no host run). 47,298 unique shaders (3,823 vertex, 40,605 pixel, 2,831 compute, 39 geometry); the Mac libraries took 2 h 12 min to compile on the first build.
 - One geometry shader seen in play writes only the layer, and its vertex shader draws with its layer entry points instead (the host's general rule).
 
@@ -49,7 +49,7 @@ Status: brought up on the Mac on 2026-10-31: the logos and the opening movie, th
 
 General mechanisms used here:
 
-- **An Unreal pak key split into two 16-byte literals in `main`'s code** (`uepak.py` `code_keys`): [An Unreal pak key split into two 16-byte literals](../../../docs/reference/shaders.md#an-unreal-pak-key-split-into-two-16-byte-literals), [01, Compressed RomFS content](../../../docs/agents/01-extract.md#compressed-romfs-content).
+- **An encrypted Unreal pak** (not read): [Encrypted Unreal paks and containers](../../../docs/reference/shaders.md#encrypted-unreal-paks-and-containers), [01, Compressed RomFS content](../../../docs/agents/01-extract.md#compressed-romfs-content).
 - **Offline depth metadata:** [Offline pipeline archive and profile depth disagree](../../../docs/reference/shaders.md#offline-pipeline-archive-and-profile-depth-disagree).
 
 ## Open

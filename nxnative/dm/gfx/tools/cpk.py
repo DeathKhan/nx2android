@@ -2,23 +2,18 @@
 # CRI CPK archives (CRIWARE File System): Bayonetta 2 keeps all its data but sound and movies in six of them (data000.cpk …). A CPK starts with 'CPK ' and a 0x10-byte header, then an
 # @UTF table that names where its table of contents is (TocOffset) and where the file data starts (ContentOffset); the TOC ('TOC ', 0x10 bytes, @UTF) has one row per file:
 # DirName, FileName, FileSize (stored), ExtractSize, FileOffset (relative to the smaller of TocOffset and ContentOffset). A file whose stored size is smaller than its size is
-# CRILAYLA-compressed (crilayla). The @UTF tables may be stored masked (Unicorn Overlord; unmask). shader_split.py reads every CPK through it (cpk_jobs).
+# CRILAYLA-compressed (crilayla). A CPK whose @UTF tables are stored masked (Unicorn Overlord) is not read: nup2android has no de-obfuscation code (utf_at). shader_split.py reads every CPK through it (cpk_jobs).
 # Usage: cpk.py <file.cpk> [--extract <dir> [<name regex>]] lists (or extracts) the files.
 import re, struct, sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import open
 from pathlib import Path
 
-def unmask(b):
-    """An @UTF table stored masked (Unicorn Overlord's CPKs): each byte XOR the low byte of a 16-bit value that starts at 0x655f and is multiplied by 0x4115 after every byte"""
-    out, m = bytearray(len(b)), 0x655f
-    for i, x in enumerate(b): out[i] = x ^ (m & 0xff); m = m * 0x4115 & 0xffff
-    return bytes(out)
-
 def utf_at(d, o, n):
-    """The @UTF table of n bytes at d[o:], unmasked when it is stored masked"""
+    """The @UTF table of n bytes at d[o:]; ValueError for one stored masked, which is not read (nup2android has no de-obfuscation code)"""
     t = d[o:o + n]
-    return t if t[:4] == b'@UTF' else unmask(t)
+    if t[:4] != b'@UTF': raise ValueError('its @UTF table is stored masked, and nup2android has no de-obfuscation code')
+    return t
 
 def utf(d, o=0):
     """A CRI @UTF table at d[o:]: '@UTF', u32 table length, then (offsets from o + 8, big-endian) u16 version, u16 rows offset, u32 strings offset, u32 data offset, u32 table name,

@@ -127,7 +127,7 @@ def main():
                         body = smash_arc.read(m, e); h = hashlib.sha256(body).digest()
                         if h in want: found[h] = (f'{os.path.relpath(p, romfs)}#{e[0]:010x}', 'index', body)
                         else: print(f'[RED] {os.path.relpath(p, romfs)}#{e[0]:010x}: an NRO that no NRR registers')
-            elif head[:4] != b'CRA.': big.append((p, sz))   # Camelot's archive is scrambled, so no scan can find anything in it (dm/gfx/tools/cra.py)
+            elif head[:4] != b'CRA.': big.append((p, sz))   # Camelot's archive is scrambled, so no scan can find anything in it (and it is not read: shader_split.py cra_jobs)
     if indexed:   # the NROs a game loads are the current files of its archives: the hashes not among them belong to superseded copies
         print(f'{len(found)} NROs among the current files of {indexed} indexed archive(s); {len(want) - len(found)} registered hashes are superseded copies, left out')
         want = {h: n for h, n in want.items() if h in found}

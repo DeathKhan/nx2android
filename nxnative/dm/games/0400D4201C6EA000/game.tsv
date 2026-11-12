@@ -1,6 +1,6 @@
 # Mario Tennis Fever (Switch 2, update v327680). Plays on the Mac: see README.md
 # Camelot's engine on NintendoWare, SDK 20.5.17 built for the Switch 2 (Ounce), NVN2. main is a boot stub (nxboot): it decodes the game's code, one NRO, out of its data segment and loads it with nn::ro; the game's files are one archive, rom:/42.
-# Packed from a dump folder with scripts/pack_dump.py. Shaders: BNSH in the archive's FSHA, VFXB and SARC members, and in the NRO (dm/gfx/tools/cra.py).
+# Packed from a dump folder with scripts/pack_dump.py. Shaders: BNSH in the archive's FSHA, VFXB and SARC members, and in the NRO. The archive is scrambled; nup2android does not read it.
 
 # ---- Identity ----
 title_id	0400D4201C6EA000

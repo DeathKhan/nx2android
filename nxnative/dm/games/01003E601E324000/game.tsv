@@ -51,7 +51,7 @@ sys_resource	0x5000000
 pad_layout	full
 
 # ---- Shader split ----
-# The shader code archives of Nicola-Switch_0_P.pak (ShaderArchive-*.ushaderbytecode), each shader LZ4-compressed (uepak.py lz4_shaders), read once uepak.py has the index's AES key
+# The shader code archives of Nicola-Switch_0_P.pak (ShaderArchive-*.ushaderbytecode), each shader LZ4-compressed (uepak.py lz4_shaders); the pak's index is encrypted, which nup2android does not read
 # (two 16-byte literals in main's code, uepak.py code_keys): the engine's global shaders and the game's material shaders
 shader_groups	ShaderArchive-Global-=global ShaderArchive-=game
 shader_note	DRAGON QUEST III HD-2D Remake shaders

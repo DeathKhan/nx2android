@@ -135,12 +135,10 @@ class MonolithTests(unittest.TestCase):
         trie = b''.join(struct.pack('<ii', *n) for n in nodes)
         so, no = 48, 48 + len(strings)
         fo = no + len(trie)
-        # A non-word-aligned suffix table leaves the last two ID bytes plain.
-        mask = bytes.fromhex('12345678')
-        enc = lambda b: bytes(x ^ mask[i & 3] for i, x in enumerate(b[:len(b) & ~3])) + b[len(b) & ~3:]
-        header = struct.pack('<4s9I8x', b'arh1', len(strings), len(nodes), so, len(strings), no, len(trie), fo, 1, int.from_bytes(mask, 'little') ^ 0xf3f35353)
-        data = header + enc(strings) + enc(trie) + struct.pack('<Q4I', 32, 100, 200, 2, 0)
-        self.assertEqual(split.arh_entries(data), [('a.bin', 32, 148)])
+        tail = strings + trie + struct.pack('<Q4I', 32, 100, 200, 2, 0)
+        header = lambda key: struct.pack('<4s9I8x', b'arh1', len(strings), len(nodes), so, len(strings), no, len(trie), fo, 1, key)
+        self.assertEqual(split.arh_entries(header(0xf3f35353) + tail), [('a.bin', 32, 148)])   # tables stored in the clear
+        self.assertIsNone(split.arh_entries(header(0x12345678) + tail))   # masked tables are not read: no de-obfuscation code
 
 
 if __name__ == '__main__':

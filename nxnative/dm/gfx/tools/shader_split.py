@@ -29,7 +29,7 @@
 #   · data.arc (Super Smash Bros. Ultimate, smash_arc.py): GLSLC outputs in its SSBH shader databases and BNSH in its effects and UI layouts, each of its current files (zstd) scanned, see smash_arc_jobs
 #   · PKZ (PlatinumGames, Bayonetta 3): shader objects (VSO / PSO / CSO / HSO / DSO, a control section and a code area each) in the DAT archives of the PKZ entries (Oodle Kraken, decoded by the
 #       game's own decoder in the Mac host), see pkz_entries, pgdat_members and pg_shader
-#   · CRA (Camelot, Mario Tennis Fever): BNSH in the FSHA, VFXB and SARC members of the NARC containers in rom:/42, its files scrambled and listed only in the NRO the game decodes at run time, see cra.py and cra_jobs
+#   · CRA (Camelot, Mario Tennis Fever): BNSH in the FSHA, VFXB and SARC members of the NARC containers in rom:/42, its files scrambled, so the archive is not read (no de-obfuscation code: cra_jobs); NARC containers found in the clear are (cra.py)
 #   · CPK (CRI's file system, Bayonetta 2): BNSH files ('.vso' / '.pso') in the PlatinumGames DAT archives of the CPK entries (CRILAYLA entries, cpk.py), see cpk_jobs
 #       NieR:Automata's DAT members instead prefix length-delimited NVN code and control sections with a binding table (pg_sized_shader)
 #   · HNSHV002 (Needle, Persona 5 Royal): NVN section descriptors in the shader containers embedded in main and the GSC files of its CPK archives, see needle_shaders
@@ -724,29 +724,31 @@ def pkz_shaders(path, rel, ents, out):
             scan_blob(d, f'/{rel}/{name}', out)
 
 RPF6, RGXD = b'RPF6', b'rgxd'
-def rpf_jobs(files, mains, parts=64):
-    """Every file of every Rockstar RPF6 archive in ranges of about equal stored length (Red Dead Redemption: 134 archives, 11 GB; its shaders are the .nvn effects in shaders.rpf, but no
-    file name is relied on). The entry and name tables are AES encrypted with a key in main (rpf6.py find_key): the first main that opens the first archive gives it.
-    → ([(path, rel, (RPF6, key, entries)), …], the RPF6 paths)"""
+def rpf_jobs(files, parts=64):
+    """Every file of every Rockstar RPF6 archive in ranges of about equal stored length. An archive whose entry and name tables are encrypted (Red Dead Redemption: all 134) is not read:
+    nup2android has no decryption code and looks for no key, so its shaders are left out with a message. → ([(path, rel, (RPF6, entries)), …], the RPF6 paths)"""
     import rpf6
     rp = [(p, r) for p, r in files if rpf6.header(p) is not None]
     if not rp: return [], set()
-    key = next((k for m in mains if (k := rpf6.find_key(m, rp[0][0])) is not None), None)
-    if key is None: red(f'/{rp[0][1]}: an encrypted RPF6 archive, and no 32-byte window of main decrypts its first entry to the root directory')
-    arcs = [(p, r, rpf6.Rpf(p, key).files) for p, r in rp]
+    arcs, closed = [], 0
+    for p, r in rp:
+        if rpf6.header(p)[2]: closed += 1; continue
+        try: arcs.append((p, r, rpf6.Rpf(p).files))
+        except (OSError, ValueError, struct.error) as e: print(f'[RED] /{r}: the RPF6 archive cannot be read ({e}); its shaders are left out', flush=True)
+    if closed: print(f'[RED] {closed} RPF6 archive(s) with encrypted tables (/{next(r for p, r in rp if rpf6.header(p)[2])} …): nup2android has no decryption code; their shaders are left out', flush=True)
     jobs, step = [], max(1, sum(e[2] for _, _, es in arcs for e in es) / parts)
     for p, r, es in arcs:
         cur, size = [], 0
         for e in es:
             cur.append(e); size += e[2]
-            if size >= step: jobs.append((p, r, (RPF6, key, tuple(cur)))); cur, size = [], 0
-        if cur: jobs.append((p, r, (RPF6, key, tuple(cur))))
+            if size >= step: jobs.append((p, r, (RPF6, tuple(cur)))); cur, size = [], 0
+        if cur: jobs.append((p, r, (RPF6, tuple(cur))))
     return jobs, {p for p, _ in rp}
 
-def rpf_shaders(path, rel, key, ents, out):
+def rpf_shaders(path, rel, ents, out):
     """A range of RPF6 files (rpf_jobs), each zstd-decoded and scanned like a loose file"""
     import rpf6
-    r = rpf6.Rpf.__new__(rpf6.Rpf); r.path, r.key = path, key   # the entries came with the job; only read() is needed
+    r = rpf6.Rpf.__new__(rpf6.Rpf); r.path = path   # the entries came with the job; only read() is needed
     z = zstd_mod()
     with open(path, 'rb') as f:
         for e in ents: scan_blob(r.read(f, e, z), f'/{rel}/{e[0]}', out)
@@ -832,35 +834,15 @@ def boot_nros():
 
 
 def cra_jobs(files, parts=64):
-    """Every file of Camelot's archive in ranges of about equal length (Mario Tennis Fever: the whole game in rom:/42, 8,671 files, 7.6 GB; cra.py). Its index is in the NRO the game decodes at run time,
-    which DM_NRO_DIR holds (the NSP script's capture). → ([(path, rel, entries), …], the archive paths)"""
-    jobs, arcs = [], set()
+    """Camelot's archives (Mario Tennis Fever: the whole game in rom:/42). Their files are scrambled and their index is obfuscated in the game's code; nup2android has no de-obfuscation code, so
+    an archive is not read: its shaders are left out with a message, and it is not scanned as a loose file either (nothing in it is in the clear). → ([], the archive paths)"""
+    arcs = set()
     for p, r in files:
         with open(p, 'rb') as f: h = f.read(4)
         if h != CRA: continue
-        import cra
-        idx = None
-        for n in boot_nros():
-            try: idx = cra.Index(open(n, 'rb').read()); break
-            except cra.Error: continue
-        if idx is None: red(f'/{r}: a CRA archive, and no NRO in DM_NRO_DIR ({os.environ.get("DM_NRO_DIR")}) holds its file table')
-        es = idx.files()
-        step = sum(e[2] for e in es) / parts
-        cur, size = [], 0
-        for e in es:
-            cur.append(e); size += e[2]
-            if size >= step: jobs.append((p, r, tuple(cur))); cur, size = [], 0
-        if cur: jobs.append((p, r, tuple(cur)))
+        print(f'[RED] /{r}: a CRA archive, whose files are scrambled: nup2android has no de-obfuscation code; its shaders are left out', flush=True)
         arcs.add(p)
-    return jobs, arcs
-
-def cra_shaders(path, rel, ents, out):
-    """A range of a CRA archive's files, unscrambled and scanned like loose files; sound and movies (their magics: FSTM, EBML) are left out by their first block, as unscrambling is the slow part"""
-    import cra
-    with open(path, 'rb') as f:
-        for e in ents:
-            if cra.head(f, e)[:4] in (b'FSTM', b'\x1aE\xdf\xa3'): continue
-            scan_blob(cra.undo(cra.read(f, e)), f'/{rel}/{e[1]}', out)
+    return [], arcs
 
 PDAT, PDAT_PMAP = b'PDAT', b'PMAP'
 PDAT_ZSTD, PDAT_CTL, PDAT_SPAN = b'\x28\xb5\x2f\xfd', CTL_MAGIC + b'\xc9\0\0\0', 1 << 20   # a PMAP frame never takes up 1 MB (the largest of Kirby Air Riders' 27,299: 186 KB inflated); pdat_shaders stops if one does
@@ -2264,44 +2246,39 @@ def ue3_shaders(d, label):
     return out
 
 UE_LEGACY, UE_IO = 'UE legacy pak', 'UE IoStore'
-def ue_legacy_jobs(files, parts=64, mains=()):
+def ue_legacy_jobs(files, parts=64):
     """Unreal paks whose shaders are inline in the cooked packages (uepak.inline_shaders): legacy paks (version 4, DRAGON QUEST XI S: pakchunk0-Switch.pak and pakchunk1-Switch.pak, 13.8 GB,
     and the update's *_0_P.pak) and version 11 paks without shader code archives (OCTOPATH TRAVELER II: Majesty-Switch.pak, 3.3 GB). The engine mounts them all as one view, and a patch pak
     (name ending in _P.pak) wins over the others for the same path. Only the newest copy of each path is scanned. With IoStore on (Mario & Luigi: Brothership) the cooked packages are the export bundles
     of the containers beside such a pak, the pak holding only the global shader cache of the shaders: those chunks are scanned too, the newest copy of each chunk ID (uepak.mount_order).
-    A pak whose index is encrypted (Little Nightmares II: Helios-Switch.pak, version 8, every entry encrypted too) is opened with the AES key from mains, the ExeFS main of every version
-    (uepak.Keys), and its jobs carry the key: (UE_LEGACY, names, key). An encrypted container (DRAGON BALL Sparking! ZERO: every pakchunk*-Switch.utoc, the index of the pak beside each
-    encrypted too) is read with the key that opens that pak, else the first key found, and its jobs carry it: (UE_IO, chunks, key).
-    → ([(pak path, rel, (UE_LEGACY, names[, key])) or (TOC path, rel, (UE_IO, chunk indices[, key])), …] in about equal raw sizes, the pak and container paths taken)"""
-    key_of = uepak.Keys(mains)
-    def key(p):
-        try: return key_of(p)
-        except (OSError, ValueError, struct.error): return None
+    A pak whose index is encrypted (Little Nightmares II: Helios-Switch.pak) and an encrypted container (DRAGON BALL Sparking! ZERO: every pakchunk*-Switch.utoc) are not read:
+    nup2android has no decryption code and looks for no key, so their shaders are left out with a message.
+    → ([(pak path, rel, (UE_LEGACY, names)) or (TOC path, rel, (UE_IO, chunk indices)), …] in about equal raw sizes, the pak and container paths taken)"""
     def inline(p):
-        try: return uepak.inline_shaders(p, key(p)) is True
+        try: return uepak.inline_shaders(p) is True
         except (OSError, ValueError, struct.error): return False
-    paks = [(p, r) for p, r in files if p.endswith('.pak') and inline(p)]
-    if not paks: return [], set()
-    view, keys = {}, {}
+    paks, closed = [(p, r) for p, r in files if p.endswith('.pak') and inline(p)], set()
+    for p, r in files:   # a legacy pak with an encrypted index is among paks: Pak refuses it below
+        if p.endswith('.pak') and (p, r) not in paks and uepak.encrypted(p):
+            print(f'[RED] /{r}: the pak\'s index is encrypted, and nup2android has no decryption code; its shaders are left out', flush=True); closed.add(p)
+    if not paks: return [], closed
+    view = {}
     for p, r in sorted(paks, key=lambda x: (x[1].endswith('_P.pak'), x[1])):   # patch paks last, so they replace; one view per pak folder (one per version given)
         try:   # all of a pak's names or none: a patch pak read halfway would still replace the base pak's files
-            keys[p] = key_of(p); pk = uepak.Pak(p, keys[p])
+            pk = uepak.Pak(p)
             view.update({(os.path.dirname(p), os.path.normpath(pk.mount + name)): (p, r, name, pk.entry(name)['raw']) for name in pk.files})
         except (OSError, ValueError) as e: print(f'[RED] /{r}: the pak cannot be read ({e}); its shaders are left out', flush=True)
-    chunks, taken, folders = {}, {p for p, _ in paks}, {os.path.dirname(p) for p, _ in paks}
+    chunks, taken, folders = {}, {p for p, _ in paks} | closed, {os.path.dirname(p) for p, _ in paks}
     for p, r in sorted(((p, r) for p, r in files if p.endswith('.utoc') and os.path.dirname(p) in folders), key=lambda x: uepak.mount_order(x[0])):
         try: t = uepak.Toc(p)
         except (OSError, ValueError, struct.error) as e: print(f'[RED] /{r}: the container cannot be read ({e}); its shaders are left out', flush=True); continue
         bundles = t.export_bundles()
         if not bundles: continue
-        if t.encrypted:
-            beside = p[:-len('.utoc')] + '.pak'
-            keys[p] = (key(beside) if os.path.exists(beside) else None) or next(iter(key_of.found), None)
-            if not keys[p]: print(f'[RED] /{r}: the container is encrypted and no key of the game opens the pak beside it; its shaders are left out', flush=True); continue
+        if t.encrypted: print(f'[RED] /{r}: the container is encrypted, and nup2android has no decryption code; its shaders are left out', flush=True); continue
         taken.update([p, *t.ucas_paths()])
         chunks.update({(os.path.dirname(p), t.ids[i]): (p, r, i, t.ranges[i][1]) for i in bundles})
     jobs = []
-    def job(p, r, tag, ns): return (p, r, (tag, tuple(ns), keys[p]) if keys.get(p) else (tag, tuple(ns)))
+    def job(p, r, tag, ns): return (p, r, (tag, tuple(ns)))
     for tag, items in ((UE_LEGACY, view.values()), (UE_IO, chunks.values())):
         cur, size, step = collections.defaultdict(list), 0, sum(v[3] for v in items) / parts
         for p, r, name, raw in sorted(items, key=lambda x: (x[1], x[2])):
@@ -2323,17 +2300,17 @@ def ue_packages(items, out, shown=8):
             if lost <= shown: print(f'[RED] {why} (its shaders are left out)', flush=True)
     return ('unreadable', first, lost) if lost else None
 
-def ue_legacy_shaders(path, rel, names, out, key=None):
+def ue_legacy_shaders(path, rel, names, out):
     """Files of an Unreal pak with inline shaders (ue_legacy_jobs), each decoded block by block (Zlib and LZ4 in uepak.py; others with the game's own decoder, DRAGON QUEST XI S: LZ5) and scanned
-    for the shader records the engine keeps inline; key: the AES key of a pak whose index and entries are encrypted (ue_legacy_jobs) → ue_packages's extra"""
-    pk = _PAKS.get(path) or _PAKS.setdefault(path, uepak.Pak(path, key))
+    for the shader records the engine keeps inline → ue_packages's extra"""
+    pk = _PAKS.get(path) or _PAKS.setdefault(path, uepak.Pak(path))
     label = lambda name: re.sub(r"^(\.\./)+", "", os.path.normpath(pk.mount + name))
     return ue_packages(((f'/{rel}#{label(name)}', lambda name=name: pk.read(name, decode=oodle)) for name in names), out)
 
-def ue_io_shaders(path, rel, chunks, out, key=None):
+def ue_io_shaders(path, rel, chunks, out):
     """Export bundles of an IoStore container (ue_legacy_jobs), decoded with the game's own decoder as far as its blocks need it, and scanned as a pak's cooked packages are; labelled by the package's
-    path where the container has a directory index, so that shader_groups and the shader map read as for a pak; key: an encrypted container's AES key (ue_legacy_jobs) → ue_packages's extra"""
-    t, names = _PAKS.get(path) or _PAKS.setdefault(path, (lambda k: (k, k.names()))(uepak.Toc(path, key)))
+    path where the container has a directory index, so that shader_groups and the shader map read as for a pak → ue_packages's extra"""
+    t, names = _PAKS.get(path) or _PAKS.setdefault(path, (lambda k: (k, k.names()))(uepak.Toc(path)))
     return ue_packages(((f'/{rel}#{names.get(i) or t.ids[i].hex()}', lambda i=i: t.read(i, decode=oodle)) for i in chunks), out)
 
 ZLIB_HEAD = re.compile(b'\x78[\x01\x5e\x9c\xda]')
@@ -2399,17 +2376,16 @@ def ue_inline_shaders(d, label, out):
         out.append((f'{label}#UE{at:x}', st, bytes(ctl), bytes(code)))
 
 def arh_entries(d):
-    """Monolith ARH1 index → (path, ARD offset, stored size). The XOR trie
+    """Monolith ARH1 index → (path, ARD offset, stored size), or None for an index whose string and node tables are stored masked (the header's key word is not the
+    format's constant; Xenoblade Chronicles 3's are): nup2android has no de-obfuscation code, so such an index is not read. The trie
     reconstructs full paths; the metadata table supplies the actual file bounds.
     Format: https://github.com/roccodev/ard-tools/blob/master/docs/arh1.md
     Xenoblade 3 2.2.1: 76,445 entries in bf3.arh, 9.05 GB in bf3.ard."""
     if len(d) < 48 or d[:4] != b'arh1': return []
     _, count, so, sn, no, nn, fo, fn, key = struct.unpack_from('<9I', d, 4)
     if nn != count * 8 or any(o > len(d) or n > len(d) - o for o, n in ((so, sn), (no, nn), (fo, fn * 24))): red('ARH1: index table out of bounds')
-    key = (key ^ 0xf3f35353).to_bytes(4, 'little')
-    # The format encrypts whole u32 words; a final partial word stays plain.
-    dec = lambda o, n: bytes(v ^ key[i & 3] for i, v in enumerate(d[o:o + (n & ~3)])) + d[o + (n & ~3):o + n]
-    strings = dec(so, sn); nodes = list(struct.iter_unpack('<ii', dec(no, nn)))
+    if key != 0xf3f35353: return None   # masked tables: not read
+    strings = d[so:so + sn]; nodes = list(struct.iter_unpack('<ii', d[no:no + nn]))
     names = {}
     for i, (nxt, prev) in enumerate(nodes):
         if nxt >= 0 or prev < 0: continue
@@ -2441,6 +2417,9 @@ def arh_jobs(files, parts=64):
         ard = path[:-4] + '.ard'
         if not os.path.isfile(ard): red(f'{rel}: ARH1 index has no ARD data file')
         entries = arh_entries(d); length = os.path.getsize(ard)
+        if entries is None:
+            print(f'[RED] /{rel}: the ARH1 index is stored masked, and nup2android has no de-obfuscation code; the shaders of its ARD archive are left out', flush=True)
+            used.update((path, ard)); continue
         if any(o > length or n > length - o for _, o, n in entries): red(f'{rel}: ARD entry out of bounds')
         step = max(1, (len(entries) + parts - 1) // parts)
         jobs += [(ard, rel[:-4] + '.ard', (b'ARH1', entries[i:i + step])) for i in range(0, len(entries), step)]
@@ -3066,22 +3045,19 @@ def scan_file_in(args):
         zip_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == UE_LEGACY:   # files of a legacy Unreal pak (ue_legacy_jobs)
-        lost = ue_legacy_shaders(path, rel, args[2][1], found, *args[2][2:])
+        lost = ue_legacy_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), lost or trees
     if len(args) > 2 and args[2][0] == UE_IO:   # export bundles of an IoStore container beside such a pak (ue_legacy_jobs)
-        lost = ue_io_shaders(path, rel, args[2][1], found, *args[2][2:])
+        lost = ue_io_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), lost or trees
     if len(args) > 2 and args[2][0] == FB_CAS:   # CompiledBytecode resources of a Frostbite cas file (frostbite_jobs)
         frostbite_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and head[:4] == RPF6 and args[2][0] == RPF6:   # files of a Rockstar RPF6 archive (rpf_jobs)
-        rpf_shaders(path, rel, args[2][1], args[2][2], found)
+        rpf_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and head[:4] == PKZL:   # entries of a PlatinumGames PKZ (pkz_jobs)
         pkz_shaders(path, rel, args[2], found)
-        return rel, uniq_keys(found), var_pairs(found), trees
-    if len(args) > 2 and head[:4] == CRA:   # files of Camelot's archive (cra_jobs)
-        cra_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and head[:4] == CPK:   # entries of a CRI CPK (cpk_jobs)
         cpk_shaders(path, rel, args[2], found)
@@ -3243,7 +3219,7 @@ def main():
         # Unreal Engine shader code archives decoded on the Mac (uepak.py): <version dir>/ue_shaders, or DM_UE_SHADERS; needed when the RomFS has Unreal paks
         ued = os.environ.get('DM_UE_SHADERS') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'ue_shaders')
         names = sorted(f for f in os.listdir(ued) if f.endswith('.ushaderbytecode') and not f.startswith('._')) if os.path.isdir(ued) else []   # AppleDouble metadata, not decoded shader archives
-        if not names and uepak.unreal_paks(romfs, inline=False, mains=[mainnso]): red(f'the RomFS has Unreal paks, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
+        if not names and uepak.unreal_paks(romfs, inline=False): red(f'the RomFS has Unreal paks, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
         for nm in names: found += ue_shaders(open(os.path.join(ued, nm), 'rb').read(), f'/ue_shaders/{nm}')
         results.append(('main', {skey(c, k): (w, s, c, k) for w, s, c, k in found}, var_pairs(found), {}))
     for romfs in dlc_v:
@@ -3257,17 +3233,17 @@ def main():
     big = [j for p, r in files for j in (linkdata_jobs(p, r) or [])]   # Three Houses' 6.9 GB DATA1.bin: one job per range of entries, not one read of the whole file
     pak_jobs, paks = kpka_jobs(files)   # Monster Hunter Rise's PAKs: the newest copy of each path, in ranges of entries
     tr_jobs, trp = trpfs_jobs(files)   # Pokémon Legends: Z-A's Trinity packs (data.trpfs and its index data.trpfd), decoded by the game's own Oodle in the Mac host
-    ue_jobs, uep = ue_legacy_jobs(files, mains=main_v)   # Unreal paks with inline shaders: DRAGON QUEST XI S's legacy ones (the game's own LZ5 in the Mac host), OCTOPATH TRAVELER II's (Zlib)
+    ue_jobs, uep = ue_legacy_jobs(files)   # Unreal paks with inline shaders: DRAGON QUEST XI S's legacy ones (the game's own LZ5 in the Mac host), OCTOPATH TRAVELER II's (Zlib)
     bd_jobs, bdts = bdt_jobs(files)   # Dark Souls Remastered's dvdbnd archives: the entries of each .bdt by its .bhd5 index, in ranges
     arc_jobs, arcs = smash_arc_jobs(files)   # Super Smash Bros. Ultimate's data.arc: its current files, in ranges
     pz_jobs, pkzs = pkz_jobs(files)   # Bayonetta 3's PKZ archives, Oodle Kraken decoded by the game's own decoder in the Mac host
     ck_jobs, cpks = cpk_jobs(files)   # Bayonetta 2's CRI CPK archives (CRILAYLA entries)
-    cr_jobs, cras = cra_jobs(files)   # Mario Tennis Fever's CRA archive, its index in the NRO the game decodes at run time
+    cr_jobs, cras = cra_jobs(files)   # Mario Tennis Fever's CRA archive: scrambled, left out (no jobs)
     zp_jobs, zips = zip_jobs(files)   # Portal's game.zip (Deflate members)
     ah_jobs, arhs = arh_jobs(files)   # Monolith's ARH1/ARD archives and embedded XBC1/HCPS programs
     fb_jobs, fbs = frostbite_jobs(files)   # EA SPORTS FC 27's Frostbite bundles, Oodle Leviathan decoded by the game's own decoder in the Mac host
     pd_jobs, pdats = pdat_jobs(files)   # Kirby Air Riders' PDAT archives: the PMAP records in byte ranges
-    rp_jobs, rpfs = rpf_jobs(files, main_v)   # Red Dead Redemption's RPF6 archives, their tables decrypted with the key in main (rpf6.py)
+    rp_jobs, rpfs = rpf_jobs(files)   # Rockstar RPF6 archives stored in the clear (encrypted ones are left out: rpf6.py)
     big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + cr_jobs + zp_jobs + ah_jobs + fb_jobs + pd_jobs + rp_jobs
     files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in cras and p not in zips and p not in arhs and p not in fbs and p not in pdats and p not in rpfs]
     with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zdicts)) as ex:

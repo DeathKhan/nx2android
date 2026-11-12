@@ -2,7 +2,7 @@
 """Fuzz dm/gfx/tools/uepak.py's readers of Unreal Engine files: Pak (the footer, a version 11 index with its encoded entries and directory index, a legacy version 4 index) and
 Pak.read of every file it lists, archive / lz4_shaders / decoded_archive (a version 2 shader code archive) and lslg (a decoded shader record).
 Seeds: a version 11 pak (a stored, a Zlib and an LZ4 file), a version 4 pak (a stored and a Zlib file), a shader code archive with a stored and an LZ4-compressed LSLG record,
-and an LSLG record. Index encryption is left out (no key is given: an encrypted index is the ValueError Pak raises for it; the AES path uses macOS's CommonCrypto).
+and an LSLG record. An encrypted index is the ValueError Pak raises for it (uepak.py has no decryption code).
 Clean rejection: ValueError, which every reader raises for what it does not read, KeyError for a path the index does not list, zlib.error and LZ4BlockError from a block that
 does not decode, and lslg's None. Any other exception (struct.error from a read past the end of a table, for one) and an oversized allocation are findings. Usage: see fuzzlib.py"""
 import struct

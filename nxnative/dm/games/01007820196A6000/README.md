@@ -30,11 +30,11 @@ Update 1.0.7 on the Mac (2026-11-10, Apple M6 16 GB, macOS 27.2, main at 47773ed
 ## Files
 
 - RomFS: 138 files, 11.24 GB: 134 `.rpf` (25 at the root, 10.36 GB, among them `shaders.rpf`, `fragments.rpf` and `audio_switch.rpf`; 107 in `redemption/territory_swall/`), two `.bk2` movies, and `d11extra/langselect.pkdswitch` with its index `.pkiswitch`.
-- The RPF6 archives' table key is in `main`'s data segment (1.0.0: `main+0x3757f88`). 1.0.4 has the same key, loaded as eight big-endian words from four constants by its key setup (`main+0x145d8c`). `dm/gfx/tools/rpf6.py` finds it by trying `main`'s windows on an archive's first entry; it is never printed or written to disk. `rpf6.py <main NSO> <file.rpf> [--extract <dir>]` lists or extracts an archive.
+- The RPF6 archives' entry and name tables are encrypted. **Not read by this fork:** nup2android has no decryption or de-obfuscation code, so the effects in `shaders.rpf` are not extracted. `rpf6.py <file.rpf> [--extract <dir>]` lists or extracts an archive whose tables are plain.
 
 ## Shaders
 
-- **Current:** 3,628 distinct shaders over both builds (the profile's tables are their union; 1.0.4 changes 45 of `shaders.rpf`'s); 1.0.0 has 3,583, all translated for the Mac: 3,413 from the 131 RAGE effects (`.nvn`, `rgxd`) in `shaders.rpf` (2,089 vertex, 1,324 pixel), 168 from effects in `main`, and 2 from the language selection's Double Eleven pack. Each RPF6 archive is read through `rpf6.py` ([RAGE RPF6 archives and `rgxd` effects](../../../docs/reference/shaders.md#rage-rpf6-archives-and-rgxd-effects)).
+- **Current:** 3,628 distinct shaders over both builds (the profile's tables are their union; 1.0.4 changes 45 of `shaders.rpf`'s); 1.0.0 has 3,583, all translated for the Mac: 3,413 from the 131 RAGE effects (`.nvn`, `rgxd`) in `shaders.rpf` (2,089 vertex, 1,324 pixel), 168 from effects in `main`, and 2 from the language selection's Double Eleven pack. That was with the archives read; this fork does not read them ([RAGE RPF6 archives and `rgxd` effects](../../../docs/reference/shaders.md#rage-rpf6-archives-and-rgxd-effects)).
 - **Open:** the prewarm list (`pso_manifest.tsv`) is empty.
 
 ## Memory

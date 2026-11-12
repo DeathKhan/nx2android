@@ -33,7 +33,7 @@ The normal-layout startup log reports `62.00 GB asked, 2.81 GB of address space`
 
 ## Files and shaders
 
-Two encrypted-index version 11 paks under `Nicola/Content/Paks/`: the base `Nicola-Switch.pak` and update `Nicola-Switch_0_P.pak`, about 8.22 GiB combined. The base has 268,956 entries and the patch 10,430. The shared pak reader obtains the AES key from the game's code; no key belongs in this profile. Shader code archives are LZ4 compressed and split into global and game packages, with 69,924 unique shaders. The complete Mac build on 2026-11-01 has 69,924 successful records, no failed side libraries, no unrecognized bindings and no driver reads outside the host's filled ranges. Its chain is `e65a4ebd3322`, with profile input digest `9bcfe89d0d4a`.
+Two encrypted-index version 11 paks under `Nicola/Content/Paks/`: the base `Nicola-Switch.pak` and update `Nicola-Switch_0_P.pak`, about 8.22 GiB combined. The base has 268,956 entries and the patch 10,430. This fork does not read them: nup2android has no decryption or de-obfuscation code. The figures below are from before that. Shader code archives are LZ4 compressed and split into global and game packages, with 69,924 unique shaders. The complete Mac build on 2026-11-01 has 69,924 successful records, no failed side libraries, no unrecognized bindings and no driver reads outside the host's filled ranges. Its chain is `e65a4ebd3322`, with profile input digest `9bcfe89d0d4a`.
 
 The six DLC entries are licence-only. Their ownership metadata stays beside the build; no extra content files are required for startup.
 
