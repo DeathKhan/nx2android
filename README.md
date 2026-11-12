@@ -5,7 +5,7 @@
   </picture>
 </h1>
 
-Port your own Nintendo Switch games to Android, natively: the game's own arm64 code runs on the device, with the Switch's system services stood in for by a host and NVN graphics replayed on Vulkan. Pick the game's folder, click **Port**, and get an APK plus the game's data, installed on your device if you like. Bring your own game as a NUP container (game files that are already plain); the tool holds no keys and decrypts nothing, and nothing from any game is in this repository.
+Port your own Nintendo Switch games to Android, natively: the game's own arm64 code runs on the device, with the Switch's system services stood in for by a host and NVN graphics replayed on Vulkan. Pick the game's folder, click **Port**, and get an APK plus the game's data, installed on your device if you like. Bring your own game as a NUP container (game files that are already plain); the tool **holds no keys and decrypts nothing**, and nothing from any game is in this repository.
 
 > **No decryption and no de-obfuscation happen anywhere in this codebase.** nup2android has no key handling, no key search, no AES or other cipher run over game content, and no code that unscrambles or unmasks a game's files. It reads one input, a NUP container whose files are already plain, and it cannot open NSP, XCI, NSZ or XCZ packages. Where a game's own archives are encrypted or scrambled (some Unreal paks and IoStore containers, RAGE RPF6 archives, masked CRI CPK tables, and the like), the tool reports them and leaves them closed, and that game is simply not supported. No keys, no game files and nothing taken from a game are in this repository or its releases.
 >

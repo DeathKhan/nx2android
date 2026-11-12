@@ -1,5 +1,5 @@
 # PreToolUse hook (.claude/settings.json): checks release commands against CLAUDE.md's release rules before they run.
-#   gh release create|upload|edit  needs --repo shirai91/nx2android (gh here defaults to seedds/nxnative) and attaches no zip (the
+#   gh release create|upload|edit  needs --repo DeathKhan/nup2android (gh here defaults to seedds/nxnative) and attaches no zip (the
 #                                  release-windows.yml, release-macos.yml and release-linux.yml workflows build and attach them on publish, --clobber)
 #   gh release create <tag>        and git tag <tag>: the tag is v + porter/__init__.py's __version__ (bump it first)
 # A refused command gets the reason back; an allowed gh release create gets the steps that follow publishing.
@@ -7,7 +7,7 @@ import json, re, shlex, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-REPO = 'shirai91/nx2android'
+REPO = 'DeathKhan/nup2android'
 
 
 def version():
