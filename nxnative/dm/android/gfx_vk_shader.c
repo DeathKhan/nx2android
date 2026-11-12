@@ -301,21 +301,19 @@ int vk_tbl_n(void) {   // the texture tables' length (gfx_vk.h): DM_VK_TBL_N, 20
 }
 // The texture pool read marks (DM_VK_POOL_MARK=1, start-up, off unless set; gfx_vk_exec.c pool marks, gfx_vk.h POOL_MARK_B). Fixed for the process, as set 0 is: the layout has
 // the marks' binding only with it, and only with it are the shaders that index the texture pool given their stores (spv_pool_mark). The device must let the shader stages store
-// (fragmentStoresAndAtomics; vertexPipelineStoresAndAtomics for the vertex stages that index the pool, else those shaders leave the marks partial), the pool tables must be on, and
-// one more dynamic storage descriptor must fit the pipeline layout's limit beside DM_VK_DYN_SSBO's thirds. Off, nothing below differs from before
+// (fragmentStoresAndAtomics; vertexPipelineStoresAndAtomics for the vertex stages that index the pool, else those shaders leave the marks partial), the pool tables must be on;
+// set 0 gets one plain storage buffer more (not a dynamic one: gfx_vk_exec.c pool read marks). Off, nothing below differs from before
 static int g_mark_on, g_mark_vtx; static int g_mark_partial;
 static void pool_mark_init(void) {
     const char *e = getenv("DM_VK_POOL_MARK"); if (!(e && atoi(e))) return;
     VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; vkGetPhysicalDeviceFeatures2(V.pd, &f2); const VkPhysicalDeviceFeatures f = f2.features;   // (all it has is enabled: gfx_vk_core.c)
     const VkPhysicalDeviceLimits *lim = &V.props.limits;
-    uint32_t dyn = lim->maxDescriptorSetStorageBuffersDynamic, dyn_used = V.dyn_ssbo ? dyn / 3 * 3 : 0;
-    const char *why = !vk_pool_n() ? "the texture pool tables are off (DM_VK_POOL_N=0, or no shader of the bundle reads a pool)" : !f.fragmentStoresAndAtomics ? "the device has no fragment stores (fragmentStoresAndAtomics)" :
-                      dyn_used + 1 > dyn ? "no dynamic storage descriptor to spare beside DM_VK_DYN_SSBO's" : NULL;
+    const char *why = !vk_pool_n() ? "the texture pool tables are off (DM_VK_POOL_N=0, or no shader of the bundle reads a pool)" : !f.fragmentStoresAndAtomics ? "the device has no fragment stores (fragmentStoresAndAtomics)" : NULL;
     if (why) { VKLOG("[RED] pool read marks: off (DM_VK_POOL_MARK=1 asked): %s", why); return; }
     g_mark_on = 1; g_mark_vtx = f.vertexPipelineStoresAndAtomics;
     // (each graphics stage sees one storage buffer more: the translator's stage sets have at most Maxwell's 16 and the geometry claim's one; the limit is logged to check it)
-    VKLOG("pool read marks: on (DM_VK_POOL_MARK): shaders that index the texture pool store the IDs they read; the pool tables give a texture its image only once it is read (the device binds %u storage buffers a stage, %u dynamic a layout)%s",
-          lim->maxPerStageDescriptorStorageBuffers, dyn, g_mark_vtx ? "" : "; it has no vertex-stage stores: a vertex shader that indexes the pool leaves the marks partial");
+    VKLOG("pool read marks: on (DM_VK_POOL_MARK): shaders that index the texture pool store the IDs they read; the pool tables give a texture its image only once it is read (the device binds %u storage buffers a stage)%s",
+          lim->maxPerStageDescriptorStorageBuffers, g_mark_vtx ? "" : "; it has no vertex-stage stores: a vertex shader that indexes the pool leaves the marks partial");
 }
 int vk_pool_mark_on(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, pool_mark_init); return g_mark_on; }
 int vk_pool_mark_partial(void) { return __atomic_load_n(&g_mark_partial, __ATOMIC_RELAXED); }
@@ -357,8 +355,9 @@ VkDescriptorSetLayout vk_tbl_dsl(void) {   // one common set 0: large bindings o
         for (uint32_t i = 0; i < TBL_SLOTS; i++) lb[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
         for (uint32_t i = 0; i < POOL_TEX_SLOTS; i++) lb[POOL_B0 + i] = (VkDescriptorSetLayoutBinding){POOL_B0 + i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, (g_pool_kinds & (1u << i)) ? np : 1, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
         lb[POOL_SAMP_B] = (VkDescriptorSetLayoutBinding){POOL_SAMP_B, VK_DESCRIPTOR_TYPE_SAMPLER, ns, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
-        // DM_VK_POOL_MARK=1: the pool read marks after them (binding SET0_BINDINGS, gfx_vk.h POOL_MARK_B), one storage buffer whose dynamic offset picks the submission slot's words
-        uint32_t nb = SET0_BINDINGS; if (vk_pool_mark_on()) { lb[nb] = (VkDescriptorSetLayoutBinding){nb, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL_GRAPHICS, NULL}; nb++; }
+        // DM_VK_POOL_MARK=1: the pool read marks after them (binding SET0_BINDINGS, gfx_vk.h POOL_MARK_B), one plain storage buffer: a dynamic one made Adreno copy the whole
+        // set into the command stream at every bind (gfx_vk_exec.c pool read marks)
+        uint32_t nb = SET0_BINDINGS; if (vk_pool_mark_on()) { lb[nb] = (VkDescriptorSetLayoutBinding){nb, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL_GRAPHICS, NULL}; nb++; }
         VkDescriptorSetLayout m = shader_layout(lb, nb); __atomic_store_n(&l, m, __ATOMIC_RELEASE); }
     pthread_mutex_unlock(&g_sh_mu);
     return l;

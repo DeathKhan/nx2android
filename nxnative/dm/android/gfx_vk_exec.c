@@ -3171,10 +3171,14 @@ static unsigned tbl_kinds(const vkshader_t *s) {
 // The pool tables (tbl_ring, tbl_set) hold every registered texture ID, and their fills give each ID with contents an image (vk_tex_pool_ok 1, 64 a fill) and count that image
 // as drawn at every fill (gfx_vk_tex.c vk_tex_: vkimg_t.used), whether a shader ever reads the ID or not. Ocarina of Time registers whole scenes: in Kokiri Forest (Odin 3,
 // 2026-11-11) 5,957 images of 2.85 GB stood at the 3,072 MB image budget (DM_VK_IMAGE_BUDGET_MB), PSS 7.8 GB with 1.1 GB swapped, and the budget logged "none old enough to
-// drop": each image had just been filled. With the marks every shader that indexes the texture pool stores 1 at each ID it reads (gfx_vk_shader.c spv_pool_mark) into the
-// recording submission slot's words of one host-visible buffer (set 0's POOL_MARK_B, a dynamic storage buffer whose offset picks the slot), and once the slot's last
-// submission is done (mtl_sub_begin, before the slot is recorded again; never before its fence, with logical queues and the async replay too) its words are folded into each
-// ID's last read (a present) and cleared (vk_pool_mark_fold). Upstream (droidplay-core de4e11e80) copies the read IDs back for the same end; here the host reads them in place.
+// drop": each image had just been filled. With the marks every shader that indexes the texture pool stores 1 at each ID it reads (gfx_vk_shader.c spv_pool_mark) into one
+// host-visible buffer of a word per ID (set 0's POOL_MARK_B, a plain storage buffer), and at each submission's start its words are folded into each ID's last read (a
+// present) and cleared (vk_pool_mark_fold). The buffer is shared by the submissions in flight, so a fold may see a mark one submission early or one fold late (the
+// GPU's store of 1 can land between the fold's read of a 1 and its clear: that ID was just counted as read anyway); a mark is only ever 1, so nothing else can be misread.
+// It was one slice per submission slot, picked by a dynamic offset (cb715ba8d): a set with a dynamic descriptor is copied whole into the command stream at each bind on
+// Adreno, and set 0 is 131,074 images, 6,144 combined samplers and 4,096 samplers, about 38 MB a bind. Ocarina of Time's first Kokiri frames (pm2, Odin 3, 2026-11-11)
+// mapped 850-1,260 MB of command memory a submission, each slot's command buffers kept their largest, and the driver's command buffers held 4.5 GB (253 MB without the
+// marks) before the low-memory killer. Without a dynamic descriptor set 0 is bound by reference, as it was before the marks. Upstream (droidplay-core de4e11e80) copies the read IDs back for the same end; here the host reads them in place.
 //   - a fill gives an ID its first image only if a shader read it in the last MARK_RECENT presents; an unread one gets the dummy, as one without contents does. Its first read
 //     brings it in: IDs read for the first time, or again after MARK_RECENT presents unread, go to a log that the ring's patches take (pool_mark_take) and that tbl_set's
 //     cache counts as a texture generation (pool_mark_gen). That first read draws the dummy for a frame or two (counted in the periodic line: "began to be read");
@@ -3183,10 +3187,10 @@ static unsigned tbl_kinds(const vkshader_t *s) {
 //   - the pool prefetch (DM_VK_POOL_PREFETCH) makes first uses only for IDs read at least once.
 // A shader whose reads could not be marked (gfx_vk_shader.c pool_mark_give_up) leaves the marks deciding nothing for the rest of the run (vk_pool_mark_partial). Without the
 // switch none of this runs and set 0, the shaders, the binds and the fills are as before
-enum { MARK_RECENT = 120, MARK_TOUCH = 16, MARK_LOG = 16384, MARK_SLOTS = 16, MARK_LOG_EVERY = 600 };
-static struct { int on, np, nslot, coherent, whole; VkBuffer b; VkDeviceMemory m; uint32_t *p; uint8_t used[MARK_SLOTS]; uint32_t *last, *touched, *log; int *warm, *touch;
-                uint64_t seq, reads, subs, warms, touches, cold, ns, logged, binds; } g_mk = {.on = -1};
-// Fold one completed slot's words m (np of them, nonzero: read) into last[] (the present + 1 each pool index was last read at) and clear them. Indices read for the first time,
+enum { MARK_RECENT = 120, MARK_TOUCH = 16, MARK_LOG = 16384, MARK_LOG_EVERY = 600 };
+static struct { int on, np, coherent; VkBuffer b; VkDeviceMemory m; uint32_t *p; uint32_t *last, *touched, *log; int *warm, *touch;
+                uint64_t seq, reads, subs, warms, touches, cold, ns, logged, binds, lbinds, lsubs, lmapped; } g_mk = {.on = -1};
+// Fold the words m (np of them, nonzero: read) into last[] (the present + 1 each pool index was last read at) and clear them. Indices read for the first time,
 // or again after MARK_RECENT presents unread, go to warm[]; those whose image was last counted as drawn MARK_TOUCH or more presents ago to touch[] (both np long). Returns the
 // indices read
 static int pool_mark_scan(uint32_t *m, int np, uint32_t now, uint32_t *last, uint32_t *touched, int *warm, int *nwarm, int *touch, int *ntouch) {
@@ -3201,11 +3205,10 @@ static int pool_mark_scan(uint32_t *m, int np, uint32_t now, uint32_t *last, uin
 }
 static void pool_mark_init(void) {
     if (!vk_pool_mark_on()) { __atomic_store_n(&g_mk.on, 0, __ATOMIC_RELEASE); return; }
-    int np = vk_pool_n(), ns = vk_sub_slots(); if (ns > MARK_SLOTS) die("[vk] pool read marks: %d submission slots, at most %d", ns, MARK_SLOTS);
-    VkDeviceSize size = (VkDeviceSize)np * 4 * (VkDeviceSize)ns;
+    int np = vk_pool_n(); VkDeviceSize size = (VkDeviceSize)np * 4;
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
     VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &g_mk.b)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, g_mk.b, &rq);
-    // host-cached memory where there is some: the fold reads the slot's whole np words (256 KB at 65,536 IDs) after each submission, slow from uncached memory
+    // host-cached memory where there is some: the fold reads the whole np words (256 KB at 65,536 IDs) at each submission, slow from uncached memory
     uint32_t t = vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
     if (t == UINT32_MAX) t = vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
     if (t == UINT32_MAX) die("[vk] pool read marks: no host-visible memory for their buffer");
@@ -3213,13 +3216,12 @@ static void pool_mark_init(void) {
     vk_mem_tag = "pool marks"; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &g_mk.m)); vk_mem_tag = NULL; VKCHK(vkBindBufferMemory(V.dev, g_mk.b, g_mk.m, 0));
     void *p; VKCHK(vkMapMemory(V.dev, g_mk.m, 0, VK_WHOLE_SIZE, 0, &p)); g_mk.p = p; memset(p, 0, (size_t)size);
     g_mk.coherent = (V.mem.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
-    VkDeviceSize atom = V.props.limits.nonCoherentAtomSize; g_mk.whole = atom && ((VkDeviceSize)np * 4) % atom != 0;   // (a slot's range not whole atoms: the whole mapping is flushed)
     if (!g_mk.coherent) { VkMappedMemoryRange mr = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, g_mk.m, 0, VK_WHOLE_SIZE}; VKCHK(vkFlushMappedMemoryRanges(V.dev, 1, &mr)); }
     g_mk.last = calloc((size_t)np, 4); g_mk.touched = calloc((size_t)np, 4); g_mk.log = calloc(MARK_LOG, 4); g_mk.warm = calloc((size_t)np, sizeof(int)); g_mk.touch = calloc((size_t)np, sizeof(int));
     if (!g_mk.last || !g_mk.touched || !g_mk.log || !g_mk.warm || !g_mk.touch) die("[vk] pool read marks: out of memory");
-    g_mk.np = np; g_mk.nslot = ns;
-    VKLOG("pool read marks: %d texture IDs x %d submission slots, %.1f MB of host-%s memory (DM_VK_POOL_MARK); an ID gets an image from the pool tables once a shader read it in the last %d presents",
-          np, ns, size / 1048576.0, g_mk.coherent ? "coherent" : "cached", MARK_RECENT);
+    g_mk.np = np;
+    VKLOG("pool read marks: %d texture IDs, %.2f MB of host-%s memory (DM_VK_POOL_MARK); an ID gets an image from the pool tables once a shader read it in the last %d presents",
+          np, size / 1048576.0, g_mk.coherent ? "coherent" : "cached", MARK_RECENT);
     __atomic_store_n(&g_mk.on, 1, __ATOMIC_RELEASE);
 }
 static int pool_mark_ready(void) {   // the marks are on (their buffer made at the first call)
@@ -3245,36 +3247,35 @@ static int pool_mark_take(uint64_t from, uint64_t to, int *tids, int *n, int cap
     for (uint64_t s = from; s < to; s++) tids[(*n)++] = (int)g_mk.log[s % MARK_LOG] + g_pool_tex_base;
     return 0;
 }
-// a set 0 just allocated: its marks binding, the whole buffer (the bind's dynamic offset picks the slot's words). 1 write added to *w, 0 without the marks
+// a set 0 just allocated: its marks binding, the buffer. 1 write added to *w, 0 without the marks
 static int pool_mark_write(VkDescriptorSet set, VkWriteDescriptorSet *w) {
     if (!pool_mark_ready()) return 0;
     static VkDescriptorBufferInfo bi; bi = (VkDescriptorBufferInfo){g_mk.b, 0, (VkDeviceSize)g_mk.np * 4};
-    *w = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, POOL_MARK_B, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, NULL, &bi, NULL};
+    *w = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, POOL_MARK_B, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi, NULL};
     return 1;
 }
-// binding set 0: the dynamic offset of the recording slot's words (1 offset, and the slot is folded when it is next begun), 0 offsets without the marks
-static uint32_t pool_mark_bind(uint32_t *off) {
-    if (!pool_mark_ready()) return 0;
-    int slot = vk_sub_slot(); if (slot < 0 || slot >= g_mk.nslot) slot = 0;
-    g_mk.used[slot] = 1; g_mk.binds++; *off = (uint32_t)slot * (uint32_t)g_mk.np * 4u; return 1;
-}
-void vk_pool_mark_fold(int slot) {
-    if (__atomic_load_n(&g_mk.on, __ATOMIC_ACQUIRE) != 1 || slot < 0 || slot >= g_mk.nslot || !g_mk.used[slot]) return;
-    uint64_t t0 = tick(); g_mk.used[slot] = 0;
-    uint32_t *m = g_mk.p + (size_t)slot * (size_t)g_mk.np; uint32_t now = (uint32_t)g_tex_frame + 1; int nwarm = 0, ntouch = 0;
-    VkMappedMemoryRange mr = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, g_mk.m, g_mk.whole ? 0 : (VkDeviceSize)slot * g_mk.np * 4, g_mk.whole ? VK_WHOLE_SIZE : (VkDeviceSize)g_mk.np * 4};
+static void pool_mark_bound(void) { if (__atomic_load_n(&g_mk.on, __ATOMIC_RELAXED) == 1) g_mk.binds++; }   // (set 0 bound: counted for the periodic line)
+void vk_pool_mark_fold(void) {
+    if (__atomic_load_n(&g_mk.on, __ATOMIC_ACQUIRE) != 1) return;
+    uint64_t t0 = tick(); uint32_t *m = g_mk.p; uint32_t now = (uint32_t)g_tex_frame + 1; int nwarm = 0, ntouch = 0;
+    VkMappedMemoryRange mr = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, g_mk.m, 0, VK_WHOLE_SIZE};
     if (!g_mk.coherent) vkInvalidateMappedMemoryRanges(V.dev, 1, &mr);   // (each submission ends with its writes made visible to the host: gfx_vk_core.c pools_readback_barrier)
     int reads = pool_mark_scan(m, g_mk.np, now, g_mk.last, g_mk.touched, g_mk.warm, &nwarm, g_mk.touch, &ntouch);
-    if (!g_mk.coherent) vkFlushMappedMemoryRanges(V.dev, 1, &mr);        // the cleared words, for the slot's next submission
+    if (!g_mk.coherent) vkFlushMappedMemoryRanges(V.dev, 1, &mr);        // the cleared words
     for (int i = 0; i < ntouch; i++) g_mk.touch[i] += g_pool_tex_base;
     if (ntouch) vk_tex_touch_ids(g_mk.touch, ntouch);
     uint64_t s = g_mk.seq; for (int i = 0; i < nwarm; i++) g_mk.log[(s + (uint64_t)i) % MARK_LOG] = (uint32_t)g_mk.warm[i];
     __atomic_store_n(&g_mk.seq, s + (uint64_t)nwarm, __ATOMIC_RELEASE);
     g_mk.subs++; g_mk.reads += (uint64_t)reads; g_mk.warms += (uint64_t)nwarm; g_mk.touches += (uint64_t)ntouch; g_mk.ns += tick() - t0;
-    if (g_mk.subs <= 8) VKLOG("pool read marks: slot %d folded at present %llu: %d IDs read, %d began to be read (%llu set 0 binds with the marks so far)", slot, (unsigned long long)g_tex_frame, reads, nwarm, (unsigned long long)g_mk.binds);
+    { static int said; if (reads && !said++) VKLOG("pool read marks: the first read IDs folded at present %llu: %d IDs read (%llu set 0 binds so far)", (unsigned long long)g_tex_frame, reads, (unsigned long long)g_mk.binds); }
     if (g_tex_frame >= g_mk.logged + MARK_LOG_EVERY) { g_mk.logged = g_tex_frame; int recent = 0, ever = 0;
         for (int k = 0; k < g_mk.np; k++) { uint32_t l = g_mk.last[k]; if (l) { ever++; if (now - l <= MARK_RECENT) recent++; } }
         uint64_t bu, ev, evb, sw; vk_img_budget_stats(&bu, &ev, &evb, &sw);
+        // set 0 binds and GPU memory mapped (kgsl) per submission since the last line: with the marks' buffer a plain descriptor they should stay as without the marks
+        uint64_t mapped = vk_gpu_mapped(), ds = g_mk.subs - g_mk.lsubs;
+        VKLOG("pool read marks: %.1f set 0 binds a submission, GPU memory mapped %.0f MB (%+.2f MB a submission) over the last %llu submissions",
+              ds ? (double)(g_mk.binds - g_mk.lbinds) / (double)ds : 0.0, mapped / 1048576.0, ds && g_mk.lmapped ? ((double)mapped - (double)g_mk.lmapped) / 1048576.0 / (double)ds : 0.0, (unsigned long long)ds);
+        g_mk.lbinds = g_mk.binds; g_mk.lsubs = g_mk.subs; g_mk.lmapped = mapped;
         VKLOG("pool read marks at present %llu: %d texture IDs read in the last %d presents, %d ever; %llu began to be read (their first reads drew the dummy or a kept image), %llu fill lookups of unread IDs, %llu images counted as drawn by reads; images %.0f MB of the %.0f MB budget (%llu dropped, %.0f MB); %llu submissions folded, %.3f ms a fold%s",
               (unsigned long long)g_tex_frame, recent, MARK_RECENT, ever, (unsigned long long)g_mk.warms, (unsigned long long)g_mk.cold, (unsigned long long)g_mk.touches, vk_img_vkbytes() / 1048576.0, bu / 1048576.0,
               (unsigned long long)ev, evb / 1048576.0, (unsigned long long)g_mk.subs, g_mk.subs ? g_mk.ns / 1e6 / (double)g_mk.subs : 0.0, vk_pool_mark_partial() ? " [RED] partial: the marks decide nothing" : ""); }
@@ -4086,8 +4087,7 @@ static int prepare_draw(int prim, int indexed) {
         if (fresh || g_bc.lay != layout || g_bc.nsets != (uint32_t)nsets || g_bc.ndofs != ndofs || memcmp(g_bc.sets + 1, sets + 1, sizeof *sets * (size_t)(nsets - 1)) || memcmp(g_bc.dofs, dall, sizeof *dall * ndofs)) {
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, (uint32_t)(nsets - 1), sets + 1, ndofs, dall);
             g_bc.lay = layout; g_bc.nsets = (uint32_t)nsets; g_bc.ndofs = ndofs; memcpy(g_bc.sets, sets, sizeof *sets * (size_t)nsets); memcpy(g_bc.dofs, dall, sizeof *dall * ndofs); } }
-    if (tbl && !(dbg_draw() & 4) && (g_bc.tbl != tbl || g_bc.gen != g_cmd_gen)) { uint32_t mo = 0, nmo = pool_mark_bind(&mo);   // (DM_VK_POOL_MARK: the slot's marks, by dynamic offset; a command buffer is one slot's)
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &tbl, nmo, nmo ? &mo : NULL); g_bc.tbl = tbl; g_tbl_binds++; }   // the texture table: set 0, kept across pipelines (every graphics layout's set 0 is vk_tbl_dsl)   // the texture table: set 0, kept across pipelines (every graphics layout's set 0 is vk_tbl_dsl)
+    if (tbl && !(dbg_draw() & 4) && (g_bc.tbl != tbl || g_bc.gen != g_cmd_gen)) { vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &tbl, 0, NULL); g_bc.tbl = tbl; g_tbl_binds++; pool_mark_bound(); }   // the texture table: set 0, kept across pipelines (every graphics layout's set 0 is vk_tbl_dsl)
     // vertex buffers
     for (uint32_t i = 0; i < k.nbind; i++) {
         uint32_t b = k.bind[i].binding; VkBuffer buf; VkDeviceSize off;

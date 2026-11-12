@@ -132,9 +132,12 @@ class PoolMarks(unittest.TestCase):
         self.assertIn("if (vk_pool_mark_on()) { lb[nb]", function(shader, "VkDescriptorSetLayout vk_tbl_dsl("))
         init = function(exec_, "static void pool_mark_init(")
         self.assertIn("if (!vk_pool_mark_on()) { __atomic_store_n(&g_mk.on, 0", init)
-        for name in ("static int pool_mark_warm(", "static int pool_mark_seen(", "static int pool_mark_write(", "static uint32_t pool_mark_bind("):
+        for name in ("static int pool_mark_warm(", "static int pool_mark_seen(", "static int pool_mark_write("):
             self.assertIn("if (!pool_mark_ready()", function(exec_, name))   # each answers as before without the marks
         self.assertIn("== 1 ? __atomic_load_n(&g_mk.seq", function(exec_, "static uint64_t pool_mark_gen("))
+        # no dynamic descriptor in set 0: Adreno then copies the whole set into the command stream at each bind (pm2: 4.5 GB of command memory)
+        self.assertIn("VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,", function(shader, "VkDescriptorSetLayout vk_tbl_dsl("))
+        self.assertIn("&tbl, 0, NULL);", function(exec_, "static int prepare_draw("))
 
 
 if __name__ == "__main__":

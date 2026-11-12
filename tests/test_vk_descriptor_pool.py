@@ -42,7 +42,6 @@ class DescriptorPool(unittest.TestCase):
 #include <pthread.h>
 #define H(type, value) ((type)(uintptr_t)(value))
 static struct {VkDevice dev;int dyn_ssbo;} V;
-static int vk_pool_mark_on(void){return 0;}   // (DM_VK_POOL_MARK off: dynamic storage in the shared pools only with DM_VK_DYN_SSBO)
 enum { DP_KEEP = 16 };
 static int g_uab;static uint64_t g_dp_made,g_dp_freed,g_set_new,destroyed;
 static uint64_t kgsl_mapped(void){return 0;}
