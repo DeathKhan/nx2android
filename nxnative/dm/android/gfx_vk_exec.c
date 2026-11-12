@@ -5651,6 +5651,7 @@ static void bind_handles_rec(uint32_t op, const void *a) {
     }
 }
 uint32_t g_sub_ops[64];   // record ops replayed in the open submission, by op (logged when the driver refuses it)
+void vk_dq_replay_thread(void);   // gfx_vk_dq.c: the replaying thread, for its CPU time a frame (vk_dq_report)
 static void exec_ops(const uint8_t *p, const uint8_t *end);
 // DM_VK_PROF=1 (start-up): a 1 ms CPU-time timer on the replay thread samples where it is; every 20 s the most frequent places are logged: offsets in this library,
 // time in other libraries charged to the first caller of ours ("via:"), or with =2 the place itself (libc, the driver). Resolve offsets with llvm-symbolizer
@@ -5696,13 +5697,13 @@ static void prof_tick(void) {
     VKLOG("%s", line);
 }
 void mtl_exec(const uint8_t *p) {   // timed at the top level only (OP_CALL nests)
-    static int depth; uint64_t t0 = depth ? 0 : tnow(); depth++; if (depth == 1) { prof_tick(); g_la_depth = 0; g_la_epoch++; g_la_span = 0; }
+    static int depth; uint64_t t0 = depth ? 0 : tnow(); depth++; if (depth == 1) { prof_tick(); vk_dq_replay_thread(); g_la_depth = 0; g_la_epoch++; g_la_span = 0; }
     exec_ops(p, NULL);
     if (!--depth) g_vkst.ns_exec += tnow() - t0;
 }
 // A piece of a recording's control list replayed where the game recorded it (hle_nvn.c sub_inplace): the records from p up to end, which no OP_END closes
 void mtl_exec_span(const uint8_t *p, const uint8_t *end) {
-    uint64_t t0 = tnow(); prof_tick(); g_la_depth = 0; g_la_epoch++; g_la_span = 1;   // (no OP_END closes a span: occ_reset_next does not read ahead of it)
+    uint64_t t0 = tnow(); prof_tick(); vk_dq_replay_thread(); g_la_depth = 0; g_la_epoch++; g_la_span = 1;   // (no OP_END closes a span: occ_reset_next does not read ahead of it)
     exec_ops(p, end);
     g_vkst.ns_exec += tnow() - t0;
 }

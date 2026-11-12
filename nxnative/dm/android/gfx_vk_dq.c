@@ -5,6 +5,22 @@
 // allocation, queue submission and presentation first wait until the recorder has made every queued call (vk_dq_drain): command pools are externally synchronized, and a
 // submission must hold everything recorded before it. A call whose arguments the wrapper cannot copy (an unknown pNext chain) is made directly after such a wait.
 // Producers: the replay thread and the present thread (its blits into its own pool) at once: each record is written under a spinlock
+// DM_VK_MT_REPLAY=2 (start-up): the recorder also begins and ends the command buffers, submits them and writes the descriptor sets, so the replay waits for it only where
+// it needs a result. Ocarina of Time in Kokiri Forest on the Odin 3 (simpleperf of the replay thread, an older build): besides the vkCmd* calls (about 20%), vkEndCommandBuffer
+// and vkQueueSubmit took about 10% and vkUpdateDescriptorSets 5%, and with =1 each end and submission (several a frame) waited for the recorder to empty the queue.
+//   - vkBeginCommandBuffer, vkEndCommandBuffer and vkQueueSubmit are records and return VK_SUCCESS at once. A command buffer whose begin or end the driver refuses on the
+//     recorder is left out of the submission that names it (a [RED] line; mtl_sub_commit's recovery of a refused submission does not run then). A submission the driver
+//     refuses is made again without command buffers, so that its fence and semaphores still signal; a lost device dies as before.
+//   - A submission's fence or timeline value may be waited for before the recorder has made it (the completion thread, slot_recycle, mtl_wait): the wait lasts until it
+//     has, which Vulkan allows; nothing the recorder makes waits for a producer.
+//   - vkUpdateDescriptorSets: the writes and their arrays are copied into the queue ahead of the set's bind, from every thread, so two writes of one set keep their order. A
+//     set's pool is reset or destroyed only after the GPU passed the submission that used it (slot_recycle), so after the recorder wrote it, and the views, samplers and
+//     buffers a write names go through the deferred lists (vk_defer_free_*) to that point too. A write with a pNext chain, or copies between sets, is made directly after a
+//     drain. Allocation stays on the replay thread: Vulkan synchronizes a pool's allocations and a set's writes separately.
+//   - The VkQueue: the recorder's submissions and the direct queue calls (presents, waits for idle, a submission this cannot copy; each after a drain) hold g_qmu, so the
+//     recorder never takes the callers' g_vk_queue_mu (a present holds it while it drains).
+//   - vkAllocateCommandBuffers and vkResetCommandPool still drain (rare), and so does a present: its submission must be made before it.
+// vk_dq_report: beside the replay's line every 600 presents, the replay thread's and the recorder's CPU time a frame, in any mode (=0 too)
 #include "gfx_vk.h"
 #include <sched.h>
 #include <stdlib.h>
@@ -19,10 +35,11 @@
     X(vkCmdPushConstants) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) X(vkCmdDispatchIndirect) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) \
     X(vkCmdWriteTimestamp) X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT) X(vkCmdDrawIndirectByteCountEXT) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount)
 #define DQ_SYNC(X) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkAllocateCommandBuffers) X(vkResetCommandPool) X(vkQueueSubmit) X(vkQueuePresentKHR) X(vkQueueWaitIdle) X(vkDeviceWaitIdle)
+#define DQ_MODE2(X) X(vkUpdateDescriptorSets)   // swapped with DM_VK_MT_REPLAY=2 only
 #define DQ_REAL(f) static PFN_##f r_##f;
-DQ_CMDS(DQ_REAL) DQ_SYNC(DQ_REAL)
+DQ_CMDS(DQ_REAL) DQ_SYNC(DQ_REAL) DQ_MODE2(DQ_REAL)
 #define DQ_OP(f) OP_##f,
-enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_N };
+enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_UPDDS, OP_BEGINCB, OP_ENDCB, OP_SUBMIT, OP_N };
 
 // ---- the queue: one producer, one consumer; positions count bytes since the start (the ring index is position % RING), records 16-byte aligned ----
 enum { RING = 32 << 20 };
@@ -32,17 +49,22 @@ static _Atomic uint64_t g_pub, g_rd;           // published end, the recorder's 
 static _Atomic int g_sleeping, g_draining;
 static pthread_spinlock_t g_pl;   // the producers' lock, from rec_begin to rec_end
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER, g_dcv = PTHREAD_COND_INITIALIZER;
-static int g_on;
+static int g_on, g_mode;   // g_mode: DM_VK_MT_REPLAY, 1 or 2
+static pthread_mutex_t g_qmu = PTHREAD_MUTEX_INITIALIZER;   // mode 2: the VkQueue, between the recorder's submissions and the direct queue calls
 uint64_t g_dq_recs, g_dq_drains, g_dq_direct;   // records queued, drains, calls made directly (unknown arguments)
+static uint64_t g_dq_desc, g_dq_desc_direct, g_dq_subs, g_dq_refused;   // mode 2: descriptor set writes queued / made directly, submissions queued, command buffers the driver refused
+static _Atomic uint64_t g_dq_wait_ns;   // the producers' time in drains that waited
+static clockid_t g_rec_clk, g_rep_clk; static _Atomic int g_rec_clk_ok, g_rep_clk_ok; static pthread_t g_rep_thr;   // the recorder's and the replay thread's CPU-time clocks (vk_dq_report)
+static uint64_t ns_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 
 static void wake(void) { if (atomic_load(&g_sleeping)) { pthread_mutex_lock(&g_mu); pthread_cond_signal(&g_cv); pthread_mutex_unlock(&g_mu); } }
 void vk_dq_drain(void) {
     if (!g_on) return;
     pthread_spin_lock(&g_pl); uint64_t w = g_w; pthread_spin_unlock(&g_pl);   // the records queued so far (another producer may add more meanwhile)
     if (atomic_load_explicit(&g_rd, memory_order_acquire) >= w) return;
-    g_dq_drains++; wake();
+    g_dq_drains++; wake(); uint64_t t0 = ns_now();
     for (int i = 0; i < 2000 && atomic_load_explicit(&g_rd, memory_order_acquire) < w; i++) sched_yield();   // the recorder is usually a few calls behind
-    if (atomic_load_explicit(&g_rd, memory_order_acquire) >= w) return;
+    if (atomic_load_explicit(&g_rd, memory_order_acquire) >= w) { atomic_fetch_add(&g_dq_wait_ns, ns_now() - t0); return; }
     pthread_mutex_lock(&g_mu); atomic_store(&g_draining, 1);
     while (atomic_load_explicit(&g_rd, memory_order_acquire) < w) { pthread_cond_signal(&g_cv);
         struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 1;
@@ -50,6 +72,7 @@ void vk_dq_drain(void) {
             if (n++ < 20) VKLOG("[RED] two-stage replay: a drain waits over 1 s: written %llu, published %llu, read %llu; the record there: op %u size %u",
                 (unsigned long long)w, (unsigned long long)atomic_load(&g_pub), (unsigned long long)rd, h->op, h->size); } }
     atomic_store(&g_draining, 0); pthread_mutex_unlock(&g_mu);
+    atomic_fetch_add(&g_dq_wait_ns, ns_now() - t0);
 }
 static void *rec_begin(uint32_t op, VkCommandBuffer cb, size_t n) {   // room for a record with n bytes after its header
     size_t need = (sizeof(rec_hdr) + n + 15) & ~(size_t)15;   // 16-byte records: the ring's end always has room for a whole header
@@ -73,6 +96,104 @@ static void rec_end(void *payload) {
 // copying helpers: a record is a fixed struct followed by its arrays
 #define ARR(T, p, n) ((n) && (p) ? (size_t)(n) * sizeof(T) : 0)
 static uint8_t *put(uint8_t **at, const void *src, size_t n) { uint8_t *d = *at; if (n) memcpy(d, src, n); *at += n; return d; }
+
+// ---- mode 2: descriptor set writes, command buffer begins and ends, submissions ----
+// A vkUpdateDescriptorSets call in a record: a_updds, then each write as a ds_write followed by its descriptors (image infos, buffer infos or buffer views, by its
+// type). All are multiples of 8 bytes, so every structure stays aligned in the 16-byte records
+typedef struct { VkDevice dev; uint32_t n, pad; } a_updds;
+typedef struct { VkDescriptorSet set; uint32_t binding, elem, count; VkDescriptorType type; } ds_write;
+enum { DS_MAX = 128 };   // writes in one record: a call with more is made directly
+static int ds_kind(VkDescriptorType t) {   // 1: image infos, 2: buffer infos, 3: buffer views; 0: in a pNext chain (inline uniform blocks, acceleration structures) or unknown here
+    switch (t) {
+    case VK_DESCRIPTOR_TYPE_SAMPLER: case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: return 1;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return 2;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: return 3;
+    default: return 0;
+    }
+}
+static const size_t ds_elem[4] = {0, sizeof(VkDescriptorImageInfo), sizeof(VkDescriptorBufferInfo), sizeof(VkBufferView)};
+_Static_assert(sizeof(ds_write) % 8 == 0 && sizeof(VkDescriptorImageInfo) % 8 == 0 && sizeof(VkDescriptorBufferInfo) % 8 == 0 && sizeof(a_updds) % 8 == 0, "8-byte multiples");
+static const void *ds_src(const VkWriteDescriptorSet *w, int k) { return k == 1 ? (const void *)w->pImageInfo : k == 2 ? (const void *)w->pBufferInfo : (const void *)w->pTexelBufferView; }
+static size_t ds_size(uint32_t n, const VkWriteDescriptorSet *w) {   // the writes' bytes in a record; 0: they cannot be copied (none, too many, a pNext chain, an unknown type, a missing array)
+    if (!n || n > DS_MAX) return 0;
+    size_t b = 0;
+    for (uint32_t i = 0; i < n; i++) { int k = ds_kind(w[i].descriptorType);
+        if (!k || w[i].pNext || (w[i].descriptorCount && !ds_src(&w[i], k))) return 0;
+        b += sizeof(ds_write) + ds_elem[k] * w[i].descriptorCount; }
+    return b;
+}
+static void ds_pack(uint8_t *d, uint32_t n, const VkWriteDescriptorSet *w) {
+    for (uint32_t i = 0; i < n; i++) { int k = ds_kind(w[i].descriptorType); ds_write h = {w[i].dstSet, w[i].dstBinding, w[i].dstArrayElement, w[i].descriptorCount, w[i].descriptorType};
+        memcpy(d, &h, sizeof h); d += sizeof h; size_t b = ds_elem[k] * h.count; if (b) memcpy(d, ds_src(&w[i], k), b); d += b; }
+}
+static void ds_unpack(const uint8_t *s, uint32_t n, VkWriteDescriptorSet *out) {   // out's arrays point into the record
+    for (uint32_t i = 0; i < n; i++) { const ds_write *h = (const void *)s; s += sizeof *h; int k = ds_kind(h->type);
+        out[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, h->set, h->binding, h->elem, h->count, h->type, NULL, NULL, NULL};
+        if (k == 1) out[i].pImageInfo = (const void *)s; else if (k == 2) out[i].pBufferInfo = (const void *)s; else out[i].pTexelBufferView = (const void *)s;
+        s += ds_elem[k] * h->count; }
+}
+// A vkQueueSubmit call in a record: a_submit, then each submit info as an a_subinfo followed by its wait semaphores, command buffers, signal semaphores, timeline wait
+// and signal values (8 bytes each), then its wait stages (4 bytes each, padded to 8). Only a VkTimelineSemaphoreSubmitInfo may be chained; anything else is made directly
+typedef struct { VkCommandBufferUsageFlags flags; } a_begincb;
+typedef struct { VkQueue q; VkFence f; uint32_t n, pad; } a_submit;
+typedef struct { uint32_t nw, ncb, ns, ts, ntw, nts; } a_subinfo;   // ts: a VkTimelineSemaphoreSubmitInfo with ntw wait and nts signal values was chained
+enum { SUB_MAX = 8, SUB_N = 64 };   // submit infos in a record; semaphores, command buffers or values of one kind in a submit info
+_Static_assert(sizeof(a_submit) % 8 == 0 && sizeof(a_subinfo) % 8 == 0 && sizeof(VkSemaphore) == 8 && sizeof(VkCommandBuffer) == 8, "8-byte multiples");
+static size_t sub_size(const VkSubmitInfo *x) {   // a submit info's bytes in a record; 0: it cannot be copied
+    const VkTimelineSemaphoreSubmitInfo *t = x->pNext;
+    if (t && (t->sType != VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO || t->pNext)) return 0;
+    uint32_t ntw = t ? t->waitSemaphoreValueCount : 0, nts = t ? t->signalSemaphoreValueCount : 0;
+    if (x->waitSemaphoreCount > SUB_N || x->commandBufferCount > SUB_N || x->signalSemaphoreCount > SUB_N || ntw > SUB_N || nts > SUB_N) return 0;
+    if ((x->waitSemaphoreCount && (!x->pWaitSemaphores || !x->pWaitDstStageMask)) || (x->commandBufferCount && !x->pCommandBuffers) || (x->signalSemaphoreCount && !x->pSignalSemaphores) ||
+        (ntw && !t->pWaitSemaphoreValues) || (nts && !t->pSignalSemaphoreValues)) return 0;
+    return sizeof(a_subinfo) + 8u * (x->waitSemaphoreCount + x->commandBufferCount + x->signalSemaphoreCount + ntw + nts) + ((4u * x->waitSemaphoreCount + 7) & ~7u);
+}
+// Command buffers whose begin or end the driver refused on the recorder: left out of the submission that names them (under g_qmu)
+static VkCommandBuffer g_failed[64]; static int g_nfailed;
+static int failed_take(VkCommandBuffer cb) { for (int i = 0; i < g_nfailed; i++) if (g_failed[i] == cb) { g_failed[i] = g_failed[--g_nfailed]; return 1; } return 0; }
+static void cb_refused(VkCommandBuffer cb, VkResult r, const char *what) {
+    pthread_mutex_lock(&g_qmu); int had = 0; for (int i = 0; i < g_nfailed; i++) had |= g_failed[i] == cb;
+    if (!had && g_nfailed < 64) g_failed[g_nfailed++] = cb;
+    uint64_t n = ++g_dq_refused; pthread_mutex_unlock(&g_qmu);
+    if (n <= 3 || !(n & (n - 1))) VKLOG("[RED] two-stage replay: %s refused on the recorder thread (%d): the command buffer is left out of its submission (%llu so far)", what, r, (unsigned long long)n);
+}
+// a submission made now, under g_qmu, without the command buffers the driver refused: the recorder's, or a producer's after a drain (mode 2)
+static VkResult submit_now(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) {
+    pthread_mutex_lock(&g_qmu); VkResult r;
+    if (!g_nfailed) r = r_vkQueueSubmit(q, n, si, f);
+    else {   // (rare: a copy of the submit infos without them)
+        uint32_t ncb = 0; for (uint32_t i = 0; i < n; i++) ncb += si[i].commandBufferCount;
+        VkSubmitInfo *cs = malloc(n * sizeof *cs + ncb * sizeof(VkCommandBuffer) + 8); if (!cs) die("[vk] two-stage replay: no memory for a submission");
+        VkCommandBuffer *cbs = (VkCommandBuffer *)(cs + n);
+        for (uint32_t i = 0; i < n; i++) { cs[i] = si[i]; uint32_t k = 0;
+            for (uint32_t j = 0; j < si[i].commandBufferCount; j++) if (!failed_take(si[i].pCommandBuffers[j])) cbs[k++] = si[i].pCommandBuffers[j];
+            cs[i].pCommandBuffers = k ? cbs : NULL; cs[i].commandBufferCount = k; cbs += k; }
+        r = r_vkQueueSubmit(q, n, cs, f); free(cs);
+    }
+    pthread_mutex_unlock(&g_qmu); return r;
+}
+static void submit_rec(const uint8_t *p) {   // the recorder: a queued submission
+    const a_submit *a = (const void *)p; p += sizeof *a;
+    VkSubmitInfo si[SUB_MAX]; VkTimelineSemaphoreSubmitInfo ts[SUB_MAX];
+    for (uint32_t i = 0; i < a->n && i < SUB_MAX; i++) { const a_subinfo *b = (const void *)p; p += sizeof *b;
+        const VkSemaphore *ws = (const void *)p; p += 8u * b->nw; const VkCommandBuffer *cbs = (const void *)p; p += 8u * b->ncb; const VkSemaphore *ss = (const void *)p; p += 8u * b->ns;
+        const uint64_t *wv = (const void *)p; p += 8u * b->ntw; const uint64_t *sv = (const void *)p; p += 8u * b->nts; const VkPipelineStageFlags *st = (const void *)p; p += (4u * b->nw + 7) & ~7u;
+        ts[i] = (VkTimelineSemaphoreSubmitInfo){VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, b->ntw, b->ntw ? wv : NULL, b->nts, b->nts ? sv : NULL};
+        si[i] = (VkSubmitInfo){VK_STRUCTURE_TYPE_SUBMIT_INFO, b->ts ? &ts[i] : NULL, b->nw, b->nw ? ws : NULL, b->nw ? st : NULL, b->ncb, b->ncb ? cbs : NULL, b->ns, b->ns ? ss : NULL};
+    }
+    VkResult r = submit_now(a->q, a->n, si, a->f);
+    if (r < 0 && r != VK_ERROR_DEVICE_LOST) {   // its fence and semaphores must still signal: the same submission without its command buffers
+        static int nl; if (nl++ < 8) VKLOG("[RED] two-stage replay: vkQueueSubmit refused on the recorder thread (%d): made again without its command buffers", r);
+        for (uint32_t i = 0; i < a->n; i++) { si[i].commandBufferCount = 0; si[i].pCommandBuffers = NULL; }
+        r = submit_now(a->q, a->n, si, a->f);
+    }
+    if (r < 0) { if (r == VK_ERROR_DEVICE_LOST) vk_device_lost(r, "vkQueueSubmit (the recorder thread)"); die("[vk] vkQueueSubmit on the recorder thread: %d (device lost?)", r); }
+}
+static void begin_rec(VkCommandBuffer cb, const a_begincb *a) {
+    pthread_mutex_lock(&g_qmu); failed_take(cb); pthread_mutex_unlock(&g_qmu);   // (begun again: no longer refused)
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, a->flags, NULL};
+    VkResult r = r_vkBeginCommandBuffer(cb, &bi); if (r < 0) cb_refused(cb, r, "vkBeginCommandBuffer");
+}
 
 // ---- the recorder thread ----
 typedef struct { VkPipelineStageFlags src, dst; VkDependencyFlags dep; uint32_t nm, nb, ni; } a_barrier;
@@ -163,11 +284,16 @@ static void run(const rec_hdr *h) {
     case OP_vkCmdDrawIndirectCount: { const a_indcount *a = (const void *)p; r_vkCmdDrawIndirectCount(cb, a->b, a->off, a->cb, a->coff, a->max, a->stride); break; }
     case OP_vkCmdDrawIndexedIndirectCount: { const a_indcount *a = (const void *)p; r_vkCmdDrawIndexedIndirectCount(cb, a->b, a->off, a->cb, a->coff, a->max, a->stride); break; }
     case OP_vkCmdDrawIndirectByteCountEXT: { const a_bytecount *a = (const void *)p; r_vkCmdDrawIndirectByteCountEXT(cb, a->inst, a->first_inst, a->b, a->off, a->ctr_off, a->stride); break; }
+    case OP_UPDDS: { const a_updds *a = (const void *)p; VkWriteDescriptorSet w[DS_MAX]; ds_unpack(p + sizeof *a, a->n, w); r_vkUpdateDescriptorSets(a->dev, a->n, w, 0, NULL); break; }
+    case OP_BEGINCB: begin_rec(cb, (const a_begincb *)(const void *)p); break;
+    case OP_ENDCB: { VkResult r = r_vkEndCommandBuffer(cb); if (r < 0) cb_refused(cb, r, "vkEndCommandBuffer"); break; }
+    case OP_SUBMIT: submit_rec(p); break;
     default: break;
     }
 }
 static void *recorder_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk record"); uint64_t r = 0;
+    if (!pthread_getcpuclockid(pthread_self(), &g_rec_clk)) atomic_store(&g_rec_clk_ok, 1);   // (vk_dq_report)
     for (;;) {
         uint64_t pub = atomic_load(&g_pub);
         if (r == pub) {
@@ -306,25 +432,86 @@ static VKAPI_ATTR void VKAPI_CALL w_vkCmdDrawIndirectByteCountEXT(VkCommandBuffe
     { BEGIN(OP_vkCmdDrawIndirectByteCountEXT, a_bytecount, 0); *a = (a_bytecount){inst, first_inst, b, off, ctr_off, stride}; (void)at_; rec_end(base_); return; }
     direct: DIRECT(vkCmdDrawIndirectByteCountEXT, cb, inst, first_inst, b, off, ctr_off, stride); }
 
-// the calls that own command pools or the queue: after every queued call is made
-static VKAPI_ATTR VkResult VKAPI_CALL w_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) { vk_dq_drain(); return r_vkBeginCommandBuffer(cb, bi); }
-static VKAPI_ATTR VkResult VKAPI_CALL w_vkEndCommandBuffer(VkCommandBuffer cb) { vk_dq_drain(); return r_vkEndCommandBuffer(cb); }
+// the calls that own command pools or the queue: after every queued call is made; with DM_VK_MT_REPLAY=2 a begin, an end and a submission are records themselves
+static VKAPI_ATTR VkResult VKAPI_CALL w_vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *bi) {
+    if (g_mode >= 2 && !bi->pNext && !bi->pInheritanceInfo) { a_begincb *a = rec_begin(OP_BEGINCB, cb, sizeof *a); if (a) { a->flags = bi->flags; rec_end(a); return VK_SUCCESS; } }
+    vk_dq_drain();
+    if (g_mode >= 2) { pthread_mutex_lock(&g_qmu); failed_take(cb); pthread_mutex_unlock(&g_qmu); }
+    return r_vkBeginCommandBuffer(cb, bi);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL w_vkEndCommandBuffer(VkCommandBuffer cb) {
+    if (g_mode >= 2) { void *a = rec_begin(OP_ENDCB, cb, 0); if (a) { rec_end(a); return VK_SUCCESS; } }
+    vk_dq_drain(); return r_vkEndCommandBuffer(cb);
+}
 static VKAPI_ATTR VkResult VKAPI_CALL w_vkAllocateCommandBuffers(VkDevice d, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *cb) { vk_dq_drain(); return r_vkAllocateCommandBuffers(d, ai, cb); }
 static VKAPI_ATTR VkResult VKAPI_CALL w_vkResetCommandPool(VkDevice d, VkCommandPool p, VkCommandPoolResetFlags f) { vk_dq_drain(); return r_vkResetCommandPool(d, p, f); }
-static VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) { vk_dq_drain(); return r_vkQueueSubmit(q, n, si, f); }
-static VKAPI_ATTR VkResult VKAPI_CALL w_vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) { vk_dq_drain(); return r_vkQueuePresentKHR(q, pi); }
-static VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueWaitIdle(VkQueue q) { vk_dq_drain(); return r_vkQueueWaitIdle(q); }
-static VKAPI_ATTR VkResult VKAPI_CALL w_vkDeviceWaitIdle(VkDevice d) { vk_dq_drain(); return r_vkDeviceWaitIdle(d); }
+static VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) {
+    if (g_mode < 2) { vk_dq_drain(); return r_vkQueueSubmit(q, n, si, f); }
+    size_t b = n && n <= SUB_MAX ? sizeof(a_submit) : 0;
+    for (uint32_t i = 0; b && i < n; i++) { size_t s = sub_size(&si[i]); b = s ? b + s : 0; }
+    a_submit *a = b ? rec_begin(OP_SUBMIT, VK_NULL_HANDLE, b) : NULL;
+    if (!a) { vk_dq_drain(); g_dq_direct++; return submit_now(q, n, si, f); }
+    *a = (a_submit){q, f, n, 0}; uint8_t *at = (uint8_t *)(a + 1);
+    for (uint32_t i = 0; i < n; i++) { const VkSubmitInfo *x = &si[i]; const VkTimelineSemaphoreSubmitInfo *t = x->pNext;
+        a_subinfo *h = (a_subinfo *)(void *)at; at += sizeof *h;
+        *h = (a_subinfo){x->waitSemaphoreCount, x->commandBufferCount, x->signalSemaphoreCount, t != NULL, t ? t->waitSemaphoreValueCount : 0, t ? t->signalSemaphoreValueCount : 0};
+        put(&at, x->pWaitSemaphores, 8u * h->nw); put(&at, x->pCommandBuffers, 8u * h->ncb); put(&at, x->pSignalSemaphores, 8u * h->ns);
+        put(&at, t ? t->pWaitSemaphoreValues : NULL, 8u * h->ntw); put(&at, t ? t->pSignalSemaphoreValues : NULL, 8u * h->nts);
+        put(&at, x->pWaitDstStageMask, 4u * h->nw); at += (8 - 4u * h->nw % 8) % 8; }
+    g_dq_subs++; rec_end(a); return VK_SUCCESS;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL w_vkQueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
+    vk_dq_drain(); if (g_mode < 2) return r_vkQueuePresentKHR(q, pi);
+    pthread_mutex_lock(&g_qmu); VkResult r = r_vkQueuePresentKHR(q, pi); pthread_mutex_unlock(&g_qmu); return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL w_vkQueueWaitIdle(VkQueue q) {
+    vk_dq_drain(); if (g_mode < 2) return r_vkQueueWaitIdle(q);
+    pthread_mutex_lock(&g_qmu); VkResult r = r_vkQueueWaitIdle(q); pthread_mutex_unlock(&g_qmu); return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL w_vkDeviceWaitIdle(VkDevice d) {
+    vk_dq_drain(); if (g_mode < 2) return r_vkDeviceWaitIdle(d);
+    pthread_mutex_lock(&g_qmu); VkResult r = r_vkDeviceWaitIdle(d); pthread_mutex_unlock(&g_qmu); return r;
+}
+static VKAPI_ATTR void VKAPI_CALL w_vkUpdateDescriptorSets(VkDevice d, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) {
+    size_t b = nc ? 0 : ds_size(nw, w);
+    a_updds *a = b ? rec_begin(OP_UPDDS, VK_NULL_HANDLE, sizeof *a + b) : NULL;
+    if (!a) { if (nw || nc) { vk_dq_drain(); g_dq_desc_direct++; r_vkUpdateDescriptorSets(d, nw, w, nc, c); } return; }
+    *a = (a_updds){d, nw, 0}; ds_pack((uint8_t *)(a + 1), nw, w); g_dq_desc++; rec_end(a);
+}
+
+// The replay thread's and the recorder's CPU time a frame, beside the replay's line (gfx_vk_present.c, every 600 presents), and what went through the queue
+static uint64_t clk_ns(clockid_t c) { struct timespec t; return clock_gettime(c, &t) ? 0 : (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+void vk_dq_replay_thread(void) {   // gfx_vk_exec.c mtl_exec: the thread replaying now
+    pthread_t t = pthread_self(); if (atomic_load_explicit(&g_rep_clk_ok, memory_order_acquire) && pthread_equal(t, g_rep_thr)) return;
+    clockid_t c; if (pthread_getcpuclockid(t, &c)) return;
+    atomic_store(&g_rep_clk_ok, 0); g_rep_thr = t; g_rep_clk = c; atomic_store_explicit(&g_rep_clk_ok, 1, memory_order_release);
+}
+void vk_dq_report(unsigned frames) {
+    static uint64_t prep, prec, precs, pdesc, pddir, psubs, pdrains, pwait, pdirect; static clockid_t pclk;
+    if (!frames) return;
+    double f = frames; int rok = atomic_load_explicit(&g_rep_clk_ok, memory_order_acquire); clockid_t rc = g_rep_clk;
+    uint64_t rep = rok ? clk_ns(rc) : 0, rec = atomic_load(&g_rec_clk_ok) ? clk_ns(g_rec_clk) : 0, wait = atomic_load(&g_dq_wait_ns);
+    double rep_ms = rok && rc == pclk && rep >= prep ? (rep - prep) / f / 1e6 : -1;   // (-1: the replay thread changed, or the first line)
+    if (!g_on) VKLOG("replay thread per frame (last %u): %.2f ms of CPU; no recorder thread (DM_VK_MT_REPLAY=0)", frames, rep_ms);
+    else VKLOG("two-stage replay per frame (last %u, DM_VK_MT_REPLAY=%d): replay thread %.2f ms of CPU, recorder thread %.2f; %.0f calls queued (%.0f descriptor set writes, %.1f submissions), "
+               "%.1f drains (the producers waited %.2f ms in them), %.1f calls made directly (%.1f descriptor set writes); %llu command buffers refused on the recorder (cumulative)",
+               frames, g_mode, rep_ms, prec ? (rec - prec) / f / 1e6 : -1, (g_dq_recs - precs) / f, (g_dq_desc - pdesc) / f, (g_dq_subs - psubs) / f,
+               (g_dq_drains - pdrains) / f, (wait - pwait) / f / 1e6, (g_dq_direct + g_dq_desc_direct - pdirect - pddir) / f, (g_dq_desc_direct - pddir) / f, (unsigned long long)g_dq_refused);
+    prep = rep; pclk = rc; prec = rec; precs = g_dq_recs; pdesc = g_dq_desc; pddir = g_dq_desc_direct; psubs = g_dq_subs; pdrains = g_dq_drains; pwait = wait; pdirect = g_dq_direct;
+}
 
 void vk_dq_init(void) {   // vk_init, after the device's entry points are loaded
-    const char *e = getenv("DM_VK_MT_REPLAY"); if (!(e && atoi(e) > 0)) return;
+    const char *e = getenv("DM_VK_MT_REPLAY"); int m = e ? atoi(e) : 0; if (m <= 0) return;
     pthread_spin_init(&g_pl, PTHREAD_PROCESS_PRIVATE);
     if (!(g_ring = malloc(RING))) { VKLOG("[RED] DM_VK_MT_REPLAY: no memory for the queue; recording on the replay thread"); return; }
+    g_mode = m >= 2 ? 2 : 1;
 #define DQ_SWAP(f) r_##f = f; if (r_##f) f = w_##f;
     DQ_CMDS(DQ_SWAP) DQ_SYNC(DQ_SWAP)
+    if (g_mode >= 2) { DQ_MODE2(DQ_SWAP) }
     g_on = 1;
     pthread_t t; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&t, &at, recorder_main, NULL)) die("[vk] recorder thread");
     pthread_attr_destroy(&at);
-    VKLOG("two-stage replay: vkCmd* calls queued for the recorder thread (DM_VK_MT_REPLAY)");
+    if (g_mode >= 2) VKLOG("two-stage replay: vkCmd* calls, command buffer begins and ends, submissions and descriptor set writes queued for the recorder thread (DM_VK_MT_REPLAY=2)");
+    else VKLOG("two-stage replay: vkCmd* calls queued for the recorder thread (DM_VK_MT_REPLAY)");
 }
