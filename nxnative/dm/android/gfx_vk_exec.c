@@ -223,6 +223,7 @@ static stimg_t g_stimg[3][32]; static int g_stn[3], g_coll_st = -1;
 // barrier, when that draw samples one of the pass's attachments, or a shader of it or of an earlier draw of the pass writes memory (shader_wmem). Attachment writes
 // themselves keep their order inside a pass (primitive order). Off by default: Xenoblade Chronicles 3's characters tore with such barriers kept
 static int g_order_keep, g_order_pending, g_order_check, g_pass_wmem; uint64_t g_order_kept, g_order_ended;   // (kept / ended: gfx_vk_present.c reports them)
+static int g_pm, g_pm_mesh, g_pm_body, g_pm_now, g_pm_meshes, g_pm_ending;   // DM_VK_PASS_MERGE (pm_mesh_keep): the switch; a mesh draw's prepare_draw; the open pass is a body; the draw being prepared continues a kept pass; mesh draws in the body; vk_end_pass commits clears
 static void list_reads(const char *what) {
     if (!g_lst_nrd) return;
     char t[1024]; int k = 0; for (int i = 0; i < g_lst_nrd && k < (int)sizeof t - 24; i++) k += snprintf(t + k, sizeof t - k, " %llx", (unsigned long long)g_lst_rd[i]);
@@ -468,6 +469,7 @@ static void x_read(void) { light_diag_poll(); original_index_read(); set_profile
     g_drv_compact = !((e = getenv("DM_VK_DRV_COMPACT")) && !atoi(e)); g_buffer_memo = !((e = getenv("DM_VK_BUFFER_MEMO")) && !atoi(e));
     g_x_nosetc = (e = getenv("DM_VK_X_NOSETC")) && atoi(e) == 1; g_x_nosetc_bits = e ? atoi(e) & ~1 : 0; g_x_nodrvc = (e = getenv("DM_VK_X_NODRVC")) && atoi(e); g_x_landcut = (e = getenv("DM_VK_X_LANDCUT")) && atoi(e);
     g_x_nodispbar = (e = getenv("DM_VK_X_NODISPBAR")) && atoi(e);
+    { int on = (e = getenv("DM_VK_PASS_MERGE")) && atoi(e); if (on != g_pm) VKLOG("pass merge (DM_VK_PASS_MERGE): %s", on ? "mesh draws stay in their pass (secondary command buffers)" : "off"); g_pm = on; }
     g_ubo_bounds = !((e = getenv("DM_VK_UBO_BOUNDS")) && !atoi(e));
     g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_spv_key = (e = getenv("DM_VK_SPV_KEY")) ? strtoull(e, NULL, 16) : 0; g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
     { uint64_t key = (e = getenv("DM_VK_FDZ_FS")) ? strtoull(e, NULL, 16) : 0; if (key != g_fdz_fs) { g_fdz_fs = key; VKLOG("FDZ fragment diagnostic: %016llx (depth bias still excluded)", (unsigned long long)key); } }
@@ -687,13 +689,79 @@ static vkimg_t *g_lrz_prev;
 void vk_lrz_forget(vkimg_t *im) { if (g_lrz_prev == im) g_lrz_prev = NULL; }   // an image dropped (gfx_vk_tex.c img_drop)
 // 0: no pass could be begun (no render pass or framebuffer, and no dynamic rendering to fall back on): the caller records nothing that needs one
 static void pass_journal_pass(const char *event);
+// DM_VK_PASS_MERGE=1 (live; default off until measured on a device): mesh draws stay in the pass they continue. Mesh emulation runs a draw's kernels as dispatches, and a
+// dispatch cannot run inside a pass, so each mesh draw ended the open pass and began another on the same attachments, which loaded them again: Ocarina of Time's Kokiri
+// frame (Odin 3, 29.7 ms of GPU) had 91 passes in 10 runs on the same attachments, 10.85 ms, almost every boundary a mesh draw (#249-#262 at 1536x864: one mesh draw a
+// pass, colour and depth loaded and stored each time). Such a pass is recorded into a secondary command buffer instead (vk_body_begin), and a mesh draw in it records its
+// kernels into the main buffer (vk_body_out), ahead of the pass, which the main buffer begins only when it ends (pm_body_close: begin, the body, end). The kernels then run
+// before the pass's earlier draws instead of after them, which is the same as long as nothing in the pass wrote what they read: not after a draw of the pass that writes
+// memory (g_pass_wmem, g_tf_in_pass), and the mesh arena does not start over under a pass that still holds earlier mesh draws' outputs (mesh_reserve ends the pass first). The draw is
+// checked as after an order-only barrier (g_order_check): a draw that samples one of the attachments or writes memory ends the pass there, as before. Passes begun by a
+// mesh draw are bodies, and passes on attachments (and size) whose pass a mesh draw ended in the last two presents. A pass that holds only folded clears stays set up
+// across the kernels too (the clears run as its load ops after them), as it does across an NVN barrier (OP_BARRIER), each with the same check at its first draw
+uint64_t g_pm_merged, g_pm_undone, g_pm_bodies;   // pass boundaries left out, kept and then ended by the check, bodies recorded (gfx_vk_present.c)
+static struct { VkRenderPass rp; VkFramebuffer fb; uint32_t na; VkImageView views[9]; VkClearValue cv[9]; VkRenderingInfo ri; VkRenderingAttachmentInfo ca[8], da, sa; } P_b;
+static struct { const vkimg_t *c, *d; uint32_t w, h; uint64_t frame; } g_pm_learn[32]; static unsigned g_pm_nlearn;
+static void pm_learn(void) {   // a mesh draw ended this (inline) pass: its attachments' next passes are bodies
+    for (unsigned i = 0; i < 32; i++) if (g_pm_learn[i].c == P_att[0].im && g_pm_learn[i].d == P_att[8].im && g_pm_learn[i].w == S.pass_w && g_pm_learn[i].h == S.pass_h) { g_pm_learn[i].frame = g_tex_frame; return; }
+    g_pm_learn[g_pm_nlearn++ % 32] = (typeof(g_pm_learn[0])){P_att[0].im, P_att[8].im, S.pass_w, S.pass_h, g_tex_frame};
+}
+static int pm_body_wanted(void) {
+    if (!g_pm || g_pm_ending || g_mrt_active || g_noatt_open || P_ri.layerCount != 1 || (!P_ri.colorAttachmentCount && !P_ri.pDepthAttachment && !P_ri.pStencilAttachment)) return 0;
+    if (g_pm_mesh) return 1;
+    for (unsigned i = 0; i < 32; i++) if (g_pm_learn[i].frame && g_pm_learn[i].c == P_att[0].im && g_pm_learn[i].d == P_att[8].im && g_pm_learn[i].w == S.pass_w && g_pm_learn[i].h == S.pass_h &&
+                                          g_tex_frame - g_pm_learn[i].frame <= 2) return 1;
+    return 0;
+}
+// the body begun (1), the pass's begin kept for pm_body_close: a render pass object's (rp) or dynamic rendering's (rp VK_NULL_HANDLE: P_ri as it is now)
+static int pm_body_open(VkRenderPass rp, VkFramebuffer fb, uint32_t na, const VkImageView *views, const VkClearValue *cv) {
+    VkCommandBufferInheritanceRenderingInfo ir = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO}; VkFormat cf[8] = {0};
+    VkCommandBufferInheritanceInfo ii = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, NULL, rp, 0, fb, VK_FALSE, 0, 0};
+    if (!rp) {
+        for (uint32_t i = 0; i < P_ri.colorAttachmentCount && i < 8; i++) cf[i] = P_ca[i].imageView ? (VkFormat)P_att[i].fmt : VK_FORMAT_UNDEFINED;
+        ir.colorAttachmentCount = P_ri.colorAttachmentCount; ir.pColorAttachmentFormats = cf;
+        ir.depthAttachmentFormat = P_ri.pDepthAttachment ? (VkFormat)P_att[8].fmt : VK_FORMAT_UNDEFINED; ir.stencilAttachmentFormat = P_ri.pStencilAttachment ? (VkFormat)P_att[8].fmt : VK_FORMAT_UNDEFINED;
+        ir.rasterizationSamples = (VkSampleCountFlagBits)(S.samples ? S.samples : 1); ii.pNext = &ir;
+    }
+    if (!vk_body_begin(&ii)) { static int n; if (n++ < 3) VKLOG("[RED] pass merge: no secondary command buffer could be begun: the pass is recorded inline"); return 0; }
+    P_b.rp = rp; P_b.fb = fb; P_b.na = na; if (na) { memcpy(P_b.views, views, na * sizeof *views); memcpy(P_b.cv, cv, na * sizeof *cv); }
+    if (!rp) { memcpy(P_b.ca, P_ca, sizeof P_b.ca); P_b.da = P_da; P_b.sa = P_sa; P_b.ri = P_ri; P_b.ri.pColorAttachments = P_b.ca;
+        P_b.ri.pDepthAttachment = P_ri.pDepthAttachment ? &P_b.da : NULL; P_b.ri.pStencilAttachment = P_ri.pStencilAttachment ? &P_b.sa : NULL; P_b.ri.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT; }
+    g_pm_body = 1; g_pm_meshes = 0; g_pm_bodies++;
+    { static int n; if (n++ < 3) VKLOG("pass merge: pass %ux%u recorded as a secondary command buffer (%s)", S.pass_w, S.pass_h, rp ? "render pass object" : "dynamic rendering"); }
+    return 1;
+}
+static void pm_body_close(void) {   // vk_end_pass: the body ended, then the pass in the main buffer around it (S.rp_pass as begun)
+    VkCommandBuffer b = vk_body_end(); g_pm_body = 0; g_pm_meshes = 0;
+    if (!b) return;   // (the submission is refused at its end: vk_body_end marked it)
+    static PFN_vkCmdExecuteCommands exec; if (!exec) exec = (PFN_vkCmdExecuteCommands)vkGetDeviceProcAddr(V.dev, "vkCmdExecuteCommands");
+    void vk_dq_drain(void); vk_dq_drain();   // (DM_VK_MT_REPLAY: vkCmdExecuteCommands is made here, after everything queued before it)
+    void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);
+    VkCommandBuffer cb = vk_cmd();
+    if (S.rp_pass) { VkRenderPassAttachmentBeginInfo abi = {VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO, NULL, P_b.na, P_b.views};
+        VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, &abi, P_b.rp, P_b.fb, P_ri.renderArea, P_b.na, P_b.cv};
+        vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS); exec(cb, 1, &b); vkCmdEndRenderPass(cb); }
+    else { vkCmdBeginRendering(cb, &P_b.ri); exec(cb, 1, &b); vkCmdEndRendering(cb); }
+}
+// a mesh draw about to record its kernels: 1 when they go into the main buffer with the pass kept (a body: vk_body_out until the draw; set up with clears only: as it is)
+static int pm_mesh_keep(void) {
+    void vk_ubd_land(VkCommandBuffer cb);
+    if (!g_pm || g_mrt_active || g_noatt_open) return 0;
+    if (S.pass_open == 2 && P_cleared) { if (vk_sub_open()) vk_ubd_land(vk_cmd()); g_order_pending = 0; g_pm_now = 1; return 1; }
+    if (S.pass_open != 1) return 0;
+    if (!g_pm_body) { pm_learn(); return 0; }
+    if (g_pass_wmem || g_tf_in_pass) return 0;   // (a draw of the pass wrote memory, by a shader or by transform feedback: the kernels might read it)
+    vk_body_out(1); if (vk_sub_open()) vk_ubd_land(vk_cmd());   // (the deferred uniform updates land ahead of the pass: its draws read their shadows)
+    g_pm_now = 1; return 1;
+}
 static int pass_commit(void) {
     if (S.pass_open != 2) return S.pass_open == 1;
     vkimg_t *dim = S.daspect ? P_att[8].im : NULL;
     if ((g_lrz_touch & LRZ_SWITCH) && dim && g_lrz_prev && g_lrz_prev != dim) lrz_touch(g_lrz_prev, 1);
     if (dim) g_lrz_prev = dim;
     if ((g_lrz_touch & LRZ_READ) && dim && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) lrz_touch(dim, 0);
-    void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);
+    int body = pm_body_wanted();   // DM_VK_PASS_MERGE: recorded as a secondary, begun in the main buffer when it ends (pm_body_close; its start time then too)
+    void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); if (!body) vk_pass_ts(0, 0, 0, 0, 0);
     if (rp_on() && !noatt_dyn(P_ri.colorAttachmentCount, P_ri.pDepthAttachment || P_ri.pStencilAttachment ? 1u : 0u)) {
         rpkey k; memset(&k, 0, sizeof k); k.ncol = P_ri.colorAttachmentCount; k.samples = S.samples ? S.samples : 1;
         fbkey fk; memset(&fk, 0, sizeof fk); VkImageView views[9]; VkClearValue cv[9]; uint32_t na = 0;
@@ -710,12 +778,16 @@ static int pass_commit(void) {
         VkRenderPass rp = rp_get(&k);
         fk.rp = rp_compat(k.ncol, k.cfmt, k.dfmt, k.samples); fk.w = P_ri.renderArea.extent.width; fk.h = P_ri.renderArea.extent.height; fk.layers = P_ri.layerCount; fk.n = na;
         VkFramebuffer fb = rp && fk.rp ? fb_get(&fk) : VK_NULL_HANDLE;
-        if (fb) { VkRenderPassAttachmentBeginInfo abi = {VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO, NULL, na, views};
+        if (fb && body && pm_body_open(rp, fb, na, views, cv)) S.rp_pass = 1;
+        else if (fb) { VkRenderPassAttachmentBeginInfo abi = {VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO, NULL, na, views};
             VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, &abi, rp, fb, P_ri.renderArea, na, cv};
+            if (body) vk_pass_ts(0, 0, 0, 0, 0);
             vkCmdBeginRenderPass(vk_cmd(), &rbi, VK_SUBPASS_CONTENTS_INLINE); S.rp_pass = 1; }
-        else if (V.has_dynrender) { vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
+        else if (V.has_dynrender && body && pm_body_open(VK_NULL_HANDLE, VK_NULL_HANDLE, 0, NULL, NULL)) S.rp_pass = 0;
+        else if (V.has_dynrender) { if (body) vk_pass_ts(0, 0, 0, 0, 0); vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
         else { VKRED_ONCE(76, "render pass or framebuffer failed without dynamic rendering: pass skipped"); return 0; }   // (still pass_open 2: vk_end_pass drops it)
-    } else { vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
+    } else if (body && pm_body_open(VK_NULL_HANDLE, VK_NULL_HANDLE, 0, NULL, NULL)) S.rp_pass = 0;
+    else { if (body) vk_pass_ts(0, 0, 0, 0, 0); vkCmdBeginRendering(vk_cmd(), &P_ri); S.rp_pass = 0; }
     S.pass_open = 1; g_vkst.passes++; g_sub_pass++; g_pass_wmem = 0;
     pass_journal_pass("begin");
     for (int i = 0; i < 9; i++) { vkimg_t *a = P_att[i].im; if (a && a->rt_last != g_tex_frame + 1) { a->rt_frames = a->rt_last == g_tex_frame ? a->rt_frames + 1 : 1; a->rt_last = g_tex_frame + 1; } }   // (async_pipe)
@@ -1254,12 +1326,12 @@ static void lin_back(void) {
 }
 void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); list_reads("it"); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
-    if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
+    if (S.pass_open == 2 && P_cleared) { g_pm_ending = 1; (void)pass_commit(); g_pm_ending = 0; }   // only clears: the pass still runs, for its load ops (inline: g_pm_ending)
     if (S.pass_open == 1) { extern uint32_t g_vk_pass_flags; g_vk_pass_flags = (uint32_t)(S.ncol & 15) | (S.daspect ? 16u : 0) | (S.daspect && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 32u : 0) | (S.ncol && P_ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 64u : 0) | (P_split ? 128u : 0); }
-    if (S.pass_open == 1) { pass_journal_pass("end"); vk_occ_end(); if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
+    if (S.pass_open == 1) { if (g_pm_body) vk_body_out(0); pass_journal_pass("end"); vk_occ_end(); if (g_pm_body) pm_body_close(); else if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
-    S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
+    S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0; g_pm_now = 0;
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
 // copies, the submission's end): the deferred uniform updates land first (draws read them through their shadows, so ordinary pass ends keep them)
@@ -3901,6 +3973,7 @@ static int prepare_draw(int prim, int indexed) {
     else if (g_psplit > 0 && S.pass_open == 1 && g_pass_draws == (uint64_t)g_psplit && S.daspect && !g_psplit_depth) { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) has depth (format %d): not split", g_sub_pass - 1, S.pass_w, S.pass_h, S.dfmt); }
     for (int st = 0; st < 3; st++) if (!(st == 1 && S.rast_discard)) stage_storage_prepare(st, S.sh[st]);
     if (g_order_pending) { g_order_pending = 0; g_order_check = S.pass_open == 1; }   // an order-only barrier kept the pass open: decided below, once the draw's images are known
+    if (g_pm_now) g_order_check = 1;   // so did DM_VK_PASS_MERGE (pm_mesh_keep, OP_BARRIER): the same check
     if (!begin_pass() || !mrt_prepare(g_claim_draw.count, g_claim_draw.instances, prim, g_claim_draw.indirect, indexed) || !pass_commit()) { g_vkst.skip_rt++; return 0; }
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) g_tracing = 1;
     uint64_t t0 = tick();
@@ -4004,12 +4077,13 @@ static int prepare_draw(int prim, int indexed) {
     pool_prefetch();
     if (ts || poolmask) tbl = tbl_set(ts ? tst : 0, ts, poolmask);   // set 0: the handle source and the union of every active stage's pool kinds
     if (g_order_check) {   // the order-only barrier before this draw (see g_order_keep): kept, or the pass ends here with it
-        g_order_check = 0; vkshader_t *fs = k.raster_discard ? NULL : S.sh[1];
+        g_order_check = 0; vkshader_t *fs = k.raster_discard ? NULL : S.sh[1]; int pm = g_pm_now; g_pm_now = 0;   // (pm: a pass kept across a mesh draw's kernels or a barrier, DM_VK_PASS_MERGE)
         if (g_pass_wmem || shader_wmem(S.sh[0]) || shader_wmem(fs) || shader_wmem(S.sh[2]) || order_feedback(3)) {
-            g_order_ended++; vk_end_pass(); vk_img_barrier_all(vk_cmd());
+            if (pm) g_pm_undone++; else g_order_ended++;
+            vk_end_pass(); vk_img_barrier_all(vk_cmd());
             if (!begin_pass() || !mrt_prepare(g_claim_draw.count, g_claim_draw.instances, prim, g_claim_draw.indirect, indexed) || !pass_commit()) { g_vkst.skip_rt++; return 0; }
             cb = vk_cmd();
-        } else g_order_kept++;
+        } else if (pm) g_pm_merged++; else g_order_kept++;
     }
     g_pass_wmem |= shader_wmem(S.sh[0]) | shader_wmem(k.raster_discard ? NULL : S.sh[1]) | shader_wmem(S.sh[2]);
     uint64_t tdesc = tick() - t1d; g_vkst.ns_desc += tdesc; if (g_prof_on) g_prof_ns[5] += tdesc;
@@ -5223,6 +5297,7 @@ static void *g_mesh_alloc_p; static int g_mesh_dump_on;   // DM_VK_MESH_DUMP: th
 static uint64_t g_mesh_wraps;
 static void mesh_reserve(VkDeviceSize total) {
     if (g_mesh_arena.epoch != g_set_epoch || !g_mesh_arena.b || total > g_mesh_arena.size || g_mesh_arena.used + total <= g_mesh_arena.size) return;
+    if (g_pm_body && g_pm_meshes) { vk_body_out(0); vk_end_pass_land(); g_pm_now = 0; }   // (DM_VK_PASS_MERGE: the pass's mesh draws read their outputs where the arena starts over)
     g_mesh_arena.used = 0; if (!g_mesh_wraps++) VKLOG("mesh emulation: the arena (%llu MB) is reused within a submission from here on", (unsigned long long)(g_mesh_arena.size >> 20));
 }
 static mesh_buf mesh_alloc(VkDeviceSize n) {   // GPU-only memory for this draw: the arena, else this submission's scratch
@@ -5299,7 +5374,7 @@ static void mesh_draw(const p_draw *d) {
         uint64_t want = ((uint64_t)seen + seen / 2 + cap_m - 1) / cap_m; n = want < 1 ? 1 : want > batches ? batches : (uint32_t)want;
         if (seen > top) { top = seen; VKLOG("mesh draw without a task shader: indirect count %u (capacity %u a slice, %u slices%s); mesh %016llx fragment %016llx", seen, cap_m, n,
             want > batches ? ", NOT ENOUGH: DM_VK_MESH_BATCHES" : "", S.sh[4] ? (unsigned long long)S.sh[4]->key : 0ull, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0ull); } }
-    for (uint32_t b = 0; b < n; b++) mesh_draw_one(d, b);
+    for (uint32_t b = 0; b < n; b++) { mesh_draw_one(d, b); if (g_pm_body) vk_body_out(0); g_pm_now = 0; }   // (DM_VK_PASS_MERGE: also where a draw was skipped after its kernels began)
 }
 static void mesh_draw_one(const p_draw *d, uint32_t batch) {
     vkshader_t *ts = S.sh[3], *ms = S.sh[4];
@@ -5316,7 +5391,7 @@ static void mesh_draw_one(const p_draw *d, uint32_t batch) {
     uint32_t count = d->ind ? 0 : (uint32_t)d->count, first = d->ind ? 0 : (uint32_t)d->first, verts = ms->mesh_verts ? ms->mesh_verts : 3, ipw = ms->mesh_max_p * verts;
     uint32_t ntask = ts ? (d->ind ? cap_t : count) : 0, nmesh = ts ? cap_m : (d->ind ? cap_m : count), pay = ts ? ts->mesh_pay : ms->mesh_pay;
     if (!ntask && !nmesh) return;
-    vk_end_pass_land();   // the dispatches run outside the pass (prepare_draw begins it again for the draw)
+    if (!pm_mesh_keep()) vk_end_pass_land();   // the dispatches run outside the pass (prepare_draw begins it again for the draw; DM_VK_PASS_MERGE: ahead of it)
     VkCommandBuffer cb = vk_cmd();
     // the buffers: control words (host-written; an indirect draw's record copied in by meshprep.comp), the task payloads, the launch list, the vertices and indices
     mesh_buf ctl; uint32_t *cw = vk_scratch(64, 256, &ctl.b, &ctl.off); ctl.len = 64; memset(cw, 0, 64); cw[0] = first; cw[1] = ts ? ntask : nmesh;
@@ -5362,9 +5437,9 @@ static void mesh_draw_one(const p_draw *d, uint32_t batch) {
     S.bound_pipe = VK_NULL_HANDLE;
     // the draw: the pass-through vertex shader in the vertex stage, the program's fragment stage as it is, an indexed indirect draw of the header's arguments
     vkshader_t *vs0 = S.sh[0]; S.sh[0] = vs; g_draw_binst = 0;
-    g_fs_buffer_mesh = 1;
+    g_fs_buffer_mesh = 1; if (g_pm_body) vk_body_out(0); g_pm_mesh = 1;
     int prim = verts == 3 ? 4 : verts == 2 ? 1 : 0, ok = prepare_draw(prim, 1);
-    g_fs_buffer_mesh = 0;
+    g_fs_buffer_mesh = 0; g_pm_mesh = 0; if (ok && g_pm_body) g_pm_meshes++;
     S.sh[0] = vs0;
     if (ok && g_pd_draw_mode) pass_dump_draw_geometry("mesh", prim, d->first, 0, 0, 0, -1);
     if (ok) pass_journal_draw("mesh", count, 1, d->ind, vs->key, ts ? ts->key : 0, ms->key);
@@ -5793,6 +5868,7 @@ static void exec_ops(const uint8_t *p, const uint8_t *end) {
             int32_t bits = *(const int32_t *)a;
             if (g_x_listpasses) VKLOG("    barrier %#x%s", bits, g_order_keep && S.pass_open == 1 && !(bits & ~0x7) ? " (order only: decided at the next draw)" : "");
             if (g_order_keep && S.pass_open == 1 && !(bits & ~0x7)) { g_order_pending = 1; break; }   // (g_order_keep)
+            if (g_pm && S.pass_open == 2 && P_cleared && !g_mrt_active) { vk_img_barrier_all(vk_cmd()); g_order_pending = 0; g_pm_now = 1; break; }   // DM_VK_PASS_MERGE: clears only, kept (pm_mesh_keep)
             vk_end_pass(); vk_img_barrier_all(vk_cmd()); g_order_pending = 0; break; }
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: {   // bound handles were rebased when recorded (hle_nvn.c bind_handles); handles read from memory are rebased by these (mem_handle)
             const p_set_pool *sp = (const p_set_pool *)a; int base = sp->pool ? nvn_dpool_base(sp->pool, h.op == OP_SET_TEX_POOL) : 0;

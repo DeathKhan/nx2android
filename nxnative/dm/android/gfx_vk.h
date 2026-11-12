@@ -90,6 +90,7 @@ void vk_pools_sync(VkCommandBuffer cb);
 typedef struct vksub vksub_t;
 VkCommandBuffer vk_cmd(void);          // the current submission's main command buffer (recording)
 int vk_cmd_split(void);               //1 only if a new command-buffer part began
+VkCommandBuffer vk_body_begin(const VkCommandBufferInheritanceInfo *ii); VkCommandBuffer vk_body_end(void); void vk_body_out(int on);   // DM_VK_PASS_MERGE: a pass recorded as a secondary (gfx_vk_core.c)
 int vk_cmd_parts_left(void);
 void vk_cmd_split_refused(int capacity);
 int vk_readback_ranges(void);
