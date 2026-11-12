@@ -3185,7 +3185,7 @@ static unsigned tbl_kinds(const vkshader_t *s) {
 // switch none of this runs and set 0, the shaders, the binds and the fills are as before
 enum { MARK_RECENT = 120, MARK_TOUCH = 16, MARK_LOG = 16384, MARK_SLOTS = 16, MARK_LOG_EVERY = 600 };
 static struct { int on, np, nslot, coherent, whole; VkBuffer b; VkDeviceMemory m; uint32_t *p; uint8_t used[MARK_SLOTS]; uint32_t *last, *touched, *log; int *warm, *touch;
-                uint64_t seq, reads, subs, warms, touches, cold, ns, logged; } g_mk = {.on = -1};
+                uint64_t seq, reads, subs, warms, touches, cold, ns, logged, binds; } g_mk = {.on = -1};
 // Fold one completed slot's words m (np of them, nonzero: read) into last[] (the present + 1 each pool index was last read at) and clear them. Indices read for the first time,
 // or again after MARK_RECENT presents unread, go to warm[]; those whose image was last counted as drawn MARK_TOUCH or more presents ago to touch[] (both np long). Returns the
 // indices read
@@ -3256,7 +3256,7 @@ static int pool_mark_write(VkDescriptorSet set, VkWriteDescriptorSet *w) {
 static uint32_t pool_mark_bind(uint32_t *off) {
     if (!pool_mark_ready()) return 0;
     int slot = vk_sub_slot(); if (slot < 0 || slot >= g_mk.nslot) slot = 0;
-    g_mk.used[slot] = 1; *off = (uint32_t)slot * (uint32_t)g_mk.np * 4u; return 1;
+    g_mk.used[slot] = 1; g_mk.binds++; *off = (uint32_t)slot * (uint32_t)g_mk.np * 4u; return 1;
 }
 void vk_pool_mark_fold(int slot) {
     if (__atomic_load_n(&g_mk.on, __ATOMIC_ACQUIRE) != 1 || slot < 0 || slot >= g_mk.nslot || !g_mk.used[slot]) return;
@@ -3271,6 +3271,7 @@ void vk_pool_mark_fold(int slot) {
     uint64_t s = g_mk.seq; for (int i = 0; i < nwarm; i++) g_mk.log[(s + (uint64_t)i) % MARK_LOG] = (uint32_t)g_mk.warm[i];
     __atomic_store_n(&g_mk.seq, s + (uint64_t)nwarm, __ATOMIC_RELEASE);
     g_mk.subs++; g_mk.reads += (uint64_t)reads; g_mk.warms += (uint64_t)nwarm; g_mk.touches += (uint64_t)ntouch; g_mk.ns += tick() - t0;
+    if (g_mk.subs <= 8) VKLOG("pool read marks: slot %d folded at present %llu: %d IDs read, %d began to be read (%llu set 0 binds with the marks so far)", slot, (unsigned long long)g_tex_frame, reads, nwarm, (unsigned long long)g_mk.binds);
     if (g_tex_frame >= g_mk.logged + MARK_LOG_EVERY) { g_mk.logged = g_tex_frame; int recent = 0, ever = 0;
         for (int k = 0; k < g_mk.np; k++) { uint32_t l = g_mk.last[k]; if (l) { ever++; if (now - l <= MARK_RECENT) recent++; } }
         uint64_t bu, ev, evb, sw; vk_img_budget_stats(&bu, &ev, &evb, &sw);
@@ -3439,7 +3440,7 @@ static void tbl_trace(unsigned c, int st, const vkshader_t *s, int reused) {
 // contents or of first-use budget are retried by later patches, RING_RETRY at a time. Each take marks the images the set holds as used by the submission (eviction waits for it)
 enum { RING_N = 6, RING_TIDS = 2048, RING_RETRY = 256, RING_DROPS = 1024 };
 typedef struct { VkDescriptorSet set; uint64_t fence, logpos, fullgen, sampgen, sampseq, jobpos, dropseq, firstgen, markpos; uint32_t poolgen; int tex_base, samp_base, valid; vkimg_t **img; int *itid; size_t nimg, capimg; int *pend; size_t npend, cappend, pcur; } ring_slot;
-static ring_slot g_ring[RING_N]; static int g_ring_on = -1, g_ring_cur = -1;
+static ring_slot g_ring[RING_N]; static int g_ring_on = -1, g_ring_cur = -1; static uint64_t g_ring_stale;   // (stale: DM_VK_POOL_MARK's reuses of the submission's own set, tbl_ring)
 uint64_t vk_reglog_visible_end(uint64_t before); uint64_t vk_reglog_head(void); int vk_reglog_pending(uint64_t p, uint64_t before); uint64_t vk_reglog_take(uint64_t from, uint64_t before, int *tids, int max, int *n);
 int vk_alloc_sets_owned(VkDescriptorSetLayout l, int n, VkDescriptorSet *out); unsigned vk_pool_kinds(void); uint64_t nvn_replaying_job(void);
 extern uint64_t g_tex_gen_why[4], g_samp_gen;
@@ -3541,7 +3542,17 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
     uint64_t done = vk_fence_done(); int pick = -1;
     for (int i = 0; i < RING_N; i++) { ring_slot *r = &g_ring[i]; if (r->fence > done || r->fence == f) continue;
         if (pick < 0 || (r->valid && (!g_ring[pick].valid || r->logpos > g_ring[pick].logpos))) pick = i; }
-    if (pick < 0) { g_ring_none++; return VK_NULL_HANDLE; }
+    if (pick < 0) { g_ring_none++;
+        // DM_VK_POOL_MARK: with the marks the fills make no first uses until a shader has read an ID, so at an area load every texture gets its first use from a real bind,
+        // each one a ring miss (g_tex_gen_why[1]) inside one submission, and a set the recording submission holds cannot be written again. Ocarina of Time's first Kokiri
+        // submission (Odin 3, 2026-11-11, pm1) used up the six sets, and every draw after fell to tbl_set, whose set is 65,536 x 2 images in a descriptor pool of its own
+        // (71-82 MB) built again at each first use and kept until the slot's next submission: 32 of them in about 2 s, then the low-memory killer. Here the set this
+        // submission already holds is drawn with again: the IDs it lacks wait for the next submission's set, a frame. Not when the bases moved or the replay went back to an
+        // earlier job (its entries would be another snapshot's); without the marks, as before
+        if (g_ring_cur >= 0 && pool_mark_ready()) { ring_slot *c = &g_ring[g_ring_cur];
+            if (c->valid && c->fence == f && c->tex_base == g_pool_tex_base && c->samp_base == g_pool_samp_base && c->jobpos <= jp) { g_ring_stale++; g_ring_ns += tick() - t0; return c->set; } }
+        static int nl; if (nl++ < 8) VKLOG("[RED] pool table ring: no set free at fence %llu (done %llu; job %llu; %llu so far, %llu draws with the submission's own set)", (unsigned long long)f, (unsigned long long)done, (unsigned long long)job, (unsigned long long)g_ring_none, (unsigned long long)g_ring_stale);
+        return VK_NULL_HANDLE; }
     ring_slot *r = &g_ring[pick]; const int NP = vk_pool_n(), NS = vk_pool_samp_n(); const unsigned kinds = vk_pool_kinds();
     static VkDescriptorImageInfo *dd; static VkWriteDescriptorSet *ww; static int *tids;
     if (!dd) { dd = calloc((size_t)POOL_TEX_SLOTS * NP + NS + (size_t)(RING_TIDS + RING_RETRY) * POOL_TEX_SLOTS, sizeof *dd); ww = calloc((size_t)(RING_TIDS + RING_RETRY + RING_DROPS) * POOL_TEX_SLOTS + 8, sizeof *ww); tids = calloc(RING_TIDS + RING_DROPS, sizeof *tids); }

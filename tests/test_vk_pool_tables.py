@@ -370,6 +370,7 @@ static int ring_pool_ok=2;static int vk_tex_pool_ok(const tex_t*t){(void)t;retur
 static unsigned mark_cold,cold_lookups;static uint64_t mark_seq;static int mark_ids[8];
 static uint64_t pool_mark_gen(void){return mark_seq;}
 static int pool_mark_warm(int k){return !(mark_cold>>k&1);}
+static int mark_on;static int pool_mark_ready(void){return mark_on;}
 static int pool_mark_take(uint64_t from,uint64_t to,int *tids,int *n,int cap){assert(to<=8);for(uint64_t s=from;s<to;s++){if(*n>=cap)return -1;tids[(*n)++]=mark_ids[s];}return 0;}
 static void vk_tex_pool_cold(int on){cold_lookups+=(unsigned)on;}
 static int pool_mark_write(VkDescriptorSet s,VkWriteDescriptorSet *w){(void)s;(void)w;return 0;}
@@ -452,6 +453,12 @@ int main(int argc,char **argv){
  }else if(mode==11){
   // an unread ID's image stays bound, but the fill does not count it as drawn
   mark_cold=2;VkDescriptorSet a=take();assert(img(a)==10101&&cold_lookups==1);
+ }else if(mode==12){
+  // DM_VK_POOL_MARK: no set free (mode 5's exhaustion) and the recording submission's set is drawn with again, never NULL (tbl_set's 70 MB sets)
+  mark_on=1;VkDescriptorSet a=NULL;for(int i=0;i<6;i++){last_fence++;assert((a=take()));}
+  g_samp_gen++;assert(take()==a&&g_ring_stale==1&&g_ring_none==1);
+  job=0;assert(take()==a);   // (the latest job: not an earlier one)
+  job=1;g_samp_gen++;g_pool_tex_base=1;assert(!take());   // bases moved: its entries are not this draw's
  }
  for(int i=0;i<RING_N;i++){free(g_ring[i].img);free(g_ring[i].pend);}
  return 0;
@@ -512,7 +519,7 @@ class PoolTables(unittest.TestCase):
                                 str(c), "-o", str(exe)], check=True)
                 return exe
             exe = compile_one(source, "candidate")
-            for mode in range(12):
+            for mode in range(13):
                 subprocess.run([str(exe), str(mode)], check=True, timeout=15)
             # Recreate the previous global-generation-only hit/update predicates.
             previous = source.replace(" && r->sampseq == sampseq", "").replace(
