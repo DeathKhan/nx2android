@@ -1,0 +1,44 @@
+# Game profile of Frostpunk (Switch, update 1.0.1). Plays on the Mac from boot through the title, the main menu and A New Home's intro into the city at 30 fps;
+# on Android the same at 30 fps, with the buildings, the Generator and the props drawn through raw global memory (android_defaults.txt, see README.md)
+# Format: see dm/games/README.md
+# 11 bit studios' own Liquid engine (namespace N6Liquid; the survey's "Unreal 4" marker is a stray "UE4" in main, there are no paks), NVN, SDK 20.5.19.
+# Every game file is in a dozen archives of three files each at the RomFS root (<name>.idx / .str / .dat: zstd entries, sound and movies as Ogg streams);
+# shader_split.py reads the 2,550 shaders in common.dat (liquid_shaders), HLSL compiled for NVN, one stage per file
+
+# ---- Identity ----
+title_id	0100B1C0249B4000
+program_id	0100B1C0249B4000
+
+# ---- App ----
+name	Frostpunk
+ipa	Frostpunk.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v65536	1.0.1	main=e258a7371ecd2a270591d9c574cf12c0	sdk=8bfebccd6f5c1392597b364b9ab22a8d
+package	v65536
+shader_versions	v65536
+
+# ---- Files ----
+# main imports from these two only; it imports nn::ro, but the RomFS holds no NRO and none was loaded in the runs
+modules	main sdk
+romfs_marker	textures-s3.dat
+# the archives' entries are zstd frames and Ogg streams already
+zip_store	.dat:.metallib
+
+# ---- Memory ----
+# the NPDM declares no system resource, so no virtual address memory (IsVirtualAddressMemoryEnabled is false, as on Horizon); main sets a heap of at most the
+# pool − 64 MB, which the 3328 MB heap region holds (the log: heap 3.12 GB in a 3.25 GB region, on the Mac and on Android)
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+sys_resource	0x0
+
+# ---- Shader split ----
+shader_groups	/=romfs
+shader_note	Frostpunk shaders
+
+# ---- After the rewrite ----
+# used memory for the rewritten modules, at least the default 64 MB
+mem_used	0x5c00000
