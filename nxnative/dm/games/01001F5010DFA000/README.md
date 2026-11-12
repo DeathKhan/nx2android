@@ -12,6 +12,7 @@ Update 1.1.1 (`v262144`) over the base game, SDK 11.4.0. Game Freak's engine bet
 | `depth_mode zero` | `game.tsv` | the game sets the near=0 depth mode, so the pipeline bases made before it runs take the `main0_z` vertex entries |
 | `pad_layout full` | `game.tsv` | the 3D gamepad layout: the camera is on the right stick |
 | The capture demo's empty result | [`patches.py`](patches.py) `MATCH_CUTS` | a workaround for a null read in the game's own code, whose cause is open: [Crash in the capture demo](#crash-in-the-capture-demo) |
+| `fps_target 60` and the frame step stubs | [`game.tsv`](game.tsv), [`patches.py`](patches.py) `FRAME_STEP` | 60 fps (30 on the Switch) with game time at real time: [60 fps](#60-fps) |
 
 No host code keyed to this game.
 
@@ -33,6 +34,16 @@ Open: the cause; the crash is worked around ([GitHub issue #712](https://github.
 - **Workaround:** `patches.py` returns the function's empty result (`{0, 0}` through x20) on both null paths, before it takes any reference. All 12 direct reads of the result (the ball's `+0x810`, `main+0x19cbcd0` to `main+0x19d1fac`) null-check it; three other places copy it as a reference (`main+0x19cc230`, `main+0x19d2074`, `main+0x19d257c`), whose users were not followed. The room for the check is two of the function's five identical blocks, so the abort stub stays. It is function-matched on 1.1.1 ([function-matched cuts](../../../docs/reference/rewriter.md#function-matched-cuts-for-unregistered-builds)); other builds are unchecked and get a red line if the function differs.
 - **Checked:** the rewriter matches the rule once and writes the five cuts, and the game then boots on the Mac to the field setup with no crash (200 s, on the disk's older shader libraries). The patched function run on the module's own bytes in a small interpreter: both null paths return `{0, 0}` with the stack and callee-saved registers restored, and never reach `main+0x16e34fc`; a live object goes on to `main+0x16e3420` as before. The issue's earlier form of the cuts, with the same effect, ran about 7 hours on the Mac with no crash, and the skip was seen once (id 1, frame 142020, followed by 55 minutes of play). These cuts have not met the path in play, and any visible effect on that one ball is unknown.
 - **To settle the cause:** `DM_PROBE=main:16e341c,main:16e3828` on a save with Poké Balls, with `DM_PROBE=main:16dde90` to see the order.
+
+## 60 fps
+
+The game runs at 30 on the Switch. Two things in 1.1.1's `main` hold it there, and the frame step stubs in `patches.py` move both to the host's frame step ([`fps_target`](../README.md), the launcher's **Frame rate**):
+
+- **The present interval.** The start-up code builds the display's settings on the stack and the display setup sets the window's present interval to one word of them + 1 (`main+0x2aa2788`). The word is 1 (`main+0x277d838`): interval 2. The stub makes it 0 when the target is not 0.
+- **The frame period.** The game steps its time by a stored period, not by the clock: the frame-time object's constructor (`main+0x277bda4`) stores 33,333,334 ns in four pairs, read through a getter (`main+0x278303c`). With the interval at 1 alone the game ran at double speed. The stub in the getter stores the host's step, the vsyncs the frame stays on screen, times 16,666,667 ns: 1/60 s at 60 fps, 1/30 s when the host holds 30 (target 30, heat, a movie, late frames).
+- **Target 0** keeps the game's own interval 2 and period.
+- **Checked:** on an AYN Odin 3 (Adreno 830, Android 15, 2026-11-10 and 11) in a fork with the same two period stubs and the interval as a fixed cut: 60 fps in play with the host's line `frame step: game time … (1.000 of real time)`, and 1,800 of 1,800 frames at 60 through a scripted camera pan; the interval cut alone ran at double speed. The rewriter places the three stubs on 1.1.1's `main`. Not run: the Mac and iOS, target 0 and target 30 with the interval read from the state page (this form of the first stub), and movies.
+- The Odin held 60 through that pan only with its GPU clock kept up (832 MHz); when frames are late the host's hold steps to 30 and the period follows it.
 
 ## Performance and memory
 
