@@ -34,11 +34,27 @@ typedef struct nq_node {
     tex_t texture; double period; int crop[4];
 } nq_node;
 typedef struct nq_owned { struct nq_owned *next; unsigned kind; uint64_t data[]; } nq_owned;
-typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame, id; } nq_job;
+typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame, id; struct nq_job *live_prev, *live_next; } nq_job;
+#ifdef __ANDROID__
+// Jobs with a logical ID from creation to end, in ID order (IDs are taken under g_sub_mu, where they are listed), so the first-touch list (hle_nvn.c ft_del_drain) knows
+// when no job made before a texture's Finalize can still name it: queues replay round-robin and a parked one waits, so a job made later can end first. nq_live_mu is a
+// leaf lock: nothing else is taken while it is held (droidplay-core 7d2c4ed7c)
+static pthread_mutex_t nq_live_mu = PTHREAD_MUTEX_INITIALIZER; static nq_job *nq_live_first, *nq_live_last;
+static void nq_live_add(nq_job *j) {
+    pthread_mutex_lock(&nq_live_mu); j->live_prev=nq_live_last; if(nq_live_last) nq_live_last->live_next=j; else nq_live_first=j; nq_live_last=j; pthread_mutex_unlock(&nq_live_mu);
+}
+static void nq_live_del(nq_job *j) {
+    pthread_mutex_lock(&nq_live_mu);
+    if(j->live_prev) j->live_prev->live_next=j->live_next; else nq_live_first=j->live_next;
+    if(j->live_next) j->live_next->live_prev=j->live_prev; else nq_live_last=j->live_prev;
+    pthread_mutex_unlock(&nq_live_mu);
+}
+static uint64_t nvn_jobs_oldest(void) { pthread_mutex_lock(&nq_live_mu); uint64_t s=nq_live_first?nq_live_first->id:UINT64_MAX; pthread_mutex_unlock(&nq_live_mu); return s; }
+#endif
 static void nq_job_free(nq_job *j) {
     for(nq_owned *o=j->owned,*next;o;o=next) { next=o->next; if(o->kind==CAP_K_PROG) mtl_prog_unpin((prog_t *)o->data); else if(o->kind==CAP_K_TEX) mtl_tex_unpin(((tex_t *)o->data)->serial); free(o); }
 #ifdef __ANDROID__
-    if (j->id) vk_registry_job_unpin(j->id);
+    if (j->id) { nq_live_del(j); vk_registry_job_unpin(j->id); }
 #endif
     free(j->objects.keys); free(j->objects.vals); free(j);
 }
@@ -213,7 +229,7 @@ static void *nq_worker(void *unused) {
             if(n->kind==NQ_COMMANDS) {
                 uint64_t handle=(uintptr_t)n->bytes;
                 nvn_cap_submit(1,&handle);
-                mtl_sub_begin(); nvn_ft_poll(); mtl_sub_index(&handle,1);
+                mtl_sub_begin(); ft_del_drain(); nvn_ft_poll(); mtl_sub_index(&handle,1);
                 mtl_exec_rest(NULL,0); mtl_exec(n->bytes); fence=mtl_sub_commit();
             } else {
                 nvn_cap_present(&n->texture,n->crop);
@@ -290,7 +306,7 @@ void nvn_queue_submit(queue_t *q,int count,const uint64_t *handles) {
     // No scheduler lock while copying descriptors or resolving shader libraries.
     dm_host_mutex_lock(&g_sub_mu); void *pool=nq_pool_push(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
 #ifdef __ANDROID__
-    j->id=atomic_fetch_add(&g_nq_enqueued,1)+1; vk_registry_job_pin(j->id);
+    j->id=atomic_fetch_add(&g_nq_enqueued,1)+1; vk_registry_job_pin(j->id); nq_live_add(j);
 #endif
     for(int i=0;i<count;i++) nq_flatten(j,(const uint8_t *)(uintptr_t)handles[i]); nq_end(j);
     nq_cost_end(cost); nq_pool_pop(pool); pthread_mutex_unlock(&g_sub_mu);
@@ -311,7 +327,7 @@ uint64_t nvn_queue_present(queue_t *q,const tex_t *t,double period,const int cro
     j->receipt=nq_new(); j->frame=dm_nvn_frame_count(); nq_node *n=nq_append(j,NQ_PRESENT);
 #ifdef __ANDROID__
     dm_host_mutex_lock(&g_sub_mu);
-    j->id=atomic_fetch_add(&g_nq_enqueued,1)+1; vk_registry_job_pin(j->id);
+    j->id=atomic_fetch_add(&g_nq_enqueued,1)+1; vk_registry_job_pin(j->id); nq_live_add(j);
 #endif
     nq_tex_snapshot(&n->texture,t);
 #ifdef __ANDROID__

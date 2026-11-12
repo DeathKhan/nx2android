@@ -508,6 +508,9 @@ static void ft_add(const tex_t *t) {
 // Under asynchronous replay a texture Finalized (or initialized again) between submit and replay is still drawn by that submission, and its first use there (nvn_ft_written) needs
 // the entry: the deletion waits for the replay of the first job queued after it (ft_del_drain, submit_now); without a replay thread it is at once
 uint64_t nvn_jobs_queued(void); uint64_t nvn_replaying_job(void);
+#if NVN_LOGICAL_QUEUES && defined(__ANDROID__)
+static uint64_t nvn_jobs_oldest(void);   // nvn_queue.inc: the oldest logical job not yet ended
+#endif
 typedef struct { uint64_t serial, seq; } ft_rel;
 static ft_rel *g_ftrel; static size_t g_nftrel, g_cftrel;   // under g_ft_mu
 static void ft_del_now(uint64_t serial) {   // g_ft_mu held
@@ -523,6 +526,11 @@ static void ft_del(uint64_t serial) {
 }
 static void ft_del_drain(void) {   // the replay thread, at each submission
     uint64_t job = nvn_replaying_job(); if (!job) return;
+#if NVN_LOGICAL_QUEUES && defined(__ANDROID__)
+    // Logical queues replay round-robin and a parked queue waits, so a job made before the deletion can still be queued while a later one replays: the oldest live
+    // job says when none made before can name the texture (droidplay-core 7d2c4ed7c). Without this drain in nq_worker, deferred deletions were never made there
+    if (nvn_logical_queues_on()) job = nvn_jobs_oldest();
+#endif
     pthread_mutex_lock(&g_ft_mu);
     size_t o = 0; for (size_t i = 0; i < g_nftrel; i++) { if (g_ftrel[i].seq < job) ft_del_now(g_ftrel[i].serial); else g_ftrel[o++] = g_ftrel[i]; }
     g_nftrel = o;
