@@ -32,7 +32,17 @@
 #define FETCH_MS 10000   // the longest the game waits for the cloud's copy (a download); then it plays on with this device's save, which is not sent until the two have been compared
 #define KEEP_BACKUPS 10  // backups kept of each side (local, cloud); older ones are removed when a new one is made
 enum { HDR = 8 + 4 + 4 + SS_HASH + 8 + 24 + 64, ENT = 24, CHUNK = 1 << 16 };   // header bytes, entry header bytes, the copy buffer
-static const char MAGIC[8] __attribute__((nonstring)) = "DMSYNC1\n", END[8] __attribute__((nonstring)) = "DMSYNCE\n";
+// The markers fill their 8 bytes with no terminating zero: nonstring says so to a clang that checks (Apple's 21 warns -Wunterminated-string-initialization without it),
+// and is left out where the compiler has no such attribute (the NDK's clang 19 warned that it ignored it)
+#if defined(__has_attribute)
+#if __has_attribute(nonstring)
+#define SS_NONSTRING __attribute__((nonstring))
+#endif
+#endif
+#ifndef SS_NONSTRING
+#define SS_NONSTRING
+#endif
+static const char MAGIC[8] SS_NONSTRING = "DMSYNC1\n", END[8] SS_NONSTRING = "DMSYNCE\n";
 static const char *const FOLDERS[2] = {"save", "save_device"};   // their names in a packed save; on disk DM_SAVE and DM_SAVE_device (hle_fs.c h_fs_MountDeviceSave)
 
 // ---------- files ----------
