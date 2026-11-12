@@ -26,6 +26,17 @@ int main(void) {
 '''
 
 
+LOW_PROBE = r'''
+#include <sys/mman.h>
+#include <stdint.h>
+static int here;
+int main(void) {
+    void *m = mmap(0, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return m == MAP_FAILED || (uintptr_t)m >> 47 || (uintptr_t)&here >> 47;
+}
+'''
+
+
 def _builds(code, *flags, env=None):
     if not shutil.which('cc'):
         return False
@@ -62,3 +73,10 @@ def sanitizers():
 def leaks():
     """An ASan program runs with detect_leaks=1 (LeakSanitizer: Linux has it, macOS on arm64 does not)."""
     return _builds('int main(void) { return 0; }\n', '-fsanitize=address', env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=1'})
+
+
+@functools.lru_cache(maxsize=None)
+def low_addresses():
+    """cc's programs get their static data and anonymous mappings below 2^47, as an NVN control entry needs (nvn_obj.h ctl_e keeps
+    an address in 44 bits; a Linux arm64 host with 48-bit addresses puts both above it)."""
+    return _builds(LOW_PROBE, '-std=gnu11', env=dict(os.environ))

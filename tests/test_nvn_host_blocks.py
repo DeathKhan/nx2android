@@ -37,6 +37,7 @@ class HostLentBlocks(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('cc'), 'C compiler required')
     @unittest.skipUnless(host_cc.posix(), 'a POSIX host C compiler is required (MinGW has no <sys/mman.h>)')
+    @unittest.skipUnless(host_cc.low_addresses(), 'a host whose mappings are below 2^47 is required (not a 48-bit Linux arm64 host)')
     def test_entries_name_lent_blocks_exactly(self):
         obj = (NVN / 'nvn_obj.h').read_text(encoding='utf-8')
         helpers = '\n'.join(l for l in obj.splitlines()

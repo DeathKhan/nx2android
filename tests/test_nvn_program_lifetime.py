@@ -23,6 +23,7 @@ def function(source, declaration):
 class ProgramLifetime(unittest.TestCase):
     @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
     @unittest.skipUnless(host_cc.posix() and host_cc.sanitizers(), 'a POSIX host C compiler with ASan and UBSan is required (MinGW has no setenv, libasan or libubsan)')
+    @unittest.skipUnless(host_cc.low_addresses(), 'a host whose static data is below 2^47 is required (not a 48-bit Linux arm64 host)')
     def test_queued_finalize_and_replacement(self):
         source = (ROOT / 'nxnative/dm/gfx/nvn/hle_nvn.c').read_text(encoding='utf-8')
         parts = {
