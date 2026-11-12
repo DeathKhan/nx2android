@@ -5278,6 +5278,16 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
             VKLOG("buffer %s texture copy: texture ser=%llu %ux%u nvn format %#x flags %#x, buffer %#llx, region %d,%d %ux%u, row stride %lld image stride %lld",
                   to_texture ? "→" : "←", (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.format, c->tex->d.flags, (unsigned long long)c->src,
                   c->r.xoffset, c->r.yoffset, (unsigned)c->r.width, (unsigned)c->r.height, (long long)S.row_stride, (long long)S.image_stride); } } }
+    if (im->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {   // (droidplay-core 59278b091's remainder) one aspect is copied, pitched by the guest's
+        // texel, where NVN's depth-stencil layouts pack the aspects into each texel and Vulkan writes each aspect tightly at its own size: logged once per format and
+        // direction, so a run shows whether a game copies depth or stencil between buffers and textures before the per-aspect conversion is written
+        static uint32_t seen[32]; static int nseen; uint32_t id = c->tex->d.format << 1 | (uint32_t)to_texture; int k = 0; while (k < nseen && seen[k] != id) k++;
+        if (k == nseen && nseen < 32) { seen[nseen++] = id; VkImageAspectFlags ca = sub_of(im, &c->view, c->has_view, c->r.zoffset).aspectMask;
+            VKLOG("depth-stencil buffer %s texture copy: nvn format %#x (vk format %d, %u bytes a texel), texture %ux%u, region %ux%ux%d, row stride %lld; the image has %s%s%s, "
+                  "the %s aspect alone is copied, in Vulkan's per-aspect layout (not NVN's packed one; said once per format and direction)", to_texture ? "→" : "←", c->tex->d.format, (int)f->vk,
+                  f->bpb, c->tex->d.width, c->tex->d.height, (unsigned)c->r.width, (unsigned)(c->r.height ? c->r.height : 1), c->r.depth ? c->r.depth : 1, (long long)S.row_stride,
+                  im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? "depth" : "", (im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && (im->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? " and " : "",
+                  im->aspect & VK_IMAGE_ASPECT_STENCIL_BIT ? "stencil" : "", ca & VK_IMAGE_ASPECT_DEPTH_BIT ? "depth" : "stencil"); } }
     VkBuffer b; VkDeviceSize o;
     if (im->promoted) { VKRED_ONCE(172, "buffer ↔ texture copy of an image promoted for image stores (nvn format %#x, %ux%u): skipped, its texels are not the guest's layout", c->tex->d.format, c->tex->d.width, c->tex->d.height); return; }
     vk_pool_tag = "buffer-texture copy"; if (!vk_buf_at(c->src, 1, &b, &o)) { VKRED_ONCE(70, "buffer of a buffer ↔ texture copy outside the memory pools"); return; }
