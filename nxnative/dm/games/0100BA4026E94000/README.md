@@ -37,7 +37,7 @@ Update 1.1.0 (v65536) over the base game, SDK 19.3.16. Unity 2022.3.62f2 IL2CPP 
 
 ## Mac routes
 
-- Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform mac` and use its printed command.
+- Build with `scripts/build_ipa_from_nsp.py <game folder> --platform mac` and use its printed command.
 - From a fresh save, the first-run language screen is up by about 40 s. Its **Continue takes a long hold of A**: `A~3` was always enough, `A~1.5` only sometimes, and short presses never. Then A on the confirm button screen, a held A on the brightness screen, A on Start, A on New Game.
 - The opening movie takes about 3.5 minutes, and neither a held A nor Plus skipped it. About 30 presses of A go through the dock dialogue that follows. **Stop pressing A when the HUD appears:** A dashes, and Rose starts at the left edge of the pier facing left, so each press drops her in the water, which costs about 6% of her health and fades to black with only the HUD showing before she respawns on the pier. That is the game, not a rendering fault: frames right after a press show the dash, the fall and the red respawn burst, and A on solid ground costs nothing.
 - L heals only when held (`L~2.5` worked, a 0.3 s tap did nothing).
@@ -46,7 +46,7 @@ Update 1.1.0 (v65536) over the base game, SDK 19.3.16. Unity 2022.3.62f2 IL2CPP 
 
 ## Found on this game
 
-- A base NSZ of this game tagged `[v0]` is 1.1.0 (v65536) by its content meta, as the eShop now serves it: the NSP script names a package's version from its content meta, so that base alone is this profile's `v65536` ([An update is taken for the version in its file name](../../../docs/reference/packing.md#an-update-is-taken-for-the-version-in-its-file-name)).
+- A base NSZ of this game tagged `[v0]` is 1.1.0 (v65536) by its content meta, as the eShop now serves it: the NSP script names a package's version from its content meta, so that base alone is this profile's `v65536` (An update is taken for the version in its file name).
 - Existing [Function-matched cuts](../../../docs/reference/rewriter.md#function-matched-cuts-for-unregistered-builds) work on this `sdk` build without a row of its own.
 
 ## Open

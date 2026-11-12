@@ -44,7 +44,7 @@ Update 1.2.1 (v196608) over the base game, SDK 9.4.0. Moon Studios' game (publis
 
 ## Mac routes
 
-- Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform mac` and use its printed command. Keep the window in front.
+- Build with `scripts/build_ipa_from_nsp.py <game folder> --platform mac` and use its printed command. Keep the window in front.
 - `DM_CTL` presses of 0.4 s (`A~0.4`) work on the menus.
 - From a fresh save: the title about 2 minutes after boot. A on Press A, A on Start Game, A on slot 1, A on Normal Mode (preselected). The opening scene plays for about 45 s, then Ori stands on a log; `LLeft` walks off it into Swallow's Nest. Plus opens the pause menu (Resume, Skip Prologue, Options, Exit); one Down press of 0.4 s moved two entries, to Options.
 - Controls checked: A on menus, the left stick, A to jump, Plus.

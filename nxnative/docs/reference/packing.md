@@ -4,13 +4,6 @@
 
 ## Game packages
 
-### PFS0 file-name table missing its final NUL
-
-- **Symptom:** package identification stops with `ValueError: subsection not found` in `pfs0_names`, or LibHac reports `ResultFsPathNotFound` opening the last file of an NSP.
-- **Cause:** older NSZ writers omitted the final NUL in the PFS0 string table. The final name is bounded by the table length, but the Python scanner required a terminator and LibHac reads names as NUL-terminated strings.
-- **Fix:** `nx_extract` supplies LibHac with a virtual header containing the missing NUL followed by the original payload storage. File offsets remain relative to that payload, and the source package and encrypted NCA bytes are unchanged. Truncated tables and out-of-table name offsets still fail. Synthetic package tests cover the reader and payload preservation (`test_pfs0_storage.py`). The Python scanner's own table reader (`pfs0_names`), which accepted the table boundary as the end of the final name, is gone: the scan reads every package through `nx_extract` ([An update is taken for the version in its file name](#an-update-is-taken-for-the-version-in-its-file-name)).
-- **Found on:** Moving Out 2 (`010065D018172000`), base 1.1.254 NSP and update 1.3.315 NSZ. Package reading was checked, not gameplay.
-
 ### A NUP with complete standalone updates stops at "no base game"
 
 - **Symptom:** `no base game, only update packages: pack the base game and its update into one NUP`, even when the update carries the complete game's files ([issue #1195](https://github.com/seedds/nxnative/issues/1195)).
@@ -303,13 +296,6 @@
 
 ## Compressed inputs
 
-### NSZ decompression rejects `--keys`
-
-- **Symptom:** `decompress NSZ` stops immediately with `nsz: error: unrecognized arguments: --keys …`.
-- **Cause:** `nsz` 4.6.1 has no `--keys` argument. It loads `keys.txt` beside `sys.argv[0]`, or falls back to `~/.switch/prod.keys`, while importing its modules, before parsing arguments ([4.6.1 key loader](https://github.com/nicoboss/nsz/blob/4.6.1/nsz/nut/Keys.py)). Version 5.0 supports `--keys` ([argument parser](https://github.com/nicoboss/nsz/blob/5.0.0/nsz/ParseArguments.py)); staging `keys.txt` also supports 4.6.1.
-- **Fix:** `scripts/build_ipa_from_nsp.py` `decompress_nsz` prefers the current Python's module: it links the file selected by `-k` as `keys.txt` in the conversion's temporary folder and runs `nsz -D` there, with `sys.argv[0]` set to `nsz` before import. Without the module, `nsz_command` probes `nsz` and `nsz-cli-macos-arm64` on the build's PATH and passes `--keys` to the first whose successful help lists that option. An unsupported or failed candidate does not hide the next one; when none works, the error lists the reasons and installation options. Executable, input and output paths are absolute because conversion changes directories. The temporary folder and link are removed on success or failure; the user's default keys are untouched.
-- **Found on:** [Super Mario Odyssey](../../dm/games/0100000000010000/README.md), converting its v0 NSZ. Applies to NSZ and XCZ inputs for every game. Synthetic tests during [PR #327](https://github.com/seedds/nxnative/pull/327) also reproduce an older console script hiding the release binary, a failed help probe containing `--keys`, and a relative PATH executable failing after the directory change; no game files are needed for those cases.
-
 ### ZBIC-compressed NSO segments
 
 - **Symptom:** the NSP script or any module tool stops on `main`: `compressed with zstd (NSO flag bit 7), which this loader does not decode yet`; with the decoder but without its package, `ZBIC (zstd) segments need the zbic package (python3 -m pip install zbic)`.
@@ -329,34 +315,6 @@
 
 ## Package identification
 
-### An update is taken for the version in its file name
-
-- **Symptom:** `[RED] leaving out update NSPs without a version tag ([v<N>]) in their name`, for every untagged update when the folder holds any other update (`….v720896.UPD.nsp`, [PR #393](https://github.com/seedds/nxnative/pull/393)). A single untagged update is packed as the newest version the profile registers, whatever it is. A wrongly tagged update is packed as the tagged version, and after the whole extraction the build IDs disagree with the profile's row and the build goes on from a derived profile, without that build's fixes. A base game served at a later version is packed as `v0`, which the profile may not register: Castlevania: Belmont's Curse's base is 1.1.0 (v65536) and its profile registers only `v65536`.
-- **Cause:** `scan_nsps` took each package's version from the `[v<N>]` tag in its file name and its title ID from its ticket or tag; it read a package's content metas only when it held several. A base game was always `v0`. Tags drift in real collections: a Castlevania base NSZ was tagged `[v0]`, while its content meta and `cnmt.xml` say v65536.
-- **Fix:** `scan_nsps` reads every package's content metas in one run, `nx_extract <prod.keys> --contents <package>...` (`package <index> <file name>`, then one `content <type> <title ID> <version>` line per content meta; only headers and the meta NCAs are read, about 0.05 s for a folder). Each package's title ID and version are its content metas', for the base game, every update and every DLC, so a file's name no longer matters to the build. `nsp_versions` names the base game by its own version (`v0` for most games; `v65536` for that Castlevania base, its profile's registered row). A `[v<N>]` tag that disagrees is said in one line and ignored. Keys that cannot open the meta NCAs stop the scan with `nx_extract`'s line ([Keys older than the game](#keys-older-than-the-game-stop-the-extraction-with-an-unhandled-missingkeyexception)). A package that cannot be read, or that holds no base game, update or DLC (a delta update), is skipped with a `[RED]` line, since it could not be extracted either. The ticket and tag readers (`title_of`, `nx_extract --title`, `is_merged`) and the untagged-update guess are gone. DLC extraction always names the DLC's title ID (`--aoc … <DLC title ID>`).
-- **Found on:** [Castlevania: Belmont's Curse](../../dm/games/0100BA4026E94000/README.md)'s base game ([issue #1629](https://github.com/seedds/nxnative/issues/1629)). Checked with the real tool on renamed links: Balatro with an untagged update (base v0, update v851968); Mario Kart 8 Deluxe with its update tagged `[v65536]` (taken as v1441792, said), an untagged DLC (v65536) and a truncated package (skipped: `ResultFsOutOfRange`); NieR:Automata's XCI; keys holding only `header_key` stop with `prod.keys has no key_area_key_application_0c`. Applies to every game.
-
-### An NSP without a ticket or a title ID in its name stops with "no NSP with a readable title ID"
-
-- **Symptom:** `[RED] no NSP with a readable title ID in <folder>`, although the keys open the package (the launcher's key check passes). Renaming the file to `Game [0100XXXXXXXXXXXX].nsp` makes the build go on.
-- **Cause:** `title_of` took the title ID only from the ticket's file name (`<rights ID>.tik`) or from a `[title ID]` tag in the package's file name. Many NSPs carry no ticket (standard-crypto dumps, repacks), and a download's file name often has no tag.
-- **Fix:** with neither, `title_of` asked the package (`nx_extract <prod.keys> --title <package>`: the lowest title ID of its meta NCAs' headers). Since [issue #1629](https://github.com/seedds/nxnative/issues/1629) every package's title ID comes from its content metas, ticket or not, tag or not ([An update is taken for the version in its file name](#an-update-is-taken-for-the-version-in-its-file-name)); `title_of` and `--title` are gone. It works for NSP, NSZ (the meta NCAs are not compressed), XCI and XCZ. `nx_extract` is built into a temporary folder for it, since the build folder is named after the title ID. Key values are never printed.
-- **Found on:** NX2Apple, [LNPANDY/NX2Apple#177](https://github.com/LNPANDY/NX2Apple/issues/177) ([Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), whose base NSP has no ticket). Applies to every game.
-
-### A game file whose extension is in capitals is not found
-
-- **Symptom:** `[RED] no NSP with a readable title ID in <folder>` for a folder holding `Game [0100XXXXXXXXXXXX].NSP`, on any Mac volume; renaming it to `.nsp` makes the build go on. A dump folder beside `Game.NSP` is packed instead of the package, and `Game.NUP` is not found. A `Game.NSZ` stops with `nsz made no Game.nsp`.
-- **Cause:** the script listed the folder with `Path.glob('*.nsp')`, which compares case-sensitively on every POSIX system, a case-insensitive Mac volume included. nsz has the same limit of its own: `PathTools.isCompressedGame` takes only a lowercase extension, and nsz skips anything else and exits 0 with no output. It resolves a symlink before it looks.
-- **Fix:** `files_with_suffix` lists a folder's files by their lowercased extension, for every scan of the inputs, and a package beside a compressed one is found in that listing. A compressed file in capitals goes to nsz as a hard link with a lowercase extension in its temporary folder, or as a copy where there can be none (another volume, exFAT), so the player's file stays as it is.
-- **Found on:** NX2Apple, [LNPANDY/NX2Apple#554](https://github.com/LNPANDY/NX2Apple/issues/554) ([Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md)). Applies to every game.
-
-### A merged NSP (base game, update and DLC in one file) packs as one title
-
-- **Symptom:** a game folder holding one merged package (`[Base + Update + DLC].nsp`, or a 1G+1U cartridge dump with no update NSP beside it) stops with `no base game NSP found`, or packs the base game alone (v0) without its update and DLC; when the base game's own build cannot be packed (Mario Kart 8 Deluxe 1.0.0's `main` is 32-bit), the build stops there.
-- **Cause:** `scan_nsps` gave each file one title ID: its first ticket's, else its name's tag. A merged package holds a ticket per title in any order, so it counted as the base game or as the update, never as both, and its DLC was never seen. `nx_extract` then read the update from a separate update NSP only.
-- **Fix:** a package is asked for its content metas (`nx_extract <prod.keys> --contents`; first only a package whose file table held more than one `*.cnmt.nca`, since [issue #1629](https://github.com/seedds/nxnative/issues/1629) every package: [An update is taken for the version in its file name](#an-update-is-taken-for-the-version-in-its-file-name)), and counts as each Application, Patch and AddOnContent it lists, with the versions from the metas. The one file is then given to `nx_extract` as both the base game and the update: `OpenNsp` keeps the NCAs that the Application content meta lists for the base and the Patch content meta's for the update, both of the application being packed (`--app`), and `--aoc <package> <out> <DLC title ID>` takes one DLC's data NCA by its title ID. The extraction estimate, the progress total and the NSZ conversion count the file once. A DLC NSP that bundles several DLC is read the same way.
-- **Found on:** Mario Kart 8 Deluxe (0100152000022000, no profile here) from one merged NSP, in NX2Apple ([PR #842](https://github.com/seedds/nxnative/pull/842), [LNPANDY/NX2Apple#376](https://github.com/LNPANDY/NX2Apple/issues/376)). Checked with Balatro's update NSP and base NSP merged into one PFS0: it scans as base v0 and update v851968, and `nx_extract` given it as base and update writes the same ExeFS, control data and RomFS manifest as the two separate NSPs. Applies to every game.
-
 ### A derived profile leaves out a module that moved to another slot
 
 - **Symptom:** a version a profile was not brought up on crashes at its first movie: `UNIMPL _ZN5movie9ExtractorC1ENS_13ContainerTypeE`, then `CRASH sig=11` ([issue #1211](https://github.com/seedds/nxnative/issues/1211)). The derived profile's `modules` has only `main sdk`.
@@ -374,37 +332,9 @@
 
 ## Keys
 
-### Keys older than the game stop the extraction with an unhandled MissingKeyException
-
-- **Symptom:** `nx_extract` stops with exit code 134 and `Unhandled exception. LibHac.Common.Keys.MissingKeyException: Unable to decrypt NCA section.` with `Key Name: key_area_key_application_<NN>` (or `titlekek_<NN>`), after any NSZ conversion, the build ID lookup or the survey. An NSZ converted with such keys is written anyway: `nsz -D` warns `master_key_<NN> missing … This will lead to corrupted output.` and exits 0.
-- **Cause:** each NCA's header names the key generation its content needs; a prod.keys dumped from a console on older firmware than the game lacks that master key and every key derived from it. Nothing checked the keys against the packages before the first step that decrypts them, and LibHac's exception reached the log as a crash.
-- **Fix:** `nx_extract <prod.keys> --keys <package>...` opens every NCA of the packages (an NSZ's or XCZ's compressed ones by their header, which nsz keeps as it was) and applies LibHac's own test (`CanOpenSection`). On the newest key missing it prints `[RED] <file>: prod.keys has no <key> (master key <NN>, which came with firmware <version>) …` and exits with code 6; a rights-ID NCA with no common ticket is named the same way. The NSP script runs it once after scanning the folder (`check_keys` in `package_reader`), before `nsz -D`, the survey and the extraction, and stops with that line; any other failure of the check is left to those steps. Extraction, `--aoc` and `--contents` run the same check before they decrypt anything (the content metas first), so `nx_extract` alone also stops with exit code 6 instead of a crash. The firmware table runs to 21.0.0 (master key 0x14); a newer key is named as "a firmware after 21.0.0". The check reads only headers: the NSP script stops on Balatro's two NSPs in about 1.5 s.
-- **Found on:** NX Library ([Bium23/NxLibrary](https://github.com/Bium23/NxLibrary)), a Mac front end that checks the keys before starting a build, an idea from NX2Apple. Checked with Balatro's NSPs and an NSZ of its base game, with a copy of prod.keys without the keys of master key 0x10 and later (and one without 0x0a and later): every path names `key_area_key_application_10` and firmware 17.0.0, and the complete keys pass and extract as before. Applies to every game.
-
 ## Cartridge dumps
 
-### A cartridge dump with its update on it extracts the update as the base game
-
-- **Symptom:** the extraction of a game whose base is an XCI that also carries its update (a "1G+1U" dump) stops with `[RED] nx_extract exit code -6`. `extract_v<version>.log` lists the update's build IDs even for the base game alone, then ends in an unhandled exception from the RomFS (`ResultFsNonRealDataVerificationFailed (2002-4604): Hash error!` from `RomFsFileSystem..ctor`, or `ArgumentException` / `InvalidOperationException` from the patch layers).
-- **Cause:** the XCI's secure partition holds the update's NCAs beside the base game's, and the update's Program NCA has the program's title ID too. `nx_extract` took the first Program NCA of the lowest title ID as the base, which is the update's when the dump lists it first. Its data section is a patch (BKTR) over the base RomFS, so it cannot be read alone or under another patch. The ExeFS still opens, with the update's build IDs, because an update's code section is complete. The Control NCA (display version, icon) was also whichever of the two came last.
-- **Fix:** `dm/tools/nx_extract/Program.cs` `OpenNsp` reads the base package's content metas (`*.cnmt` in its Meta NCAs) and keeps only the NCAs that its Application content meta lists, and prints how many it left out. When none of them is a Program NCA (NCA files renamed, so their names are not content IDs), it prints a `[RED]` line and reads every NCA as before. An NSP or a base-only XCI keeps every NCA but its meta NCA, so it extracts as before (Balatro's NSPs and Monster Hunter Rise's XCI give identical manifests). The update on the cartridge is packed too since [a merged package counts as each title it holds](#a-merged-nsp-base-game-update-and-dlc-in-one-file-packs-as-one-title).
-- **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), a 1G+1U XCI (base v0 with update 1.4.3, whose 524 MB Program NCA is listed before the base's 17.1 GB one) beside the 1.4.3 update NSP ([PR #311](https://github.com/seedds/nxnative/pull/311)). Reproduced with a package of Balatro's update NSP followed by its base NSP: the base alone and the base with the update now give the same manifests and control data as the separate NSPs. Applies to any game's XCI that carries its update.
-
-### A cartridge dump that holds two games packs only the first
-
-- **Symptom:** an XCI with two applications (Super Mario Galaxy + Super Mario Galaxy 2 on one cartridge dump) always packs the first game; `build_ipa_from_nsp.py` never reaches the second.
-- **Cause:** the scan took one title ID per file (the file name tags both games, and the first tag won), and `nx_extract` kept the NCAs of every Application content meta and took the Program NCA of the lowest title ID. Nothing could name the other application.
-- **Fix:** the XCI's content metas make it [count as each title it holds](#a-merged-nsp-base-game-update-and-dlc-in-one-file-packs-as-one-title), so the scan finds two games and stops with `more than one game in the folder`, naming both. `--title-id <title ID>` (`TITLE_ID` in Spyder) picks the game to pack from them; the script passes its title ID to every base extraction (`nx_extract … --app <title ID>`), and `OpenNsp` keeps only that title's Application and Patch content metas' NCAs (an `--app` the package has no content meta of stops with the ones it has). Each game gets its own `<title ID>_build/` folder and app.
-- **Found on:** [Super Mario Galaxy 2](../../dm/games/0100FD8022DAA000/README.md), on the same XCI as [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md) ([PR #701](https://github.com/seedds/nxnative/pull/701), which packed both from the XCI with an earlier form of the option). This form is checked with a test XCI's file table and with Balatro's packages (`--app` of a title the package does not hold stops, naming the one it has); no two-game XCI is on hand.
-
 ## Damaged packages
-
-### Extraction of a damaged NSP ends in "The LinkedList is empty"
-
-- **Symptom:** `nx_extract` stops with exit code 134 and `Unhandled exception. System.InvalidOperationException: The LinkedList is empty.` from `LibHac.Tools.FsSystem.CachedStorage.GetBlock`, with no `[RED] hash check failed` list, with or without `--allow-damaged`.
-- **Cause:** a damaged NSP with more than a few damaged files used up LibHac 0.19's hash cache. `CachedStorage.GetBlock` takes a block off its list before reading into it and does not put it back when the read fails, so the 4 blocks of a filesystem last for 4 failed reads and the next read that misses the cache throws. That exception is no hash error, so `nx_extract` did not catch it. A copy of SteamWorld Dig with 2 flipped bytes listed its 2 files; with 40 it crashed.
-- **Fix:** each hash error gets a new checked filesystem (`Failed` in `dm/tools/nx_extract/Program.cs`, on the image, folder and manifest paths), so a damaged NSP lists every damaged file and stops with exit code 3, or goes on with `--allow-damaged`. The same copy with 40 flipped bytes lists all 36 files. `test_every_damaged_file_is_listed_past_the_hash_cache` in `dm/tools/tests/test_romfs_read.py` puts a real RomFS behind a real `CachedStorage` on all three paths, with no NSP or keys.
-- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md#found-on-this-game) ([issue #810](https://github.com/seedds/nxnative/issues/810), whose reporter diagnosed the lost cache blocks and carried a local patch that reopens the filesystem). Applies to any game.
 
 ### A damaged RomFS's own tables
 

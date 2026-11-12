@@ -73,7 +73,7 @@ General host and tool changes first needed here; each applies to every game:
 - **A failed pipeline archive no longer stops the build:** [A failed pipeline archive stops the whole build](../../../docs/reference/shaders.md#a-failed-pipeline-archive-stops-the-whole-build).
 - **Pipeline archive flush periods** (no compile waits for a flush; the prepare step stops at the last pair handed out): [A compile that does not return stalls every flush and draw](../../../docs/reference/shaders.md#a-compile-that-does-not-return-stalls-every-flush-and-draw).
 
-- **Resolved: NSZ decompression rejected `--keys`** when packing v0: [NSZ decompression rejects `--keys`](../../../docs/reference/packing.md#nsz-decompression-rejects---keys).
+- **Resolved: NSZ decompression rejected `--keys`** when packing v0: NSZ decompression rejects `--keys`.
 
 - **Largest point size at `c0 + 0x610`**: [04, section 3](../../../docs/agents/04-graphics.md#3-find-the-binding-layout-by-census) and [Graphics `c0 + 0x610`: the largest point size](../../../docs/reference/shaders.md#graphics-c0--0x610-the-largest-point-size).
 - **Vertex fetches past a stream's bound size** (a copy padded with zeros): [Vertex fetches past a stream's bound size](../../../docs/reference/rendering.md#vertex-fetches-past-a-streams-bound-size).

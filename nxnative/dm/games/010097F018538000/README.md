@@ -30,7 +30,7 @@ Update 1.0.6.1267 (v3080192) over the base game, SDK 20.5.29. Unity 6000.0.52f1 
 
 ## Mac routes
 
-- Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform mac` and use its printed command.
+- Build with `scripts/build_ipa_from_nsp.py <game folder> --platform mac` and use its printed command.
 - **Many confirmations are held, not tapped.** `Normal Start` on the Select Starting Point dialog ignores a tap and a 0.5 s hold, and `A~3` starts the game, so a tap looks like a hang. A tap of X did nothing on `Skip to Jungle` either; a hold there was not tried. Hold X (`X~2`) to dive and to open the boat's destination menu, and hold A (`A~3`) to skip the opening credits. A tap of B leaves the dialog.
 - From the start of the title: five A presses for the five DLC notices, which come back on every start, then A on `New Game`, `A~3` on `Normal Start`, `A~3` once the `Skip` prompt shows. About 24 A presses go through the boat dialogue.
 - Dive: `LRight~1` to the dive point, `X~2`. In the water the left stick swims, B is the knife, and a held A aims the harpoon with the **left** stick while ZR fires (`A+L1/-0.4~0.8`, then `A+L1/-0.4+ZR~0.25`); the right stick does not aim. The tutorial refills the oxygen when it runs out.

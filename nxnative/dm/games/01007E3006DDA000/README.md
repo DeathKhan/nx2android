@@ -43,7 +43,7 @@ No code of the game is cut, and no run-time key is set. The game asks for presen
 
 ## Mac routes
 
-- Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform mac`; its last line runs the game.
+- Build with `scripts/build_ipa_from_nsp.py <game folder> --platform mac`; its last line runs the game.
 - A fresh save: the opening movie plays first (46 s), then the title. `A`, `A` (File 1); the free update notices and the Dream Friends pages take about a minute of `A` presses, 1.5 s apart; then the second movie (84 s) and the map.
 - With a save past that, the title is up about 15 s after boot. `A` (wait 7 s), `A` (wait 12 s), four `A` presses, `A` closes the world card, `LRight` for 1.5 s reaches Green Gardens, `A` enters it. In the stage `A` jumps and floats, `B` attacks and inhales, `X` throws a Friend Heart.
 - The tutorial stops at a door (up to enter) and later waits for `X` before it goes on.

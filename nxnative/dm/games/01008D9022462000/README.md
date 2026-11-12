@@ -36,7 +36,7 @@ Update 1.1.0 (v262144) over the base game, SDK 20.5.29. Evil Empire's game on Un
 
 ## Mac routes
 
-- Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform mac` and use its printed command.
+- Build with `scripts/build_ipa_from_nsp.py <game folder> --platform mac` and use its printed command.
 - From a fresh save: about 25 s to the title, Plus, A on the health warning, then the first-run options: `LDown`, `LDown`, A on Play (X on that screen asks to restore the defaults instead). A loading screen, then about 16 A presses through the narration, the publisher's logo and an intro movie of about 90 s, then A through the prince's first lines.
 - With a save: Plus, A on the warning, A on the slot. The save made during the opening has the same opening again.
 - Controls (the pause menu's Options, Controls): B jump, Y weapon, A tool, ZR dash / vault, ZL wall run, X kick, L heal, R interact, Minus the bag, Plus pause. A ledge needs B held with the direction (`B+LRight~2.5`); ZL with a jump against a wall clings to it.

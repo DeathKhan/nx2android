@@ -37,7 +37,7 @@ Update 1.0.3 (v196608) over the base game, SDK 14.3.0. Andrew Shouldice's game (
 
 ## Mac routes
 
-- Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform mac` and use its printed command.
+- Build with `scripts/build_ipa_from_nsp.py <game folder> --platform mac` and use its printed command.
 - From a fresh save: the title within 40 s (first frame at about 8 s), A on New Game, a fly-over of about 20 s, then control on the beach.
 - From the start spot: the stairs are up and to the left; `LDown+LLeft`, `LLeft` about 1 s each, then `LUp+LRight` climbs them. The plateau above has the first enemies.
 - Controls checked: the left stick, A on the title, Plus for the pause menu (Return To Game, Options, Quit To Title Screen).

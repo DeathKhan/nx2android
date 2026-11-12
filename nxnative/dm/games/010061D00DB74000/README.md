@@ -41,7 +41,7 @@ Update 1.0.2 (v131072) over the base game, SDK 8.2.0. Moon Studios' game (publis
 
 ## Mac routes
 
-- Build with `scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> --platform mac` and use its printed command.
+- Build with `scripts/build_ipa_from_nsp.py <game folder> --platform mac` and use its printed command.
 - `DM_CTL` presses of 0.15 s are often missed on the menus; hold them 0.4 s (`A~0.4`).
 - From a fresh save: the title 12 s after boot (with a filled pipeline archive). A on Press A, A on Start Game, A on slot 1 (difficulty Normal is preselected), A on Normal. The opening storm starts; Plus opens the pause menu, Down then A is Skip Prologue, and about 15 s later Ori stands on a log in the forest. To the right are thorns.
 - Controls checked: A on menus, Plus, Down, the left stick, A to jump.
