@@ -3,12 +3,15 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import sys
 import unittest
 
 from porter.upstream import android_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 
 class OverlayVisibility(unittest.TestCase):
@@ -17,6 +20,8 @@ class OverlayVisibility(unittest.TestCase):
         cc = shutil.which('cc') or shutil.which('clang')
         if not cc:
             raise unittest.SkipTest('a C compiler is needed for the overlay check')
+        if not host_cc.posix():
+            raise unittest.SkipTest('a POSIX host C compiler is required (front.h calls setenv)')
         front = (ROOT / 'nxnative/dm/android/front_android.c').read_text(encoding='utf-8')
         pad = front[front.index('static int32_t axis('):front.index('// ---- the on-screen gamepad')]
         visible = front[front.index('int dm_overlay_visible(void)'):front.index('int dm_overlay_layout(void)')]
@@ -72,7 +77,7 @@ enum { AMOTION_EVENT_AXIS_X, AMOTION_EVENT_AXIS_Y, AMOTION_EVENT_AXIS_Z, AMOTION
 typedef struct { int source, type, action, key, device; float x, y, axis[10]; } AInputEvent;
 typedef int ANativeWindow;
 static int width, height, window, vibration = -1, touches, menu_opens, pad_publications;
-static uint64_t g_btn, g_touch_btn, touch_buttons;
+static uint64_t g_btn, touch_buttons; static _Atomic uint64_t g_touch_btn;
 static float g_ax[8];
 static int32_t pad_sticks[4];
 static uint64_t pad_buttons;
@@ -269,7 +274,7 @@ int main(int argc, char **argv) {
         (tmp / 'android_profile.h').write_text(android_profile.header(None), encoding='utf-8')
         c, cls.exe = tmp / 'visibility.c', tmp / 'visibility'
         c.write_text(harness, encoding='utf-8')
-        result = subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+        result = subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers',   # (clang: the menu rows' short initializers)
                                  f'-I{tmp}', f'-I{ROOT / "nxnative/dm/android"}',
                                  f'-I{ROOT / "nxnative/dm/host"}', str(c), '-lm', '-o', str(cls.exe)],
                                 capture_output=True, text=True, timeout=60)

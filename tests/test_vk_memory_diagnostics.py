@@ -60,7 +60,7 @@ int main(void) {
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
 
-    @unittest.skipUnless(host_cc.posix(), 'a POSIX host C compiler is required (<sys/mman.h>, pthread, setenv)')
+    @unittest.skipUnless(host_cc.posix() and sys.platform.startswith('linux'), 'a Linux host C compiler is required (<sys/mman.h>, pthread, setenv, SOCK_CLOEXEC)')
     def test_failure_stages_and_cleanup(self):
         ndk, _ = find_ndk()
         headers = next(ndk.glob('toolchains/llvm/prebuilt/*/sysroot/usr/include'), None) if ndk else None

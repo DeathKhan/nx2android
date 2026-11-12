@@ -108,7 +108,7 @@ int main(void) {
 '''
 
 
-@unittest.skipUnless(shutil.which('cc') and host_cc.posix(), 'a POSIX host C compiler is required')
+@unittest.skipUnless(shutil.which('cc') and host_cc.posix() and sys.platform.startswith('linux'), 'a Linux host C compiler is required (the two-argument pthread_setname_np)')
 class MemReport(unittest.TestCase):
     def test_driver_reports_and_own_counts(self):
         ndk, _ = find_ndk()

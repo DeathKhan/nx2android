@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
     uint32_t nw, *w = load(argv[1], &nw), pool = (uint32_t)atoi(argv[3]), np = (uint32_t)atoi(argv[4]), before = nw, *copy = malloc(nw * 4);
     memcpy(copy, w, nw * 4);
     uint32_t var = 0; const char *why = NULL; int r = spv_pool_mark(&w, &nw, &pool, 1, np, &var, &why);
-    if (r <= 0) { assert(nw == before && !memcmp(w, copy, nw * 4) && !var); printf("%d %s\n", r, why ? why : "-"); return 0; }   // unchanged when nothing is marked
+    if (r <= 0) { assert(nw == before && !memcmp(w, copy, nw * 4) && !var); printf("%d %s\n", r, why ? why : "-"); free(w); free(copy); return 0; }   // unchanged when nothing is marked
     assert(var && why == NULL && w[3] > copy[3] && spv_wmem(w, nw, var) == 0 && spv_wmem(w, nw, 0) == 1 && spv_wmem(copy, before, 0) == 0);
     FILE *f = fopen(argv[2], "wb"); fwrite(w, 4, nw, f); fclose(f);
     printf("%d %u\n", r, var); free(w); free(copy); return 0;
@@ -102,7 +102,9 @@ class PoolMarks(unittest.TestCase):
 
     def mark(self, spv, np=65536):
         d = Path(self.dir.name); (d / "in.spv").write_bytes(spv)
-        out = subprocess.run([str(self.exe), str(d / "in.spv"), str(d / "out.spv"), "16", str(np)], check=True, capture_output=True, text=True, timeout=30).stdout.split(" ", 1)
+        run = subprocess.run([str(self.exe), str(d / "in.spv"), str(d / "out.spv"), "16", str(np)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        out = run.stdout.split(" ", 1)
         return int(out[0]), out[1].strip(), d / "out.spv"
 
     def test_fold(self):

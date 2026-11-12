@@ -25,7 +25,10 @@ HARNESS = r'''
 static char last[512];
 #define VKLOG(...) snprintf(last, sizeof last, __VA_ARGS__)
 #define VKRED_ONCE(id, ...) VKLOG(__VA_ARGS__)
-static struct { VkDevice dev; VkPhysicalDeviceProperties props; } V;
+static struct { VkDevice dev; VkPhysicalDevice pd; VkPhysicalDeviceProperties props; } V;
+static VkDriverId drv;   // the driver ID the device reports (asked for on Vulkan 1.2 and later only)
+static void props2(VkPhysicalDevice pd, VkPhysicalDeviceProperties2 *p) { (void)pd; ((VkPhysicalDeviceDriverProperties *)p->pNext)->driverID = drv; }
+static PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2 = props2;
 static VkAttachmentDescription2 made[9]; static uint32_t nmade;
 static VkResult create_rp(VkDevice d, const VkRenderPassCreateInfo2 *ci, const VkAllocationCallbacks *a, VkRenderPass *rp) {
     (void)d; (void)a; nmade = ci->attachmentCount; memcpy(made, ci->pAttachments, sizeof *made * nmade); *rp = (VkRenderPass)(uintptr_t)(0x100 + nmade); return VK_SUCCESS; }
@@ -40,6 +43,7 @@ static int wanted(const char *name, uint32_t vendor, const char *env, int ncol, 
 }
 int main(int argc, char **argv) {
     (void)argc; int mode = atoi(argv[1]);
+    V.props.apiVersion = VK_API_VERSION_1_3; drv = VK_DRIVER_ID_MESA_TURNIP;
     VkPhysicalDeviceProperties p = {0}; p.vendorID = 0x5143;
     snprintf(p.deviceName, sizeof p.deviceName, "Adreno (TM) 830"); assert(adreno_model(&p) == 830);
     snprintf(p.deviceName, sizeof p.deviceName, "Turnip Adreno (TM) 830"); assert(adreno_model(&p) == 830);
@@ -50,7 +54,11 @@ int main(int argc, char **argv) {
     if (mode == 0) {   // an Adreno 830 by default: multi-target, single-sample, single-layer passes with slot 0 empty only
         assert(wanted("Adreno (TM) 830", 0x5143, NULL, 6, 0, 1, 1) && strstr(last, "a scratch target there") && strstr(last, "default"));
         assert(!slot0_fill_wanted(1, 0, 1, 1) && !slot0_fill_wanted(6, 1, 1, 1) && !slot0_fill_wanted(6, 0, 4, 1) && !slot0_fill_wanted(6, 0, 1, 6));
-    } else if (mode == 1) assert(!wanted("Adreno (TM) 750", 0x5143, NULL, 6, 0, 1, 1) && strstr(last, "left empty"));   // an Adreno 7xx: off
+    } else if (mode == 1) assert(!wanted("Adreno (TM) 750", 0x5143, NULL, 6, 0, 1, 1) && strstr(last, "left empty"));   // an Adreno 7xx on Turnip: off
+    else if (mode == 5) { drv = VK_DRIVER_ID_QUALCOMM_PROPRIETARY; assert(wanted("Adreno (TM) 750", 0x5143, NULL, 6, 0, 1, 1)); }   // on Qualcomm's own driver: on
+    else if (mode == 6 || mode == 7) {   // no driver ID before Vulkan 1.2: the top bit of driverVersion tells Qualcomm's driver (set) from Mesa's
+        V.props.apiVersion = VK_API_VERSION_1_1; drv = VK_DRIVER_ID_QUALCOMM_PROPRIETARY; V.props.driverVersion = mode == 6 ? 0x80266000u : 0x06400000u;
+        assert(wanted("Adreno (TM) 730", 0x5143, NULL, 6, 0, 1, 1) == (mode == 6)); }
     else if (mode == 2) assert(!wanted("Adreno (TM) 830", 0x5143, "0", 6, 0, 1, 1));   // switched off
     else if (mode == 3) assert(wanted("Mali-G715", 0x13B5, "1", 2, 0, 1, 1));           // forced on elsewhere
     else {   // the render pass: slot 0's scratch is not stored; the others are, as before (cstore 0 from memset)
@@ -83,7 +91,7 @@ class Slot0Fill(unittest.TestCase):
             c.write_text(HARNESS.replace('RPKEY', rpkey).replace('CUTS', cuts), encoding='utf-8')
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-missing-field-initializers', '-pthread',
                             '-I', str(EXEC.parents[1] / 'gfx/nvn'), '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
-            for mode in range(5):
+            for mode in range(8):
                 with self.subTest(mode=mode):
                     env = {k: v for k, v in os.environ.items() if k != 'DM_VK_SLOT0_FILL'}
                     out = subprocess.run([str(exe), str(mode)], capture_output=True, text=True, env=env, timeout=60)
