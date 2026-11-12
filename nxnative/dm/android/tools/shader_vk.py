@@ -584,8 +584,9 @@ def main():
             mesh_vs = None
             if k in mesh_jobs:   # a task or mesh kernel: wrapped for the compute emulation, and a mesh shader's pass-through vertex shader beside it (shader_meshwrap.py)
                 mi, mlay, msize = mesh_jobs[k]
-                try: spv = shader_meshwrap.wrap(spv, mi, mlay, msize); mesh_vs = shader_meshwrap.vertex_shader(mi) if mi['kind'] == 'ms' else None
+                try: mst = {}; spv = shader_meshwrap.wrap(spv, mi, mlay, msize, stats=mst); mesh_vs = shader_meshwrap.vertex_shader(mi) if mi['kind'] == 'ms' else None
                 except ValueError as e: raise ValueError(f'{stages[k]} kernel not drawn: mesh: {e}') from e
+                nvn2_notes['task / mesh kernels storing their outputs in place' if mst.get('direct') else 'task / mesh kernels with the stage memory whole in shared memory'] += 1
             if PAD_WAVE and stages[k] == 'cs' and k not in mesh_jobs and shader_padwave.wants_pad(spv, PAD_WAVE):   # (before the reflection: the bundle header carries the padded local size)
                 try: spv, pst = shader_padwave.pad(spv, 2 * PAD_WAVE); padded[k] = pst
                 except ValueError as e: fails['pad_wave: ' + str(e)] += 1; print(f'[RED] {k} (cs): not padded to {2 * PAD_WAVE} lanes, left at {PAD_WAVE}: {e}', flush=True)

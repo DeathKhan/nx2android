@@ -12,6 +12,13 @@ On Metal dmsh_meshstage.to_stage wraps the kernel's MSL into object and mesh fun
                   After the body: every vertex v < max_v of the workgroup → vtx[(wg * max_v + v) * NCOMP + c] = component c (the SPH's OMAP order, dmsh_meshstage.sph_outputs);
                   every index n < max_p * verts → idx[wg * max_p * verts + n] = wg * max_v + (n < count * verts ? the primitive byte : 0), count = the byte at PRIM + 3, so a
                   primitive the shader did not emit is a degenerate one of vertex 0 (the draw is a fixed max_p primitives a workgroup, in workgroup order, as the hardware rasterizes them)
+                  A mesh shader whose max_v is whole blocks of 32 (blocks()) keeps the stage memory's attribute blocks in vtx instead: vertex v's component c is at
+                  vtx[wg * max_v * NCOMP + (v / 32) * NCOMP * 32 + c * 32 + v % 32], the same size, and the pass-through vertex shader reads that
+Direct stores and loads (the usual case; the idea of droidplay-core's #411, on this wrapper): the translator writes every attribute store and payload read with its area's offset as a
+constant in the address ((register + C) >> 2, InstEmitAmpereMem.cs AStageOut and AIsberd), so _areas tells the areas apart and _rewrite sends a mesh kernel's attribute stores straight
+to vtx (the block layout's word), a task kernel's payload stores straight to taskout (zeroed first), and a launched mesh kernel's payload reads straight to the task's payload in
+taskout (word 0 reads k). The Workgroup array then holds the header and the primitive bytes alone, and nothing but the indices is copied out after the body: a kernel's GPU time on an
+Adreno 830 follows its shared memory. A kernel whose addresses do not all sort, or that reads its outputs back or writes its input, keeps the copy form above (_direct_ok)
 The buffers are storage buffers the wrapper adds at bindings above the kernel's own, named for the backend's reflection (shader_vk.py classify → gfx_vk.h RK_MESH_*):
   dm_mesh_ctl      {first workgroup, workgroup count, ...} (gfx_vk_exec.c mesh_draw writes it, or dm/android/shaders/meshprep.comp for an indirect draw)
   dm_mesh_taskout  the task payloads, PAY words a task workgroup
@@ -22,6 +29,8 @@ vertex_shader() makes the pass-through vertex shader of a mesh shader (bundle ke
 and writes gl_Position and a vec4 at each generic location the mesh shader's OMAP names (a component the mesh shader does not write is 0, w 1, as a vertex output starts).
 Not supported (ValueError, the shader is noted and left out): a point size output, per-primitive outputs, a primitive of other than 1, 2 or 3 vertices, a kernel without exactly one
 Workgroup array of the stage memory's size."""
+import bisect
+import collections
 import struct
 import dmsh_meshstage as ms
 
@@ -41,6 +50,9 @@ DEC_BLOCK, DEC_BUFFER_BLOCK, DEC_ARRAY_STRIDE, DEC_BUILTIN, DEC_LOCATION, DEC_BI
 BI_POSITION, BI_WORKGROUP_ID, BI_LOCAL_INDEX, BI_VERTEX_INDEX = 0, 26, 29, 42
 SC_INPUT, SC_UNIFORM, SC_OUTPUT, SC_WORKGROUP, SC_FUNCTION = 1, 2, 3, 4, 7
 OP_CONST_NULL = 46
+OP_PARAM, OP_INBOUNDS, OP_COPY, OP_ISUB = 55, 66, 83, 130
+SC_PRIVATE = 6
+SEM_WORKGROUP, SEM_WORKGROUP_UNIFORM = 0x108, 0x148   # AcquireRelease | WorkgroupMemory; with UniformMemory too: a barrier that orders the buffer stores
 DEC_NO_CONTRACTION = 42
 FLOAT_ARITH = (127, 129, 131, 133, 136, 140, 141, 142, 148)   # FNegate FAdd FSub FMul FDiv FRem FMod VectorTimesScalar Dot
 GLSL_UMIN = 38
@@ -135,7 +147,7 @@ class _Fn:
     def shr(self, a, b): return self.val(OP_SHR, self.uint, a, b)
     def shl(self, a, b): return self.val(OP_SHL, self.uint, a, b)
     def band(self, a, b): return self.val(OP_AND, self.uint, a, b)
-    def barrier(self): self.emit(OP_BARRIER, self.c(2), self.c(2), self.c(0x108))   # Workgroup, Workgroup, AcquireRelease | WorkgroupMemory
+    def barrier(self, sem=SEM_WORKGROUP): self.emit(OP_BARRIER, self.c(2), self.c(2), self.c(sem))   # Workgroup, Workgroup
 
     def if_zero(self, v, body):
         """if (v == 0) body()"""
@@ -198,8 +210,156 @@ def no_contraction(m):
     return len(ids)
 
 
-def wrap(spv, i, lay, size):
-    """The translated kernel (job stage_memory = lay, shared = size bytes; dmsh_meshstage.memory) wrapped as described above → SPIR-V"""
+def blocks(i):
+    """Whether a mesh shader's vertices lie in vtx as the stage memory's attribute blocks (the docstring): its max_v is whole blocks, so workgroups' blocks lie end to end"""
+    return i['kind'] == 'ms' and i['max_v'] > 0 and i['max_v'] % BLOCK == 0 and not i['primitive']   # per-primitive blocks follow the vertices' in the output area: the old layout
+
+
+def _areas(ins, mem, lay, words):
+    """Every access to the stage memory, by the area its address names: {access chain id: (kind, area, dyn, c)} with kind 'load' / 'store' / 'atomic', area 'hdr' / 'in' /
+    'out' / 'prim' or None when the address is not of the translator's form ((register + C) >> 2 or a constant), dyn the register's id (None for a constant address) and c
+    the constant's bytes. A helper that takes a byte address (the translator's dmsh_shared_store8, the primitive area's) is classified by its call sites, all of which must
+    agree. ins: the module as [opcode, operands...] lists (droidplay-core's spv_meshemu._areas, which this follows)"""
+    inp_b, out_b, prim_b = lay[1], lay[2], lay[3]
+    cval = {x[2]: x[3] for x in ins if x[0] == OP_CONST and len(x) == 4}
+    defs = {x[2]: (i, x) for i, x in enumerate(ins) if len(x) > 2 and x[0] in (OP_LOAD, OP_BITCAST, OP_IADD, OP_SHR, OP_COPY, OP_PARAM)}
+    fns, cur, fn_of, params = [], None, {}, set()
+    for i, x in enumerate(ins):
+        if x[0] == OP_FUNCTION: cur = [i, x[2], []]
+        elif x[0] == OP_PARAM: cur[2].append(x[2]); params.add(x[2])
+        elif x[0] == OP_FUNCTION_END: fns.append((cur[0], i, cur[1], cur[2])); cur = None
+    for s, e, fid, _ in fns:
+        for i in range(s, e + 1): fn_of[i] = fid
+    stores = collections.defaultdict(list)
+    for i, x in enumerate(ins):
+        if x[0] == OP_STORE: stores[x[1]].append((i, x[2]))
+    labels = [i for i, x in enumerate(ins) if x[0] == OP_LABEL]
+    def block_of(i): return labels[bisect.bisect_right(labels, i) - 1]
+    def last_store(var, i):   # the local's value at i: its last store in the block, or its one store in the function (the translator's registers are stored before use)
+        prev = [s for s in stores.get(var, []) if s[0] < i and block_of(s[0]) == block_of(i)]
+        if not prev and len(stores.get(var, [])) == 1 and fn_of.get(stores[var][0][0]) == fn_of.get(i) and stores[var][0][0] < i: prev = stores[var]
+        return prev[-1][1] if prev else None
+    def value(v):   # v as (dyn, C bytes, parameter): through bitcasts, copies, locals and additions of constants
+        for _ in range(16):
+            if v in cval: return None, cval[v], None
+            if v in params: return None, 0, v
+            d = defs.get(v)
+            if d is None: return v, 0, None
+            i, x = d
+            if x[0] in (OP_BITCAST, OP_COPY): v = x[3]; continue
+            if x[0] == OP_PARAM: return None, 0, x[2]
+            if x[0] == OP_LOAD:
+                if x[3] in params: return v, 0, x[3]   # a helper's parameter: its value here, and the parameter
+                w = last_store(x[3], i)
+                if w is None: return v, 0, None
+                v = w; continue
+            if x[0] == OP_IADD:
+                a, b = x[3], x[4]
+                if b in cval: dv, c, p = value(a); return dv, c + cval[b], p
+                if a in cval: dv, c, p = value(b); return dv, c + cval[a], p
+                return v, 0, None
+            return v, 0, None
+        return v, 0, None
+    def index(idx):   # the word index → (dyn, C bytes, parameter), or None when its form is not (X + C) >> 2, a constant or a parameter's
+        if idx in cval: return None, cval[idx] * 4, None
+        d = defs.get(idx)
+        for _ in range(8):
+            if d is None: return None
+            i, x = d
+            if x[0] in (OP_BITCAST, OP_COPY): d = defs.get(x[3]); continue
+            if x[0] == OP_LOAD:
+                if x[3] in params: return None, 0, x[3]
+                w = last_store(x[3], i)
+                if w is None: return None
+                d = defs.get(w); continue
+            if x[0] == OP_SHR and x[4] in cval and cval[x[4]] == 2: return value(x[3])
+            if x[0] == OP_PARAM: return None, 0, x[2]
+            return None
+        return None
+    def area(c): return 'hdr' if c < inp_b else 'in' if c < out_b else 'out' if c < prim_b else 'prim' if c < words * 4 else None
+    param_area = {}
+    for s, e, fid, ps in fns:
+        calls = [(i, x) for i, x in enumerate(ins) if x[0] == OP_CALL and x[3] == fid]
+        for n, p in enumerate(ps):
+            found = set()
+            for i, x in calls:
+                w = last_store(x[4 + n], i)
+                dv, c, q = value(w) if w is not None else (None, 0, p)
+                found.add(area(c) if q is None and (dv is None or c) else None)   # a register alone names no area
+            param_area[p] = next(iter(found)) if len(found) == 1 else None
+    uses = {}   # an access chain's one use; our translator computes a store's value between the chain and the store, so the use may lie far below
+    for y in ins:
+        q = y[3] if y[0] == OP_LOAD or 227 <= y[0] <= 241 else y[1] if y[0] == OP_STORE else None
+        if q is not None: uses[q] = None if q in uses else y   # used twice: not the translator's form
+    out = {}
+    for i, x in enumerate(ins):
+        if x[0] in (OP_ACCESS, OP_INBOUNDS) and x[3] == mem and len(x) == 5:
+            use = uses.get(x[2])
+            kind = 'load' if use and use[0] == OP_LOAD else 'store' if use and use[0] == OP_STORE else 'atomic' if use else None
+            r = index(x[4])
+            if r is None or kind is None: out[x[2]] = (kind, None, None, 0); continue
+            dv, c, p = r
+            if p is not None and not c:   # a helper's whole address (dmsh_shared_store8): its area is its callers'; only the header's and the primitive bytes' stay in shared memory, where the address needs no rewriting
+                a = param_area.get(p); out[x[2]] = (kind, a if a in ('hdr', 'prim') else None, None, 0); continue
+            out[x[2]] = (kind, area(c) if dv is None or c else None, dv, c)   # a register alone names no area
+    return out
+
+
+def _direct_ok(areas, i):
+    """Whether the kernel can store its outputs and read its payload in place: every address sorts, nothing is read back from the output area or written into the input's,
+    and a mesh shader's vertices are whole blocks"""
+    if any(a is None for _, a, _, _ in areas.values()): return False
+    if any(k in ('load', 'atomic') and a == 'out' or k in ('store', 'atomic') and a == 'in' for k, a, _, _ in areas.values()): return False
+    return i['kind'] == 'ts' or blocks(i)
+
+
+_TYPED = (OP_LOAD, OP_BITCAST, OP_IADD, OP_ISUB, OP_IMUL, OP_SHR, OP_SHL, OP_AND, OP_SELECT, OP_EXTRACT, OP_ACCESS, OP_INBOUNDS, OP_PARAM, OP_COPY, OP_EXT_INST, OP_CONST, OP_PHI, OP_CALL,
+          126, 134, 135, 137, 138, 139, 195, 197, 198, 200)   # ... SNegate UDiv SDiv UMod SRem SMod ShiftRightArithmetic BitwiseOr BitwiseXor Not
+
+
+def _rewrite(m, k):
+    """The kernel's functions rewritten for the direct stores and loads (the docstring), by the context k → counts by kind. Its stage memory's access chains into the input
+    and output areas go, and the load or store that used each becomes one of taskout or vtx; the primitive area's move down by k['shift'] words"""
+    uint, bool_, p_u, mem, areas = k['uint'], k['bool'], k['p_u'], k['mem'], k['areas']
+    rtype = {a[1]: a[0] for o, a in m.ins if o in _TYPED and len(a) > 1}
+    out, pending, n, infn = [], {}, collections.Counter(), False
+    c = lambda v: m.const(uint, v & 0xffffffff)
+    def val(op, ty, *a): r = m.id(); out.append((op, [ty, r] + list(a))); return r
+    def as_uint(v): return v if rtype.get(v) == uint else val(OP_BITCAST, uint, v)
+    for o, a in m.ins:
+        if o == OP_FUNCTION: infn = True
+        if not infn: out.append((o, a)); continue
+        if o == OP_FUNCTION_END:
+            if pending: raise ValueError(f'{len(pending)} stage memory accesses with no load or store after them')
+            infn = False; out.append((o, a)); continue
+        if o in (OP_ACCESS, OP_INBOUNDS) and a[2] == mem and len(a) == 4:
+            kind, ar, dyn, cb = areas[a[1]]
+            if ar == 'in': pending[a[1]] = ('in', a[3], cb); n['in'] += 1; continue
+            if ar == 'out': pending[a[1]] = ('out', dyn, cb); n['out'] += 1; continue
+            if ar == 'prim' and k['shift']: out.append((o, a[:3] + [val(OP_ISUB, uint, as_uint(a[3]), c(k['shift']))])); n['prim'] += 1; continue
+            out.append((o, a)); n['hdr'] += 1; continue
+        if o == OP_LOAD and a[2] in pending:   # a payload word: the task's in taskout, word 0 being k; a task kernel's or a mesh kernel's without a task reads 0, as its stage memory held
+            _, idx, cb = pending.pop(a[2])
+            if k['task_v'] is None: out.append((OP_COPY, [a[0], a[1], c(0)])); continue
+            w = val(OP_ISUB, uint, as_uint(idx), c(k['inp'])); at = val(OP_IADD, uint, val(OP_LOAD, uint, k['task_v']), w)
+            p = val(OP_ACCESS, p_u, k['taskout'], c(0), at)
+            if cb - k['inp'] * 4 >= 4: out.append((OP_LOAD, [a[0], a[1], p]))   # never word 0
+            else:
+                g = val(OP_LOAD, uint, p); kk = val(OP_LOAD, uint, k['k_v']); z = val(OP_IEQUAL, bool_, w, c(0)); out.append((OP_SELECT, [a[0], a[1], z, kk, g]))
+            continue
+        if o == OP_STORE and a[0] in pending:   # an output word: at the word the stage memory had past its output area, in the workgroup's part of vtx (a task's of taskout)
+            _, dyn, cb = pending.pop(a[0]); off = c(cb - k['out_b'])
+            at = off if dyn is None else val(OP_IADD, uint, as_uint(dyn), off)
+            at = val(OP_IADD, uint, val(OP_LOAD, uint, k['pbase_v']), val(OP_SHR, uint, at, c(2)))
+            out.append((OP_STORE, [val(OP_ACCESS, p_u, k['dst'], c(0), at), a[1]])); continue
+        out.append((o, a))
+    m.ins = out
+    return n
+
+
+def wrap(spv, i, lay, size, direct=None, stats=None):
+    """The translated kernel (job stage_memory = lay, shared = size bytes; dmsh_meshstage.memory) wrapped as described above → SPIR-V. direct: None for _direct_ok's
+    answer, False for the copy form (a test); stats: a dict that gets 'direct' and the shared array's words"""
     _check(i)
     m = _Mod(spv); words = size // 4
     init_locals(m)
@@ -236,15 +396,37 @@ def wrap(spv, i, lay, size):
     ctl, p_u = m.ssbo(uint, rarr, nb, CTL); taskout, _ = m.ssbo(uint, rarr, nb + 1, TASKOUT)
     if i['kind'] == 'ms': launch, _ = m.ssbo(uint, rarr, nb + 2, LAUNCH); vtx, _ = m.ssbo(uint, rarr, nb + 3, VTX); idx, _ = m.ssbo(uint, rarr, nb + 4, IDX)
     # the wrapper
+    # the direct form: the body's stores and loads in the buffers, the shared array the header and the primitive bytes (moved down by shift words) alone
+    launched = i['kind'] == 'ms' and bool(i['task'])
+    areas = _areas([[o] + a for o, a in m.ins], mem, lay, words)
+    if direct is None: direct = _direct_ok(areas, i)
+    tail_w = prim >> 2 if i['kind'] == 'ms' else lay[3] >> 2
+    shift, nwords = (tail_w - inp_w, inp_w + words - tail_w) if direct else (0, words)
+    area_w = (lay[3] - lay[2]) >> 2   # a mesh workgroup's attribute blocks
+    pbase_v = task_v = k_v = None
+    if direct:   # what the body's stores and loads need: a Private word each, set before the body runs
+        p_pv = m.type(OP_TYPE_PTR, SC_PRIVATE, uint); priv = [m.var(p_pv, SC_PRIVATE, 'dm_pbase')]; pbase_v = priv[0]
+        if launched: task_v, k_v = m.var(p_pv, SC_PRIVATE, 'dm_task'), m.var(p_pv, SC_PRIVATE, 'dm_k'); priv += [task_v, k_v]
+        if m.hdr[1] >= 0x10400: ep.extend(priv)   # 1.4 lists every global the entry point uses
+        _rewrite(m, dict(uint=uint, bool=bool_, p_u=p_u, mem=mem, areas=areas, shift=shift, inp=inp_w, out_b=lay[2], taskout=taskout, dst=vtx if i['kind'] == 'ms' else taskout,
+                         pbase_v=pbase_v, task_v=task_v, k_v=k_v))
+        mem_arr = next(ptr_ty[a[0]][1] for o, a in m.ins if o == OP_VARIABLE and a[1] == mem)   # the shared array's size, by a constant of its own
+        at = next(n for n, (o, a) in enumerate(m.ins) if o == OP_TYPE_ARRAY and a[0] == mem_arr)
+        nc = m.id(); m.ins.insert(at, (OP_CONST, [uint, nc, nwords])); m.ins[at + 1][1][2] = nc
+    if stats is not None: stats.update(direct=int(bool(direct)), words=nwords)
     f = _Fn(m, uint, bool_); new_main = m.id()
     f.emit(OP_FUNCTION, void, new_main, 0, fn_void); f.block()
     c = f.c
     lid = f.load(uint, v_lid); wg = f.val(OP_EXTRACT, uint, f.load(v3, v_wg), 0)
-    f.loop(lid, c(words), c(thr), lambda k: f.store(f.chain(p_wg_uint, mem, k), c(0)))   # the stage memory starts at zero
+    f.loop(lid, c(nwords), c(thr), lambda k: f.store(f.chain(p_wg_uint, mem, k), c(0)))   # the stage memory starts at zero
     f.barrier()
     if i['kind'] == 'ts' or not i['task']:
         def first(): f.store(f.chain(p_wg_uint, mem, c(wg_w)), f.add(f.load(uint, f.chain(p_u, ctl, c(0), c(0))), wg))   # word 0 = the draw's first workgroup + this one
         f.if_zero(lid, first)
+    elif direct:   # the task's payload is read in place: every lane keeps where it is and k, lane 0 sets word 0
+        e = f.shl(wg, c(1)); task = f.load(uint, f.chain(p_u, launch, c(0), f.add(e, c(LAUNCH_HDR)))); k = f.load(uint, f.chain(p_u, launch, c(0), f.add(e, c(LAUNCH_HDR + 1))))
+        f.store(task_v, f.mul(task, c(pay))); f.store(k_v, k)
+        f.if_zero(lid, lambda: f.store(f.chain(p_wg_uint, mem, c(wg_w)), k))
     else:
         e = f.shl(wg, c(1)); task = f.load(uint, f.chain(p_u, launch, c(0), f.add(e, c(LAUNCH_HDR)))); k = f.load(uint, f.chain(p_u, launch, c(0), f.add(e, c(LAUNCH_HDR + 1))))
         base = f.mul(task, c(pay))
@@ -252,20 +434,32 @@ def wrap(spv, i, lay, size):
         f.barrier()
         def own(): f.store(f.chain(p_wg_uint, mem, c(wg_w)), k); f.store(f.chain(p_wg_uint, mem, c(inp_w)), k)   # word 0 and the payload's word 0: its number among the task's launches
         f.if_zero(lid, own)
-    f.barrier(); f.emit(OP_CALL, void, m.id(), old_main); f.barrier()
-    if i['kind'] == 'ts':
+    if direct: f.store(pbase_v, f.mul(wg, c(pay if i['kind'] == 'ts' else area_w)))   # the workgroup's attribute blocks in vtx (a task's payload in taskout)
+    if direct and i['kind'] == 'ts':   # the payload zero first, as the stage memory was: a task may leave words unwritten (its launch count among them), which meshlaunch.comp and the mesh kernel read
         base = f.mul(wg, c(pay))
-        f.loop(lid, c(pay), c(thr), lambda n: f.store(f.chain(p_u, taskout, c(0), f.add(base, n)), f.load(uint, f.chain(p_wg_uint, mem, f.add(c(out_w), n)))))
+        f.loop(lid, c(pay), c(thr), lambda n: f.store(f.chain(p_u, taskout, c(0), f.add(base, n)), c(0)))
+        f.barrier(SEM_WORKGROUP_UNIFORM)   # the zeros land before the body's stores
+    else: f.barrier()
+    f.emit(OP_CALL, void, m.id(), old_main); f.barrier()
+    if i['kind'] == 'ts':
+        if not direct:
+            base = f.mul(wg, c(pay))
+            f.loop(lid, c(pay), c(thr), lambda n: f.store(f.chain(p_u, taskout, c(0), f.add(base, n)), f.load(uint, f.chain(p_wg_uint, mem, f.add(c(out_w), n)))))
     else:
         ncomp, max_v, max_p, verts = len(i['vertex']), i['max_v'], i['max_p'], i.get('verts', 3); vstride = ncomp * BLOCK
         glsl = next((a[0] for o, a in m.ins if o == OP_EXT_IMPORT), None)
         if glsl is None: raise ValueError('the kernel imports no GLSL.std.450 (UMin)')
+        prim -= shift * 4   # the primitive bytes in the shared array
         np_ = f.val(OP_EXT_INST, uint, glsl, GLSL_UMIN, f.shr(f.load(uint, f.chain(p_wg_uint, mem, c(prim >> 2))), c(24)), c(max_p))   # the count byte at PRIM + 3
         vbase = f.mul(wg, c(max_v))
         def vertex(v):
             dst = f.mul(f.add(vbase, v), c(ncomp)); src = f.add(f.add(c(out_w), f.mul(f.shr(v, c(5)), c(vstride))), f.band(v, c(BLOCK - 1)))
             for k in range(ncomp): f.store(f.chain(p_u, vtx, c(0), f.add(dst, c(k))), f.load(uint, f.chain(p_wg_uint, mem, f.add(src, c(k * BLOCK)))))
-        f.loop(lid, c(max_v), c(thr), vertex)
+        if direct: pass   # the body stored them
+        elif blocks(i):   # the attribute blocks as they are
+            abase = f.mul(wg, c(area_w))
+            f.loop(lid, c(area_w), c(thr), lambda n: f.store(f.chain(p_u, vtx, c(0), f.add(abase, n)), f.load(uint, f.chain(p_wg_uint, mem, f.add(c(out_w), n)))))
+        else: f.loop(lid, c(max_v), c(thr), vertex)
         nidx = f.mul(np_, c(verts)); ibase = f.mul(wg, c(max_p * verts))
         def index(n):
             at = f.add(c(prim + 4), n); word = f.load(uint, f.chain(p_wg_uint, mem, f.shr(at, c(2))))
@@ -302,12 +496,15 @@ def vertex_shader(i):
     main = m.id(); m.ins.append((OP_ENTRY, [0, main] + _string('main') + [v_vi, v_pv] + [outs[n] for n in locs]))
     m.new_dec.append((OP_NAME, [main] + _string('main')))
     f = _Fn(m, uint, bool_); f.emit(OP_FUNCTION, void, main, 0, fn_void); f.block(); c = f.c
-    base = f.mul(f.val(OP_BITCAST, uint, f.load(int_, v_vi)), c(ncomp))
+    vid = f.val(OP_BITCAST, uint, f.load(int_, v_vi))
+    if blocks(i):   # component k of vertex v: (v / 32) * ncomp * 32 + k * 32 + v % 32, the blocks of every workgroup end to end
+        base = f.add(f.mul(f.shr(vid, c(5)), c(ncomp * BLOCK)), f.band(vid, c(BLOCK - 1))); step = BLOCK
+    else: base = f.mul(vid, c(ncomp)); step = 1
     f0, f1 = m.const(float_, 0), m.const(float_, 0x3f800000)
     def value(n):
         parts = []
         for k in range(4):
-            if (n, k) in comps: parts.append(f.val(OP_BITCAST, float_, f.load(uint, f.chain(p_u, vtx, c(0), f.add(base, c(comps.index((n, k))))))))
+            if (n, k) in comps: parts.append(f.val(OP_BITCAST, float_, f.load(uint, f.chain(p_u, vtx, c(0), f.add(base, c(comps.index((n, k)) * step))))))
             else: parts.append(f1 if k == 3 else f0)
         return f.val(OP_CONSTRUCT, v4, *parts)
     f.store(f.chain(p_out_v4, v_pv, m.const(int_, 0)), value(None))
