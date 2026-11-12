@@ -1382,7 +1382,6 @@ int g_desc_timing;
 struct vksub {
     VkCommandPool pool; VkCommandBuffer up, main; int up_used;
     VkCommandBuffer mains[MAIN_CBS]; int nmain_alloc, nmain_used, cb_err;
-    VkCommandBuffer body, prim, *bodies; int nbody_alloc, nbody_used;   // DM_VK_PASS_MERGE: the open pass's secondary command buffer (vk_body_begin; main while it is open), the main buffer it replaces, the slot's secondaries
     VkCommandBuffer ups[MAIN_CBS]; int nup_alloc, nup_used; int nmain_sent;   // upload command buffers in order (one per part sent early), main buffers already submitted   // the submission's main command buffers in order (vk_cmd_split); main = the one being recorded
     uint64_t fence;   // the fence this slot last committed with (0 = never)
     uint64_t t_begin, part_ns[MAIN_CBS];   // DM_VK_PASS_TIMES chain line: host time of mtl_sub_begin and of each part's vkQueueSubmit
@@ -1684,30 +1683,6 @@ VkCommandBuffer vk_upload_cmd(void) {
     if (!s->up_used) { VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHK(vkBeginCommandBuffer(s->up, &bi)); s->up_used = 1; g_up_gen++; }
     return s->up;
 }
-// DM_VK_PASS_MERGE (gfx_vk_exec.c): a pass recorded into a secondary command buffer, its body, which the main buffer runs inside the pass once it ends (vk_body_end), so
-// that work which must run outside a pass (mesh emulation's kernels) can still go into the main buffer, ahead of the pass, while the pass stays open. The body stands in
-// for the main buffer (s->main, so vk_cmd and the occlusion queries record into it) from vk_body_begin to vk_body_end, except while vk_body_out(1) holds. No part begins
-// and no submission ends while a pass is open. The secondaries come from the slot's pool and are begun again once the slot comes round
-VkCommandBuffer vk_body_begin(const VkCommandBufferInheritanceInfo *ii) {
-    vksub_t *s = cur(); if (s->body) return VK_NULL_HANDLE;
-    if (s->nbody_used == s->nbody_alloc) {
-        VkCommandBuffer *n = realloc(s->bodies, (size_t)(s->nbody_alloc + 16) * sizeof *n); if (!n) return VK_NULL_HANDLE; s->bodies = n;
-        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_SECONDARY, 16};
-        if (vkAllocateCommandBuffers(V.dev, &ai, s->bodies + s->nbody_alloc)) return VK_NULL_HANDLE;
-        s->nbody_alloc += 16;
-    }
-    VkCommandBuffer b = s->bodies[s->nbody_used];
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT, ii};
-    if (vkBeginCommandBuffer(b, &bi)) return VK_NULL_HANDLE;
-    s->nbody_used++; s->body = b; s->prim = s->main; s->main = b; return b;
-}
-VkCommandBuffer vk_body_end(void) {   // the body, ended (VK_NULL_HANDLE: none was open); vk_cmd gives the main buffer again
-    vksub_t *s = cur(); VkCommandBuffer b = s->body; if (!b) return VK_NULL_HANDLE;
-    s->main = s->prim; s->body = VK_NULL_HANDLE;
-    if (vkEndCommandBuffer(b) < 0) { s->cb_err = 1; return VK_NULL_HANDLE; }
-    return b;
-}
-void vk_body_out(int on) { vksub_t *s = cur(); if (s->body) s->main = on ? s->prim : s->body; }
 void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off) {
     vksub_t *s = cur(); if (!align) align = 16;
     for (int i = 0; i < s->nblk; i++) {
@@ -2222,7 +2197,6 @@ void mtl_sub_begin(void) {
     vk_pool_mark_fold();   // DM_VK_POOL_MARK: the texture IDs the shaders read so far, at each submission's start
     cut_stats_begin(s);
     { const char *e = getenv("DM_VK_DESC_TIMING"); g_desc_timing = e && atoi(e); }
-    s->body = VK_NULL_HANDLE; s->nbody_used = 0;   // (DM_VK_PASS_MERGE bodies: the GPU is done with the slot's, slot_recycle)
     s->npost = 0; s->up_used = 0; s->ngw = 0; s->nocc = 0; g_occ_active = -1; memset(s->occ, 0, sizeof s->occ);
     { const char *e = getenv("DM_VK_POOL_READBACK_RANGES"); s->readback_ranges = e && atoi(e); }
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
