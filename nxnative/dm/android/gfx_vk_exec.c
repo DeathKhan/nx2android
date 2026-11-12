@@ -2020,6 +2020,7 @@ static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
 // pipeline cache's lookup, is the cost: tens of milliseconds per pipeline on Adreno). DM_VK_NOPREWARM=1 turns it off.
 #define PIPE_MAGIC 0x31455050u   // "PPE1"; the header also holds sizeof(pkey), so a changed key layout starts a new file
 static FILE *g_prec;
+static nvn_hmap g_pw_skip = {.klen = sizeof(pkey)};   // the prewarm's skip list (pwm_take): read at the start, read-only after
 // The records are written by a thread of their own: a flush to the app's files folder (FUSE) took tens of milliseconds, and made under g_pipe_mu it held up the replay's
 // pipeline lookups (a 66 ms frame with no pipeline built in it)
 enum { PREC_Q = 64 };
@@ -2035,14 +2036,67 @@ static void *pipe_record_thread(void *arg) {
 }
 static void pipe_record(const pkey *k) {   // (under g_pipe_mu: only queued here)
     if (!g_prec || k->alt || k->flat) return;   // alternate-code and flat-shader pipelines are a debugging run's own
+    if (g_pw_skip.n && nvn_hm_get(&g_pw_skip, k)) {   // the skip list's (pwm_take): play made it, but it is not listed again
+        static int said; if (!said++) VKLOG("prewarm: play made a pipeline the skip list leaves out (shaders %016llx %016llx); it stays off the list (said once)", (unsigned long long)k->key[0], (unsigned long long)k->key[1]);
+        return; }
     pthread_mutex_lock(&g_precq_mu);
     if (!g_precw_on) { g_precw_on = 1; pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, pipe_record_thread, NULL); pthread_attr_destroy(&a); }
     if (g_precq_n < PREC_Q) g_precq[g_precq_n++] = *k;   // (a full queue drops the record: that pipeline is only not prewarmed next time)
     pthread_cond_signal(&g_precq_cv); pthread_mutex_unlock(&g_precq_mu);
 }
 static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done;
+// A recorded pipeline whose compile never finishes (droidplay-core feca0ebe5): the prewarm makes the list again at every start, so an entry the driver's compiler crashes
+// or hangs on would end every start a few seconds in, and vk_pipelines.bin sits where a player does not clear it. Each prewarm thread writes the entry it makes (from its
+// shader modules to the end of the driver's compile) into its own slot of a marker file (vk_pipelines.making) and clears the slot when the compile returns; a crash in that
+// compile also flags the slot (build_dump, on the crashing thread: one pwrite). At the next start an entry still in a slot goes to the skip list (vk_pipelines.skip), which
+// the prewarm and the record leave out from then on. An end for another reason (a kill, a stop) skips the entries in flight too; that costs only their compile ahead of play.
+// Both files are in the app's internal storage, beside DM_SAVE (two pwrites a pipeline; a flush to DM_ROOT, FUSE, took tens of milliseconds). DM_VK_PREWARM_SKIP=0 turns it off
+#define PWM_MAGIC 0x314d5750u   // "PWM1"; the header also holds sizeof(pkey), so a changed key layout drops both files
+enum { PWM_SLOTS = 4, PWM_REC = sizeof(pkey) + 1 };   // a slot per prewarm thread (3 at most): the key, then its state byte (0 idle, 'B' being made, 'C' crashed)
+static int g_pwm_fd = -1; static FILE *g_pwm_f; static _Atomic int g_pwm_tid[PWM_SLOTS];
+static void pwm_path(char *p, size_t n, const char *ext) {   // <the app's files folder>/vk_pipelines.<ext> (DM_SAVE is <files>/save), else DM_ROOT
+    const char *s = getenv("DM_SAVE"), *e = s ? strrchr(s, '/') : NULL;
+    if (e && e > s) snprintf(p, n, "%.*s/vk_pipelines.%s", (int)(e - s), s, ext);
+    else { const char *r = getenv("DM_ROOT"); snprintf(p, n, "%s/vk_pipelines.%s", r ? r : ".", ext); }
+}
+static void pwm_mark(int slot, const pkey *k) {   // this thread is about to make k, or (k NULL) its compile returned
+    if (g_pwm_fd < 0 || slot < 0 || slot >= PWM_SLOTS) return;
+    off_t at = 8 + (off_t)slot * PWM_REC;
+    if (k) { uint8_t r[PWM_REC]; memcpy(r, k, sizeof *k); r[sizeof *k] = 'B'; atomic_store(&g_pwm_tid[slot], gettid()); (void)!pwrite(g_pwm_fd, r, sizeof r, at); }
+    else { uint8_t z = 0; (void)!pwrite(g_pwm_fd, &z, 1, at + (off_t)sizeof(pkey)); atomic_store(&g_pwm_tid[slot], 0); }
+}
+// The skip list read, and the entries an earlier start left in the marker added to it (said once each, at the start that adds them); the marker removed
+static void pwm_take(void) {
+    const char *e = getenv("DM_VK_PREWARM_SKIP"); if (e && !atoi(e)) return;
+    char mk[1100], sk[1100]; pwm_path(mk, sizeof mk, "making"); pwm_path(sk, sizeof sk, "skip");
+    const uint32_t hdr[2] = {PWM_MAGIC, (uint32_t)sizeof(pkey)}; uint32_t fh[2] = {0}; int added = 0;
+    FILE *f = fopen(sk, "rb");
+    if (f && fread(fh, sizeof fh, 1, f) == 1 && fh[0] == hdr[0] && fh[1] == hdr[1]) { pkey k; while (fread(&k, sizeof k, 1, f) == 1) nvn_hm_put(&g_pw_skip, &k, (void *)1); }
+    if (f) fclose(f);
+    f = fopen(mk, "rb");
+    if (f && fread(fh, sizeof fh, 1, f) == 1 && fh[0] == hdr[0] && fh[1] == hdr[1]) {
+        uint8_t r[PWM_REC];
+        while (fread(r, sizeof r, 1, f) == 1) {
+            uint8_t st = r[sizeof(pkey)]; if (st != 'B' && st != 'C') continue;
+            pkey k; memcpy(&k, r, sizeof k); if (nvn_hm_get(&g_pw_skip, &k)) continue;
+            nvn_hm_put(&g_pw_skip, &k, (void *)1); added++;
+            VKLOG("[RED] prewarm: the recorded pipeline with shaders %016llx %016llx %016llx (topology %u, depth format %u, %u colour targets) %s, so it is left out from now on (%s)",
+                  (unsigned long long)k.key[0], (unsigned long long)k.key[1], (unsigned long long)k.key[2], k.topo, k.dfmt, k.ncol,
+                  st == 'C' ? "crashed the driver's compile at an earlier start" : "was being made when an earlier start ended (a crash, a hang, a kill or a stop)", sk);
+        }
+    }
+    if (f) { fclose(f); remove(mk); }
+    if (added) { f = fopen(sk, "wb");   // written again whole: the header, then every key in the set
+        if (f) { fwrite(hdr, sizeof hdr, 1, f); for (uint32_t i = 0; i < g_pw_skip.cap; i++) if (g_pw_skip.vals[i]) fwrite(g_pw_skip.keys + (size_t)i * g_pw_skip.klen, g_pw_skip.klen, 1, f); fclose(f); } }
+}
+static void pwm_open(void) {   // this session's marker: the header, then a slot per prewarm thread, all idle
+    const char *e = getenv("DM_VK_PREWARM_SKIP"); if (e && !atoi(e)) return;
+    char mk[1100]; pwm_path(mk, sizeof mk, "making"); g_pwm_f = fopen(mk, "wbe"); if (!g_pwm_f) return;
+    const uint32_t hdr[2] = {PWM_MAGIC, (uint32_t)sizeof(pkey)}; uint8_t z[PWM_REC * PWM_SLOTS]; memset(z, 0, sizeof z);
+    fwrite(hdr, sizeof hdr, 1, g_pwm_f); fwrite(z, sizeof z, 1, g_pwm_f); fflush(g_pwm_f); g_pwm_fd = fileno(g_pwm_f);
+}
 static void *prewarm_thread(void *arg) {
-    (void)arg; pthread_setname_np(pthread_self(), "vk prewarm");
+    int slot = (int)(intptr_t)arg; pthread_setname_np(pthread_self(), "vk prewarm");
     setpriority(PRIO_PROCESS, 0, 10);   // below the game's threads: prewarm uses idle cores
     for (;;) {
         size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_n) break;
@@ -2058,11 +2112,13 @@ static void *prewarm_thread(void *arg) {
                 (unsigned long long)k->key[s], vk_shader_stage(k->key[s]), s);
             ok = 0; } }
         if (!ok) continue;
+        pwm_mark(slot, k);   // the marker holds it from its shader modules to the end of its compile
         for (int s = 0; s < 3; s++) if (k->key[s] && !(s == 1 && k->raster_discard)) { stg[s] = vk_shader(k->key[s], s); if (!stg[s]) ok = 0; }
-        if (!ok || !stg[0]) continue;
+        if (!ok || !stg[0]) { pwm_mark(slot, NULL); continue; }
         VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;
         for (int s = 0; s < 3; s++) if (stg[s]) { dsl[stg[s]->set] = stg[s]->dsl; if (stg[s]->set + 1 > nsets) nsets = stg[s]->set + 1; }
         VkPipeline p = build_pipeline(k, vk_pipeline_layout(dsl, nsets), stg);
+        pwm_mark(slot, NULL);
         pthread_mutex_lock(&g_pipe_mu);
         if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, p); else if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL);
         pthread_mutex_unlock(&g_pipe_mu);
@@ -2085,12 +2141,16 @@ static void prewarm_start(void) {
         VKLOG("prewarm: %zu pipelines recorded before the alpha test key fields, read with the test off", g_pw_n);
     }
     if (f) fclose(f);
-    // rewrite the file with the records read (dropping a torn last record), then append to it
+    pwm_take();
+    if (g_pw_skip.n) { size_t j = 0; for (size_t i = 0; i < g_pw_n; i++) if (!nvn_hm_get(&g_pw_skip, &g_pw[i])) g_pw[j++] = g_pw[i];
+        if (j < g_pw_n) VKLOG("prewarm: %zu recorded pipelines left out (the skip list: an earlier start ended in their compile)", g_pw_n - j); g_pw_n = j; }
+    // rewrite the file with the records read (dropping a torn last record and the skipped), then append to it
     g_prec = fopen(path, "wb"); if (g_prec) { fwrite(hdr, sizeof hdr, 1, g_prec); if (g_pw_n) fwrite(g_pw, sizeof(pkey), g_pw_n, g_prec); fflush(g_prec); }
     if (!g_pw_n || getenv("DM_VK_NOPREWARM")) { VKLOG("prewarm: %zu pipelines recorded%s", g_pw_n, g_pw_n ? ", off (DM_VK_NOPREWARM)" : ""); return; }
     long nc = sysconf(_SC_NPROCESSORS_ONLN); int nt = nc >= 8 ? 3 : nc >= 4 ? 2 : 1;
     VKLOG("prewarm: %zu recorded pipelines on %d threads", g_pw_n, nt);
-    for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, NULL); pthread_attr_destroy(&a); }
+    pwm_open();
+    for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, (void *)(intptr_t)i); pthread_attr_destroy(&a); }
 }
 // ---- what each thread is building, for the crash dump. Issue #64: Super Mario Bros. Wonder crashed in the Adreno 750's shader compiler (libllvm-qgl.so, driver 512.762)
 // at its title scene, with no log line to say which pipeline or which thread; and a pipeline that crashes is never recorded for the prewarm, so every run met it again.
@@ -2104,6 +2164,8 @@ static int build_begin(void) {   // the slot, or -1 when all are taken (nothing 
 static void build_end(int i) { if (i >= 0) { g_build[i].phase = 0; atomic_store(&g_build[i].tid, 0); } }
 static void build_dump(void) {   // (the crash handler: no locks, no allocation)
     int me = gettid(), n = 0;
+    for (int s = 0; s < PWM_SLOTS; s++) if (g_pwm_fd >= 0 && atomic_load(&g_pwm_tid[s]) == me) {   // a prewarm entry crashed its compile: the next start says so and skips it (pwm_take)
+        uint8_t c = 'C'; (void)!pwrite(g_pwm_fd, &c, 1, 8 + (off_t)s * PWM_REC + (off_t)sizeof(pkey)); }
     for (int i = 0; i < NBUILD; i++) { int t = atomic_load(&g_build[i].tid); if (!t || !g_build[i].phase) continue; n++;
         char nm[64]; crash_thread_name((unsigned)t, nm, sizeof nm);
         fprintf(stderr, "[dm] [vk] %s thread %#x '%s' was %s: %s\n", t == me ? "this (the crashing)" : "another", (unsigned)t, nm,
