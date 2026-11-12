@@ -1,0 +1,42 @@
+# Game profile of Pokémon: Let's Go, Pikachu! (Switch, base game 1.0.0, no update). On Android it plays at 30 fps (as on the Switch) from a new game
+# to Route 1, catching Pikachu and wild Pokémon with buttons, with saves and Continue working (a Galaxy Z Fold 8, see README.md); the Mac has not run it yet
+# Format: see dm/games/README.md
+# Game Freak's engine before Sword and Shield's, NVN, SDK 5.4.150, Wwise sound. The provisional profile the survey made (dm/games/profile_guess.py),
+# unchanged but for these comments. Shaders: 11,160, from the effect files (.ptcl), main itself, the GFPAK archives and loose BNSH files (see README.md)
+
+# ---- Identity ----
+title_id	010003F003A34000
+program_id	010003F003A34000
+
+# ---- App ----
+name	Pokémon: Let's Go, Pikachu!
+ipa	PokMonLetsGoPikachu.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v0	1.0.0	main=1c375692de4f4b879abe88742dc0ca60	subsdk0=7a7ca048269ec2e6ed9a2d812a951d9f	subsdk1=15c1c7f4f364010c95aeb5bb8adf30dc	sdk=eee08631aff2601e0718f411cfefa13f
+package	v0
+shader_versions	v0
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 subsdk1 sdk
+romfs_marker	bin/app/staff_roll/bin/staff_roll_00.arc
+zip_store	.arc:.bfotf:.gfpak:.ptcl:.webm:.metallib
+
+# ---- Memory ----
+# main sets a heap of at most the pool − 64 MB: a 3328 MB heap region
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+# the NPDM declares 0 MB of system resource: IsVirtualAddressMemoryEnabled is false, as on Horizon (Big Brain Academy: Brain vs. Brain sets a heap only then)
+sys_resource	0x0
+
+# ---- Shader split ----
+shader_groups	/bin/=bin /system_resource/=systemresource
+shader_note	Pokémon: Let's Go, Pikachu! shaders
+
+# ---- After the rewrite ----
+# used memory for the current rewritten modules, at least the default 64 MB
+mem_used	0x4600000
