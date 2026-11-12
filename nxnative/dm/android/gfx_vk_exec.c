@@ -1295,7 +1295,9 @@ static int pass_cut(int interior, uint64_t *cuts) {
 // driver (512.800). Slot 0 of such a pass gets a scratch RGBA8 image at least the pass's size (one, grown when a pass is larger; the old ones stay: submissions in flight
 // name their views), loaded and stored DONT_CARE (on a tiler it never leaves tile memory), and the pipelines write nothing to it (prepare_draw: write mask 0 where
 // P_att[0] is the scratch). Single-sample, single-layer passes only. DM_VK_SLOT0_FILL=1 / 0 (start-up): on / off whatever the GPU; by default on for the Adreno 8xx
-// (named "Adreno (TM) 8nn" by Qualcomm's driver and by Turnip), off elsewhere
+// (named "Adreno (TM) 8nn" by Qualcomm's driver and by Turnip) and for every Adreno on Qualcomm's own driver (droidplay-core e8feb01a1: an Adreno 730, driver V@0615.98,
+// crashed in vkCmdEndRenderPass at every Mario Kart 8 Deluxe course load on a pass with slots 0-2 empty and slot 3 used; slot 0 filled, it ran), off elsewhere.
+// The scratch's sides are rounded up to 512: a dynamic-resolution pass growing a few texels at a time (MK8D: 480x270, 484x272, 493x277...) made a new image each time
 static vkimg_t g_s0_image; static VkImageView g_s0_view; static uint64_t g_s0_passes; static int g_s0_failed;
 static int adreno_model(const VkPhysicalDeviceProperties *p) {   // 830 for "Adreno (TM) 830" (Qualcomm's vendor ID), 0 for any other GPU
     const char *n = p->vendorID == 0x5143 ? strstr(p->deviceName, "Adreno (TM) ") : NULL; return n ? atoi(n + 12) : 0;
@@ -1303,7 +1305,11 @@ static int adreno_model(const VkPhysicalDeviceProperties *p) {   // 830 for "Adr
 static int slot0_fill_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("DM_VK_SLOT0_FILL"); int m = adreno_model(&V.props);
-        on = e && *e ? atoi(e) != 0 : m >= 800 && m < 900;
+        int qcom = 0;   // Qualcomm's own driver (its driver ID; without one, its driverVersion's top bit, which Mesa's lacks), not Turnip however a build names it
+        if (V.props.vendorID == 0x5143) { VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES}; VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
+            if (vkGetPhysicalDeviceProperties2 && V.props.apiVersion >= VK_API_VERSION_1_2) vkGetPhysicalDeviceProperties2(V.pd, &p2);
+            qcom = dp.driverID ? dp.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY : (V.props.driverVersion & 0x80000000u) != 0; }
+        on = e && *e ? atoi(e) != 0 : (m >= 800 && m < 900) || (m && qcom);
         VKLOG("empty colour slot 0: %s (DM_VK_SLOT0_FILL%s; %s)", on ? "a scratch target there in multi-target passes" : "left empty", e && *e ? "" : " default", V.props.deviceName); }
     return on;
 }
@@ -1314,6 +1320,7 @@ static int slot0_scratch(uint32_t w, uint32_t h) {   // the scratch image, at le
     if (g_s0_failed) return 0;
     vkimg_t im = {0}; VkImageView v = VK_NULL_HANDLE;
     im.w = w > g_s0_image.w ? w : g_s0_image.w; im.h = h > g_s0_image.h ? h : g_s0_image.h;
+    im.w = (im.w + 511) & ~511u; im.h = (im.h + 511) & ~511u;   // whole 512s: a pass growing by a few texels reuses it (above)
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {im.w, im.h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
                             VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     if (vkCreateImage(V.dev, &ci, NULL, &im.img)) goto fail;
