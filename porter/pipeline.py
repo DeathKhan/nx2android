@@ -720,7 +720,7 @@ class Port:
         nsp.derive_profile(g, pdir / g.id, self.pkg_ver, self.game, g.words('modules'), self.app, shader_only=True)
         self.use_profile_dir(pdir, first=True)
         self.g = game.load(g.id); self.ap = android_profile.AndroidProfile(self.g)
-        self.derived_shaders = f'the DLC\'s shaders are not in game profile {g.id}\'s tables'
+        self.derived_shaders = f'the DLC\'s shaders or newly read compute kernels are not in game profile {g.id}\'s tables'
         say(f'{self.derived_shaders}: using a shader-only derived profile at {self.g.dir}; registered module fixes are preserved')
         return self.g
 
@@ -738,7 +738,8 @@ class Port:
             nsp.split_shaders(PY, NXNATIVE, [self.dirs[v] / 'RomFS' for v in sv], [self.dirs[v] / 'ExeFS/main' for v in sv], pkg, self.env, self.logs, self.g, own,
                                oodle=self.device_oodle if self.oodle_why else None,   # Oodle-compressed archives: the game's own decoder on the device
                                dlc_roms=sorted(p for p in self.aoc.iterdir() if p.is_dir() or p.suffix == '.img') if self.aoc else (),   # the DLC roots, aoc/<index>.img images (or legacy folders): DLC with shaders of its own (Xenoblade Chronicles 3's archives)
-                               derive_dlc=None if own else self.derive_shader_tables)   # the player's DLC is not the set the profile's tables were split with: a shader-only derived profile (upstream's derive_dlc)
+                               derive_dlc=None if own else self.derive_shader_tables,   # the player's DLC is not the set the profile's tables were split with: a shader-only derived profile (upstream's derive_dlc)
+                               derive_compute=None if own else self.derive_shader_tables)   # compute kernels a newer reader finds that the tables lack (split_shaders' strict additive-compute check; droidplay-core 5d1ebdd2d: AI: THE SOMNIUM FILES 1.0.1)
         finally: self.device_oodle_end()
         self.dmsv = self.aw / 'shaders.dmsv'; kf = self.aw / 'shaders.dmsv.key'; cap = self.aw / 'captured_shaders'
         PROG.stage('Vulkan shaders', step='building the translator')
