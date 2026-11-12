@@ -100,6 +100,12 @@ static int vk_samp_id_max(void){return g_pool_samp_base+3;}
 static int vk_tex_by_id(int id,const view_t **v,const tex_t **t){(void)id;*v=NULL;*t=&texture;return 1;}
 static int view_num(const tex_t *t,const view_t *v){(void)t;(void)v;return 0;}
 static int vk_tex_pool_ok(const tex_t *t){(void)t;return pool_ok;}
+// the pool read marks (DM_VK_POOL_MARK): unread pool indices (mark_cold bits), IDs that began to be read so far (mark_seq); off unless a mode sets them
+static unsigned mark_cold,cold_lookups;static uint64_t mark_seq;
+static uint64_t pool_mark_gen(void){return mark_seq;}
+static int pool_mark_warm(int k){return !(mark_cold>>k&1);}
+static void vk_tex_pool_cold(int on){cold_lookups+=(unsigned)on;}
+static int pool_mark_write(VkDescriptorSet s,VkWriteDescriptorSet *w){(void)s;(void)w;return 0;}
 static VkSampler vk_samp_by_id(int id){sampler_resolves++;return H(VkSampler,id+1000);}
 static void tex_desc_for(int st,const dmsv_bind*b,uint64_t h,VkDescriptorImageInfo*d,int x){
  (void)st;(void)x;unsigned kind=b->dim==3?2:b->dim==2?3:b->flags&1?1:0;resolves[kind]++;
@@ -126,6 +132,15 @@ SELECTION
 static VkImageView view(VkDescriptorSet s,int binding,int element){return captured[(uintptr_t)s][binding][element].imageView;}
 int main(int argc,char **argv){
  assert(argc==2);int mode=atoi(argv[1]);unsetenv("DM_VK_POOL_PERSIST");unsetenv("DM_VK_DPX_REUSE");
+ if(mode==14){
+  // DM_VK_POOL_MARK: an ID no shader has read gets no first use (the dummy); one with an image keeps it, uncounted as drawn; its first read makes a new set
+  pool_ok=1;mark_cold=2;VkDescriptorSet a=tbl_set(0,NULL,17);
+  assert(view(a,3,1)==H(VkImageView,999)&&view(a,3,2)==H(VkImageView,10002)&&!cold_lookups);
+  assert(tbl_set(0,NULL,17)==a);mark_cold=0;mark_seq=1;VkDescriptorSet b=tbl_set(0,NULL,17);
+  assert(b!=a&&view(b,3,1)==H(VkImageView,10001));
+  pool_ok=2;mark_cold=2;mark_seq=2;VkDescriptorSet c=tbl_set(0,NULL,17);assert(view(c,3,1)==H(VkImageView,10001)&&cold_lookups==1);
+  return 0;
+ }
  if(mode==0){
   VkDescriptorSet a=tbl_set(0,NULL,17);assert(view(a,3,1)==H(VkImageView,10001));
   assert(tbl_set(0,NULL,17)==a);
@@ -350,7 +365,14 @@ static tex_t texture={.d={1,16,16,1,122},.L={4}};
 static vkimg_t image,*g_desc_im=&image;
 static int vk_tex_by_id(int id,const view_t **view,const tex_t **t){(void)id;*view=NULL;*t=&texture;return 1;}
 static int view_num(const tex_t*t,const view_t*v){(void)t;(void)v;return 0;}
-static int vk_tex_pool_ok(const tex_t*t){(void)t;return 2;}
+static int ring_pool_ok=2;static int vk_tex_pool_ok(const tex_t*t){(void)t;return ring_pool_ok;}
+// the pool read marks (DM_VK_POOL_MARK): unread pool indices (mark_cold bits) and the log of IDs that began to be read (mark_ids, mark_seq of them)
+static unsigned mark_cold,cold_lookups;static uint64_t mark_seq;static int mark_ids[8];
+static uint64_t pool_mark_gen(void){return mark_seq;}
+static int pool_mark_warm(int k){return !(mark_cold>>k&1);}
+static int pool_mark_take(uint64_t from,uint64_t to,int *tids,int *n,int cap){assert(to<=8);for(uint64_t s=from;s<to;s++){if(*n>=cap)return -1;tids[(*n)++]=mark_ids[s];}return 0;}
+static void vk_tex_pool_cold(int on){cold_lookups+=(unsigned)on;}
+static int pool_mark_write(VkDescriptorSet s,VkWriteDescriptorSet *w){(void)s;(void)w;return 0;}
 static void vk_tex_pool_fill(int on){(void)on;}
 static pthread_mutex_t g_view_mu=PTHREAD_MUTEX_INITIALIZER;
 DROPLOG
@@ -421,6 +443,15 @@ int main(int argc,char **argv){
  }else if(mode==8){
   VkDescriptorSet a=take();next(4);assert(take()==a&&sampler(a)==1002);
   assert(sampler_updates==1&&g_ring_patch==1);
+ }else if(mode==10){
+  // DM_VK_POOL_MARK: an ID no shader has read gets no first use (the dummy) and waits in no retry list; its first read (the log) has the next patch write it
+  ring_pool_ok=1;mark_cold=2;VkDescriptorSet a=take();ring_slot *r=&g_ring[(uintptr_t)a-1];assert(img(a)==999&&!r->npend);
+  unsigned iu=image_updates;next(1);assert(take()==a&&image_updates==iu);
+  mark_cold=0;mark_ids[0]=1;mark_seq=1;next(1);assert(take()==a&&img(a)==10101&&image_updates>iu&&g_ring_full==1);
+  iu=image_updates;assert(take()==a&&image_updates==iu); // (a hit: the log is taken)
+ }else if(mode==11){
+  // an unread ID's image stays bound, but the fill does not count it as drawn
+  mark_cold=2;VkDescriptorSet a=take();assert(img(a)==10101&&cold_lookups==1);
  }
  for(int i=0;i<RING_N;i++){free(g_ring[i].img);free(g_ring[i].pend);}
  return 0;
@@ -451,7 +482,7 @@ class PoolTables(unittest.TestCase):
                                 str(c), "-o", str(exe)], check=True)
                 return exe
             exe = compile_one(source, "candidate")
-            for mode in range(13):
+            for mode in list(range(13)) + [14]:
                 subprocess.run([str(exe), str(mode)], check=True, timeout=15)
             bounded = source.replace("TBL_PERSIST_BYTES = 32 << 20", "TBL_PERSIST_BYTES = 6 * sizeof(tex_t)")
             exe = compile_one(bounded, "six-slots")
@@ -481,7 +512,7 @@ class PoolTables(unittest.TestCase):
                                 str(c), "-o", str(exe)], check=True)
                 return exe
             exe = compile_one(source, "candidate")
-            for mode in range(10):
+            for mode in range(12):
                 subprocess.run([str(exe), str(mode)], check=True, timeout=15)
             # Recreate the previous global-generation-only hit/update predicates.
             previous = source.replace(" && r->sampseq == sampseq", "").replace(

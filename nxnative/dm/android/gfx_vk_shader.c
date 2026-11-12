@@ -299,6 +299,29 @@ int vk_tbl_n(void) {   // the texture tables' length (gfx_vk.h): DM_VK_TBL_N, 20
     static int n = -1; if (n < 0) { const char *e = getenv("DM_VK_TBL_N"); n = e ? atoi(e) : 2048; if (n < 0) n = 0; if (n > 65536) n = 65536; }
     return n;
 }
+// The texture pool read marks (DM_VK_POOL_MARK=1, start-up, off unless set; gfx_vk_exec.c pool marks, gfx_vk.h POOL_MARK_B). Fixed for the process, as set 0 is: the layout has
+// the marks' binding only with it, and only with it are the shaders that index the texture pool given their stores (spv_pool_mark). The device must let the shader stages store
+// (fragmentStoresAndAtomics; vertexPipelineStoresAndAtomics for the vertex stages that index the pool, else those shaders leave the marks partial), the pool tables must be on, and
+// one more dynamic storage descriptor must fit the pipeline layout's limit beside DM_VK_DYN_SSBO's thirds. Off, nothing below differs from before
+static int g_mark_on, g_mark_vtx; static int g_mark_partial;
+static void pool_mark_init(void) {
+    const char *e = getenv("DM_VK_POOL_MARK"); if (!(e && atoi(e))) return;
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; vkGetPhysicalDeviceFeatures2(V.pd, &f2); const VkPhysicalDeviceFeatures f = f2.features;   // (all it has is enabled: gfx_vk_core.c)
+    const VkPhysicalDeviceLimits *lim = &V.props.limits;
+    uint32_t dyn = lim->maxDescriptorSetStorageBuffersDynamic, dyn_used = V.dyn_ssbo ? dyn / 3 * 3 : 0;
+    const char *why = !vk_pool_n() ? "the texture pool tables are off (DM_VK_POOL_N=0, or no shader of the bundle reads a pool)" : !f.fragmentStoresAndAtomics ? "the device has no fragment stores (fragmentStoresAndAtomics)" :
+                      dyn_used + 1 > dyn ? "no dynamic storage descriptor to spare beside DM_VK_DYN_SSBO's" : NULL;
+    if (why) { VKLOG("[RED] pool read marks: off (DM_VK_POOL_MARK=1 asked): %s", why); return; }
+    g_mark_on = 1; g_mark_vtx = f.vertexPipelineStoresAndAtomics;
+    // (each graphics stage sees one storage buffer more: the translator's stage sets have at most Maxwell's 16 and the geometry claim's one; the limit is logged to check it)
+    VKLOG("pool read marks: on (DM_VK_POOL_MARK): shaders that index the texture pool store the IDs they read; the pool tables give a texture its image only once it is read (the device binds %u storage buffers a stage, %u dynamic a layout)%s",
+          lim->maxPerStageDescriptorStorageBuffers, dyn, g_mark_vtx ? "" : "; it has no vertex-stage stores: a vertex shader that indexes the pool leaves the marks partial");
+}
+int vk_pool_mark_on(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, pool_mark_init); return g_mark_on; }
+int vk_pool_mark_partial(void) { return __atomic_load_n(&g_mark_partial, __ATOMIC_RELAXED); }
+static void pool_mark_give_up(uint64_t key, int stage, const char *why) {   // one shader's reads cannot be seen: the marks decide nothing from now on (every ID counts as read, as without them)
+    if (!__atomic_exchange_n(&g_mark_partial, 1, __ATOMIC_RELAXED)) VKLOG("[RED] pool read marks: shader %016llx (stage %d): %s; its reads cannot be marked, so from now on every texture ID counts as read (as without DM_VK_POOL_MARK)", (unsigned long long)key, stage, why);
+}
 // Pool lengths are process-wide, as is set 0. Only image kinds absent from every bundle entry
 // have a one-element binding. Account for those placeholders in the device limit too; do not
 // divide the available descriptor budget by four when only two full arrays can ever be used.
@@ -330,11 +353,13 @@ unsigned vk_pool_kinds(void) { return g_pool_kinds; }   // the pool kinds set 0 
 VkDescriptorSetLayout vk_tbl_dsl(void) {   // one common set 0: large bindings only for kinds the whole bundle uses
     static VkDescriptorSetLayout l; VkDescriptorSetLayout r = __atomic_load_n(&l, __ATOMIC_ACQUIRE); if (r) return r;
     pthread_mutex_lock(&g_sh_mu);
-    if (!l) { VkDescriptorSetLayoutBinding lb[SET0_BINDINGS]; uint32_t n = (uint32_t)(vk_tbl_n() ? vk_tbl_n() : 1), np = (uint32_t)(vk_pool_n() ? vk_pool_n() : 1), ns = (uint32_t)(vk_pool_samp_n() ? vk_pool_samp_n() : 1);
+    if (!l) { VkDescriptorSetLayoutBinding lb[SET0_BINDINGS + 1]; uint32_t n = (uint32_t)(vk_tbl_n() ? vk_tbl_n() : 1), np = (uint32_t)(vk_pool_n() ? vk_pool_n() : 1), ns = (uint32_t)(vk_pool_samp_n() ? vk_pool_samp_n() : 1);
         for (uint32_t i = 0; i < TBL_SLOTS; i++) lb[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
         for (uint32_t i = 0; i < POOL_TEX_SLOTS; i++) lb[POOL_B0 + i] = (VkDescriptorSetLayoutBinding){POOL_B0 + i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, (g_pool_kinds & (1u << i)) ? np : 1, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
         lb[POOL_SAMP_B] = (VkDescriptorSetLayoutBinding){POOL_SAMP_B, VK_DESCRIPTOR_TYPE_SAMPLER, ns, VK_SHADER_STAGE_ALL_GRAPHICS, NULL};
-        VkDescriptorSetLayout m = shader_layout(lb, SET0_BINDINGS); __atomic_store_n(&l, m, __ATOMIC_RELEASE); }
+        // DM_VK_POOL_MARK=1: the pool read marks after them (binding SET0_BINDINGS, gfx_vk.h POOL_MARK_B), one storage buffer whose dynamic offset picks the submission slot's words
+        uint32_t nb = SET0_BINDINGS; if (vk_pool_mark_on()) { lb[nb] = (VkDescriptorSetLayoutBinding){nb, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL_GRAPHICS, NULL}; nb++; }
+        VkDescriptorSetLayout m = shader_layout(lb, nb); __atomic_store_n(&l, m, __ATOMIC_RELEASE); }
     pthread_mutex_unlock(&g_sh_mu);
     return l;
 }
@@ -419,6 +444,74 @@ static int spv_nonuniform(uint32_t **pw, uint32_t *pnw, const uint32_t *vars, in
     for (uint32_t id = 1; id < bound; id++) if (mark[id] >= 2) { o[k++] = 3u << 16 | 71; o[k++] = id; o[k++] = 5300; }
     memcpy(o + k, w + ann_end, (size_t)(nw - ann_end) * 4); k += nw - ann_end;
     free(mark); free(w); *pw = o; *pnw = k; return (int)nd;
+}
+// The pool read marks (DM_VK_POOL_MARK=1; gfx_vk_exec.c pool marks): after each access chain into a texture pool array (vars[], nvars of them) the shader stores 1 into a
+// storage buffer of uints at the ID it indexes (marks[id] = 1), so the host learns which registered textures are drawn. The pool tables otherwise give every registered texture
+// with contents an image and count it as drawn at every fill: Ocarina of Time's Kokiri Forest (Odin 3, 2026-11-11) held 5,957 images of 2.85 GB at the 3,072 MB image budget,
+// which could drop none of them. A plain store, not an atomic: every writer writes the same 1, and the host only asks whether any did. The index is the translator's own clamp
+// (GLSL.std.450 UMin of the handle's ID with the array's last index, which spv_tbl_shrink cut to the table's length; an OpBitcast to int may follow it) or a constant inside
+// the table: robust buffer access is off, so an index that cannot be shown to be inside the np words fails the shader's marks (the caller then gives the marks up). The buffer
+// is a new variable in set 0 (binding POOL_MARK_B; the caller's decoration pass sets both), with its own runtime array and BufferBlock struct, as the translator declares its
+// storage buffers (SPIR-V 1.3); an 1.4 module would need it in its entry points' interfaces and fails instead. *pw may be reallocated. Returns the stores added (0: the module
+// indexes no texture pool array and is unchanged), -1 with *why on failure (the module unchanged). *var_out: the buffer's variable
+static int spv_pool_mark(uint32_t **pw, uint32_t *pnw, const uint32_t *vars, int nvars, uint32_t np, uint32_t *var_out, const char **why) {
+    uint32_t *w = *pw, nw = *pnw, bound = nw >= 5 ? w[3] : 0; *var_out = 0; *why = NULL;
+    if (!bound || bound > (1u << 22) || !np) { *why = "its header is not valid"; return -1; }
+    if (w[1] >= 0x10400) { *why = "SPIR-V 1.4 or later (the buffer would have to join its entry points' interfaces)"; return -1; }
+    uint8_t *pool = calloc(bound, 1); uint32_t *def = calloc(bound, 4); if (!pool || !def) { free(pool); free(def); *why = "out of memory"; return -1; }
+    for (int k = 0; k < nvars; k++) if (vars[k] < bound) pool[vars[k]] = 1;   // the texture pool array variables
+    uint32_t glsl = 0, u32 = 0, pu = 0, c0 = 0, c1 = 0, ann_end = 0, first_fn = 0, nsite = 0;
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { *why = "a malformed instruction"; break; }
+        if (op == 11 && n >= 3 && !memcmp(&w[i + 2], "GLSL.std.450", 12)) glsl = w[i + 1];                     // OpExtInstImport
+        if (op == 21 && n == 4 && w[i + 2] == 32 && w[i + 3] == 0 && !u32) u32 = w[i + 1];                     // OpTypeInt 32 0
+        if (op == 32 && n == 4 && w[i + 2] == 2 && u32 && w[i + 3] == u32 && !pu) pu = w[i + 1];                // OpTypePointer Uniform uint
+        if (op == 43 && n == 4 && u32 && w[i + 1] == u32 && w[i + 3] == 0 && !c0) c0 = w[i + 2];                // OpConstant uint 0
+        if (op == 43 && n == 4 && u32 && w[i + 1] == u32 && w[i + 3] == 1 && !c1) c1 = w[i + 2];                // OpConstant uint 1
+        if ((op == 71 || op == 72 || op == 73 || op == 74 || op == 75 || op == 332 || op == 5632 || op == 5633) && !first_fn) ann_end = i + n;   // the annotations
+        if (op == 54 && !first_fn) first_fn = i;                                                                // the first OpFunction
+        if ((op == 43 || op == 124 || op == 12) && n >= 4 && w[i + 2] < bound) def[w[i + 2]] = i;               // OpConstant, OpBitcast, OpExtInst: where their results are made
+        if ((op == 65 || op == 66) && n >= 5 && w[i + 3] < bound && pool[w[i + 3]]) nsite++;                    // an access chain into a pool array
+        i += n; }
+    if (!*why && !nsite) { free(pool); free(def); return 0; }
+    if (!*why && (!u32 || !glsl)) *why = "it has no 32-bit unsigned integer type or no GLSL.std.450 import (not the translator's clamp)";
+    if (!*why && (!ann_end || !first_fn || ann_end > first_fn)) *why = "its annotations and functions are not where SPIR-V puts them";
+    uint32_t next = bound, rta = next++, st = next++, pst = next++, var = next++; if (!pu) pu = next++; int add_c0 = !c0, add_c1 = !c1; if (add_c0) c0 = next++; if (add_c1) c1 = next++;
+    uint32_t add = 20 + 3 + 3 + 4 + 4 + (pu >= bound ? 4 : 0) + (add_c0 ? 4 : 0) + (add_c1 ? 4 : 0) + 9 * nsite, *o = *why ? NULL : malloc((size_t)(nw + add) * 4), k = 0;
+    if (!*why && !o) *why = "out of memory";
+    if (*why) { free(pool); free(def); free(o); return -1; }
+    memcpy(o, w, (size_t)ann_end * 4); k = ann_end;
+    o[k++] = 4u << 16 | 71; o[k++] = rta; o[k++] = 6; o[k++] = 4;                     // OpDecorate rta ArrayStride 4
+    o[k++] = 3u << 16 | 71; o[k++] = st; o[k++] = 3;                                  // OpDecorate st BufferBlock
+    o[k++] = 5u << 16 | 72; o[k++] = st; o[k++] = 0; o[k++] = 35; o[k++] = 0;         // OpMemberDecorate st 0 Offset 0
+    o[k++] = 4u << 16 | 71; o[k++] = var; o[k++] = 34; o[k++] = 0;                    // OpDecorate var DescriptorSet 0
+    o[k++] = 4u << 16 | 71; o[k++] = var; o[k++] = 33; o[k++] = POOL_MARK_B;          // OpDecorate var Binding POOL_MARK_B
+    memcpy(o + k, w + ann_end, (size_t)(first_fn - ann_end) * 4); k += first_fn - ann_end;
+    o[k++] = 3u << 16 | 29; o[k++] = rta; o[k++] = u32;                               // OpTypeRuntimeArray rta uint
+    o[k++] = 3u << 16 | 30; o[k++] = st; o[k++] = rta;                                // OpTypeStruct st rta
+    o[k++] = 4u << 16 | 32; o[k++] = pst; o[k++] = 2; o[k++] = st;                    // OpTypePointer pst Uniform st
+    if (pu >= bound) { o[k++] = 4u << 16 | 32; o[k++] = pu; o[k++] = 2; o[k++] = u32; }   // OpTypePointer pu Uniform uint
+    if (add_c0) { o[k++] = 4u << 16 | 43; o[k++] = u32; o[k++] = c0; o[k++] = 0; }    // OpConstant uint 0
+    if (add_c1) { o[k++] = 4u << 16 | 43; o[k++] = u32; o[k++] = c1; o[k++] = 1; }    // OpConstant uint 1
+    o[k++] = 4u << 16 | 59; o[k++] = pst; o[k++] = var; o[k++] = 2;                   // OpVariable pst var Uniform
+    int stores = 0;
+    for (uint32_t i = first_fn; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        memcpy(o + k, w + i, (size_t)n * 4); k += n;
+        if ((op == 65 || op == 66) && n >= 5 && w[i + 3] < bound && pool[w[i + 3]]) {
+            uint32_t y = w[i + 4], ok = 0;   // the index; through an OpBitcast to the uint it was made as
+            if (y < bound && def[y] && (w[def[y]] & 0xffff) == 124) y = w[def[y] + 3];
+            if (y < bound && def[y] && w[def[y] + 1] == u32) { uint32_t d = def[y], dop = w[d] & 0xffff;
+                if (dop == 43) ok = w[d + 3] < np;   // a constant index inside the table
+                else if (dop == 12 && (w[d] >> 16) == 7 && w[d + 3] == glsl && w[d + 4] == 38)   // UMin(x, c) with c a constant inside the table: the translator's clamp
+                    for (int a = 5; a <= 6 && !ok; a++) { uint32_t c = w[d + a]; ok = c < bound && def[c] && (w[def[c]] & 0xffff) == 43 && w[def[c] + 1] == u32 && w[def[c] + 3] < np; } }
+            if (!ok) { *why = "a pool array index that is not the translator's clamp to the table"; break; }
+            uint32_t p = next++;
+            o[k++] = 6u << 16 | 65; o[k++] = pu; o[k++] = p; o[k++] = var; o[k++] = c0; o[k++] = y;   // OpAccessChain pu p var 0 index
+            o[k++] = 3u << 16 | 62; o[k++] = p; o[k++] = c1;                                       // OpStore p 1
+            stores++; }
+        i += n; }
+    free(pool); free(def);
+    if (*why) { free(o); return -1; }
+    o[3] = next; free(w); *pw = o; *pnw = k; *var_out = var; return stores;
 }
 // A pipeline currently combines vertex, fragment and geometry sets. Reserve at most one third of the total dynamic-storage limit per stage.
 // Only directly bound single storage buffers participate; arrays, UBO-derived pointers, compute and unsupported alignment keep their static descriptor.
@@ -519,6 +612,12 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
         { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NONUNIFORM"); on = e && atoi(e); }   // DM_VK_NONUNIFORM=1 (start-up, opt-in): decorate them (measured on Ocarina of Time 2026-11-09: no visible change, so not by default)
           if (!pfail && on) { uint32_t all[192]; int na = 0; for (int k = 0; k < ntv; k++) all[na++] = tv[k]; for (int k = 0; k < nsv; k++) all[na++] = sv[k];
               int nd = spv_nonuniform(&w, &nw, all, na); static int nl; if (nl++ < 4) VKLOG("shader %016llx: %d pool array accesses decorated NonUniform", (unsigned long long)key, nd); } }
+        // DM_VK_POOL_MARK=1: the texture IDs it reads stored for the host (spv_pool_mark); its buffer joins the pool variables so the decoration pass below puts it in set 0
+        // at POOL_MARK_B. A shader that cannot be marked is still drawn as before, and the marks are given up for the run (vk_pool_mark_partial)
+        if (!pfail && ntv && vk_pool_mark_on()) { uint32_t mv = 0; const char *why = NULL;
+            int ns = stage != 1 && !g_mark_vtx ? (why = "the device has no stores in vertex stages (vertexPipelineStoresAndAtomics)", -1) : npv >= 96 ? (why = "too many pool arrays", -1) : spv_pool_mark(&w, &nw, tv, ntv, (uint32_t)vk_pool_n(), &mv, &why);
+            if (ns < 0) pool_mark_give_up(key, stage, why);
+            else if (ns) { pv[npv++] = (typeof(pv[0])){mv, POOL_MARK_B - POOL_B0}; s->mark_var = mv; static int nl; if (nl++ < 4) VKLOG("shader %016llx (stage %d): %d texture pool reads marked (DM_VK_POOL_MARK)", (unsigned long long)key, stage, ns); } }
     }
     if (pfail) { static int nl; if (nl++ < 16) VKLOG("[RED] shader %016llx (stage %d): %s; not drawn (its texture pool arrays can be bound only from the pool tables)", (unsigned long long)key, stage, pfail);
         nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); free(w); free(s); return NULL; }

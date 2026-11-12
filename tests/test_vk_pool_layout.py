@@ -39,6 +39,7 @@ static unsigned bundle_opens, layout_calls, desired_mask=3; static int desired_s
 static VkDescriptorSetLayoutBinding captured[8];
 static void bundle_auto(void){bundle_opens++;g_pool_kinds=desired_mask;g_pool_samp_seen=desired_samp;}
 static int vk_tbl_n(void){return 2048;}
+static int vk_pool_mark_on(void){return 0;}   // (DM_VK_POOL_MARK off: set 0 has no marks binding)
 #define VKLOG(...) ((void)0)
 static VkDescriptorSetLayout shader_layout(const VkDescriptorSetLayoutBinding *b,uint32_t n){
  assert(n==8);layout_calls++;memcpy(captured,b,sizeof captured);

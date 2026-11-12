@@ -238,6 +238,7 @@ typedef struct {
     // a primitive's vertices, the most vertices and primitives a workgroup, and the words a vertex has in the emulation's vertex buffer (gfx_vk_exec.c mesh_draw)
     int mesh_kind; uint32_t mesh_threads, mesh_pay, mesh_task, mesh_verts, mesh_max_v, mesh_max_p, mesh_ncomp;
     int wmem;                           // gfx_vk_exec.c shader_wmem: 1 it writes memory (stores to storage buffers or images, atomics), 2 not, 0 not known yet
+    uint32_t mark_var;                  // DM_VK_POOL_MARK: the pool read marks' buffer variable (gfx_vk_shader.c spv_pool_mark), 0 none; its stores are not the game's memory writes (shader_wmem)
 } vkshader_t;
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader
 // Texture tables: a shader's arrays of TBL_MIN or more combined image samplers whose handles are consecutive words of one of the game's uniform buffers (element k = the handle at
@@ -258,6 +259,15 @@ int vk_pool_n(void); int vk_pool_samp_n(void);
 int vk_tex_id_max(void); int vk_samp_id_max(void);   // the highest texture / sampler ID registered so far (gfx_vk_tex.c)
 int vk_tex_pool_ok(const tex_t *t);   // may the pool tables bind this registered texture: 2 its image has its contents, 1 the table may give it its first use (small, storage mapped), 0 the dummy (gfx_vk_tex.c)
 void vk_tex_pool_fill(int on);        // around a pool-table fill: first uses made by it do not bump g_tex_gen (a real bind's first use does, so the tables are built again with it)
+// Pool read marks (DM_VK_POOL_MARK=1, start-up; gfx_vk_exec.c pool marks): set 0 has one more binding, POOL_MARK_B, a dynamic storage buffer of vk_pool_n() words per submission
+// slot, and every shader that indexes the texture pool stores 1 at the ID it reads (gfx_vk_shader.c spv_pool_mark). Without the switch set 0 and the shaders are as before
+enum { POOL_MARK_B = SET0_BINDINGS };
+int vk_pool_mark_on(void);            // the switch, where the device can take it (stores from the shader stages, pool tables, a dynamic storage descriptor to spare)
+int vk_pool_mark_partial(void);       // a shader's pool reads could not be marked: the marks then decide nothing (every ID counts as read)
+void vk_pool_mark_fold(int slot);     // gfx_vk_core.c mtl_sub_begin, once the slot's last submission is done: its marks into the IDs' last reads, cleared for its next
+void vk_tex_pool_cold(int on);        // around a pool-table fill's lookup of an ID no shader read lately: its image is not counted as drawn by it (vkimg_t.used)
+void vk_tex_touch_ids(const int *ids, int n);   // the images of these registered texture IDs counted as drawn now (vkimg_t.used): IDs the shaders were seen to read
+int vk_sub_slot(void); int vk_sub_slots(void);   // the submission slot being recorded (-1 between submissions), and how many slots there are (gfx_vk_core.c NSLOT)
 vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo);   // the geometry shader translated for the draw's input primitive (shader_vk.py gs_variant_key); gs when there is none
 enum { VK_ATEST_SPEC_FUNC = 0x7a00, VK_ATEST_SPEC_REF = 0x7a01 };   // the alpha test variant's specialization constants (gfx_vk_shader.c spv_alpha_test)
 int vk_shader_observer_pair(vkshader_t *vs, vkshader_t *fs, VkShaderModule modules[2]); // opt-in atomic diagnostic pair

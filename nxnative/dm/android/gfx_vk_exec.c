@@ -3167,6 +3167,117 @@ static unsigned tbl_kinds(const vkshader_t *s) {
         if (s->tbl[i] > 0 && s->tbl[i] <= SET0_BINDINGS) kinds |= 1u << (s->tbl[i] - 1);
     return kinds;
 }
+// ---------------- the texture pool read marks (DM_VK_POOL_MARK=1, start-up; off unless set) ----------------
+// The pool tables (tbl_ring, tbl_set) hold every registered texture ID, and their fills give each ID with contents an image (vk_tex_pool_ok 1, 64 a fill) and count that image
+// as drawn at every fill (gfx_vk_tex.c vk_tex_: vkimg_t.used), whether a shader ever reads the ID or not. Ocarina of Time registers whole scenes: in Kokiri Forest (Odin 3,
+// 2026-11-11) 5,957 images of 2.85 GB stood at the 3,072 MB image budget (DM_VK_IMAGE_BUDGET_MB), PSS 7.8 GB with 1.1 GB swapped, and the budget logged "none old enough to
+// drop": each image had just been filled. With the marks every shader that indexes the texture pool stores 1 at each ID it reads (gfx_vk_shader.c spv_pool_mark) into the
+// recording submission slot's words of one host-visible buffer (set 0's POOL_MARK_B, a dynamic storage buffer whose offset picks the slot), and once the slot's last
+// submission is done (mtl_sub_begin, before the slot is recorded again; never before its fence, with logical queues and the async replay too) its words are folded into each
+// ID's last read (a present) and cleared (vk_pool_mark_fold). Upstream (droidplay-core de4e11e80) copies the read IDs back for the same end; here the host reads them in place.
+//   - a fill gives an ID its first image only if a shader read it in the last MARK_RECENT presents; an unread one gets the dummy, as one without contents does. Its first read
+//     brings it in: IDs read for the first time, or again after MARK_RECENT presents unread, go to a log that the ring's patches take (pool_mark_take) and that tbl_set's
+//     cache counts as a texture generation (pool_mark_gen). That first read draws the dummy for a frame or two (counted in the periodic line: "began to be read");
+//   - a fill counts an image as drawn only for an ID read lately (vk_tex_pool_cold), and the fold counts the images of the IDs read as drawn (vk_tex_touch_ids, once in
+//     MARK_TOUCH presents an ID), so the texture budget keeps what the shaders read and can drop the rest (gfx_vk_budget.c);
+//   - the pool prefetch (DM_VK_POOL_PREFETCH) makes first uses only for IDs read at least once.
+// A shader whose reads could not be marked (gfx_vk_shader.c pool_mark_give_up) leaves the marks deciding nothing for the rest of the run (vk_pool_mark_partial). Without the
+// switch none of this runs and set 0, the shaders, the binds and the fills are as before
+enum { MARK_RECENT = 120, MARK_TOUCH = 16, MARK_LOG = 16384, MARK_SLOTS = 16, MARK_LOG_EVERY = 600 };
+static struct { int on, np, nslot, coherent, whole; VkBuffer b; VkDeviceMemory m; uint32_t *p; uint8_t used[MARK_SLOTS]; uint32_t *last, *touched, *log; int *warm, *touch;
+                uint64_t seq, reads, subs, warms, touches, cold, ns, logged; } g_mk = {.on = -1};
+// Fold one completed slot's words m (np of them, nonzero: read) into last[] (the present + 1 each pool index was last read at) and clear them. Indices read for the first time,
+// or again after MARK_RECENT presents unread, go to warm[]; those whose image was last counted as drawn MARK_TOUCH or more presents ago to touch[] (both np long). Returns the
+// indices read
+static int pool_mark_scan(uint32_t *m, int np, uint32_t now, uint32_t *last, uint32_t *touched, int *warm, int *nwarm, int *touch, int *ntouch) {
+    int reads = 0, nw = 0, nt = 0;
+    for (int k = 0; k < np; k += 2) {
+        if (k + 1 < np) { uint64_t two; memcpy(&two, m + k, 8); if (!two) continue; }   // (two words at a time: most IDs are not read)
+        for (int j = k; j < k + 2 && j < np; j++) { if (!m[j]) continue; m[j] = 0; reads++;
+            uint32_t l = __atomic_load_n(&last[j], __ATOMIC_RELAXED); if (!l || now - l > MARK_RECENT) warm[nw++] = j;
+            if (l != now) __atomic_store_n(&last[j], now, __ATOMIC_RELAXED);
+            if (!touched[j] || now - touched[j] >= MARK_TOUCH) { touched[j] = now; touch[nt++] = j; } } }
+    *nwarm = nw; *ntouch = nt; return reads;
+}
+static void pool_mark_init(void) {
+    if (!vk_pool_mark_on()) { __atomic_store_n(&g_mk.on, 0, __ATOMIC_RELEASE); return; }
+    int np = vk_pool_n(), ns = vk_sub_slots(); if (ns > MARK_SLOTS) die("[vk] pool read marks: %d submission slots, at most %d", ns, MARK_SLOTS);
+    VkDeviceSize size = (VkDeviceSize)np * 4 * (VkDeviceSize)ns;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
+    VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &g_mk.b)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, g_mk.b, &rq);
+    // host-cached memory where there is some: the fold reads the slot's whole np words (256 KB at 65,536 IDs) after each submission, slow from uncached memory
+    uint32_t t = vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+    if (t == UINT32_MAX) t = vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    if (t == UINT32_MAX) die("[vk] pool read marks: no host-visible memory for their buffer");
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, t};
+    vk_mem_tag = "pool marks"; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &g_mk.m)); vk_mem_tag = NULL; VKCHK(vkBindBufferMemory(V.dev, g_mk.b, g_mk.m, 0));
+    void *p; VKCHK(vkMapMemory(V.dev, g_mk.m, 0, VK_WHOLE_SIZE, 0, &p)); g_mk.p = p; memset(p, 0, (size_t)size);
+    g_mk.coherent = (V.mem.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    VkDeviceSize atom = V.props.limits.nonCoherentAtomSize; g_mk.whole = atom && ((VkDeviceSize)np * 4) % atom != 0;   // (a slot's range not whole atoms: the whole mapping is flushed)
+    if (!g_mk.coherent) { VkMappedMemoryRange mr = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, g_mk.m, 0, VK_WHOLE_SIZE}; VKCHK(vkFlushMappedMemoryRanges(V.dev, 1, &mr)); }
+    g_mk.last = calloc((size_t)np, 4); g_mk.touched = calloc((size_t)np, 4); g_mk.log = calloc(MARK_LOG, 4); g_mk.warm = calloc((size_t)np, sizeof(int)); g_mk.touch = calloc((size_t)np, sizeof(int));
+    if (!g_mk.last || !g_mk.touched || !g_mk.log || !g_mk.warm || !g_mk.touch) die("[vk] pool read marks: out of memory");
+    g_mk.np = np; g_mk.nslot = ns;
+    VKLOG("pool read marks: %d texture IDs x %d submission slots, %.1f MB of host-%s memory (DM_VK_POOL_MARK); an ID gets an image from the pool tables once a shader read it in the last %d presents",
+          np, ns, size / 1048576.0, g_mk.coherent ? "coherent" : "cached", MARK_RECENT);
+    __atomic_store_n(&g_mk.on, 1, __ATOMIC_RELEASE);
+}
+static int pool_mark_ready(void) {   // the marks are on (their buffer made at the first call)
+    int on = __atomic_load_n(&g_mk.on, __ATOMIC_ACQUIRE); if (on >= 0) return on;
+    static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, pool_mark_init); return __atomic_load_n(&g_mk.on, __ATOMIC_ACQUIRE) == 1;
+}
+// may the pool tables give pool index k an image and count it as drawn: a shader read it in the last MARK_RECENT presents (1 without the marks, or with them partial)
+static int pool_mark_warm(int k) {
+    if (!pool_mark_ready() || vk_pool_mark_partial() || k < 0 || k >= g_mk.np) return 1;
+    uint32_t l = __atomic_load_n(&g_mk.last[k], __ATOMIC_RELAXED); if (l && (uint32_t)g_tex_frame + 1 - l <= MARK_RECENT) return 1;
+    g_mk.cold++; return 0;
+}
+static int pool_mark_seen(int k) {   // has a shader ever read pool index k (the pool prefetch's IDs; 1 without the marks, or with them partial)
+    if (!pool_mark_ready() || vk_pool_mark_partial() || k < 0 || k >= g_mk.np) return 1;
+    return __atomic_load_n(&g_mk.last[k], __ATOMIC_RELAXED) != 0;
+}
+// IDs that began to be read so far (a log position; 0 without the marks): the ring's sets and tbl_set's cache take them again when it moves
+static uint64_t pool_mark_gen(void) { return __atomic_load_n(&g_mk.on, __ATOMIC_ACQUIRE) == 1 ? __atomic_load_n(&g_mk.seq, __ATOMIC_ACQUIRE) : 0; }
+// the IDs that began to be read between log positions from and to, added to tids[] (*n of cap used) as registered IDs; -1 when they do not fit or the log has gone past
+// from (the set is then written whole)
+static int pool_mark_take(uint64_t from, uint64_t to, int *tids, int *n, int cap) {
+    if (to - from > MARK_LOG || (uint64_t)(cap - *n) < to - from) return -1;
+    for (uint64_t s = from; s < to; s++) tids[(*n)++] = (int)g_mk.log[s % MARK_LOG] + g_pool_tex_base;
+    return 0;
+}
+// a set 0 just allocated: its marks binding, the whole buffer (the bind's dynamic offset picks the slot's words). 1 write added to *w, 0 without the marks
+static int pool_mark_write(VkDescriptorSet set, VkWriteDescriptorSet *w) {
+    if (!pool_mark_ready()) return 0;
+    static VkDescriptorBufferInfo bi; bi = (VkDescriptorBufferInfo){g_mk.b, 0, (VkDeviceSize)g_mk.np * 4};
+    *w = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, POOL_MARK_B, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, NULL, &bi, NULL};
+    return 1;
+}
+// binding set 0: the dynamic offset of the recording slot's words (1 offset, and the slot is folded when it is next begun), 0 offsets without the marks
+static uint32_t pool_mark_bind(uint32_t *off) {
+    if (!pool_mark_ready()) return 0;
+    int slot = vk_sub_slot(); if (slot < 0 || slot >= g_mk.nslot) slot = 0;
+    g_mk.used[slot] = 1; *off = (uint32_t)slot * (uint32_t)g_mk.np * 4u; return 1;
+}
+void vk_pool_mark_fold(int slot) {
+    if (__atomic_load_n(&g_mk.on, __ATOMIC_ACQUIRE) != 1 || slot < 0 || slot >= g_mk.nslot || !g_mk.used[slot]) return;
+    uint64_t t0 = tick(); g_mk.used[slot] = 0;
+    uint32_t *m = g_mk.p + (size_t)slot * (size_t)g_mk.np; uint32_t now = (uint32_t)g_tex_frame + 1; int nwarm = 0, ntouch = 0;
+    VkMappedMemoryRange mr = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, g_mk.m, g_mk.whole ? 0 : (VkDeviceSize)slot * g_mk.np * 4, g_mk.whole ? VK_WHOLE_SIZE : (VkDeviceSize)g_mk.np * 4};
+    if (!g_mk.coherent) vkInvalidateMappedMemoryRanges(V.dev, 1, &mr);   // (each submission ends with its writes made visible to the host: gfx_vk_core.c pools_readback_barrier)
+    int reads = pool_mark_scan(m, g_mk.np, now, g_mk.last, g_mk.touched, g_mk.warm, &nwarm, g_mk.touch, &ntouch);
+    if (!g_mk.coherent) vkFlushMappedMemoryRanges(V.dev, 1, &mr);        // the cleared words, for the slot's next submission
+    for (int i = 0; i < ntouch; i++) g_mk.touch[i] += g_pool_tex_base;
+    if (ntouch) vk_tex_touch_ids(g_mk.touch, ntouch);
+    uint64_t s = g_mk.seq; for (int i = 0; i < nwarm; i++) g_mk.log[(s + (uint64_t)i) % MARK_LOG] = (uint32_t)g_mk.warm[i];
+    __atomic_store_n(&g_mk.seq, s + (uint64_t)nwarm, __ATOMIC_RELEASE);
+    g_mk.subs++; g_mk.reads += (uint64_t)reads; g_mk.warms += (uint64_t)nwarm; g_mk.touches += (uint64_t)ntouch; g_mk.ns += tick() - t0;
+    if (g_tex_frame >= g_mk.logged + MARK_LOG_EVERY) { g_mk.logged = g_tex_frame; int recent = 0, ever = 0;
+        for (int k = 0; k < g_mk.np; k++) { uint32_t l = g_mk.last[k]; if (l) { ever++; if (now - l <= MARK_RECENT) recent++; } }
+        uint64_t bu, ev, evb, sw; vk_img_budget_stats(&bu, &ev, &evb, &sw);
+        VKLOG("pool read marks at present %llu: %d texture IDs read in the last %d presents, %d ever; %llu began to be read (their first reads drew the dummy or a kept image), %llu fill lookups of unread IDs, %llu images counted as drawn by reads; images %.0f MB of the %.0f MB budget (%llu dropped, %.0f MB); %llu submissions folded, %.3f ms a fold%s",
+              (unsigned long long)g_tex_frame, recent, MARK_RECENT, ever, (unsigned long long)g_mk.warms, (unsigned long long)g_mk.cold, (unsigned long long)g_mk.touches, vk_img_vkbytes() / 1048576.0, bu / 1048576.0,
+              (unsigned long long)ev, evb / 1048576.0, (unsigned long long)g_mk.subs, g_mk.subs ? g_mk.ns / 1e6 / (double)g_mk.subs : 0.0, vk_pool_mark_partial() ? " [RED] partial: the marks decide nothing" : ""); }
+}
 static struct { uint64_t h, epoch, tex, samp; uint32_t n, pool, kinds; int tex_base, samp_base; VkDescriptorSet set; } g_tblc[64];
 static uint64_t g_tbl_builds, g_tbl_hits, g_tbl_binds, g_ns_tbl, g_pool_builds; static uint32_t g_tbl_max_n, g_tbl_max_bytes;
 // Pool-only contents may outlive a submission only through the allocator's completed-slot lease.
@@ -3327,7 +3438,7 @@ static void tbl_trace(unsigned c, int st, const vkshader_t *s, int reused) {
 // go nearly every frame, and every one had the set after it written whole (21 ms on the Odin 3, 4 x 65,536 entries). IDs that read the dummy for lack of
 // contents or of first-use budget are retried by later patches, RING_RETRY at a time. Each take marks the images the set holds as used by the submission (eviction waits for it)
 enum { RING_N = 6, RING_TIDS = 2048, RING_RETRY = 256, RING_DROPS = 1024 };
-typedef struct { VkDescriptorSet set; uint64_t fence, logpos, fullgen, sampgen, sampseq, jobpos, dropseq, firstgen; uint32_t poolgen; int tex_base, samp_base, valid; vkimg_t **img; int *itid; size_t nimg, capimg; int *pend; size_t npend, cappend, pcur; } ring_slot;
+typedef struct { VkDescriptorSet set; uint64_t fence, logpos, fullgen, sampgen, sampseq, jobpos, dropseq, firstgen, markpos; uint32_t poolgen; int tex_base, samp_base, valid; vkimg_t **img; int *itid; size_t nimg, capimg; int *pend; size_t npend, cappend, pcur; } ring_slot;
 static ring_slot g_ring[RING_N]; static int g_ring_on = -1, g_ring_cur = -1;
 uint64_t vk_reglog_visible_end(uint64_t before); uint64_t vk_reglog_head(void); int vk_reglog_pending(uint64_t p, uint64_t before); uint64_t vk_reglog_take(uint64_t from, uint64_t before, int *tids, int max, int *n);
 int vk_alloc_sets_owned(VkDescriptorSetLayout l, int n, VkDescriptorSet *out); unsigned vk_pool_kinds(void); uint64_t nvn_replaying_job(void);
@@ -3360,10 +3471,13 @@ static int ring_entry(int st, ring_slot *r, int ps, int k, VkDescriptorImageInfo
         if (g_pdum_nf) { int f = 0; for (int q = 0; q < g_pdum_nf; q++) if ((uint32_t)t->d.format == g_pdum_f[q]) f = 1; if (!f) hit = 0; }
         if (hit) fits = 0; }
     if (!fits) return 0;
-    int ok = vk_tex_pool_ok(t);
+    int ok = vk_tex_pool_ok(t), warm = pool_mark_warm(k);   // (DM_VK_POOL_MARK: a shader read it lately; always without the marks)
+    if (ok == 1 && !warm) return 0;   // no first use for an ID no shader reads: the dummy, not retried; its first read brings it back (pool_mark_take)
     if (ok == 1) { if (*lazy_n < 64 && *lazy_b < (64u << 20)) { (*lazy_n)++; *lazy_b += t->L.size; } else return 1; }
     if (!ok) return 1;
+    if (!warm) vk_tex_pool_cold(1);   // (an image it has stays bound, but this fill does not count it as drawn: the budget may drop it)
     tex_desc_for(st, &vb, hh, d, 0); d->sampler = VK_NULL_HANDLE;
+    if (!warm) vk_tex_pool_cold(0);
     if (!d->imageView) { *d = dummy; return 1; }   // (no image yet: waits like one without contents)
     ring_img(r, g_desc_im, k + g_pool_tex_base); return 0;
 }
@@ -3395,6 +3509,7 @@ static void pool_prefetch(void) {
         if (!vk_tex_by_id(id, &v, &t) || !t) { seen[id] = 0; cur++; continue; }
         int target = v && v->set_target ? v->target : t->d.target;
         if (!(target == 1 || target == 2 || target == 4 || target == 8 || target == 9) || view_num(t, v) || vk_tex_pool_ok(t) != 1) { seen[id] = 0; cur++; continue; }
+        if (!pool_mark_seen(id - g_pool_tex_base)) { seen[id] = 0; cur++; continue; }   // (DM_VK_POOL_MARK: only IDs a shader has read; unlimited, it had made 3,010 images of 1,016 MB by the title)
         work = 1; idle = 0;
         if (!seen[id]) seen[id] = now;
         if (now - seen[id] < PF_AGE) { cur++; continue; }
@@ -3414,11 +3529,13 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
     if (!vk_registry_snapshot(&texseq, &sampseq)) return VK_NULL_HANDLE;
     if (g_ring_on < 0) { const char *e = getenv("DM_VK_POOL_RING"); g_ring_on = !e || atoi(e);
         if (g_ring_on) { VkDescriptorSet sets[RING_N]; if (!vk_alloc_sets_owned(vk_tbl_dsl(), RING_N, sets)) { g_ring_on = 0; VKLOG("[RED] pool table ring: its descriptor pool could not be made; tables are built as before"); }
-            else { for (int i = 0; i < RING_N; i++) g_ring[i].set = sets[i]; VKLOG("pool table ring: %d persistent sets (DM_VK_POOL_RING=0 builds tables as before)", RING_N); } } }
+            else { for (int i = 0; i < RING_N; i++) g_ring[i].set = sets[i]; VKLOG("pool table ring: %d persistent sets (DM_VK_POOL_RING=0 builds tables as before)", RING_N);
+                VkWriteDescriptorSet mw[RING_N]; uint32_t nm = 0; for (int i = 0; i < RING_N; i++) nm += (uint32_t)pool_mark_write(sets[i], &mw[nm]);   // (DM_VK_POOL_MARK: their marks binding, once)
+                if (nm) vkUpdateDescriptorSets(V.dev, nm, mw, 0, NULL); } } }
     if (!g_ring_on || !(poolmask & ((1u << POOL_TEX_SLOTS) - 1))) return VK_NULL_HANDLE;
     uint64_t t0 = tick(), f = mtl_last_fence() + 1, job = nvn_replaying_job(), jp = job ? job : UINT64_MAX, fg = ring_fullgen(), sg = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE); uint32_t pg = vk_pool_gen();
     if (g_ring_cur >= 0) { ring_slot *r = &g_ring[g_ring_cur];
-        if (r->valid && r->fence == f && r->fullgen == fg && r->sampgen == sg && r->sampseq == sampseq && r->poolgen == pg && r->tex_base == g_pool_tex_base && r->samp_base == g_pool_samp_base && r->jobpos <= jp && r->dropseq == vk_droplog_seq() && r->firstgen == g_tex_gen_why[1] && !vk_reglog_pending(r->logpos, jp)) {
+        if (r->valid && r->fence == f && r->fullgen == fg && r->sampgen == sg && r->sampseq == sampseq && r->poolgen == pg && r->tex_base == g_pool_tex_base && r->samp_base == g_pool_samp_base && r->jobpos <= jp && r->dropseq == vk_droplog_seq() && r->firstgen == g_tex_gen_why[1] && r->markpos == pool_mark_gen() && !vk_reglog_pending(r->logpos, jp)) {
             g_ring_hits++; g_ring_ns += tick() - t0; return r->set; } }
     // a set the GPU is done with and the recording command buffer does not hold: the most recently written one (fewest IDs to take again)
     uint64_t done = vk_fence_done(); int pick = -1;
@@ -3441,6 +3558,8 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
         if (!hit) { i++; continue; }
         if (ntid == RING_TIDS + RING_DROPS) { full = 1; break; }
         tids[ntid++] = r->itid[i]; r->nimg--; r->img[i] = r->img[r->nimg]; r->itid[i] = r->itid[r->nimg]; }
+    // DM_VK_POOL_MARK: the IDs shaders began to read since this set was written, which its fills left on the dummy: their entries again (a full write when they do not fit)
+    uint64_t mpos = pool_mark_gen(); if (!full && r->markpos != mpos && pool_mark_take(r->markpos, mpos, tids, &ntid, RING_TIDS + RING_DROPS) < 0) full = 1;
     // an image got its contents at a real bind since (a first use): every ID that waits on the dummy is tried again now, not RING_RETRY of them.
     // Pool memory that came or went (vk_pool_gen) takes a patch and no more: an entry already written holds a live image, which only the logs above take back, and what a pool
     // changes is vk_tex_pool_ok's answer for an ID without contents (its memory inside a live pool), which waits in the retry list. Writing the set whole for it was 23 ms,
@@ -3480,7 +3599,7 @@ static VkDescriptorSet tbl_ring(int st, unsigned poolmask) {
         for (int k = 1; k < NS; k++) { VkSampler sm = k < hw && !(g_pdum_kinds & 16) ? vk_samp_by_id(g_pool_samp_base + k) : VK_NULL_HANDLE; d[k] = (VkDescriptorImageInfo){sm ? sm : vk_dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL}; }
         ww[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, r->set, POOL_SAMP_B, 0, (uint32_t)NS, VK_DESCRIPTOR_TYPE_SAMPLER, d, NULL, NULL}; }
     if (nw) vkUpdateDescriptorSets(V.dev, nw, ww, 0, NULL);
-    r->valid = 1; r->fullgen = fg; r->sampgen = sg; r->sampseq = sampseq; r->poolgen = pg; r->tex_base = g_pool_tex_base; r->samp_base = g_pool_samp_base; r->jobpos = jp; r->logpos = pos; r->fence = f; r->dropseq = dseq; r->firstgen = fu;
+    r->valid = 1; r->fullgen = fg; r->sampgen = sg; r->sampseq = sampseq; r->poolgen = pg; r->tex_base = g_pool_tex_base; r->samp_base = g_pool_samp_base; r->jobpos = jp; r->logpos = pos; r->fence = f; r->dropseq = dseq; r->firstgen = fu; r->markpos = mpos;
     // (the list is for the drop log alone: full rewrites drop it, and a view drop or orphan forces one before a freed image could be reached. Nothing reads an image's last_use here)
     g_ring_cur = pick; g_ring_ns += tick() - t0;
     return r->set;
@@ -3507,7 +3626,8 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
     h = (h ^ (uint32_t)g_pool_samp_base) * 0x100000001b3ull;
     for (uint32_t k = 0; k < n; k++) h = (h ^ words[2 * k]) * 0x100000001b3ull;   // the high word of each handle is not read
     // Pool-only tables have no handle words; their kind bits live high in h. Fold them into the bucket so alternating kinds coexist.
-    uint64_t gtex = g_tex_gen, gsamp = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE); uint32_t gpool = vk_pool_gen(); unsigned c = (unsigned)((h ^ (h >> 32)) % (sizeof g_tblc / sizeof *g_tblc));
+    // (+ pool_mark_gen: with DM_VK_POOL_MARK, IDs that began to be read are new contents for a set whose fill left them on the dummy; 0 without, both only grow)
+    uint64_t gtex = g_tex_gen + pool_mark_gen(), gsamp = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE); uint32_t gpool = vk_pool_gen(); unsigned c = (unsigned)((h ^ (h >> 32)) % (sizeof g_tblc / sizeof *g_tblc));
     if (g_tblc[c].epoch == g_set_epoch && g_tblc[c].h == h && g_tblc[c].n == n && g_tblc[c].kinds == kinds && g_tblc[c].tex_base == g_pool_tex_base && g_tblc[c].samp_base == g_pool_samp_base && g_tblc[c].tex == gtex && g_tblc[c].samp == gsamp && g_tblc[c].pool == gpool && !g_x_nosetc) { tbl_trace(c, st, s, 1); g_tbl_hits++; g_ns_tbl += tick() - t0; return g_tblc[c].set; }
     tbl_persist_key persistent_key = {0}; VkDescriptorSet set = VK_NULL_HANDLE;
     int persistent = !ntbl && !n && poolmask && !g_x_nosetc && !g_var_now && tbl_persist_enabled() && tbl_persist_identity(&persistent_key, kinds);
@@ -3522,13 +3642,13 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
         // identity, retaining ownership of the claimed set rather than handing it out twice.
         if (hit < 0) {
             persistent = tbl_persist_identity(&persistent_key, kinds); sources.valid = persistent;
-            gtex = g_tex_gen; gsamp = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE); gpool = vk_pool_gen();
+            gtex = g_tex_gen + pool_mark_gen(); gsamp = __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE); gpool = vk_pool_gen();
         }
     }
     uint64_t build_start = tick();
     if (!ii) ii = calloc((size_t)TBL_SLOTS * (size_t)(N ? N : 1) + (size_t)POOL_TEX_SLOTS * (size_t)(NP ? NP : 1) + (size_t)(NS ? NS : 1), sizeof *ii);
     if (!set) set = vk_alloc_set(vk_tbl_dsl());
-    VkWriteDescriptorSet w[SET0_BINDINGS]; uint32_t nwr = 0;
+    VkWriteDescriptorSet w[SET0_BINDINGS + 1]; uint32_t nwr = 0;
     if (poolmask && NP && NS) {   // Only statically used bindings need descriptors; never update a set after recording it.
         VkDescriptorImageInfo *d = ii + (size_t)TBL_SLOTS * (size_t)(N ? N : 1); uint32_t filled[POOL_TEX_SLOTS + 1] = {0}, skipped = 0, deferred = 0;
         // textures bound only from the registry (vk_tex_pool_ok): those with contents, and at most POOL_LAZY_N first uses of POOL_LAZY_B bytes a fill (the rest the next submission's);
@@ -3542,7 +3662,7 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
             int hw = vk_tex_id_max() - g_pool_tex_base + 1; if (hw > NP) hw = NP;   // IDs past the highest registered: the dummy without a lookup (the table's length is the device's, 65536; a scene registers tens of thousands)
             for (int k = hw > 1 ? hw : 1; k < NP; k++) d[k] = dummy;
             for (int k = 1; k < hw; k++) {
-                uint64_t hh = mem_handle((uint64_t)k); const view_t *v = NULL; const tex_t *t = NULL; int fits = 0;
+                uint64_t hh = mem_handle((uint64_t)k); const view_t *v = NULL; const tex_t *t = NULL; int fits = 0, warm = 1;
                 if (vk_tex_by_id((int)(hh & 0xfffff), &v, &t) && t) { int target = v && v->set_target ? v->target : t->d.target;
                     fits = ps == 2 ? (t->d.width == t->d.height && (target == 8 || target == 9 || (target == 4 && t->d.depth >= 6))) : ps == 3 ? target == 2 : (target == 1 || target == 4 || target == 8 || target == 9);
                     if (g_pool_strict && fits) fits = ps == 0 ? target == 1 : ps == 1 ? target == 4 : ps == 2 ? target == 8 : 1;   // DM_VK_POOL_STRICT (x_read, test): as the Mac's pool_entry, each table holds only textures of its own type
@@ -3553,11 +3673,14 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
                         if (g_pdum_kinds && !(g_pdum_kinds & (1u << ps))) hit = 0;
                         if (g_pdum_nf) { int f = 0; for (int q = 0; q < g_pdum_nf; q++) if ((uint32_t)t->d.format == g_pdum_f[q]) f = 1; if (!f) hit = 0; }
                         if (hit) fits = 0; }
-                    if (fits) { int ok = vk_tex_pool_ok(t);
+                    if (fits) { int ok = vk_tex_pool_ok(t); warm = pool_mark_warm(k);   // (DM_VK_POOL_MARK, as ring_entry: no first use for an ID no shader reads lately)
+                        if (ok == 1 && !warm) ok = 0;
                         if (ok == 1) { if (lazy_n < POOL_LAZY_N && lazy_b < POOL_LAZY_B) { lazy_n++; lazy_b += t->L.size; } else { ok = 0; deferred++; } }
                         if (!ok) { fits = 0; skipped++; } } }
                 if (fits) { tex_t source; if (sources.valid) source = *t;
+                    if (!warm) vk_tex_pool_cold(1);
                     tex_desc_for(st, &vb, hh, &d[k], 0); d[k].sampler = VK_NULL_HANDLE;
+                    if (!warm) vk_tex_pool_cold(0);
                     if (!d[k].imageView) d[k] = dummy; else filled[ps]++;
                     if (sources.valid) {
                         if (d[k].imageView == dummy.imageView) sources.valid = 0;
@@ -3599,6 +3722,7 @@ static VkDescriptorSet tbl_set(int st, vkshader_t *s, unsigned poolmask) {   // 
         for (uint32_t k = n; k < (uint32_t)N; k++) d[k] = dummy;
         w[nwr++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)slot, 0, (uint32_t)N, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d, NULL, NULL};
     }
+    nwr += (uint32_t)pool_mark_write(set, &w[nwr]);   // (DM_VK_POOL_MARK: the marks binding of every set 0 built)
     if (nwr) vkUpdateDescriptorSets(V.dev, nwr, w, 0, NULL);
     if (persistent) tbl_persist_save(&persistent_key, set, &sources);
     tbl_sources_free(&sources); g_tbl_full_ns += tick() - build_start;
@@ -3686,8 +3810,9 @@ static int pass_dump_draw_initial(VkCommandBuffer *cb) {
     *cb = vk_cmd(); return 1;
 }
 // A shader that writes memory: a store through a pointer into a storage buffer, a uniform block (only BufferBlock storage can be written) or an image, an image write, an
-// atomic other than a load, a memory copy into such a pointer (SPIR-V scanned once). Without its SPIR-V: assumed to write
-static int spv_wmem(const uint32_t *w, uint32_t n) {
+// atomic other than a load, a memory copy into such a pointer (SPIR-V scanned once). Without its SPIR-V: assumed to write. skip: a variable whose stores do not count (the
+// pool read marks' buffer, DM_VK_POOL_MARK: host bookkeeping no draw of the game reads; counted, every pool shader would be compiled on the replay thread and end passes)
+static int spv_wmem(const uint32_t *w, uint32_t n, uint32_t skip) {
     if (!w || n < 5 || w[0] != 0x07230203) return 1;
     uint32_t bound = w[3]; uint8_t *mp = calloc(bound ? bound : 1, 1); if (!mp) return 1;   // 1: a pointer type into memory, 2: a pointer into memory
     int wr = 0;
@@ -3695,6 +3820,8 @@ static int spv_wmem(const uint32_t *w, uint32_t n) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16; if (!wc || i + wc > n) break;
         const uint32_t *o = w + i;
         if (op == 32 && wc >= 4 && o[1] < bound && (o[2] == 2 || o[2] == 11 || o[2] == 12 || o[2] == 5349)) mp[o[1]] = 1;   // OpTypePointer: Uniform, Image, StorageBuffer, PhysicalStorageBuffer
+        else if (op == 59 && skip && wc >= 3 && o[2] == skip) {}   // (the marks' buffer, and the access chains into it: their pointers stay untracked)
+        else if ((op == 65 || op == 66) && skip && wc >= 4 && o[3] == skip) {}
         else if ((op == 59 || op == 65 || op == 66 || op == 67 || op == 60 || op == 55 || op == 57 || op == 61 || op == 83 || op == 169 || op == 245) && wc >= 3 && o[1] < bound && o[2] < bound && mp[o[1]] == 1) mp[o[2]] = 2;   // OpVariable, access chains, OpImageTexelPointer; a pointer as a function's parameter or result, loaded, copied, selected
         else if (op == 62 && wc >= 3 && o[1] < bound && mp[o[1]] == 2) wr = 1;   // OpStore
         else if (op == 63 && wc >= 3 && o[1] < bound && mp[o[1]] == 2) wr = 1;   // OpCopyMemory
@@ -3704,7 +3831,7 @@ static int spv_wmem(const uint32_t *w, uint32_t n) {
     }
     free(mp); return wr;
 }
-static int shader_wmem(vkshader_t *s) { if (!s) return 0; if (!s->wmem) s->wmem = spv_wmem(s->spv, s->nspv) ? 1 : 2; return s->wmem == 1; }
+static int shader_wmem(vkshader_t *s) { if (!s) return 0; if (!s->wmem) s->wmem = spv_wmem(s->spv, s->nspv, s->mark_var) ? 1 : 2; return s->wmem == 1; }
 static int order_feedback(int nst) {   // a stage of the draw samples one of the open pass's attachments (its images by their storage)
     for (int st = 0; st < nst; st++) {
         if (!S.sh[st]) continue;
@@ -3948,7 +4075,8 @@ static int prepare_draw(int prim, int indexed) {
         if (fresh || g_bc.lay != layout || g_bc.nsets != (uint32_t)nsets || g_bc.ndofs != ndofs || memcmp(g_bc.sets + 1, sets + 1, sizeof *sets * (size_t)(nsets - 1)) || memcmp(g_bc.dofs, dall, sizeof *dall * ndofs)) {
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, (uint32_t)(nsets - 1), sets + 1, ndofs, dall);
             g_bc.lay = layout; g_bc.nsets = (uint32_t)nsets; g_bc.ndofs = ndofs; memcpy(g_bc.sets, sets, sizeof *sets * (size_t)nsets); memcpy(g_bc.dofs, dall, sizeof *dall * ndofs); } }
-    if (tbl && !(dbg_draw() & 4) && (g_bc.tbl != tbl || g_bc.gen != g_cmd_gen)) { vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &tbl, 0, NULL); g_bc.tbl = tbl; g_tbl_binds++; }   // the texture table: set 0, kept across pipelines (every graphics layout's set 0 is vk_tbl_dsl)
+    if (tbl && !(dbg_draw() & 4) && (g_bc.tbl != tbl || g_bc.gen != g_cmd_gen)) { uint32_t mo = 0, nmo = pool_mark_bind(&mo);   // (DM_VK_POOL_MARK: the slot's marks, by dynamic offset; a command buffer is one slot's)
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &tbl, nmo, nmo ? &mo : NULL); g_bc.tbl = tbl; g_tbl_binds++; }   // the texture table: set 0, kept across pipelines (every graphics layout's set 0 is vk_tbl_dsl)   // the texture table: set 0, kept across pipelines (every graphics layout's set 0 is vk_tbl_dsl)
     // vertex buffers
     for (uint32_t i = 0; i < k.nbind; i++) {
         uint32_t b = k.bind[i].binding; VkBuffer buf; VkDeviceSize off;

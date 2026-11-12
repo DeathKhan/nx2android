@@ -1631,6 +1631,7 @@ static void slot_recycle(vksub_t *s) {   // the GPU has passed this slot's last 
 }
 static vksub_t *cur(void) { if (g_cur < 0) die("[vk] no open submission"); return &g_slot[g_cur]; }
 int vk_sub_open(void) { return g_cur >= 0; }
+int vk_sub_slot(void) { return g_cur; } int vk_sub_slots(void) { return NSLOT; }   // (gfx_vk_exec.c pool read marks: a word array per slot)
 // A long submission is recorded into several command buffers, submitted together in order: Adreno's driver refuses a command buffer past some size at
 // vkEndCommandBuffer (VK_ERROR_OUT_OF_HOST_MEMORY), which NEO's handheld frames reached at about the 712th draw. The caller has ended the render pass.
 static void part_sent(vksub_t *s) { if (!pass_times_on()) return; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); uint64_t ns = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; for (int i = s->nmain_sent; i < s->nmain_used; i++) s->part_ns[i] = ns; }   // (the chain line's part times)
@@ -1997,8 +1998,8 @@ static const uint32_t DP_CAP_SMALL[DP_TYPES] = {[VK_DESCRIPTOR_TYPE_UNIFORM_BUFF
     [VK_DESCRIPTOR_TYPE_STORAGE_IMAGE] = 512, [VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER] = 1024, [VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER] = 512,
     [VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER] = 8192, [VK_DESCRIPTOR_TYPE_STORAGE_BUFFER] = 2048, [VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC] = 2048};
 static const uint32_t *DP_CAP = DP_CAP_BIG;   // (DM_VK_DP_SMALL=1: the small ones; a pool costs the same 11.8 MB either way on the Adreno 830, so the big ones fill slower)
-static uint32_t dp_pool_sizes(VkDescriptorPoolSize *sz) {   // the shared pools' sizes: every capacity, dynamic storage only when its descriptors are in use (DM_VK_DYN_SSBO)
-    uint32_t nz = 0; for (int t = 0; t < DP_TYPES; t++) if (DP_CAP[t] && (t != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC || V.dyn_ssbo)) sz[nz++] = (VkDescriptorPoolSize){(VkDescriptorType)t, DP_CAP[t]};
+static uint32_t dp_pool_sizes(VkDescriptorPoolSize *sz) {   // the shared pools' sizes: every capacity, dynamic storage only when its descriptors are in use (DM_VK_DYN_SSBO, DM_VK_POOL_MARK's set 0)
+    uint32_t nz = 0; for (int t = 0; t < DP_TYPES; t++) if (DP_CAP[t] && (t != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC || V.dyn_ssbo || vk_pool_mark_on())) sz[nz++] = (VkDescriptorPoolSize){(VkDescriptorType)t, DP_CAP[t]};
     return nz;
 }
 static nvn_hmap g_dsl_need = {.klen = sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t g_dsl_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -2220,6 +2221,7 @@ void mtl_sub_begin(void) {
     // for the one before to finish on the GPU, which kept the replay of a frame from overlapping the GPU work of the last)
     static int next; g_cur = next; next = (next + 1) % NSLOT; vksub_t *s = &g_slot[g_cur];
     slot_recycle(s);
+    vk_pool_mark_fold(g_cur);   // DM_VK_POOL_MARK: the slot's last submission is done (slot_recycle waited for it): the texture IDs its shaders read, before the slot records again
     cut_stats_begin(s);
     { const char *e = getenv("DM_VK_DESC_TIMING"); g_desc_timing = e && atoi(e); }
     s->npost = 0; s->up_used = 0; s->ngw = 0; s->nocc = 0; g_occ_active = -1; memset(s->occ, 0, sizeof s->occ);

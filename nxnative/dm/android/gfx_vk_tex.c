@@ -482,6 +482,10 @@ static vkimg_t *vk_tex_(const tex_t *t);
 // and deswizzles a huge texture (the 290 MB one waits for a real bind); 0: the dummy. The fill bounds how many first uses it makes (tbl_set), the rest wait for the next submission
 static __thread int t_pool_fill; extern uint64_t g_tex_gen; uint32_t vk_pool_gen(void);
 void vk_tex_pool_fill(int on) { t_pool_fill = on; }
+// DM_VK_POOL_MARK (gfx_vk_exec.c pool read marks): a fill's lookup of an ID no shader read lately leaves its image's last draw (vkimg_t.used) as it was, so the texture
+// budget can drop the images of IDs the tables hold but nothing reads; the images of the IDs read are counted as drawn from the marks instead (vk_tex_touch_ids)
+static __thread int t_pool_cold;
+void vk_tex_pool_cold(int on) { t_pool_cold = on; }
 static int range_mapped(const uint8_t *mem, size_t len) {
     uintptr_t a = (uintptr_t)mem & ~(uintptr_t)4095, e = ((uintptr_t)mem + len + 4095) & ~(uintptr_t)4095; size_t np = (e - a) / 4096;
     static __thread unsigned char *vec; static __thread size_t cap;
@@ -511,6 +515,13 @@ int vk_tex_pool_ok(const tex_t *t) {
     if ((long)t->L.size > cap) return 0;
     return range_mapped(t->mem, t->L.size) ? 1 : 0;
 }
+void vk_tex_touch_ids(const int *ids, int n) {   // (each looked up as vk_tex_pool_ok does: registry first, then the image under its lock; an ID without an image is passed over)
+    for (int i = 0; i < n; i++) { const view_t *v = NULL; const tex_t *t = NULL;
+        if (!vk_tex_by_id(ids[i], &v, &t) || !t || t->magic != MAGIC('T', 'E', 'X', 0) || t->d.target == NVN_TEXTURE_TARGET_BUFFER) continue;
+        const vkfmt_t *f = vk_fmt(t->d.format); if (!f) continue;
+        akey k; tex_storage_key(&k, t, f);
+        pthread_mutex_lock(&g_img_mu); vkimg_t *im = tex_image_find(t, &k, NULL); if (im) im->used = g_tex_frame; pthread_mutex_unlock(&g_img_mu); }
+}
 vkimg_t *vk_tex(const tex_t *t) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
     vkimg_t *im = vk_tex_(t); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[1] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return im; }
 static vkimg_t *vk_tex_(const tex_t *t) {
@@ -532,7 +543,8 @@ static vkimg_t *vk_tex_(const tex_t *t) {
         if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);
     }
     tex_image_pin_resolved(pinned, im);
-    im->used = g_tex_frame; if (!t_pool_fill) im->used_bind = g_tex_frame; int orphan = im->orphan;
+    if (!(t_pool_fill && t_pool_cold)) im->used = g_tex_frame;
+    if (!t_pool_fill) im->used_bind = g_tex_frame; int orphan = im->orphan;
     pthread_mutex_unlock(&g_img_mu);
     // A finalized pool no longer supplies CPU bytes. A queued snapshot retains its native contents.
     if (orphan) return im;

@@ -113,6 +113,11 @@ uint64_t vk_img_vkbytes(void) { return 0; }
 void vk_img_budget_stats(uint64_t *budget, uint64_t *evicted, uint64_t *evicted_bytes, uint64_t *sweeps) { *budget = *evicted = *evicted_bytes = *sweeps = 0; }
 void img_own_free_(VkDeviceMemory m) UNEXPECTED
 int vk_tex_pool_ok(const tex_t *t) UNEXPECTED
+// the pool read marks (DM_VK_POOL_MARK, off here: their set 0 binding, binds and fills are as without them)
+int vk_pool_mark_on(void) { return 0; } int vk_pool_mark_partial(void) { return 0; } void vk_tex_pool_cold(int on) UNEXPECTED
+void vk_tex_touch_ids(const int *ids, int n) UNEXPECTED
+int vk_sub_slot(void) UNEXPECTED
+int vk_sub_slots(void) UNEXPECTED
 int vk_registry_snapshot(uint64_t *textures, uint64_t *samplers) { return 0; }
 uint64_t vk_reglog_visible_end(uint64_t before) { return 0; } uint64_t vk_reglog_head(void) { return 0; } int vk_reglog_pending(uint64_t p, uint64_t before) { return 0; }
 uint64_t vk_reglog_take(uint64_t from, uint64_t before, int *tids, int max, int *n) UNEXPECTED
