@@ -996,14 +996,29 @@ def dump_folder(folder):   # a folder of the game's files (pack_dump.py), with n
     return pack_dump.is_dump(folder) and not files_with_suffix(folder, *PACKAGE_SUFFIXES)
 
 
+def addon_container(folder):
+    """A folder that holds no NUP container to pack: an add-on the user installed on their own may name one for it (dm/gfx/tools/ext.py, game_container), which is then packed
+    as if that .nup file had been given. None with no add-on (the default) and when the add-on has nothing for the folder: the caller goes on as it does without this"""
+    tools = str(Path(__file__).resolve().parents[1] / 'dm/gfx/tools')
+    if tools not in sys.path: sys.path.append(tools)
+    import ext
+    try: got = (f := ext.hook('game_container')) and f(folder, say)
+    except BuildError: raise
+    except Exception as e: raise BuildError(str(e) or type(e).__name__) from e
+    if not got: return None
+    got = Path(got)
+    if not (got.is_file() and pack_nup.is_nup(got)): raise BuildError(f'not a NUP file: {got} (which an add-on named for {folder})')
+    return got
+
+
 def nup_file(path):   # the NUP to pack: path when it is a .nup file, else the one .nup in the folder when no game package is beside it; None when there is none
     if path.is_file():
         if not pack_nup.is_nup(path): raise BuildError(f'not a folder or a NUP file: {path}')
         return path
-    if files_with_suffix(path, *PACKAGE_SUFFIXES): return None
+    if files_with_suffix(path, *PACKAGE_SUFFIXES): return addon_container(path)
     nups = [p for p in files_with_suffix(path, '.nup') if pack_nup.is_nup(p)]
     if len(nups) > 1: raise BuildError(f'more than one NUP in {path}: {", ".join(p.name for p in nups)}; keep one game per folder, or give the .nup file to pack in place of the folder')
-    return nups[0] if nups else None
+    return nups[0] if nups else addon_container(path)
 
 
 def scan_nup(path, want=None):   # a NUP: (title ID, {'base', 'updates', 'dlc', 'nup': the open container})

@@ -16,6 +16,8 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / 'dm/tools'))
 import nacp
 import romfs_image
+sys.path.append(str(REPO / 'dm/gfx/tools'))
+import ext   # the add-on loader, for the stand-in add-on of AddonContainer
 spec = importlib.util.spec_from_file_location('build_ipa_from_nsp', REPO / 'scripts/build_ipa_from_nsp.py')
 if spec is None or spec.loader is None: raise ImportError('scripts/build_ipa_from_nsp.py')
 nsp = importlib.util.module_from_spec(spec); spec.loader.exec_module(nsp)
@@ -184,6 +186,52 @@ class Read(Base):
         self.assertEqual(nsp.nup_file(self.path), self.path)
         (self.dir / 'game.nsp').write_bytes(b'x')
         self.assertIsNone(nsp.nup_file(self.dir))   # the packages win, as over a dump's layout
+
+
+class AddonContainer(Base):
+    """A folder without a NUP container to pack: an add-on's game_container hook (dm/gfx/tools/ext.py) may name one. The add-on is a stand-in written here; none ships"""
+    def setUp(self):
+        super().setUp()
+        self.other = self.dir.parent / 'other'; self.other.mkdir()   # a folder with no .nup in it
+        path = list(sys.path); self.addCleanup(lambda: sys.path.__setitem__(slice(None), path))
+
+    def addon(self, body):
+        """Load a stand-in add-on whose game_container has this body (None: no add-on at all), as a fresh process would"""
+        env = {k: v for k, v in os.environ.items() if k != 'NUP2ANDROID_ADDONS'}
+        if body is not None:
+            f = self.dir.parent / 'addon.py'; f.write_text(f'from pathlib import Path\nNUP = Path({str(self.path)!r})\ndef game_container(folder, say):\n    {body}\n')
+            env['NUP2ANDROID_ADDONS'] = str(f)
+        for p in (mock.patch.dict(os.environ, env, clear=True), mock.patch.object(ext, '_mods', None)): p.start(); self.addCleanup(p.stop)
+
+    def test_without_an_addon_nothing_changes(self):
+        self.addon(None)
+        self.assertIsNone(nsp.nup_file(self.other))
+        (self.dir / 'game.nsp').write_bytes(b'x')
+        self.assertIsNone(nsp.nup_file(self.dir))
+
+    def test_the_named_container_is_taken_as_if_given(self):
+        self.addon("say(f'asked for {folder.name}'); return NUP")
+        with mock.patch.object(nsp, 'say') as said: self.assertEqual(nsp.nup_file(self.other), self.path)
+        said.assert_called_once_with('asked for other')
+        (self.dir / 'game.nsp').write_bytes(b'x')   # a folder whose own .nup is not taken (the packages win): the add-on is asked there too
+        self.assertEqual(nsp.nup_file(self.dir), self.path)
+        fam = nsp.scan_nup(nsp.nup_file(self.other))[1]; self.addCleanup(fam['nup'].close)
+        self.assertEqual([v for v, _ in fam['updates']], [VER])
+
+    def test_a_folder_with_its_own_container_does_not_ask(self):
+        self.addon("raise RuntimeError('asked')")
+        self.assertEqual(nsp.nup_file(self.dir), self.path)
+        self.assertEqual(nsp.nup_file(self.path), self.path)
+
+    def test_an_addon_with_nothing_for_the_folder(self):
+        self.addon('return None')
+        self.assertIsNone(nsp.nup_file(self.other))
+
+    def test_an_addons_failure_and_a_wrong_answer_stop_the_build(self):
+        self.addon("raise RuntimeError('cannot make it')")
+        with self.assertRaisesRegex(nsp.BuildError, '^cannot make it$'): nsp.nup_file(self.other)
+        self.addon("return folder / 'none.nup'")
+        with self.assertRaisesRegex(nsp.BuildError, 'not a NUP file: .*none.nup'): nsp.nup_file(self.other)
 
 
 class Head(Base):

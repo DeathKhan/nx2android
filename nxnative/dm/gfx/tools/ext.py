@@ -12,6 +12,7 @@
 #   rpf_read(token, data) -> bytes                    such an archive's tables, or a file of it that reads as neither a zstd frame nor a zlib stream (rpf6.Rpf)
 #   cra_files(nros) -> [(…, name, length, …), …] or None   a CRA archive's files, from the NROs captured at a boot (shader_split.cra_jobs)
 #   cra_head(file, entry) -> bytes, cra_read(file, entry) -> bytes   the start of one such file, and all of it (shader_split.cra_shaders)
+#   game_container(folder, say) -> path or None       a folder that holds no NUP container: the .nup file to pack for it; say prints a line (build_ipa_from_nsp.nup_file, pipeline.scan)
 import importlib.util, os, sys
 
 _mods = None

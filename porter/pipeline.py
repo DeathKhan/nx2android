@@ -310,7 +310,7 @@ class Port:
     def inputs(self):
         o = self.o
         say(f'game folder: {o.folder}')
-        self.app, self.fam = scan(o.folder, getattr(o, 'title_id', None))
+        self.app, self.fam = scan(self.nup or o.folder, getattr(o, 'title_id', None))   # the container _run found: the folder is not searched a second time
         if o.folder.is_file(): o.folder = o.folder.parent   # a .nup given in place of its folder: the build folder and the output go beside it
         if self.fam.get('nup'):
             say(f'a NUP: {self.nup.name}, {len(self.fam["updates"])} update(s), {len(self.fam["dlc"])} DLC')
