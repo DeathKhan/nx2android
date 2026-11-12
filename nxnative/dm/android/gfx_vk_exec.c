@@ -2050,6 +2050,14 @@ static void *prewarm_thread(void *arg) {
         pthread_mutex_lock(&g_pipe_mu); int have = nvn_hm_get(&g_pipes, k) != NULL; pthread_mutex_unlock(&g_pipe_mu);
         if (have) continue;
         vkshader_t *stg[3] = {0}; int ok = 1;
+        // Each key must be the bundle's shader of its slot's stage (vertex 0, fragment 1, geometry 2; bind_program places shaders by the bundle's stage, and the generated
+        // mesh pass-through / per-vertex geometry shaders are bundled under those stages). A record that names another stage there (another build's, or a damaged file) would
+        // be made as a stage it is not: droidplay-core fa45ee53c met a mesh shader made as a vertex stage crash the Adreno 830's compiler at every start
+        { int vk_shader_stage(uint64_t key); for (int s = 0; s < 3 && ok; s++) if (k->key[s] && !(s == 1 && k->raster_discard) && vk_shader_stage(k->key[s]) != s) {
+            static _Atomic int wrong; if (!atomic_fetch_add(&wrong, 1)) VKLOG("[RED] prewarm: a recorded pipeline with shader %016llx (bundle stage %d) in slot %d is left out (the replay makes no such pipeline)",
+                (unsigned long long)k->key[s], vk_shader_stage(k->key[s]), s);
+            ok = 0; } }
+        if (!ok) continue;
         for (int s = 0; s < 3; s++) if (k->key[s] && !(s == 1 && k->raster_discard)) { stg[s] = vk_shader(k->key[s], s); if (!stg[s]) ok = 0; }
         if (!ok || !stg[0]) continue;
         VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;
