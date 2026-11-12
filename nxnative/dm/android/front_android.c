@@ -1539,6 +1539,16 @@ static void floor_post(int want, int wait_ms) {
 static void gpu_floor_restore(void) { floor_post(0, 0); }   // the background: the previous floor back
 static void gpu_floor_resume(void) { floor_post(1, 0); }    // back in front: the floor again, through the path that worked
 static void gpu_floor_end(void) { floor_post(0, 500); }     // onDestroy
+// The previous start's dumps kept beside the new ones (droidplay-core e6eb551de): the host opens DM_NVN_TSV and DM_AUDIO_DUMP "w", so a start after a kill (lmkd,
+// a crash) erased the killed run's. Each goes to <name>.prev<extensions> (bench.tsv → bench.prev.tsv), over the one before; log.txt → log.prev.txt is done above
+static int keep_prev(const char *path) {
+    struct stat st; char prev[1024];
+    if (!path || !*path || stat(path, &st) || !S_ISREG(st.st_mode)) return 0;
+    const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
+    const char *dot = strchr(base, '.'); size_t at = dot ? (size_t)(dot - path) : strlen(path);
+    int k = snprintf(prev, sizeof prev, "%.*s.prev%s", (int)at, path, path + at);
+    return k > 0 && (size_t)k < sizeof prev && rename(path, prev) == 0;
+}
 static void env_file(const char *path) {   // KEY=VALUE per line (# comments): switches without rebuilding, as the iOS app's Documents/env.txt
     FILE *f = fopen(path, "r"); char line[1024];
     if (!f) return;
@@ -1615,6 +1625,8 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
+    { int kept = keep_prev(getenv("DM_NVN_TSV")) + keep_prev(getenv("DM_AUDIO_DUMP"));   // before the host opens them
+      if (kept) LOG("the previous start's dumps: %d kept beside the new ones, with .prev before the extension", kept); }
 #ifdef DM_RELEASE
     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
 #endif
