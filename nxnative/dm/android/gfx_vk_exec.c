@@ -4979,7 +4979,7 @@ static void dispatch(const p_dispatch *d) {
     }
     else if (d->ind) { VkBuffer b; VkDeviceSize o; if (!(d->ind & 3) && vk_buf_at(d->ind, 12, &b, &o) && !(o & 3)) vkCmdDispatchIndirect(cb, b, o); else dispatched = 0; }   // (Vulkan: a 4-byte-aligned offset)
     else vkCmdDispatch(cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
-    vk_pass_ts(1, (uint32_t)d->x, (uint32_t)d->y, PT_DISPATCH, (uint32_t)d->z);
+    { extern uint64_t g_vk_pass_key; g_vk_pass_key = cs->key; } vk_pass_ts(1, (uint32_t)d->x, (uint32_t)d->y, PT_DISPATCH, (uint32_t)d->z);   // (the timed dispatch names its shader)
     if (g_cs_images_n) cs_trace_images_copy(cb, cs->key, 1);
     if (g_cs_buffers_n && dispatched) cs_trace_buffers_copy(cb, cs->key, 1);
     if (selected_trace) VKLOG("compute trace key %016llx native dispatch %s%s", (unsigned long long)cs->key,

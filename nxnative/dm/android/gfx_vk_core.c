@@ -1416,17 +1416,18 @@ static VkCommandBuffer g_slot_main_cb(void) { return g_slot[g_cur].main; }
 // DM_VK_PASS_TIMES=1: a timestamp before and after every render pass (the replay's per-frame line then lists the passes that cost the most GPU time)
 enum { PASSQ = 512 };   // passes (and dispatches) timed per submission
 static VkQueryPool g_pq; static int g_pq_on = -1;
-typedef struct { uint32_t w, h, fmt, draws, fidx, part, flags; uint64_t cpu_ns; } pass_meta;   // part: the command buffer it was recorded in; cpu_ns: host time its end was recorded   // fidx: the pass's place in its frame (submissions are cut every DM_VK_CB_DRAWS draws)
+typedef struct { uint32_t w, h, fmt, draws, fidx, part, flags; uint64_t cpu_ns, key; } pass_meta;   // part: the command buffer it was recorded in; cpu_ns: host time its end was recorded   // fidx: the pass's place in its frame (submissions are cut every DM_VK_CB_DRAWS draws)
 enum { FPASSQ = 512 }; static int g_fpass;   // passes of the frame so far
 void vk_pass_frame(void) { g_fpass = 0; }   // a present: the next pass is the frame's first
 static pass_meta g_pmeta[NSLOT][PASSQ]; static int g_npass[NSLOT];
 static double g_pacc[FPASSQ]; static uint32_t g_pcnt[FPASSQ]; static pass_meta g_plast[FPASSQ]; static int g_pmax;   // by the pass's place in its frame (the completion thread adds)
 static int pass_times_on(void) { if (g_pq_on < 0) { const char *e = getenv("DM_VK_PASS_TIMES"); g_pq_on = e && atoi(e); } return g_pq_on && g_pq; }
+uint64_t g_vk_pass_key;   // the dispatch being ended: its compute shader key (gfx_vk_exec.c; droidplay-core b631fa11b), so a slow dispatch names its shader
 uint32_t g_vk_pass_flags;   // the pass being ended (gfx_vk_exec.c vk_end_pass): colour attachments (bits 0-3), depth (4), depth loaded (5), colour 0 loaded (6), split continuation (7)
 void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws) {
     if (!pass_times_on() || g_cur < 0) return; int *n = &g_npass[g_cur]; if (*n >= PASSQ) return;
     vkCmdWriteTimestamp(g_slot_main_cb(), end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_pq, (uint32_t)(g_cur * PASSQ * 2 + *n * 2 + end));
-    if (end) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g_pmeta[g_cur][*n] = (pass_meta){w, h, fmt, draws, (uint32_t)(g_fpass < FPASSQ - 1 ? g_fpass : FPASSQ - 1), (uint32_t)(g_slot[g_cur].nmain_used - 1), g_vk_pass_flags, (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec}; (*n)++; g_fpass++; }
+    if (end) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g_pmeta[g_cur][*n] = (pass_meta){w, h, fmt, draws, (uint32_t)(g_fpass < FPASSQ - 1 ? g_fpass : FPASSQ - 1), (uint32_t)(g_slot[g_cur].nmain_used - 1), g_vk_pass_flags, (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec, fmt == PT_DISPATCH ? g_vk_pass_key : 0}; (*n)++; g_fpass++; }
 }
 void vk_pass_report(void) {   // the most expensive passes since the last report, then the counters start again
     if (!pass_times_on()) return;
@@ -1435,7 +1436,7 @@ void vk_pass_report(void) {   // the most expensive passes since the last report
     double tot = 0; for (int i = 0; i < m; i++) if (g_pcnt[i]) tot += g_pacc[i] / g_pcnt[i];
     char b[3000]; int o = snprintf(b, sizeof b, "passes by GPU time (%d passes, %.2f ms in passes per frame):", m, tot);
     for (int i = 0; i < m && i < 20 && o < (int)sizeof b - 80; i++) { int k = idx[i]; if (!g_pcnt[k]) continue;
-        if (g_plast[k].fmt == PT_DISPATCH) o += snprintf(b + o, sizeof b - (size_t)o, " #%d %.2f ms (dispatch %ux%ux%u);", k, g_pacc[k] / g_pcnt[k], g_plast[k].w, g_plast[k].h, g_plast[k].draws);
+        if (g_plast[k].fmt == PT_DISPATCH) o += snprintf(b + o, sizeof b - (size_t)o, " #%d %.2f ms (dispatch %ux%ux%u cs %016llx);", k, g_pacc[k] / g_pcnt[k], g_plast[k].w, g_plast[k].h, g_plast[k].draws, (unsigned long long)g_plast[k].key);
         else o += snprintf(b + o, sizeof b - (size_t)o, " #%d %.2f ms (%ux%u fmt %u, %u draws over %u px wide);", k, g_pacc[k] / g_pcnt[k], g_plast[k].w, g_plast[k].h, g_plast[k].fmt, g_plast[k].draws & 0xffff, g_plast[k].draws >> 16); }
     { extern uint64_t g_nvn_discards[2]; static uint64_t pd0, pd1; o += snprintf(b + o, sizeof b - (size_t)o, " discards since: colour %llu, depth %llu", (unsigned long long)(g_nvn_discards[0] - pd0), (unsigned long long)(g_nvn_discards[1] - pd1)); pd0 = g_nvn_discards[0]; pd1 = g_nvn_discards[1]; }
     VKLOG("%s", b);
@@ -2426,7 +2427,7 @@ static void pass_spike_flush(void) {
         for (int i = 0; i < g_nsf && i < 6; i++) for (int j = i + 1; j < g_nsf; j++) if (g_sf[j].ms > g_sf[i].ms) { __typeof__(g_sf[0]) x = g_sf[i]; g_sf[i] = g_sf[j]; g_sf[j] = x; }
         char b[1200]; int o = snprintf(b, sizeof b, "GPU spike: frame %llu, %.2f ms in %d passes and dispatches (frame GPU %.2f ms, %.2f outside them):", (unsigned long long)g_sf_frame, g_sf_tot, g_nsf, fg, fg - g_sf_tot);
         for (int i = 0; i < g_nsf && i < 6 && o < (int)sizeof b - 100; i++) { const pass_meta *m = &g_sf[i].m;
-            if (m->fmt == PT_DISPATCH) o += snprintf(b + o, sizeof b - (size_t)o, " #%u %.2f ms (dispatch %ux%ux%u);", m->fidx, g_sf[i].ms, m->w, m->h, m->draws);
+            if (m->fmt == PT_DISPATCH) o += snprintf(b + o, sizeof b - (size_t)o, " #%u %.2f ms (dispatch %ux%ux%u cs %016llx);", m->fidx, g_sf[i].ms, m->w, m->h, m->draws, (unsigned long long)m->key);
             else o += snprintf(b + o, sizeof b - (size_t)o, " #%u %.2f ms (%ux%u fmt %u, %u draws);", m->fidx, g_sf[i].ms, m->w, m->h, m->fmt, m->draws & 0xffff); }
         VKLOG("%s", b);
     }
@@ -2450,7 +2451,7 @@ static void chain_maybe(const cpend *c, const uint64_t *t, int np) {
     { const char *e = getenv("DM_VK_PASS_TIMES"); if (!e || atoi(e) < 2) return; }   // =2: every pass of it too, in order (start on the same clock, duration, size, format, draws, attachments)
     o = 0; for (int i = 0; i < np; i++) { uint64_t hs, he; const pass_meta *m = &c->pmeta[i];
         if (t[2 * i + 1] <= t[2 * i] || !gpu_clock_host_ns(ck, t[2 * i], &hs) || !gpu_clock_host_ns(ck, t[2 * i + 1], &he)) continue;
-        if (m->fmt == PT_DISPATCH) o += snprintf(b + o, sizeof b - (size_t)o, " %d@%.2f+%.3f D%ux%ux%u;", i, (hs - b0) / 1e6, (double)(he - hs) / 1e6, m->w, m->h, m->draws);
+        if (m->fmt == PT_DISPATCH) o += snprintf(b + o, sizeof b - (size_t)o, " %d@%.2f+%.3f D%ux%ux%u cs %016llx;", i, (hs - b0) / 1e6, (double)(he - hs) / 1e6, m->w, m->h, m->draws, (unsigned long long)m->key);
         else o += snprintf(b + o, sizeof b - (size_t)o, " %d@%.2f+%.3f %ux%u f%u d%u c%u%s%s%s%s;", i, (hs - b0) / 1e6, (double)(he - hs) / 1e6, m->w, m->h, m->fmt, m->draws & 0xffff, m->flags & 15,
                            m->flags & 16 ? (m->flags & 32 ? " DL" : " Dc") : "", m->flags & 64 ? " CL" : "", m->flags & 128 ? " S" : "", "");
         if (o > (int)sizeof b - 120) { VKLOG("chain passes:%s", b); o = 0; } }
