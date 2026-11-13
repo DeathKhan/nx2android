@@ -103,13 +103,14 @@ typedef struct { void *pImageInfo;int descriptorType; } Write;
 static struct {uint64_t img[6][32];} S;
 static uint64_t g_num_um,g_num_im;
 static int numeric;
+static void die(const char *m){fputs(m,stderr);abort();}   // (the capacity check in the branch)
 static uint64_t ubo_word(int st,int reg,int off){assert(st==5&&reg==4&&off==8);return 77;}
 static uint64_t mem_handle(uint64_t x){return x;}
 static int tex_desc_for(int st,const dmsv_bind *b,uint64_t h,VkDescriptorImageInfo *ii,int storage){
  assert(st==5&&b->binding==23&&h==77&&ii&&storage==1);return numeric;
 }
 static void run(int kind,int num,int index){
- dmsv_bind bind={kind,4,8,23};const dmsv_bind *b=&bind;int st=5,nii=0,nw=0;VkDescriptorImageInfo ii[1];Write w={0},*wr=&w;
+ dmsv_bind bind={kind,4,8,23};const dmsv_bind *b=&bind;int st=5,nw=0;unsigned nii=0;VkDescriptorImageInfo ii[1];Write w={0},*wr=&w;
  numeric=num;g_num_um=g_num_im=0;S.img[5][4]=77;
  for(int i=index;i==index;i++){switch(kind){
 """ + branch + r"""
