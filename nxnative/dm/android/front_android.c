@@ -213,6 +213,26 @@ static void act_finish(ANativeActivity *a) {
     if (m) (*E)->CallVoidMethod(E, a->clazz, m);
     if (!m || (*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); LOG("[RED] Activity.finish() failed: the app ends itself"); _exit(0); }
 }
+// A game left with HOME stays in memory: without this its process is cached, and Android ended it within minutes (the low memory killer takes a cached process of
+// several GB first, and the cached-app freezer kills one whose binder buffer fills: "excessive binder traffic during cached" in the Odin 3's exit records), so
+// coming back started the game from its beginning. org.nx2a.KeepAlive (java/, in the APK with mkapk.py --keep-alive) is a foreground service: with it the process is
+// not cached. startService and not startForegroundService: the activity is in front here, and a service that cannot go foreground then ends without the system
+// ending the app. An APK without the class (code-less, as before): startService finds nothing and returns null. DM_KEEP_ALIVE=0 (env.txt) leaves it off
+static void keep_alive(ANativeActivity *a) {
+    const char *e = getenv("DM_KEEP_ALIVE"); if ((e && *e == '0') || !a || !a->env || !a->clazz) return;
+    JNIEnv *E = a->env; jobject it = NULL, r = NULL;
+    jclass ci = (*E)->FindClass(E, "android/content/Intent");
+    jmethodID init = ci ? (*E)->GetMethodID(E, ci, "<init>", "()V") : NULL;
+    jmethodID scn = init ? (*E)->GetMethodID(E, ci, "setClassName", "(Landroid/content/Context;Ljava/lang/String;)Landroid/content/Intent;") : NULL;
+    if (scn && !(*E)->ExceptionCheck(E)) it = (*E)->NewObject(E, ci, init);
+    if (it && !(*E)->ExceptionCheck(E)) { jstring n = (*E)->NewStringUTF(E, "org.nx2a.KeepAlive"); if (n) (*E)->CallObjectMethod(E, it, scn, a->clazz, n); }
+    if (it && !(*E)->ExceptionCheck(E)) { jclass ca = (*E)->GetObjectClass(E, a->clazz);
+        jmethodID ss = ca ? (*E)->GetMethodID(E, ca, "startService", "(Landroid/content/Intent;)Landroid/content/ComponentName;") : NULL;
+        if (ss && !(*E)->ExceptionCheck(E)) r = (*E)->CallObjectMethod(E, a->clazz, ss, it); }
+    if ((*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); r = NULL; }
+    if (r) LOG("[front] the game stays in memory while in the background (keep-alive service; DM_KEEP_ALIVE=0 leaves it off)");
+    else LOG("[front] no keep-alive service in this APK: Android may end the game while it is in the background");
+}
 static void on_resume(ANativeActivity *a) { if (g_quit) { act_finish(a); return; } immersive(a); gpu_floor_resume(); go_foreground(); }
 static void on_destroy(ANativeActivity *a) { (void)a; gpu_floor_end(); _exit(0); }   // one game per process
 
@@ -1638,6 +1658,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);
+    keep_alive(act);
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);
     // The game's main thread: a 16 MB stack mapped here and handed over whole (pthread_attr_setstack), so the range pthread_getattr_np reports, which
     // svcQueryMemory gives the game as its main thread stack (hle_svc.c), is exactly mapped memory: IL2CPP's garbage collector scans that range from

@@ -831,7 +831,7 @@ class Port:
         icon = self.icon()
         code = version_code(self.pkg_ver, self.o.vercode_offset)
         if self.o.vercode_offset: say(f'versionCode {code} ({self.pkg_ver} + 1 + offset {self.o.vercode_offset})')
-        external = self.external_activity() if self.o.external_display or self.o.native_keyboard else []
+        external = self.external_activity() if self.o.external_display or self.o.native_keyboard else self.keep_alive_only()
         driver = self.o.vulkan_driver
         if driver and driver.name != driver_lib_name(driver):   # packed under a lib*.so name (driver_lib_name), copied beside the host library
             driver = self.so.parent / driver_lib_name(driver); shutil.copyfile(self.o.vulkan_driver, driver)
@@ -843,6 +843,13 @@ class Port:
                 self.logs / 'android_apk.log', env=self.env)
         self.result['apk'] = str(self.apk_path)
         PROG.end(f'{self.apk_path.name}, {self.apk_path.stat().st_size / 2**20:.1f} MB')
+
+    def keep_alive_only(self):
+        """A code-less APK gets the keep-alive service (java/org/nx2a/KeepAlive.java: a game left with HOME stays in memory) when javac and an Android SDK are there;
+        without them the APK stays code-less, as before, and Android may end the game in the background"""
+        try: return self.external_activity()[:2] + ['--keep-alive']
+        except BuildError:
+            say('no javac or Android SDK (ANDROID_HOME): the APK has no keep-alive service, and Android may end the game while it is in the background'); return []
 
     def external_activity(self):
         javac = shutil.which('javac')
@@ -859,7 +866,8 @@ class Port:
         nsp.run([javac, '-source', '8', '-target', '8', '-classpath', platform, '-d', classes, *sources], self.logs / 'android_external_java.log', env=self.env)
         nsp.run([d8, '--min-api', '29', '--lib', platform, '--output', dex, *sorted(classes.rglob('*.class'))], self.logs / 'android_external_dex.log', env=self.env)
         activity = 'KeyboardExternalActivity' if self.o.native_keyboard else 'ExternalActivity'
-        return ['--dex', dex / 'classes.dex', '--activity', 'org.nx2a.' + activity if self.o.external_display else 'org.nx2a.GameActivity']
+        if not (self.o.external_display or self.o.native_keyboard): return ['--dex', dex / 'classes.dex']
+        return ['--dex', dex / 'classes.dex', '--keep-alive', '--activity', 'org.nx2a.' + activity if self.o.external_display else 'org.nx2a.GameActivity']
 
     def theme(self):
         """The on-screen gamepad's theme: only the game's own pack goes in the APK (dm/android/themes/themes.tsv maps title IDs to packs; a game with no row

@@ -13,12 +13,14 @@ _p.add_argument('--icon-fg', help='with --icon-bg: an adaptive icon\'s foregroun
 _p.add_argument('--icon-bg', help='the adaptive icon\'s background layer (a PNG, like --icon-fg)')
 _p.add_argument('--asset', action='append', default=[], metavar='NAME=FILE', help='a file the app reads with AAssetManager as NAME (assets/NAME in the APK): the gamepad theme')
 _p.add_argument('--dex', help='optional classes.dex for a custom NativeActivity')
+_p.add_argument('--keep-alive', action='store_true', help='declare org.nx2a.KeepAlive (in --dex): a foreground service that keeps a game left with HOME in memory')
 _p.add_argument('--activity', default='android.app.NativeActivity', help='NativeActivity class name')
 _p.add_argument('--release', action='store_true', help='not debuggable')
 _p.add_argument('--version-code', type=int, default=1, help='versionCode: a later port of the game must have a higher one to install over it')
 _p.add_argument('--version-name', default='1.0', help='versionName: the version the player sees (the game\'s display version)'); ARGS = _p.parse_args()
 PKG, LIB, LABEL = ARGS.package, ARGS.lib, ARGS.label
 if ARGS.activity != 'android.app.NativeActivity' and not ARGS.dex: _p.error('--activity requires --dex')
+if ARGS.keep_alive and not ARGS.dex: _p.error('--keep-alive requires --dex')
 if bool(ARGS.icon_fg) != bool(ARGS.icon_bg) or (ARGS.icon_fg and not ARGS.icon): _p.error('--icon-fg and --icon-bg go together, with --icon')
 MIN_SDK, TARGET_SDK = 29, 36
 ANDROID_NS = 'http://schemas.android.com/apk/res/android'
@@ -32,9 +34,9 @@ CONFIG_CHANGES = (0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010 | 0x0020 | 0x0040 |
 # ---------------- binary XML ----------------
 ATTR_IDS = {  # android: attribute resource IDs (frameworks/base/core/res/res/values/public.xml)
     'label': 0x01010001, 'icon': 0x01010002, 'name': 0x01010003, 'hasCode': 0x0101000c, 'debuggable': 0x0101000f, 'exported': 0x01010010,
-    'configChanges': 0x0101001f, 'screenOrientation': 0x0101001e, 'value': 0x01010024, 'minSdkVersion': 0x0101020c, 'versionCode': 0x0101021b,
+    'launchMode': 0x0101001d, 'configChanges': 0x0101001f, 'screenOrientation': 0x0101001e, 'value': 0x01010024, 'minSdkVersion': 0x0101020c, 'versionCode': 0x0101021b,
     'versionName': 0x0101021c, 'targetSdkVersion': 0x01010270, 'maxSdkVersion': 0x01010271, 'isGame': 0x010103f4, 'extractNativeLibs': 0x010104ea, 'appCategory': 0x01010545,
-    'requestLegacyExternalStorage': 0x01010603, 'enableOnBackInvokedCallback': 0x0101066c, 'drawable': 0x01010199}   # (maxSdkVersion and requestLegacyExternalStorage read from android-36's android.jar, R$attr)
+    'requestLegacyExternalStorage': 0x01010603, 'enableOnBackInvokedCallback': 0x0101066c, 'foregroundServiceType': 0x01010599, 'drawable': 0x01010199}   # (maxSdkVersion and requestLegacyExternalStorage read from android-36's android.jar, R$attr)
 T_REF, T_STRING, T_INT_DEC, T_INT_HEX, T_BOOL = 0x01, 0x03, 0x10, 0x11, 0x12
 ICON_ID, ICON_FG_ID, ICON_BG_ID = 0x7f010000, 0x7f010001, 0x7f010002   # drawable/icon, icon_fg, icon_bg in resources.arsc (res_table)
 # A plain icon is drawn small on a white disc by Android 8+ launchers; an adaptive one fills the launcher's icon shape
@@ -56,17 +58,22 @@ MANIFEST = ('manifest', [(False, 'package', PKG), (True, 'versionCode', ARGS.ver
     # that reads its RomFS from its files folder runs as before; requestLegacyExternalStorage is ignored from Android 11 with this target SDK
     ('uses-permission', [(True, 'name', 'android.permission.MANAGE_EXTERNAL_STORAGE')], []),
     ('uses-permission', [(True, 'name', 'android.permission.READ_EXTERNAL_STORAGE'), (True, 'maxSdkVersion', 29)], []),
+    # --keep-alive: the service's permissions, all normal (granted at install). POST_NOTIFICATIONS is declared and never asked for: the service's notification
+    # shows only for a player who turns the game's notifications on
+    *([('uses-permission', [(True, 'name', 'android.permission.' + n)], []) for n in ('FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_MEDIA_PLAYBACK', 'POST_NOTIFICATIONS')] if ARGS.keep_alive else []),
     ('application', [(True, 'label', LABEL)] + ([(True, 'icon', ('ref', ICON_ID))] if ARGS.icon else []) + [(True, 'hasCode', bool(ARGS.dex)), (True, 'debuggable', not ARGS.release), (True, 'isGame', True), (True, 'extractNativeLibs', True),
         (True, 'requestLegacyExternalStorage', True),
         (True, 'appCategory', 0),   # a game (appCategory game = 0, and the older isGame): Android's game mode and game dashboard, and the device maker's game tools, apply to it
         # no predictive back: from target SDK 36 the system takes the back gesture itself and finishes the activity, which ends the game (front_android.c on_destroy), without
         # dispatching KEYCODE_BACK; opted out, the gesture comes as the Back key, which opens the front end's menu
         (True, 'enableOnBackInvokedCallback', False)], [
-        ('activity', [(True, 'name', ARGS.activity), (True, 'exported', True), (True, 'configChanges', ('hex', CONFIG_CHANGES))] + ([(True, 'screenOrientation', 6)] if ARGS.landscape else []), [
+        ('activity', [(True, 'name', ARGS.activity), (True, 'exported', True), (True, 'launchMode', 2),   # singleTask: a start with another intent than the first (a front end's own, adb) brings the running game forward, not a second activity over it
+                      (True, 'configChanges', ('hex', CONFIG_CHANGES))] + ([(True, 'screenOrientation', 6)] if ARGS.landscape else []), [
             ('meta-data', [(True, 'name', 'android.app.lib_name'), (True, 'value', LIB)], []),
             ('intent-filter', [], [
                 ('action', [(True, 'name', 'android.intent.action.MAIN')], []),
-                ('category', [(True, 'name', 'android.intent.category.LAUNCHER')], [])])])])])
+                ('category', [(True, 'name', 'android.intent.category.LAUNCHER')], [])])])]
+        + ([('service', [(True, 'name', 'org.nx2a.KeepAlive'), (True, 'exported', False), (True, 'foregroundServiceType', ('hex', 2))], [])] if ARGS.keep_alive else []))])   # mediaPlayback
 
 def axml(root):
     # string pool: attribute names that carry resource IDs come first, in resource-map order
