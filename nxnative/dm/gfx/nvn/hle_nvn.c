@@ -2775,6 +2775,38 @@ static int fstep_hold(void) {
     }
     return h;
 }
+// The steady step (profile fps_step steady, DM_FPS_STEADY=1 / 0; state page +0x28, a float in vsyncs, for a stub that reads it instead of the whole step at +0x20). The whole
+// step pays a late frame back with one longer step, and a trial at a shorter hold changes it too, so on a device that runs between two holds the step differs from frame to
+// frame. Ocarina of Time ships with a step that never changes in play: its physics solves the next step's length with velocities made over the one before, and Link's hat
+// and the other cloth swung and floated at every change (the Odin 3 between 20 and 30 fps: 17 hold changes and some 380 paid-back vsyncs a minute). NX2navi (MIT) found the
+// same on PC and keeps its step steady; this is that idea, not its code. The step is the mean of the last 12 frames' time on screen without the longest and the
+// shortest (one late frame and the short one after it leave it alone, a real change of rate arrives within 12 frames), exactly the hold when within 3% of it, and the
+// time the game was not given is paid back slowly: a 32nd of it a frame, 10% of the step at most; over 6 vsyncs owed (a load, a stall) the rest is dropped, as
+// FSTEP_DEBT_MAX does. Off, the float is the whole step
+#ifndef DM_GAME_FPS_STEADY
+#define DM_GAME_FPS_STEADY 0
+#endif
+static int fstep_steady_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_FPS_STEADY"); on = e && *e ? atoi(e) != 0 : DM_GAME_FPS_STEADY; if (on) LOG("[nvn] frame step: steady (%s)", e && *e ? "DM_FPS_STEADY" : "game profile fps_step"); } return on; }
+static double g_fs_given;   // game time given by steady steps, in vsyncs (the speed line)
+static float fstep_steady(double shown, int k, int n) {
+    enum { W = 12 };
+    static double ring[W], owed, last; static unsigned cnt, nx;
+    if (!fstep_steady_on()) return (float)n;
+    if (shown <= 0 || shown > 8 || k < 1) { cnt = nx = 0; owed = 0; last = k > 0 ? k : n; g_fs_given += last; return (float)last; }   // the first frame, a load or a stall: nothing to go by
+    ring[nx++ % W] = shown; if (cnt < W) cnt++;
+    if (last > 0) owed += shown - last;
+    if (owed > 6) owed = 6; else if (owed < -2) owed = -2;
+    double sum = 0, lo = ring[0], hi = ring[0];
+    for (unsigned i = 0; i < cnt; i++) { sum += ring[i]; if (ring[i] < lo) lo = ring[i]; if (ring[i] > hi) hi = ring[i]; }
+    double base = cnt >= 4 ? (sum - lo - hi) / (cnt - 2) : k;
+    if (base > k * 0.97 && base < k * 1.03) base = k;
+    double pay = owed / 32, lim = base * 0.10;
+    if (owed > -base / 2 && owed < base / 2) pay = 0; else if (pay > lim) pay = lim; else if (pay < -lim) pay = -lim;
+    double step = base + pay;
+    if (step < 0.5) step = 0.5; else if (step > FSTEP_MAX + 1) step = FSTEP_MAX + 1;
+    last = step; g_fs_given += step;
+    return (float)step;
+}
 // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
 // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs
 static void fstep_tick(const win_t *o, int c) {
@@ -2817,7 +2849,11 @@ static void fstep_tick(const win_t *o, int c) {
     { static int tr = -1; if (tr < 0) { const char *e = getenv("DM_FSTEP_TRACE"); tr = e && atoi(e) > 0; }   // DM_FSTEP_TRACE=1: the controller's inputs every 15th frame (vsyncs)
       if (tr && o->presents % 15 == 0) LOG("[nvn] fstep trace %llu: hold %d shown %.2f wait %.2f cpu %.2f gpu %.2f cost %.2f fit_run %d since %.0f hold-off %.0f trial %d late_run %d screen %d",
           (unsigned long long)o->presents, g_fs.k, shown, pw / v, cpu, gpu, cost, g_fs.fit_run, g_fs.since, g_fs.hold, g_fs.trial, g_fs.late_run, g_fs.screen); }
-    if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
+    if (dm_fps_state) {   // the float first: a stub that reads it has seen the whole step set
+        float sf = fixed ? (float)n : fstep_steady(shown, g_fs.k, n); uint32_t sb; memcpy(&sb, &sf, 4);
+        __atomic_store_n((uint32_t *)(dm_fps_state + 0x28), sb, __ATOMIC_RELAXED);
+        __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
+    }
     atomic_store(&g_fs_k, g_fs.k);
     held[g_fs.k]++; if (fixed) fixed_sum += (uint64_t)n;   // the stubs count only the host's steps
     static int fixed_was, nfix;
@@ -2839,7 +2875,7 @@ static void fstep_tick(const win_t *o, int c) {
     if (!dm_fps_state) {   // 120 fps: no game clock to read; the frames at each hold say how much of the time it held 120
         if (o->presents % 1800 == 0) { LOG("[nvn] 120 fps: held 1 / 2 ticks %llu / %llu frames, %llu late, %llu up / %llu down (%llu probes, %llu failed trials)", (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)g_fs.late, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed); memset(held, 0, sizeof held); }
     } else if (o->presents % 1800 == 0) {   // game time against real time (1.000 = normal speed; lower when a device cannot hold 20 fps or after long stalls)
-        uint64_t vs = __atomic_load_n((uint64_t *)(dm_fps_state + 0x30), __ATOMIC_RELAXED) + fixed_sum, t = now_ns();
+        uint64_t vs = fstep_steady_on() ? (uint64_t)g_fs_given : __atomic_load_n((uint64_t *)(dm_fps_state + 0x30), __ATOMIC_RELAXED) + fixed_sum, t = now_ns();
         if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late (%llu of them isolated at the cap's hold), %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials)",
                     (vs - v0) / 60.0, (t - t0) / 1e9, (vs - v0) / 60.0 / ((t - t0) / 1e9), (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3],
                     (unsigned long long)g_fs.late, (unsigned long long)g_fs.tolerated, (unsigned long long)g_fs.paid, g_fs.dropped, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed);
