@@ -731,7 +731,8 @@ static int pass_commit(void) {
     if (g_x_tracesize[0] && g_x_tracepass < 0) {   // DM_VK_TRACE_SIZE=WxH[:format[:format]] (live): trace the next pass whose first colour target is that (passes are numbered anew each frame)
         char b[48]; snprintf(b, sizeof b, "%ux%u:%d:%d", S.pass_w, S.pass_h, S.cfmt[0], S.cfmt[1]);
         const char *h = strchr(g_x_tracesize, '#'); size_t l = h ? (size_t)(h - g_x_tracesize) : strlen(g_x_tracesize);   // #n: the (n+1)th such pass
-        if (!strncmp(b, g_x_tracesize, l)) { if (h && atoi(h + 1) > 0) { snprintf(g_x_tracesize + l, sizeof g_x_tracesize - l, "#%d", atoi(h + 1) - 1); setenv("DM_VK_TRACE_SIZE", g_x_tracesize, 1); }
+        const char *at = strchr(g_x_tracesize, '@'); if (at && (size_t)(at - g_x_tracesize) < l) l = (size_t)(at - g_x_tracesize);   // @p: only the submission's pass p (WxH@p)
+        if (!strncmp(b, g_x_tracesize, l) && (!at || atoi(at + 1) == g_sub_pass - 1)) { if (h && atoi(h + 1) > 0) { snprintf(g_x_tracesize + l, sizeof g_x_tracesize - l, "#%d", atoi(h + 1) - 1); setenv("DM_VK_TRACE_SIZE", g_x_tracesize, 1); }
             else { g_x_tracepass = g_sub_pass - 1; g_x_tracesize[0] = 0; setenv("DM_VK_TRACE_SIZE", "", 1); } } }
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) VKLOG("=== traced pass %d: %ux%u, colour formats %d %d, depth format %d", g_x_tracepass, S.pass_w, S.pass_h, S.cfmt[0], S.cfmt[1], S.dfmt); g_pass_draws = 0; g_pass_bb[0] = g_pass_bb[1] = INT32_MAX; g_pass_bb[2] = g_pass_bb[3] = INT32_MIN;
     return 1;
@@ -1252,14 +1253,16 @@ static void lin_back(void) {
         { static int n; if (n++ < 4) VKLOG("linear render target %ux%u (nvn format %#x, stride %zu) copied back to its storage %p", im->w, im->h, t->d.format, stride, (void *)t->mem); }
     }
 }
+static struct { vkimg_t *dst; int slot; uint32_t lv, n, ly[8], w, h; } P_sm;   // a pass drawn into a scratch target (self_mrt_scratch, below)
+static void self_mrt_copy(VkCommandBuffer cb, int back);
 void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); list_reads("it"); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
     if (S.pass_open == 1) { extern uint32_t g_vk_pass_flags; g_vk_pass_flags = (uint32_t)(S.ncol & 15) | (S.daspect ? 16u : 0) | (S.daspect && P_da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 32u : 0) | (S.ncol && P_ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ? 64u : 0) | (P_split ? 128u : 0); }
-    if (S.pass_open == 1) { pass_journal_pass("end"); vk_occ_end(); if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
+    if (S.pass_open == 1) { pass_journal_pass("end"); vk_occ_end(); if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); if (P_sm.dst) self_mrt_copy(vk_cmd(), 1); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
-    S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
+    S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0; P_sm.dst = NULL;
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
 // copies, the submission's end): the deferred uniform updates land first (draws read them through their shadows, so ordinary pass ends keep them)
@@ -1342,6 +1345,48 @@ fail:
     if (im.img) vkDestroyImage(V.dev, im.img, NULL);
     if (im.mem) vkFreeMemory(V.dev, im.mem, NULL);
     return 0;
+}
+
+// Several colour targets that are layers of one mip level of one image (DM_VK_SELF_MRT, default on; 0 at start-up: off). Ocarina of Time builds the mip levels
+// of its two 128x128 reflection cubes (B10G11R11) that way: for each level a pass with six targets, the six faces of that level, whose fragment shader samples the same
+// cube one level up. On the Adreno 830 (Qualcomm's driver 0x80320048) a pass whose targets are layers of one image puts its outputs into the wrong layers: with a fragment
+// shader that writes one constant colour per output, face 1 got output 2's colour, face 2 output 0's, faces 4 and 5 output 0's too, with stray 8-pixel blocks of the
+// others (uniforms, views, sampler and barriers all checked right; so drawing into layers of one scratch image, tried first, was no better). The levels past the first came out
+// flat or nearly black, and the water of Kokiri Forest, which reads the rougher levels more the steeper the camera looks down, went black as the camera was raised. Such a
+// pass draws into one scratch image per target instead (the level's contents copied in first: the pass loads), and its end copies each into its face of the level
+#define SM_N 32
+static struct { vkimg_t im[8]; VkImageView v[8]; } g_sm[SM_N]; static int g_sm_n, g_sm_failed;
+static int self_mrt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_SELF_MRT"); on = e && *e ? atoi(e) : 1; } return on; }
+static int self_mrt_scratch(VkFormat fmt, uint32_t w, uint32_t h) {   // the scratch image's slot; -1: none could be made (the pass draws into the image itself)
+    for (int i = 0; i < g_sm_n; i++) if (g_sm[i].im[0].fmt == fmt && g_sm[i].im[0].w == w && g_sm[i].im[0].h == h) return i;
+    if (g_sm_failed || g_sm_n >= SM_N) return -1;
+    vkimg_t im[8]; VkImageView v[8] = {0}; memset(im, 0, sizeof im);
+    for (uint32_t l = 0; l < 8; l++) {
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, fmt, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
+                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        if (vkCreateImage(V.dev, &ci, NULL, &im[l].img)) goto fail;
+        VkMemoryRequirements mr; vkGetImageMemoryRequirements(V.dev, im[l].img, &mr);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
+        vk_mem_tag = "self-mrt-scratch"; VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &im[l].mem); vk_mem_tag = NULL;
+        if (r || vkBindImageMemory(V.dev, im[l].img, im[l].mem, 0)) goto fail;
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, im[l].img, VK_IMAGE_VIEW_TYPE_2D, fmt, {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(V.dev, &vi, NULL, &v[l])) goto fail;
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im[l].img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(vk_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        im[l].w = w; im[l].h = h; im[l].fmt = fmt; im[l].usage = ci.usage; im[l].aspect = VK_IMAGE_ASPECT_COLOR_BIT; im[l].d = im[l].levels = im[l].samples = im[l].layers = 1; im[l].vtype = VK_IMAGE_VIEW_TYPE_2D; im[l].layout = VK_IMAGE_LAYOUT_GENERAL; }
+    VKLOG("colour targets in one mip level of one image: scratch targets %ux%u format %d (DM_VK_SELF_MRT)", w, h, (int)fmt);
+    memcpy(g_sm[g_sm_n].im, im, sizeof im); memcpy(g_sm[g_sm_n].v, v, sizeof v); return g_sm_n++;
+fail:
+    VKLOG("[RED] colour targets in one mip level of one image: no scratch target %ux%u format %d could be made: such passes draw into the image itself from here", w, h, (int)fmt); g_sm_failed = 1; return -1;
+}
+static void self_mrt_copy(VkCommandBuffer cb, int back) {   // the level's layers into the scratch images (before the pass) or back (after it)
+    vkimg_t *sc = g_sm[P_sm.slot].im;
+    vk_img_barrier_all(cb);
+    for (uint32_t i = 0; i < P_sm.n; i++) { VkImageSubresourceLayers a = {VK_IMAGE_ASPECT_COLOR_BIT, P_sm.lv, P_sm.ly[i], 1}, b = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        VkImageCopy r = {back ? b : a, {0, 0, 0}, back ? a : b, {0, 0, 0}, {P_sm.w, P_sm.h, 1}};
+        vkCmdCopyImage(cb, back ? sc[i].img : P_sm.dst->img, VK_IMAGE_LAYOUT_GENERAL, back ? P_sm.dst->img : sc[i].img, VK_IMAGE_LAYOUT_GENERAL, 1, &r); }
+    vk_img_barrier_all(cb);
 }
 static int begin_pass(void) {
     if (S.pass_open) return 1;
@@ -1434,6 +1479,17 @@ static int begin_pass(void) {
       if (da.imageView) { cs[8] = dim->samples; if (cs[8] > 1) any = 1; if (s0 && cs[8] != s0) mis = 1; }
       if ((any || mis) && n < 10) { n++; VKLOG("pass %ux%u samples: colour %u %u %u %u, depth %u%s", w, h, cs[0], cs[1], cs[2], cs[3], cs[8], mis ? " MISMATCH" : ""); } }
     if (!g_x_nobar) vk_img_barrier_all(cb);
+    P_sm.dst = NULL;
+    if (ncol > 1 && ncol <= 8 && samples == 1 && layers == 1 && !da.imageView && self_mrt_on()) {   // (self_mrt_scratch)
+        vkimg_t *one = P_att[0].im; uint32_t lv0 = 0; int ok = one && one->aspect == VK_IMAGE_ASPECT_COLOR_BIT && one->samples == 1;
+        for (int i = 0; ok && i < ncol; i++) { uint32_t lv = S.rt_has_cview[i] && S.rt_cview[i].set_levels ? S.rt_cview[i].base_level : 0; if (!i) lv0 = lv;
+            ok = ca[i].imageView && P_att[i].im == one && lv == lv0 && P_att[i].fmt == (uint32_t)one->fmt && P_att[i].w == w && P_att[i].h == h && S.rt_has_cview[i] && S.rt_cview[i].set_layers && S.rt_cview[i].min_layer < one->layers; }
+        int slot = ok ? self_mrt_scratch(one->fmt, w, h) : -1;
+        if (slot >= 0) { cb = vk_cmd(); P_sm.dst = one; P_sm.slot = slot; P_sm.lv = lv0; P_sm.n = (uint32_t)ncol; P_sm.w = w; P_sm.h = h;
+            for (int i = 0; i < ncol; i++) { P_sm.ly[i] = S.rt_cview[i].min_layer; ca[i].imageView = g_sm[slot].v[i]; P_att[i].im = &g_sm[slot].im[i]; }
+            self_mrt_copy(cb, 0);
+            static int n; if (n++ < 4) VKLOG("pass %ux%u with %d colour targets in level %u of one image: drawn into a scratch target and copied back (DM_VK_SELF_MRT)", w, h, ncol, lv0); }
+    }
     if (cut_touch) lrz_touch(dim, (g_lrz_touch & LRZ_CUT) != 0);   // (after the barrier: the earlier command buffer's depth writes come first)
     if (g_x_depth) { da.loadOp = sa.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; da.storeOp = sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; }
     if (g_x_color) for (int i = 0; i < ncol; i++) ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
@@ -2852,6 +2908,10 @@ static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescrip
     vk_pool_tag = "uniform"; vkpool_t *p = g_var_now != 9 && u && u->addr ? vk_pool_of(u->addr, 1) : NULL;
     if (!p) { *bi = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536}; return; }
     buf = p->buf; off = u->addr - p->lo;
+    if (g_tracing && n >= 32) { float f[8]; vk_ubd_read(u->addr, 32, (uint8_t *)f);   // what this draw reads at the start of the buffer (with the deferred updates)
+        VKLOG("  stage %d register %d: uniform buffer 0x%llx size %llu starts %g %g %g %g  %g %g %g %g", st, b->reg, (unsigned long long)u->addr, (unsigned long long)n, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]); }
+    if (g_tracing && n >= 288) { float f[72]; vk_ubd_read(u->addr, 288, (uint8_t *)f);
+        for (int r = 0; r < 18; r++) VKLOG("    row %d: %g %g %g %g", r, f[r*4], f[r*4+1], f[r*4+2], f[r*4+3]); }
     if (off + n > p->hi - p->lo) {
         if (p->hi < p->end && u->addr + n <= p->end) {   // into the pool's next chunk (vk_cross): the whole range from CPU memory, one copy per submission
             static struct { uint64_t a, n, ep, gen; VkBuffer b; VkDeviceSize o; } cc[16]; unsigned k = (unsigned)(u->addr >> 8) % 16;
