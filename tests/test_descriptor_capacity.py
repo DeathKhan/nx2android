@@ -1,10 +1,13 @@
 """Descriptor collection rejects a full image array before writing past it."""
 from pathlib import Path
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -14,12 +17,12 @@ def between(text, start, end):
     return text[at:text.index(end, at)]
 
 
-@unittest.skipUnless(shutil.which('cc'), 'host C compiler required')
+@unittest.skipUnless(host_cc.posix(), 'a POSIX host C compiler is required')
 class DescriptorCapacity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text()
-        header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text()
+        source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
+        header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text(encoding='utf-8')
         stage = source[source.index('static VkDescriptorSet stage_set('):]
         declarations = next(line for line in stage.splitlines()
                             if line.strip().startswith('VkWriteDescriptorSet w[96];'))
@@ -40,6 +43,11 @@ class DescriptorCapacity(unittest.TestCase):
 #include <string.h>
 #include "nxnative/dm/gfx/nvn/nvn_obj.h"
 #define VKLOG(...) ((void)0)
+// This tree's stage_set also notes textures and buffers for its traces and has per-slot dynamic samplers: left out here
+#define fs_trace_texture_note(...) ((void)0)
+#define cs_trace_buffer_note(...) ((void)0)
+static int g_cs_buffer_collect, g_fs_buffer_collect;
+static VkSampler samp_dynamic_slot(int st, int slot, int dynslots) { (void)st; (void)slot; (void)dynslots; return (VkSampler)(uintptr_t)2; }
 ''' + between(header, 'enum { RK_SUPPORT', '_Static_assert(sizeof(dmsv_bind)') + r'''
 static struct { uint64_t tex[6][256], img[6][32], samp[6][32], tex_sseq[6][256]; } S;
 static uint64_t g_tex_sseq, g_num_um, g_num_im;
@@ -74,7 +82,7 @@ static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImag
     return 0;
 }
 static VkSampler vk_dummy_sampler(void) { return (VkSampler)(uintptr_t)2; }
-static VkSampler vk_samp_by_id(int id) { (void)id; return VK_NULL_HANDLE; }
+__attribute__((unused)) static VkSampler vk_samp_by_id(int id) { (void)id; return VK_NULL_HANDLE; }
 static int vk_tex_by_id(int id, const view_t **v, const tex_t **t) {
     (void)id; (void)v; (void)t; return 0;
 }
@@ -161,7 +169,7 @@ int main(int argc, char **argv) {
         cls.addClassCleanup(cls.tmp.cleanup)
         src = Path(cls.tmp.name) / 'test.c'
         cls.exe = Path(cls.tmp.name) / 'test'
-        src.write_text(code)
+        src.write_text(code, encoding='utf-8')
         flags = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if os.getenv('NX2A_TEST_SANITIZE') else []
         subprocess.run(['cc', '-std=c11', '-O1', '-Wall', '-Wextra', '-Werror', *flags,
                         '-I', str(ROOT), '-I', str(ROOT / 'nxnative/dm/gfx/nvn/include'),

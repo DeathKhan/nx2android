@@ -17,7 +17,7 @@ class OverlayKeyRelease(unittest.TestCase):
             raise unittest.SkipTest('a C compiler is needed for the key-event check')
         front = (ROOT / 'nxnative/dm/android/front_android.c').read_text(encoding='utf-8')
         visible = front[front.index('int dm_overlay_visible(void)'):front.index('int dm_overlay_layout(void)')]
-        mark = front[front.index('static void pad_mark_used('):front.index('static int handle_event(')]
+        mark = front[front.index('static void pad_mark_used('):front.index('#define NAV_DEAD ')]   # this tree's menu repeater (nav_*) follows: stubbed below
         # Compile the complete production key-event arm; the motion arm is outside
         # this test. Android accessors and unrelated menu/keyboard calls are stubs.
         keys = front[front.index('static int handle_event('):
@@ -49,6 +49,12 @@ static void menu_key(uint64_t bit) { (void)bit; }
 static uint64_t key_bit(int k) { return k == TEST_A ? 1 : 0; }
 static void dm_pad_players(int n) { assert(n == 1); }
 static void pad_publish(void) { publications++; }
+// This tree: the menu's direction repeater, the layout editor, the menu's lists and the controller's own menu key, none of them part of this check
+#define NAV_DIRS 0xf0ull
+static struct { uint64_t keys; } g_nav;
+static void nav_update(void) {}
+static _Atomic int g_edit, g_sp_on, g_pad_menukey;
+static void sp_close_all(void) {}
 ''' + visible + mark + keys + r'''
     return 0;
 }
