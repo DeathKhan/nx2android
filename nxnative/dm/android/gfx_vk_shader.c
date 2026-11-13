@@ -6,6 +6,7 @@
 #include "gfx_vk.h"
 #include "gfx_vk_ubo_extent.h"
 #include "gfx_vk_gs_claim.h"
+#include "spv_gmcache.h"   // raw global memory helpers keep their last entry's range and delta in private words (droidplay #416)
 #include "dmsh_abi.h"
 #include "nvn_hmap.h"
 #include "zstd.h"
@@ -544,6 +545,22 @@ vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo) {
     return v;
 }
 static void spv_runtime_dump(vkshader_t *s, const uint32_t *w, uint32_t nw);
+// The module with each raw global memory helper keeping its last pool table entry's range and delta in private words (spv_gmcache.h), in *out (to free); 0 when it
+// has no such helper, or one not in the translator's form (said once). DM_SPV_GMCACHE=0 (env.txt): helpers as translated, reading the entry's six words on every access
+static size_t spv_fit_gmcache(const uint32_t *code, size_t nw, uint64_t key, uint32_t **out) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_SPV_GMCACHE"); on = !(e && *e == '0'); if (!on) VKLOG("DM_SPV_GMCACHE=0: raw global memory helpers read their last entry's range from the table on every access"); }
+    *out = NULL;
+    if (!on || nw < 5 || !spv_gmcache_wanted(code, nw)) return 0;
+    size_t cap = nw + SPV_GMCACHE_EXTRA(SPV_GMCACHE_MAX); uint32_t *s = malloc(4 * (size_t)code[3] * 4), *o = malloc(cap * 4); int why = 0;
+    size_t k = s && o ? spv_gmcache(code, nw, s, o, cap, &why) : 0; free(s);
+    static _Atomic int told, logged, count;
+    if (!k) { free(o);
+        if (why && !atomic_exchange(&told, 1)) VKLOG("shader %016llx: raw global memory helpers not in the translator's form (%d), made as translated (said once)", (unsigned long long)key, why);
+        return 0; }
+    atomic_fetch_add(&count, 1);
+    if (!atomic_exchange(&logged, 1)) VKLOG("raw global memory helpers keep their last entry's range and delta in private words, so a hit reads no table word (DM_SPV_GMCACHE=0: as translated). First: shader %016llx", (unsigned long long)key);
+    *out = o; return k;
+}
 static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     bundle_auto();
     struct { uint64_t key; uint64_t stage; } hk = {key, (uint64_t)stage};
@@ -709,8 +726,11 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
         }
     }
     spv_io_locs(w, nw, &s->in_locs, &s->out_locs);
-    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
-    VkResult vr = vkCreateShaderModule(V.dev, &ci, NULL, &s->mod); s->spv = w; s->nspv = nw;
+    // The module is made with each raw global memory helper keeping its last pool table entry's range and delta in private words (spv_gmcache.h, droidplay #416); the
+    // kept code (s->spv) stays as translated, so the analyses and contracts that read it see the bundle's form. DM_SPV_GMCACHE=0: made as translated
+    uint32_t *gc = NULL; size_t gcn = spv_fit_gmcache(w, nw, key, &gc);
+    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (gcn ? gcn : (size_t)nw) * 4, gcn ? gc : w};
+    VkResult vr = vkCreateShaderModule(V.dev, &ci, NULL, &s->mod); s->spv = w; s->nspv = nw; free(gc);
     if (vr) { VKLOG("[RED] shader %016llx: vkCreateShaderModule %d", (unsigned long long)key, vr); free(w); if (s->gs_claim_invocations) free((void *)s->b); free(s); nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); return NULL; }
     spv_runtime_dump(s, w, nw); // opt-in diagnostic, after every base-module rewrite
     // descriptor set layout: one entry per binding

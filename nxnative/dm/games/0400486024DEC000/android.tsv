@@ -44,3 +44,6 @@ env	DM_VK_POOL_PREFETCH=1
 # (2026-11-12, same walk): the replay thread 18-26 ms of CPU a frame without it, 9.5-11.8 ms with it (the recorder 11-14 ms beside it), GPU time and picture unchanged, no command
 # buffer refused. The game is held by the GPU there (31-38 ms), so the frame rate does not move yet; it keeps the replay under 25 ms (40 fps) once the GPU is
 env	DM_VK_MT_REPLAY=2
+# No occlusion queries (gfx_vk_core.c occ_mode; after upstream droidplay-core 7b36952d3): every query reports one sample passed, so nothing is culled by them. On the
+# Odin 3 (Adreno 830, Qualcomm driver) a still Kokiri view of 2,300 draws took 42.5-45.0 ms of GPU with the queries and 37.8-39.0 ms without (2,500 draws), three pairs
+env	DM_VK_OCCLUSION=0

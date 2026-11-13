@@ -1263,7 +1263,7 @@ void vk_end_pass(void) {
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
 // copies, the submission's end): the deferred uniform updates land first (draws read them through their shadows, so ordinary pass ends keep them)
-void vk_end_pass_land(void) { vk_end_pass(); if (vk_sub_open()) vk_ubd_land(vk_cmd()); }
+void vk_end_pass_land(void) { vk_end_pass(); if (vk_sub_open()) { VkCommandBuffer vk_cmd_peek(void); vk_ubd_land(vk_cmd_peek()); } }   // (vk_ubd_land has a barrier of its own on either side: a run of dispatches stays open, gfx_vk_core.c vk_cmd)
 static int pass_whole(VkRect2D r) { return !r.offset.x && !r.offset.y && r.extent.width >= S.pass_w && r.extent.height >= S.pass_h; }
 // Only a native command-buffer boundary advances the depth/LRZ cut generation.
 // A refused ordinary budget or exhausted slot must retain the current draw count.
@@ -5117,7 +5117,8 @@ static void dispatch(const p_dispatch *d) {
     g_vkst.dispatches++;
     vk_end_pass_land();
     stage_storage_prepare(5, cs);
-    VkCommandBuffer cb = vk_cmd();
+    extern int g_cs_chain, g_cs_in_disp; extern uint64_t g_cs_free, g_cs_first; int vk_cs_game(void), vk_cs_chained(VkCommandBuffer cb); void vk_cs_chain_open(VkCommandBuffer cb);
+    g_cs_in_disp = 1; VkCommandBuffer cb = vk_cmd(); g_cs_in_disp = 0;   // (a run of dispatches stays open across this one: gfx_vk_core.c vk_cmd; anything the set-up below records closes it)
     VkDescriptorSetLayout dsl[VK_NSETS] = {cs->dsl}; VkPipelineLayout layout = vk_pipeline_layout(dsl, 1);
     // the group counts before the descriptors: the driver segment stage_set builds carries them at c0 + 0x200 (drv_segment), as nvn_mtl.m's does. Set after it, every
     // dispatch read the previous one's: Link's Awakening's light culling (tile = workgroup y × c0[0x200] + workgroup x) ran after a 2x1x1 dispatch, so of its 30x17
@@ -5160,7 +5161,9 @@ static void dispatch(const p_dispatch *d) {
     if (p == (void *)1) { if (selected_trace) VKLOG("compute trace key %016llx returned: pipeline unavailable", (unsigned long long)cs->key); return; }
     if (g_cs_images_n) cs_trace_images_copy(cb, cs->key, 0);
     if (g_cs_buffers_n) cs_trace_buffers_copy(cb, cs->key, 0);
-    vk_img_barrier_all(cb);
+    int cs_plain = vk_cs_game() && !g_cs_images_n && !g_cs_buffers_n && !g_x_nodispbar;   // (the trace copies record around the dispatch)
+    if (cs_plain && !d->ind && vk_cs_chained(cb)) g_cs_free++;   // the command before this one is a dispatch, with no barrier of the game's since; an indirect one reads counts a dispatch may have written
+    else { g_cs_chain = 0; vk_img_barrier_all(cb); g_cs_first++; }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, (uint32_t)cs->ndyn, dofs);
     void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);   // DM_VK_PASS_TIMES: dispatches are timed as passes
@@ -5185,7 +5188,8 @@ static void dispatch(const p_dispatch *d) {
     if (g_cs_buffers_n && dispatched) cs_trace_buffers_copy(cb, cs->key, 1);
     if (selected_trace) VKLOG("compute trace key %016llx native dispatch %s%s", (unsigned long long)cs->key,
         dispatched ? "recorded" : "not recorded: indirect buffer unavailable", dispatched && d->ind ? " (indirect counts remain GPU-owned)" : "");
-    if (!g_x_nodispbar) vk_img_barrier_all(cb);   // DM_VK_X_NODISPBAR=1 (live, a cost measurement that may draw wrong): no barrier after the dispatch
+    if (cs_plain) vk_cs_chain_open(cb);   // the barrier after it waits for the next command of another kind (vk_cmd)
+    else if (!g_x_nodispbar) vk_img_barrier_all(cb);   // DM_VK_X_NODISPBAR=1 (live, a cost measurement that may draw wrong): no barrier after the dispatch
     crumb_dispatch(cs->key);
     if (g_x_tracepass == -2 || mdi_log_now()) {   // (DM_VK_TRACE_PASS=-2 lists the dispatches too, with their storage buffers: the addresses for a DM_CTL memdump)
         char sb[512]; int o = 0; for (int r = 0; r < 16 && o < (int)sizeof sb - 40; r++) if (S.ssbo[5][r].addr) o += snprintf(sb + o, sizeof sb - (size_t)o, " s%d %#llx+%#llx", r, (unsigned long long)S.ssbo[5][r].addr, (unsigned long long)S.ssbo[5][r].size);

@@ -1363,7 +1363,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         pda = g_desc_alloc_ns; pdc = g_desc_alloc_calls; pds = g_desc_alloc_sets;
         { extern uint64_t g_vk_nbar, g_vk_nlrz; static uint64_t pbar, plrz, ppa, pdi, pfo;   // what costs the GPU a fixed amount per pass: barriers drain it, LRZ touches are a copy and barriers each
           VKLOG("pass work per frame (last 600): %.1f passes, %.1f dispatches, %.1f clears folded, %.1f full barriers, %.1f LRZ touches", (g_vkst.passes - ppa) / 600.0, (g_vkst.dispatches - pdi) / 600.0, (g_vkst.folded - pfo) / 600.0, (g_vk_nbar - pbar) / 600.0, (g_vk_nlrz - plrz) / 600.0);
-          pbar = g_vk_nbar; plrz = g_vk_nlrz; ppa = g_vkst.passes; pdi = g_vkst.dispatches; pfo = g_vkst.folded; }
+          { void vk_bar_census_log(void); vk_bar_census_log(); } { extern uint64_t g_cs_free, g_cs_first, g_cs_closed; VKLOG("compute dispatches (cumulative): %llu with no barrier before them, %llu with one, %llu runs closed by a later command", (unsigned long long)g_cs_free, (unsigned long long)g_cs_first, (unsigned long long)g_cs_closed); } pbar = g_vk_nbar; plrz = g_vk_nlrz; ppa = g_vkst.passes; pdi = g_vkst.dispatches; pfo = g_vkst.folded; }
         { extern uint64_t g_order_kept, g_order_ended; static uint64_t pk, pn;   // gfx_vk_exec.c g_order_keep
           if (g_order_kept + g_order_ended > pk + pn) VKLOG("order-only barriers per frame (last 600): %.1f kept inside their pass, %.1f ended it", (g_order_kept - pk) / 600.0, (g_order_ended - pn) / 600.0);
           pk = g_order_kept; pn = g_order_ended; }

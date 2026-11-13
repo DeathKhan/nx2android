@@ -191,7 +191,9 @@ VkImageView vk_dummy_view(int dim, int arrayed, int ms, int storage, int is_int)
 VkSampler vk_dummy_sampler(void);
 VkBufferView vk_dummy_tbuf(int storage);
 void vk_end_pass_land(void);   // vk_end_pass, then the deferred uniform updates land (before copies, dispatches, the submission's end)
-void vk_img_barrier_all(VkCommandBuffer cb);   // version 1: one global memory barrier (all images stay in GENERAL)
+void vk_img_barrier_site(VkCommandBuffer cb, const char *file, int line);   // TEMPORARY (barrier census): counted by call site, DM_VK_X_NOBAR
+#define vk_img_barrier_all(cb) vk_img_barrier_site(cb, __FILE__, __LINE__)
+//   // version 1: one global memory barrier (all images stay in GENERAL)
 void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im);   // first use: transition from UNDEFINED to GENERAL (and upload a packaged texture)
 // ---- texture memory budget (gfx_vk_budget.c): the images' device memory kept under DM_VK_IMAGE_BUDGET_MB by dropping the least recently drawn ----
 typedef struct { void *h; uint32_t i; vkimg_t *im; } vk_img_ref;   // an image and where its table holds it (gfx_vk_tex.c)
