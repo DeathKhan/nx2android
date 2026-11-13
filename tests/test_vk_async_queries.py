@@ -41,6 +41,7 @@ class AsyncQueries(unittest.TestCase):
 #include <stdatomic.h>
 #include <sched.h>
 #include <errno.h>
+#include <unistd.h>
 typedef void *VkPipeline;
 typedef int VkPipelineLayout;
 #define VK_NULL_HANDLE NULL
@@ -133,7 +134,7 @@ int main(void){
             'GETTER': function(core, 'int vk_occ_counting('),
             'COMPLETE': function(source, 'static void async_pipe_complete('),
             'SHADER': function(source, 'static int async_shader_writes('),
-            'ASYNC': function(source, 'static int pipe_must_draw(') + '\n' + function(source, 'static int apq_push(') + '\n' + function(source, 'static int async_pipe('),
+            'ASYNC': function(source, 'static int pipe_must_draw(') + '\n' + function(source, 'static int apq_threads_max(') + '\n' + function(source, 'static void apq_spawn(') + '\n' + function(source, 'static int apq_push(') + '\n' + function(source, 'static int async_pipe('),
             'GRAPHICS': function(source, 'static VkPipeline graphics_pipeline('),
         }
         for marker, text in pieces.items():

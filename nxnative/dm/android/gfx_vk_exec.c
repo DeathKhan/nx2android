@@ -1990,11 +1990,23 @@ static int pipe_must_draw(const pkey *k) {   // 1: the draw cannot be left out w
     if (!natt) return 1;
     return 0;
 }
+// The background threads: 2 at the first queued key; while the queue is deeper than the threads running (a batch, predict_rest: an area load queues dozens),
+// more up to DM_VK_ASYNC_THREADS (default 4 with 8 cores or more, else 2). The extra ones stay, waiting on the queue, once made
+static int apq_threads_max(void) {
+    static int mx; if (!mx) { const char *e = getenv("DM_VK_ASYNC_THREADS"); long nc = sysconf(_SC_NPROCESSORS_ONLN); mx = e && atoi(e) > 0 ? atoi(e) : nc >= 8 ? 4 : 2; if (mx > 8) mx = 8; }
+    return mx;
+}
+static void apq_spawn(int want) {   // under g_apq_mu
+    static int failed; if (failed) return;
+    for (int tries = want - g_apq_on; tries > 0 && g_apq_on < want; tries--) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        int r = pthread_create(&t, &a, async_pipe_thread, NULL); pthread_attr_destroy(&a);
+        if (r) { if (g_apq_on >= 2) failed = 1; continue; }   // (none at all: tried again at the next key, and a queued key without a worker is built synchronously)
+        g_apq_on++; }
+}
 static int apq_push(const pkey *k) {   // 1: queued for the background threads, pending in the table; under nothing (takes g_pipe_mu)
     pthread_mutex_lock(&g_apq_mu);
-    if (!g_apq_on) { for (int i = 0; i < 2; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-            if (!pthread_create(&t, &a, async_pipe_thread, NULL)) { g_apq_on++; }
-            pthread_attr_destroy(&a); } }
+    if (!g_apq_on) apq_spawn(2 < apq_threads_max() ? 2 : apq_threads_max());
+    else if (g_apq_on >= 2 && g_apq_on < apq_threads_max() && (int)(g_apq_h - g_apq_t) >= g_apq_on) apq_spawn(g_apq_on + 1);   // deep: one more (after the first two)
     int ok = g_apq_on && g_apq_h - g_apq_t < APQ;   // no worker: build synchronously, never leave an unfulfillable pending entry
     if (ok) { g_apq[g_apq_h % APQ] = *k; g_apq_h++; pthread_cond_signal(&g_apq_cv); }
     pthread_mutex_unlock(&g_apq_mu);
@@ -2186,7 +2198,9 @@ static void prewarm_start(void) {
       if (sf && fread(sh, sizeof sh, 1, sf) == 1 && sh[0] == hdr[0] && sh[1] == hdr[1]) {
           fseek(sf, 0, SEEK_END); long sn = (ftell(sf) - (long)sizeof sh) / (long)sizeof(pkey); fseek(sf, sizeof sh, SEEK_SET);
           if (sn > 0) {
-              nvn_hmap have = {.klen = sizeof(pkey)}; for (size_t i = 0; i < g_pw_n; i++) nvn_hm_put(&have, &g_pw[i], (void *)1);
+              // (the recorded list's own repeats go too: Kirby's 3416 records held 3140 keys, and each repeat took a place under DM_VK_PREWARM_MAX)
+              nvn_hmap have = {.klen = sizeof(pkey)}; size_t j = 0; for (size_t i = 0; i < g_pw_n; i++) if (!nvn_hm_get(&have, &g_pw[i])) { nvn_hm_put(&have, &g_pw[i], (void *)1); g_pw[j++] = g_pw[i]; }
+              if (j < g_pw_n) VKLOG("prewarm: %zu repeated records dropped", g_pw_n - j); g_pw_n = j;
               pkey *m = realloc(g_pw, (g_pw_n + (size_t)sn) * sizeof(pkey)); size_t added = 0, read = 0;
               if (m) { g_pw = m; pkey k; while (read < (size_t)sn && fread(&k, sizeof k, 1, sf) == 1) { read++; if (nvn_hm_get(&have, &k)) continue; nvn_hm_put(&have, &k, (void *)1); g_pw[g_pw_n++] = k; added++; } }
               free(have.keys); free(have.vals);
@@ -5773,30 +5787,55 @@ void mtl_exec_span(const uint8_t *p, const uint8_t *end) {
     exec_ops(p, end);
     g_vkst.ns_exec += tnow() - t0;
 }
-// Batch (upstream nxnative 6a6a018df pso_predict_rest_): at the first pipeline miss of a submission (or of a stretch between counter ops), the ops after the
-// current one (the rest of its command buffer, of the buffers that called it, and of the submission's later ones, as occ_reset_next reads them) are walked on
-// a copy of the bound state up to the next render target change. Each draw's key is made as prepare_draw makes it; the missing ones go to the background
-// threads (apq_push), so an effect's other new pipelines are being built while its first one is, not one after another as their draws come. A prediction
-// that no draw takes is not recorded (pred_taken). No GPU commands, no pass changes, S as it was afterwards. DM_VK_BATCH_PIPE=0 turns it off; at most
-// DM_VK_BATCH_MAX (24) keys a walk
+// predict_rest at a render target change (upstream pso_predict_rest_ does the same at OP_SET_RT): the new attachments' formats, samples and aspect as begin_pass
+// would take them, from the record (vk_rt_predict: no image or view made, no pass ended, no commands), so the walk goes on into the passes after it. An area load
+// (Kirby and the Forgotten Land, 2026-11-12 21:53: 68 passes in one submission, many of one draw, 51 pipelines built on the replay thread in 1.2 s) has its misses
+// spread over many passes: a walk that stopped at the next target change queued none of them. The colour alias map (one image in two slots) is not predicted
+static void pred_set_rt(const p_set_rt *r) {
+    S.rt_n = r->n > 8 ? 8 : r->n; int ncol = 0, have = 0; uint32_t samples = 1;
+    for (int i = 0; i < 8; i++) S.cfmt[i] = VK_FORMAT_UNDEFINED;
+    P_att[0].im = P_att[8].im = NULL;
+    for (int i = 0; i < S.rt_n; i++) {
+        S.rt_has_col[i] = r->color[i] != NULL && r->color[i]->magic == MAGIC('T', 'E', 'X', 0); if (S.rt_has_col[i]) S.rt_col[i] = *r->color[i];
+        S.rt_has_cview[i] = r->has_cview[i]; if (r->has_cview[i]) S.rt_cview[i] = r->cview[i];
+        VkFormat f; uint32_t sm; VkImageAspectFlags as; vkimg_t *im;
+        if (S.rt_has_col[i] && vk_rt_predict(&S.rt_col[i], S.rt_has_cview[i] ? &S.rt_cview[i] : NULL, &f, &sm, &as, &im)) { S.cfmt[i] = f; ncol = i + 1; samples = sm; have = 1; }
+    }
+    S.rt_has_dep = r->depth != NULL && r->depth->magic == MAGIC('T', 'E', 'X', 0); if (S.rt_has_dep) S.rt_dep = *r->depth;
+    S.rt_has_dview = r->has_dview; if (r->has_dview) S.rt_dview = r->dview;
+    S.dfmt = VK_FORMAT_UNDEFINED; S.daspect = 0;
+    { VkFormat f; uint32_t sm; VkImageAspectFlags as; vkimg_t *im;
+      if (S.rt_has_dep && vk_rt_predict(&S.rt_dep, S.rt_has_dview ? &S.rt_dview : NULL, &f, &sm, &as, &im)) { S.dfmt = f; S.daspect = as; samples = sm; have = 1; P_att[8].im = im; } }
+    if (have && slot0_fill_wanted(ncol, S.cfmt[0] != VK_FORMAT_UNDEFINED, samples, 1)) { S.cfmt[0] = VK_FORMAT_R8G8B8A8_UNORM; P_att[0].im = &g_s0_image; }
+    S.ncol = have ? ncol : 0; S.samples = samples;
+}
+// Batch (upstream nxnative 6a6a018df pso_predict_rest_): at a pipeline miss, the ops after the current one (the rest of its command buffer, of the buffers that called
+// it, and of the submission's later ones, as occ_reset_next reads them) are walked on a copy of the bound state, across render target changes (pred_set_rt). Each
+// draw's key is made as prepare_draw makes it; the missing ones go to the background threads (apq_push), so the other new pipelines of an effect or an area load are
+// being built while its first one is, not one after another as their draws come. A prediction that no draw takes is not recorded (pred_taken). No GPU commands, no
+// pass changes, S and the attachments as they were afterwards. One walk per submission (or stretch between counter ops), and another at a miss past the draw where
+// the last walk stopped (its cap, DM_VK_BATCH_MAX keys, default 64, or its read limit). DM_VK_BATCH_PIPE=0 turns it off
+static int g_pred_walks, g_pred_last_queued;   // (tests)
 static void predict_rest(const pkey *cur) {
-    static int on = -1, mx; static uint32_t epoch = ~0u; extern const uint64_t *vk_rest_h; extern int vk_rest_n;
-    if (on < 0) { const char *e = getenv("DM_VK_BATCH_PIPE"); on = !(e && *e == '0') && g_async_pipe; e = getenv("DM_VK_BATCH_MAX"); mx = e ? atoi(e) : 24; if (mx > APQ / 2) mx = APQ / 2; }
-    if (!on || mx <= 0 || epoch == g_la_epoch) return;
-    epoch = g_la_epoch;
+    static int on = -1, mx; static uint32_t epoch = ~0u; static int until = -1; extern const uint64_t *vk_rest_h; extern int vk_rest_n;
+    if (on < 0) { const char *e = getenv("DM_VK_BATCH_PIPE"); on = !(e && *e == '0') && g_async_pipe; e = getenv("DM_VK_BATCH_MAX"); mx = e ? atoi(e) : 64; if (mx > APQ / 2) mx = APQ / 2; }
+    if (!on || mx <= 0) return;
+    if (epoch == g_la_epoch && (until < 0 || g_draw_i < until)) return;   // walked: to the end (until -1), or this miss lies within the last walk's reach (a misprediction)
+    epoch = g_la_epoch; until = -1;
     if (!g_la_at || g_la_depth > 16 || g_la_span) return;
     static __typeof__(S) save; memcpy(&save, &S, sizeof S);
-    uint64_t t0 = tick(); int queued = 0, draws = 0;
+    static __typeof__(P_att) psave; memcpy(&psave, &P_att, sizeof P_att);
+    uint64_t t0 = tick(); int queued = 0, draws = 0, nall = 0, stopped = 1; g_pred_walks++;
     const uint8_t *p = g_la_at, *loc[32]; int nl = 0, up = g_la_depth, rest = 0;
-    for (int left = 200000; left > 0 && queued < mx && draws < 4096; left--) {
+    for (int left = 200000; left > 0 && queued < mx && draws < 4096; left--) {   // (stopped stays 1 when a limit ends the walk)
         op_hdr h; memcpy(&h, p, sizeof h); const uint8_t *a = p + 8; int prim = -1, indexed = 0;
         switch (h.op) {
         case OP_END: if (nl) { p = loc[--nl]; continue; } if (up) { p = g_la_ret[--up]; continue; }
             if (rest < vk_rest_n && vk_rest_h[rest]) { p = (const uint8_t *)(uintptr_t)vk_rest_h[rest++]; continue; }
-            goto done;
+            stopped = 0; goto done;   // the submission's end: all of it read
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (nl == 32 || !t) goto done; loc[nl++] = p + h.size; p = (const uint8_t *)(uintptr_t)t; continue; }
-        case OP_SET_RT: goto done;   // other attachments: other keys, and set_rt ends the pass
+        case OP_SET_RT: pred_set_rt((const p_set_rt *)a); break;   // the passes after it are read with their own attachments
         case OP_VIEWPORTS: { const p_viewports *v = (const p_viewports *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(S.vp[v->first + i], v->v[i], 16); break; }
         case OP_BIND_PROGRAM: bind_program((const p_bind_program *)a); break;
         case OP_BIND_STATE: { const p_bind_state *bs = (const p_bind_state *)a;
@@ -5826,6 +5865,7 @@ static void predict_rest(const pkey *cur) {
         case OP_MULTI_DRAW: { const p_multi_draw *m = (const p_multi_draw *)a; prim = m->prim; indexed = m->itype >= 0; break; }
         default: break;
         }
+        if (prim >= 0) nall++;   // (every draw: g_draw_i counts them so)
         if (prim >= 0 && prim != DM_PRIM_MESH_TASKS && S.sh[0] && !S.sh[3] && !S.sh[4] && !S.rast_discard) {
             draws++;
             pkey k; pkey_fill(&k, prim, indexed, 0, 1);
@@ -5834,15 +5874,17 @@ static void predict_rest(const pkey *cur) {
                 pthread_mutex_lock(&g_pipe_mu); int miss = !nvn_hm_get(&g_pipes, &k); pthread_mutex_unlock(&g_pipe_mu);
                 if (miss && apq_push(&k)) { queued++;   // (a build done before the mark is recorded at once: harmless)
                     pthread_mutex_lock(&g_pipe_mu); if (nvn_hm_get(&g_pipes, &k) == PIPE_PENDING) nvn_hm_put(&g_pred, &k, (void *)1); pthread_mutex_unlock(&g_pipe_mu); }
-                else if (miss) goto done;   // the queue is full
+                else if (miss) goto done;   // the queue is full (stopped: a later miss walks again)
             }
         }
         if (h.size < sizeof h) break;
         p += h.size;
     }
 done:
-    memcpy(&S, &save, sizeof S);
-    { static int n; static uint64_t tq; tq += queued; if (queued && (n++ < 8 || n % 64 == 0)) VKLOG("batch: %d pipelines of the rest of the submission queued ahead of their draws (%d draws read, %.2f ms; %llu queued, %llu taken so far)", queued, draws, (tick() - t0) / 1e6, (unsigned long long)tq, (unsigned long long)g_pred_hit); }
+    memcpy(&S, &save, sizeof S); memcpy(&P_att, &psave, sizeof P_att);
+    if (stopped) until = g_draw_i + nall;   // a miss past the draws read walks again
+    g_pred_last_queued = queued;
+    { static int n; static uint64_t tq; tq += queued; if (queued && (n++ < 16 || n % 64 == 0)) VKLOG("batch: %d pipelines of the rest of the submission queued ahead of their draws (%d draws read%s, %.2f ms; %llu queued, %llu taken so far)", queued, draws, stopped ? ", stopped at the cap" : "", (tick() - t0) / 1e6, (unsigned long long)tq, (unsigned long long)g_pred_hit); }
 }
 static void exec_ops(const uint8_t *p, const uint8_t *end) {
     for (;;) {
