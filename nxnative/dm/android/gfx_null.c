@@ -70,7 +70,7 @@ void mtl_exec(const uint8_t *p) {
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); mtl_exec((const uint8_t *)(uintptr_t)t); break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
-        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = 1; break; }
+        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); sync_replay_fence(s, g_fence + 1); break; }
         // Upstream's queue waits (hle_nvn.c nvnCommandBufferWaitEvent / WaitSync, ea0c98df3): the Apple scheduler parks the queue on them; this replay runs
         // submissions in their order and does not wait, as when the calls were no-ops. An event wait whose predicate does not hold yet is named once (an
         // ordering the logical queues would change: Ocarina of Time's lighting producer and consumer)
