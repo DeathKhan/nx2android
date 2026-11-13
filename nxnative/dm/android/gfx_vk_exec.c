@@ -1896,18 +1896,42 @@ static pkey g_last_k; static VkPipeline g_last_p;
 enum { APQ = 256 };
 static pkey g_apq[APQ]; static int g_apq_h, g_apq_t, g_apq_on;   // queued keys (a draw left out counts as skipped for no pipeline)
 static pthread_mutex_t g_apq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_apq_cv = PTHREAD_COND_INITIALIZER;
+// Batch prediction (predict_rest): keys queued ahead of their draws. They are recorded for the prewarm only when a draw takes them (graphics_pipeline,
+// pred_taken), so a mispredicted key never enters vk_pipelines.bin. Under g_pipe_mu
+static nvn_hmap g_pred = {.klen = sizeof(pkey)};
+static uint64_t g_pred_hit;
+static int pred_pending(const pkey *k) { return g_pred.n && nvn_hm_get(&g_pred, k); }   // under g_pipe_mu
+static void pred_taken(const pkey *k, VkPipeline p) {   // under g_pipe_mu: a draw took k
+    if (!pred_pending(k)) return;
+    nvn_hm_del(&g_pred, k); g_pred_hit++; if (p && p != (void *)1 && p != PIPE_PENDING) pipe_record(k);
+}
 static void async_pipe_complete(const pkey *k, VkPipeline p) {
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);   // a prewarm thread made it meanwhile (as graphics_pipeline does: the one in the table may be bound already, the new one goes)
     if (had && had != PIPE_PENDING) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); }
-    else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1) pipe_record(k); }
+    else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1 && !pred_pending(k)) pipe_record(k); }
     pthread_cond_broadcast(&g_pipe_ready); pthread_mutex_unlock(&g_pipe_mu);   // wake counted draws waiting on either success or failure
 }
+static void apq_build(const pkey *kp);
 static void *async_pipe_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk async pipe");
     for (;;) {
         pthread_mutex_lock(&g_apq_mu); while (g_apq_h == g_apq_t) pthread_cond_wait(&g_apq_cv, &g_apq_mu);
         pkey k = g_apq[g_apq_t % APQ]; g_apq_t++; pthread_mutex_unlock(&g_apq_mu);
+        apq_build(&k);
+    }
+    return NULL;
+}
+// Priority: the prewarm threads take queued keys (pipelines play is waiting for or will draw next) before each recorded entry of their own, so a draw's pipeline
+// never waits behind the start-up list. 1: one built
+static int apq_help(void) {
+    pkey k; pthread_mutex_lock(&g_apq_mu);
+    if (g_apq_h == g_apq_t) { pthread_mutex_unlock(&g_apq_mu); return 0; }
+    k = g_apq[g_apq_t % APQ]; g_apq_t++; pthread_mutex_unlock(&g_apq_mu);
+    apq_build(&k); return 1;
+}
+static void apq_build(const pkey *kp) {
+    {   pkey k = *kp;
         vkshader_t *stg[3] = {0}; VkPipeline p = (VkPipeline)1;
         for (int s = 0; s < 3; s++) if (k.key[s] && !(s == 1 && k.raster_discard)) stg[s] = vk_shader(k.key[s], s);
         if (stg[0]) { VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;
@@ -1916,7 +1940,6 @@ static void *async_pipe_thread(void *arg) {
             { static int n; if (n++ < 6) VKLOG("pipeline built in the background in %.1f ms (shaders %016llx %016llx)", (tick() - t0) / 1e6, (unsigned long long)k.key[0], (unsigned long long)k.key[1]); } }
         async_pipe_complete(&k, p);
     }
-    return NULL;
 }
 static int shader_wmem(vkshader_t *s);
 // The packed reflection does not reliably mark every write (images have no rw bit, and Bananza's shipped culling GS has an unmarked storage buffer), and a storage
@@ -1994,23 +2017,32 @@ static void pipe_sibling(const pkey *k) {
 static uint64_t g_sync_pipes, g_sync_pipe_ns;
 void mtl_create_stats(uint64_t *lib, uint64_t *pso) { *lib = 0; *pso = __atomic_load_n(&g_sync_pipes, __ATOMIC_RELAXED); }
 void mtl_create_ns(uint64_t *lib, uint64_t *pso) { *lib = 0; *pso = __atomic_load_n(&g_sync_pipe_ns, __ATOMIC_RELAXED); }
+static int g_replay_waits;   // the replay thread is building a pipeline or waiting for one (priority: prewarm_thread yields)
+static void predict_rest(const pkey *cur);
 static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     if (g_last_p && !memcmp(k, &g_last_k, sizeof *k)) return g_last_p == (void *)1 ? VK_NULL_HANDLE : g_last_p;
     pthread_mutex_lock(&g_pipe_mu); VkPipeline p = nvn_hm_get(&g_pipes, k);
     // This key may have been queued by a draw that could be left out, or as a sibling (pipe_sibling). Wait for that build rather than dropping a draw that cannot be.
-    while (p == PIPE_PENDING && pipe_must_draw(k)) { pthread_cond_wait(&g_pipe_ready, &g_pipe_mu); p = nvn_hm_get(&g_pipes, k); }
+    if (p == PIPE_PENDING && pipe_must_draw(k)) {
+        __atomic_add_fetch(&g_replay_waits, 1, __ATOMIC_RELAXED);
+        while (p == PIPE_PENDING && pipe_must_draw(k)) { pthread_cond_wait(&g_pipe_ready, &g_pipe_mu); p = nvn_hm_get(&g_pipes, k); }
+        __atomic_sub_fetch(&g_replay_waits, 1, __ATOMIC_RELAXED); }
+    if (p && p != PIPE_PENDING) pred_taken(k, p);
     pthread_mutex_unlock(&g_pipe_mu);
+    if (!p) predict_rest(k);   // the first miss of this submission: the rest of its draws' missing pipelines go to the background threads (batch)
     if (p == PIPE_PENDING) return VK_NULL_HANDLE;
     if (p) { g_last_k = *k; g_last_p = p; return p == (void *)1 ? VK_NULL_HANDLE : p; }
     if (async_pipe(k)) return VK_NULL_HANDLE;
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
     pipe_sibling(k);
+    __atomic_add_fetch(&g_replay_waits, 1, __ATOMIC_RELAXED);   // (priority: the prewarm threads start no entry of their own meanwhile)
     uint64_t tb = tick(); p = build_pipeline(k, layout, stg); tb = tick() - tb; if (g_prof_on) g_prof_ns[0] += tb; g_vkst.pipes_built++;
+    __atomic_sub_fetch(&g_replay_waits, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&g_sync_pipes, 1, __ATOMIC_RELAXED); __atomic_add_fetch(&g_sync_pipe_ns, tb, __ATOMIC_RELAXED);
     if (tb > 50000000ull) VKLOG("pipeline built on the replay thread in %.0f ms (shaders %016llx %016llx %016llx; present %llu)", tb / 1e6, (unsigned long long)k->key[0], (unsigned long long)k->key[1], (unsigned long long)k->key[2], (unsigned long long)g_tex_frame);
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);
-    if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
+    if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; pred_taken(k, p); }   // a prewarm thread made it meanwhile
     else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1) pipe_record(k); }
     pthread_mutex_unlock(&g_pipe_mu);
     return p == (void *)1 ? VK_NULL_HANDLE : p;
@@ -2044,7 +2076,7 @@ static void pipe_record(const pkey *k) {   // (under g_pipe_mu: only queued here
     if (g_precq_n < PREC_Q) g_precq[g_precq_n++] = *k;   // (a full queue drops the record: that pipeline is only not prewarmed next time)
     pthread_cond_signal(&g_precq_cv); pthread_mutex_unlock(&g_precq_mu);
 }
-static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done;
+static pkey *g_pw; static size_t g_pw_n, g_pw_lim; static volatile size_t g_pw_next, g_pw_done;   // g_pw_lim: the entries the threads make (DM_VK_PREWARM_MAX)
 // A recorded pipeline whose compile never finishes (droidplay-core feca0ebe5): the prewarm makes the list again at every start, so an entry the driver's compiler crashes
 // or hangs on would end every start a few seconds in, and vk_pipelines.bin sits where a player does not clear it. Each prewarm thread writes the entry it makes (from its
 // shader modules to the end of the driver's compile) into its own slot of a marker file (vk_pipelines.making) and clears the slot when the compile returns; a crash in that
@@ -2099,7 +2131,11 @@ static void *prewarm_thread(void *arg) {
     int slot = (int)(intptr_t)arg; pthread_setname_np(pthread_self(), "vk prewarm");
     setpriority(PRIO_PROCESS, 0, 10);   // below the game's threads: prewarm uses idle cores
     for (;;) {
-        size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_n) break;
+        // Priority: queued keys first (draws waiting, or predicted for the rest of a submission); while the replay thread builds or waits for a pipeline with nothing
+        // queued, no entry of ours is started (up to 50 ms at a time), so its compile has the cores
+        while (apq_help()) {}
+        for (int w = 0; w < 50 && __atomic_load_n(&g_replay_waits, __ATOMIC_RELAXED) > 0; w++) { usleep(1000); if (apq_help()) w = 0; }
+        size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_lim) break;
         const pkey *k = &g_pw[i];
         pthread_mutex_lock(&g_pipe_mu); int have = nvn_hm_get(&g_pipes, k) != NULL; pthread_mutex_unlock(&g_pipe_mu);
         if (have) continue;
@@ -2123,7 +2159,7 @@ static void *prewarm_thread(void *arg) {
         if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, p); else if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL);
         pthread_mutex_unlock(&g_pipe_mu);
         size_t d = __atomic_add_fetch(&g_pw_done, 1, __ATOMIC_RELAXED);
-        if (d == g_pw_n || d % 500 == 0) VKLOG("prewarm: %zu of %zu pipelines", d, g_pw_n);
+        if (d == g_pw_lim || d % 500 == 0) VKLOG("prewarm: %zu of %zu pipelines", d, g_pw_lim);
     }
     return NULL;
 }
@@ -2141,6 +2177,23 @@ static void prewarm_start(void) {
         VKLOG("prewarm: %zu pipelines recorded before the alpha test key fields, read with the test off", g_pw_n);
     }
     if (f) fclose(f);
+    // The starter list: vk_pipelines.seed.bin, which the porter puts in the data pack from the game's profile (dm/games/<id>/vk_pipelines.seed.bin, recorded on a
+    // device in play). Its entries the recorded list lacks are added after it, at every start, so a new install, an emptied list or a key layout change still
+    // prewarms what earlier play met (the scenes and effects a first sight would otherwise build on the replay thread); the player's own records are kept as
+    // they are and first. A seed of another key layout is ignored. DM_VK_SEED=0 turns it off
+    { const char *e = getenv("DM_VK_SEED"); char sp[1024]; snprintf(sp, sizeof sp, "%s/vk_pipelines.seed.bin", root); FILE *sf = !(e && *e == '0') ? fopen(sp, "rb") : NULL;
+      uint32_t sh[2] = {0};
+      if (sf && fread(sh, sizeof sh, 1, sf) == 1 && sh[0] == hdr[0] && sh[1] == hdr[1]) {
+          fseek(sf, 0, SEEK_END); long sn = (ftell(sf) - (long)sizeof sh) / (long)sizeof(pkey); fseek(sf, sizeof sh, SEEK_SET);
+          if (sn > 0) {
+              nvn_hmap have = {.klen = sizeof(pkey)}; for (size_t i = 0; i < g_pw_n; i++) nvn_hm_put(&have, &g_pw[i], (void *)1);
+              pkey *m = realloc(g_pw, (g_pw_n + (size_t)sn) * sizeof(pkey)); size_t added = 0, read = 0;
+              if (m) { g_pw = m; pkey k; while (read < (size_t)sn && fread(&k, sizeof k, 1, sf) == 1) { read++; if (nvn_hm_get(&have, &k)) continue; nvn_hm_put(&have, &k, (void *)1); g_pw[g_pw_n++] = k; added++; } }
+              free(have.keys); free(have.vals);
+              VKLOG("prewarm: starter list %zu entries, %zu added to the %zu recorded", read, added, g_pw_n - added);
+          }
+      } else if (sf) VKLOG("[RED] prewarm: starter list %s has another key layout (%u, this build %u): ignored", sp, sh[1], hdr[1]);
+      if (sf) fclose(sf); }
     pwm_take();
     if (g_pw_skip.n) { size_t j = 0; for (size_t i = 0; i < g_pw_n; i++) if (!nvn_hm_get(&g_pw_skip, &g_pw[i])) g_pw[j++] = g_pw[i];
         if (j < g_pw_n) VKLOG("prewarm: %zu recorded pipelines left out (the skip list: an earlier start ended in their compile)", g_pw_n - j); g_pw_n = j; }
@@ -2148,7 +2201,10 @@ static void prewarm_start(void) {
     g_prec = fopen(path, "wb"); if (g_prec) { fwrite(hdr, sizeof hdr, 1, g_prec); if (g_pw_n) fwrite(g_pw, sizeof(pkey), g_pw_n, g_prec); fflush(g_prec); }
     if (!g_pw_n || getenv("DM_VK_NOPREWARM")) { VKLOG("prewarm: %zu pipelines recorded%s", g_pw_n, g_pw_n ? ", off (DM_VK_NOPREWARM)" : ""); return; }
     long nc = sysconf(_SC_NPROCESSORS_ONLN); int nt = nc >= 8 ? 3 : nc >= 4 ? 2 : 1;
-    VKLOG("prewarm: %zu recorded pipelines on %d threads", g_pw_n, nt);
+    // At most the list's first DM_VK_PREWARM_MAX entries are made (default 3000, 0 = all; droidplay-core prewarm_thread's PREWARM_MAX): the list only grows, and
+    // making all of a long one kept the cores busy into play. The rest stay in the file, and the driver's pipeline cache still holds what they built before
+    { const char *e = getenv("DM_VK_PREWARM_MAX"); size_t mx = e ? (size_t)strtoul(e, NULL, 10) : 3000; g_pw_lim = mx && g_pw_n > mx ? mx : g_pw_n; }
+    VKLOG("prewarm: %zu recorded pipelines on %d threads%s", g_pw_lim, nt, g_pw_lim < g_pw_n ? " (the first of the list, DM_VK_PREWARM_MAX)" : "");
     pwm_open();
     for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, (void *)(intptr_t)i); pthread_attr_destroy(&a); }
 }
@@ -3853,6 +3909,82 @@ static int order_feedback(int nst) {   // a stage of the draw samples one of the
     }
     return 0;
 }
+// The pipeline key of the draw about to be made from the replay state (S, the open pass): prepare_draw's, and predict_rest's for the draws after it
+// (predict: no side effects, no logging). The descriptor-dependent fields (um, im: integer-texel variants) are filled by prepare_draw from its sets
+static void pkey_fill(pkey *kp, int prim, int indexed, int var, int predict) {
+    memset(kp, 0, sizeof *kp);
+    for (int i = 0; i < 3; i++) kp->key[i] = S.sh[i] ? S.sh[i]->key : 0;
+    if (S.sh[0] && S.sh[1] && !S.rast_discard) for (int i = 0; i < g_x_nflat; i++) if (kp->key[0] == g_x_flat[i]) kp->flat = (uint32_t)g_x_flat_mode[i] & 127;
+    kp->topo = topo(prim); kp->restart = S.prim_restart && (kp->topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || kp->topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || kp->topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) && indexed;
+    kp->raster_discard = S.rast_discard; kp->alt = (uint32_t)(g_spv_alt && (!g_spv_key || kp->key[0] == g_spv_key || kp->key[1] == g_spv_key || kp->key[2] == g_spv_key)); kp->cull = g_no_cull ? 0 : S.poly.cull;
+    // counter-clockwise front faces in Vulkan's framebuffer: Vulkan's clip space has y down, Metal's up (nvn_mtl.m: CCW when (front == CCW) != lower left), and the
+    // lower-left origin mode flips the viewport again, so CCW when (front == CCW) == lower left. Taken as given, upper-left games (NEO) culled their ground and walls
+    kp->front = ((S.poly.front == NVN_FRONT_FACE_CCW) == (g_lower_left != 0)) != (g_flipy != 0); kp->mode = S.poly.mode; kp->depth_clamp = S.depth_clamp;
+    kp->bias_en = (S.poly.offset_en & (S.poly.mode == 0 ? 1 : S.poly.mode == 1 ? 2 : 4)) != 0;
+    if (var == 2) kp->bias_en = 0;
+    if (var == 8) kp->raster_discard = 1;   // no fragment shader in the pipeline
+    int has_depth = (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0, has_stencil = (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+    kp->dt = has_depth && S.ds.dt; kp->dw = S.ds.dw; kp->df = S.ds.df; kp->st = has_stencil && S.ds.st;
+    if (g_depth_func_fs && S.sh[1] && S.sh[1]->key == g_depth_func_fs) kp->df = (uint32_t)g_depth_func;
+    static int npl; if (!predict && g_x_logfs && S.sh[1] && S.sh[1]->key == g_x_logfs && npl++ < 60) VKLOG("logfs: present %llu pass %d (%ux%u, %llu draws before): depth attachment %d test %d (state %d) func %u write %u; depth range %.9g %.9g; viewport %.1f %.1f %.1f %.1f",
+        (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, has_depth, kp->dt, S.ds.dt, kp->df, kp->dw, S.dnear, S.dfar, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3]);
+    // A depth buffer that a fragment shader wrote through gl_FragDepth: Adreno's early culling (LRZ) then rejects whole triangles of later draws that test it, in some frames
+    // and not others, with the same draws, state and depth contents. Hades II downsamples its scene depth into a 640x360 D24S8 with such a shader (Blit2DDepth), then
+    // draws its lights into it with the depth test on and no depth write: the lights went out in turn every 24-48 frames (whole halves of light quads missing in pass dumps),
+    // and Xenoblade Chronicles 3's cloud dome (its depth downsampled the same way) lost whole triangles. The light shader rewritten to write gl_FragDepth = gl_FragCoord.z
+    // (the same depth, tested after the shader) brought the pulses to 0 in 5 recordings, against 8-21; neither writing the depth image back by transfer (one texel or the
+    // whole image) nor waiting for the GPU after each submission changed them. So draws that test such a buffer (written in the last two presents) use that variant.
+    // Not with a depth bias (gl_FragCoord.z need not carry it). DM_VK_FDZ=0 (live): never
+    { vkimg_t *dim = has_depth ? P_att[8].im : NULL; vkshader_t *fsh = kp->raster_discard ? NULL : S.sh[1];
+      if (!predict && dim && fsh && fsh->depth_repl && kp->dt && kp->dw) dim->fdz_frame = g_tex_frame + 1;   // (a prediction leaves the depth image as it is)
+      kp->fdz = g_fdz && dim && fsh && !fsh->depth_repl && kp->dt && !kp->bias_en &&
+          ((dim->fdz_frame && g_tex_frame + 1 - dim->fdz_frame <= 2) || (g_fdz_fs && fsh->key == g_fdz_fs)); }
+    kp->sf[0] = S.ds.sf_f; kp->sf[1] = S.ds.sf_b; kp->sfail[0] = S.ds.fail_f; kp->szfail[0] = S.ds.zfail_f; kp->szpass[0] = S.ds.zpass_f; kp->sfail[1] = S.ds.fail_b; kp->szfail[1] = S.ds.zfail_b; kp->szpass[1] = S.ds.zpass_b;
+    // vertex input: every location the vertex shader reads
+    vkshader_t *vsh = S.sh[0]; uint32_t in_mask = vsh ? vsh->local[0] : 0, int_mask = vsh ? vsh->local[1] | vsh->local[2] : 0, sint_mask = vsh ? vsh->local[1] : 0;
+    uint32_t used_streams = 0; int need_zero = 0;
+    for (int loc = 0; loc < 16; loc++) {
+        if (!(in_mask >> loc & 1)) continue;
+        va_st a; memcpy(&a, &S.vattr[loc], 4);
+        VkFormat f = a.fmt ? vertex_format(a.fmt, int_mask >> loc & 1, sint_mask >> loc & 1) : VK_FORMAT_UNDEFINED;
+        if (f == VK_FORMAT_UNDEFINED || !S.vbuf[a.stream].address) { kp->attr[kp->nattr++] = (typeof(kp->attr[0])){(uint32_t)loc, 16, int_mask >> loc & 1 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32B32A32_SFLOAT, 0}; need_zero = 1; continue; }
+        kp->attr[kp->nattr++] = (typeof(kp->attr[0])){(uint32_t)loc, a.stream, f, a.offset};
+        used_streams |= 1u << a.stream;
+    }
+    for (int s = 0; s < 16; s++) if (used_streams >> s & 1) kp->bind[kp->nbind++] = (typeof(kp->bind[0])){(uint32_t)s, S.vstream[s].stride, S.vstream[s].divisor ? 1u : 0u, S.vstream[s].divisor};
+    if (need_zero) kp->bind[kp->nbind++] = (typeof(kp->bind[0])){16, 0, 0, 0};
+    // attachments and blending
+    kp->ncol = (uint32_t)S.ncol; kp->dfmt = S.dfmt; kp->samples = S.samples ? S.samples : 1; kp->a2c = S.ms.a2c;
+    kp->logic_en = S.color.logic_op != 3 && S.color.logic_op != 0 && 0;   // logic ops: not on mobile render targets in version 1
+    kp->logic_op = S.color.logic_op;
+    for (int i = 0; i < S.ncol; i++) {
+        kp->cfmt[i] = S.cfmt[i];
+        kp->wmask[i] = S.cfmt[i] && S.sh[1] ? (S.chmask.mask >> (4 * i)) & 0xf : 0;   // no fragment shader: no colour written
+        // Components outside the fragment shader's output map (SPH word 18; port of upstream 51ecd693b): the GPU leaves them as they were, the translator does not store them,
+        // and Vulkan would write them undefined. DM_VK_OMAP=0 (start-up): no such mask
+        { static int om = -1; if (om < 0) { const char *e = getenv("DM_VK_OMAP"); om = !(e && *e == '0'); }
+          if (om && kp->wmask[i] && S.sh[1]->omap_known) kp->wmask[i] &= S.sh[1]->omap >> (4 * i) & 0xf; }
+        const vkfmt_t *f = S.rt_has_col[i] ? vk_fmt(S.rt_col[i].d.format) : NULL;
+        if (((S.color.blend_en >> i) & 1) && f && !f->is_int) {
+            kp->blend_en |= 1u << i;
+            kp->bl[i].src = S.blend[i].src_rgb; kp->bl[i].dst = S.blend[i].dst_rgb; kp->bl[i].srca = S.blend[i].src_a; kp->bl[i].dsta = S.blend[i].dst_a; kp->bl[i].eq = S.blend[i].eq_rgb; kp->bl[i].eqa = S.blend[i].eq_a;
+        }
+    }
+    if (S.ncol > 1 && P_att[0].im == &g_s0_image) { kp->wmask[0] = 0; kp->blend_en &= ~1u; }   // slot 0's scratch (DM_VK_SLOT0_FILL): nothing written there
+    if (g_mrt_active) { kp->wmask[1] = 0xf; kp->blend_en &= ~2u; } // probe output is independent of original output map/blend state
+    // Dual-source blending: NVN blends colour target 0 with the shader's output 1 as its second source (factors SRC1_*, 0x10-0x13), the translator declares that output at
+    // location 1, and Vulkan takes the second source only from location 0, index 1 (with location 1 the blend reads undefined values: Pokémon Legends: Arceus's post effects,
+    // shader ha_post_effects variation 4, washed the whole picture out; the validation layer named it). Such a pipeline takes the fragment shader's dual-source variant
+    #define SRC1F(x) ((x) >= 0x10 && (x) <= 0x13)
+    kp->dual = (kp->blend_en & 1) && S.sh[1] && !kp->raster_discard && (SRC1F(kp->bl[0].src) || SRC1F(kp->bl[0].dst) || SRC1F(kp->bl[0].srca) || SRC1F(kp->bl[0].dsta));
+    #undef SRC1F
+    // Maxwell's alpha test (nvnColorStateSetAlphaTest / SetAlphaRef): colour 0's alpha against the reference, the fragment dropped when the comparison fails. Not when colour 0
+    // is an integer target or absent (as OpenGL and nvn_mtl.m atest_key). Donkey Kong Bananza's Skills grid: ui2d clears each icon capture's rectangle of the UI target
+    // with a quad of alpha 0 and blending off under GREATER 0 before copying the rectangle; drawn without the test, every cell was an opaque black square
+    { uint32_t af = S.color.alpha_func; const vkfmt_t *f0 = S.ncol && S.rt_has_col[0] ? vk_fmt(S.rt_col[0].d.format) : NULL;
+      if (af >= 1 && af <= 7 && S.sh[1] && !kp->raster_discard && S.cfmt[0] && f0 && !f0->is_int) { kp->atest = af; if (af != 1) memcpy(&kp->aref, &S.alpha_ref, 4); if (kp->aref == 0x80000000u) kp->aref = 0; } }
+    kp->clip_neg1 = !g_depth_zero;
+}
 static int prepare_draw(int prim, int indexed) {
     if (g_mrt_active) mrt_abort(); // a previous selected draw returned before its GPU command
     // DM_VK_CB_DRAWS (read every submission, default 128, 0 = never): the replay is cut every that many draws and what is recorded goes to the GPU at once
@@ -3906,78 +4038,8 @@ static int prepare_draw(int prim, int indexed) {
     uint64_t t0 = tick();
     VkCommandBuffer cb = vk_cmd();
     if (g_no_cull < 0) g_no_cull = getenv("DM_VK_NOCULL") != NULL;
-    pkey k; memset(&k, 0, sizeof k);
-    for (int i = 0; i < 3; i++) k.key[i] = S.sh[i] ? S.sh[i]->key : 0;
-    if (S.sh[0] && S.sh[1] && !S.rast_discard) for (int i = 0; i < g_x_nflat; i++) if (k.key[0] == g_x_flat[i]) k.flat = (uint32_t)g_x_flat_mode[i] & 127;
-    k.topo = topo(prim); k.restart = S.prim_restart && (k.topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) && indexed;
-    k.raster_discard = S.rast_discard; k.alt = (uint32_t)(g_spv_alt && (!g_spv_key || k.key[0] == g_spv_key || k.key[1] == g_spv_key || k.key[2] == g_spv_key)); k.cull = g_no_cull ? 0 : S.poly.cull;
-    // counter-clockwise front faces in Vulkan's framebuffer: Vulkan's clip space has y down, Metal's up (nvn_mtl.m: CCW when (front == CCW) != lower left), and the
-    // lower-left origin mode flips the viewport again, so CCW when (front == CCW) == lower left. Taken as given, upper-left games (NEO) culled their ground and walls
-    k.front = ((S.poly.front == NVN_FRONT_FACE_CCW) == (g_lower_left != 0)) != (g_flipy != 0); k.mode = S.poly.mode; k.depth_clamp = S.depth_clamp;
-    k.bias_en = (S.poly.offset_en & (S.poly.mode == 0 ? 1 : S.poly.mode == 1 ? 2 : 4)) != 0;
-    if (var == 2) k.bias_en = 0;
-    if (var == 8) k.raster_discard = 1;   // no fragment shader in the pipeline
-    int has_depth = (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0, has_stencil = (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
-    k.dt = has_depth && S.ds.dt; k.dw = S.ds.dw; k.df = S.ds.df; k.st = has_stencil && S.ds.st;
-    if (g_depth_func_fs && S.sh[1] && S.sh[1]->key == g_depth_func_fs) k.df = (uint32_t)g_depth_func;
-    static int npl; if (g_x_logfs && S.sh[1] && S.sh[1]->key == g_x_logfs && npl++ < 60) VKLOG("logfs: present %llu pass %d (%ux%u, %llu draws before): depth attachment %d test %d (state %d) func %u write %u; depth range %.9g %.9g; viewport %.1f %.1f %.1f %.1f",
-        (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, has_depth, k.dt, S.ds.dt, k.df, k.dw, S.dnear, S.dfar, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3]);
-    // A depth buffer that a fragment shader wrote through gl_FragDepth: Adreno's early culling (LRZ) then rejects whole triangles of later draws that test it, in some frames
-    // and not others, with the same draws, state and depth contents. Hades II downsamples its scene depth into a 640x360 D24S8 with such a shader (Blit2DDepth), then
-    // draws its lights into it with the depth test on and no depth write: the lights went out in turn every 24-48 frames (whole halves of light quads missing in pass dumps),
-    // and Xenoblade Chronicles 3's cloud dome (its depth downsampled the same way) lost whole triangles. The light shader rewritten to write gl_FragDepth = gl_FragCoord.z
-    // (the same depth, tested after the shader) brought the pulses to 0 in 5 recordings, against 8-21; neither writing the depth image back by transfer (one texel or the
-    // whole image) nor waiting for the GPU after each submission changed them. So draws that test such a buffer (written in the last two presents) use that variant.
-    // Not with a depth bias (gl_FragCoord.z need not carry it). DM_VK_FDZ=0 (live): never
-    { vkimg_t *dim = has_depth ? P_att[8].im : NULL; vkshader_t *fsh = k.raster_discard ? NULL : S.sh[1];
-      if (dim && fsh && fsh->depth_repl && k.dt && k.dw) dim->fdz_frame = g_tex_frame + 1;
-      k.fdz = g_fdz && dim && fsh && !fsh->depth_repl && k.dt && !k.bias_en &&
-          ((dim->fdz_frame && g_tex_frame + 1 - dim->fdz_frame <= 2) || (g_fdz_fs && fsh->key == g_fdz_fs)); }
-    k.sf[0] = S.ds.sf_f; k.sf[1] = S.ds.sf_b; k.sfail[0] = S.ds.fail_f; k.szfail[0] = S.ds.zfail_f; k.szpass[0] = S.ds.zpass_f; k.sfail[1] = S.ds.fail_b; k.szfail[1] = S.ds.zfail_b; k.szpass[1] = S.ds.zpass_b;
-    // vertex input: every location the vertex shader reads
-    vkshader_t *vsh = S.sh[0]; uint32_t in_mask = vsh ? vsh->local[0] : 0, int_mask = vsh ? vsh->local[1] | vsh->local[2] : 0, sint_mask = vsh ? vsh->local[1] : 0;
-    uint32_t used_streams = 0; int need_zero = 0;
-    for (int loc = 0; loc < 16; loc++) {
-        if (!(in_mask >> loc & 1)) continue;
-        va_st a; memcpy(&a, &S.vattr[loc], 4);
-        VkFormat f = a.fmt ? vertex_format(a.fmt, int_mask >> loc & 1, sint_mask >> loc & 1) : VK_FORMAT_UNDEFINED;
-        if (f == VK_FORMAT_UNDEFINED || !S.vbuf[a.stream].address) { k.attr[k.nattr++] = (typeof(k.attr[0])){(uint32_t)loc, 16, int_mask >> loc & 1 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32B32A32_SFLOAT, 0}; need_zero = 1; continue; }
-        k.attr[k.nattr++] = (typeof(k.attr[0])){(uint32_t)loc, a.stream, f, a.offset};
-        used_streams |= 1u << a.stream;
-    }
-    for (int s = 0; s < 16; s++) if (used_streams >> s & 1) k.bind[k.nbind++] = (typeof(k.bind[0])){(uint32_t)s, S.vstream[s].stride, S.vstream[s].divisor ? 1u : 0u, S.vstream[s].divisor};
-    if (need_zero) k.bind[k.nbind++] = (typeof(k.bind[0])){16, 0, 0, 0};
-    // attachments and blending
-    k.ncol = (uint32_t)S.ncol; k.dfmt = S.dfmt; k.samples = S.samples ? S.samples : 1; k.a2c = S.ms.a2c;
-    k.logic_en = S.color.logic_op != 3 && S.color.logic_op != 0 && 0;   // logic ops: not on mobile render targets in version 1
-    k.logic_op = S.color.logic_op;
-    for (int i = 0; i < S.ncol; i++) {
-        k.cfmt[i] = S.cfmt[i];
-        k.wmask[i] = S.cfmt[i] && S.sh[1] ? (S.chmask.mask >> (4 * i)) & 0xf : 0;   // no fragment shader: no colour written
-        // Components outside the fragment shader's output map (SPH word 18; port of upstream 51ecd693b): the GPU leaves them as they were, the translator does not store them,
-        // and Vulkan would write them undefined. DM_VK_OMAP=0 (start-up): no such mask
-        { static int om = -1; if (om < 0) { const char *e = getenv("DM_VK_OMAP"); om = !(e && *e == '0'); }
-          if (om && k.wmask[i] && S.sh[1]->omap_known) k.wmask[i] &= S.sh[1]->omap >> (4 * i) & 0xf; }
-        const vkfmt_t *f = S.rt_has_col[i] ? vk_fmt(S.rt_col[i].d.format) : NULL;
-        if (((S.color.blend_en >> i) & 1) && f && !f->is_int) {
-            k.blend_en |= 1u << i;
-            k.bl[i].src = S.blend[i].src_rgb; k.bl[i].dst = S.blend[i].dst_rgb; k.bl[i].srca = S.blend[i].src_a; k.bl[i].dsta = S.blend[i].dst_a; k.bl[i].eq = S.blend[i].eq_rgb; k.bl[i].eqa = S.blend[i].eq_a;
-        }
-    }
-    if (S.ncol > 1 && P_att[0].im == &g_s0_image) { k.wmask[0] = 0; k.blend_en &= ~1u; }   // slot 0's scratch (DM_VK_SLOT0_FILL): nothing written there
-    if (g_mrt_active) { k.wmask[1] = 0xf; k.blend_en &= ~2u; } // probe output is independent of original output map/blend state
-    // Dual-source blending: NVN blends colour target 0 with the shader's output 1 as its second source (factors SRC1_*, 0x10-0x13), the translator declares that output at
-    // location 1, and Vulkan takes the second source only from location 0, index 1 (with location 1 the blend reads undefined values: Pokémon Legends: Arceus's post effects,
-    // shader ha_post_effects variation 4, washed the whole picture out; the validation layer named it). Such a pipeline takes the fragment shader's dual-source variant
-    #define SRC1F(x) ((x) >= 0x10 && (x) <= 0x13)
-    k.dual = (k.blend_en & 1) && S.sh[1] && !k.raster_discard && (SRC1F(k.bl[0].src) || SRC1F(k.bl[0].dst) || SRC1F(k.bl[0].srca) || SRC1F(k.bl[0].dsta));
-    #undef SRC1F
-    // Maxwell's alpha test (nvnColorStateSetAlphaTest / SetAlphaRef): colour 0's alpha against the reference, the fragment dropped when the comparison fails. Not when colour 0
-    // is an integer target or absent (as OpenGL and nvn_mtl.m atest_key). Donkey Kong Bananza's Skills grid: ui2d clears each icon capture's rectangle of the UI target
-    // with a quad of alpha 0 and blending off under GREATER 0 before copying the rectangle; drawn without the test, every cell was an opaque black square
-    { uint32_t af = S.color.alpha_func; const vkfmt_t *f0 = S.ncol && S.rt_has_col[0] ? vk_fmt(S.rt_col[0].d.format) : NULL;
-      if (af >= 1 && af <= 7 && S.sh[1] && !k.raster_discard && S.cfmt[0] && f0 && !f0->is_int) { k.atest = af; if (af != 1) memcpy(&k.aref, &S.alpha_ref, 4); if (k.aref == 0x80000000u) k.aref = 0; } }
-    k.clip_neg1 = !g_depth_zero;
+    pkey k; pkey_fill(&k, prim, indexed, var, 0);
+    int has_depth = (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
     // layout and pipeline
     VkDescriptorSetLayout dsl[VK_NSETS] = {vk_tbl_dsl()}; int nsets = 1;   // set 0: the texture table (the same layout in every graphics pipeline layout, so a bound table set outlives pipeline changes)
     for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && k.raster_discard)) { dsl[S.sh[st]->set] = S.sh[st]->dsl; if (S.sh[st]->set + 1 > nsets) nsets = S.sh[st]->set + 1; }
@@ -5710,6 +5772,77 @@ void mtl_exec_span(const uint8_t *p, const uint8_t *end) {
     uint64_t t0 = tnow(); prof_tick(); vk_dq_replay_thread(); g_la_depth = 0; g_la_epoch++; g_la_span = 1;   // (no OP_END closes a span: occ_reset_next does not read ahead of it)
     exec_ops(p, end);
     g_vkst.ns_exec += tnow() - t0;
+}
+// Batch (upstream nxnative 6a6a018df pso_predict_rest_): at the first pipeline miss of a submission (or of a stretch between counter ops), the ops after the
+// current one (the rest of its command buffer, of the buffers that called it, and of the submission's later ones, as occ_reset_next reads them) are walked on
+// a copy of the bound state up to the next render target change. Each draw's key is made as prepare_draw makes it; the missing ones go to the background
+// threads (apq_push), so an effect's other new pipelines are being built while its first one is, not one after another as their draws come. A prediction
+// that no draw takes is not recorded (pred_taken). No GPU commands, no pass changes, S as it was afterwards. DM_VK_BATCH_PIPE=0 turns it off; at most
+// DM_VK_BATCH_MAX (24) keys a walk
+static void predict_rest(const pkey *cur) {
+    static int on = -1, mx; static uint32_t epoch = ~0u; extern const uint64_t *vk_rest_h; extern int vk_rest_n;
+    if (on < 0) { const char *e = getenv("DM_VK_BATCH_PIPE"); on = !(e && *e == '0') && g_async_pipe; e = getenv("DM_VK_BATCH_MAX"); mx = e ? atoi(e) : 24; if (mx > APQ / 2) mx = APQ / 2; }
+    if (!on || mx <= 0 || epoch == g_la_epoch) return;
+    epoch = g_la_epoch;
+    if (!g_la_at || g_la_depth > 16 || g_la_span) return;
+    static __typeof__(S) save; memcpy(&save, &S, sizeof S);
+    uint64_t t0 = tick(); int queued = 0, draws = 0;
+    const uint8_t *p = g_la_at, *loc[32]; int nl = 0, up = g_la_depth, rest = 0;
+    for (int left = 200000; left > 0 && queued < mx && draws < 4096; left--) {
+        op_hdr h; memcpy(&h, p, sizeof h); const uint8_t *a = p + 8; int prim = -1, indexed = 0;
+        switch (h.op) {
+        case OP_END: if (nl) { p = loc[--nl]; continue; } if (up) { p = g_la_ret[--up]; continue; }
+            if (rest < vk_rest_n && vk_rest_h[rest]) { p = (const uint8_t *)(uintptr_t)vk_rest_h[rest++]; continue; }
+            goto done;
+        case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (nl == 32 || !t) goto done; loc[nl++] = p + h.size; p = (const uint8_t *)(uintptr_t)t; continue; }
+        case OP_SET_RT: goto done;   // other attachments: other keys, and set_rt ends the pass
+        case OP_VIEWPORTS: { const p_viewports *v = (const p_viewports *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(S.vp[v->first + i], v->v[i], 16); break; }
+        case OP_BIND_PROGRAM: bind_program((const p_bind_program *)a); break;
+        case OP_BIND_STATE: { const p_bind_state *bs = (const p_bind_state *)a;
+            switch (bs->kind) {
+            case 0: { blend_st b; memcpy(&b, bs->bytes, sizeof b); if (b.target < 8) S.blend[b.target] = b; break; }
+            case 1: memcpy(&S.color, bs->bytes, sizeof S.color); break;
+            case 2: memcpy(&S.chmask, bs->bytes, sizeof S.chmask); break;   // (bind_chmask may end the pass: the mask alone here)
+            case 3: memcpy(&S.ms, bs->bytes, sizeof S.ms); break;
+            case 4: memcpy(&S.poly, bs->bytes, sizeof S.poly); break;
+            case 5: memcpy(&S.ds, bs->bytes, sizeof S.ds); break;
+            }
+            break; }
+        case OP_BIND_VATTR: { const p_bind_vattr *v = (const p_bind_vattr *)a; memset(S.vattr, 0, sizeof S.vattr); for (int i = 0; i < v->n && i < 16; i++) S.vattr[v->first + i] = v->st[i]; break; }
+        case OP_BIND_VSTREAM: { const p_bind_vstream *v = (const p_bind_vstream *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) S.vstream[v->first + i] = v->st[i]; break; }
+        case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf t1; const p_bind_vbuf *v = vbuf_rec(h.op, a, &t1); for (int i = 0; i < v->n && v->first + i < 16; i++) S.vbuf[v->first + i] = v->r[i]; break; }
+        case OP_STENCIL: { const p_stencil *st = (const p_stencil *)a;
+            for (int f = 0; f < 2; f++) if (st->face & (1 << f)) { if (st->which == 0) S.smask[f] = st->value_mask; else if (st->which == 1) S.swmask[f] = st->mask; else S.sref[f] = st->ref; }
+            break; }
+        case OP_POLY_OFFSET: S.pofs = *(const p_poly_offset *)a; break;
+        case OP_ALPHA_REF: S.alpha_ref = ((const p_alpha_ref *)a)->ref; break;
+        case OP_BLEND_COLOR: memcpy(S.blendc, ((const p_blend_color *)a)->rgba, 16); break;
+        case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_depth_clamp *)a)->on; break;
+        case OP_RAST_DISCARD: S.rast_discard = ((const p_rast_discard *)a)->on; break;
+        case OP_PRIM_RESTART: S.prim_restart = ((const p_prim_restart *)a)->on; break;
+        case OP_DRAW: memcpy(&prim, a, 4); break;
+        case OP_DRAW_IDX: memcpy(&prim, a, 4); indexed = 1; break;
+        case OP_MULTI_DRAW: { const p_multi_draw *m = (const p_multi_draw *)a; prim = m->prim; indexed = m->itype >= 0; break; }
+        default: break;
+        }
+        if (prim >= 0 && prim != DM_PRIM_MESH_TASKS && S.sh[0] && !S.sh[3] && !S.sh[4] && !S.rast_discard) {
+            draws++;
+            pkey k; pkey_fill(&k, prim, indexed, 0, 1);
+            if (k.key[0] == cur->key[0] && k.key[1] == cur->key[1] && k.key[2] == cur->key[2]) { memcpy(k.um, cur->um, sizeof k.um); memcpy(k.im, cur->im, sizeof k.im); }
+            if (!k.alt && !k.flat && memcmp(&k, cur, sizeof k)) {
+                pthread_mutex_lock(&g_pipe_mu); int miss = !nvn_hm_get(&g_pipes, &k); pthread_mutex_unlock(&g_pipe_mu);
+                if (miss && apq_push(&k)) { queued++;   // (a build done before the mark is recorded at once: harmless)
+                    pthread_mutex_lock(&g_pipe_mu); if (nvn_hm_get(&g_pipes, &k) == PIPE_PENDING) nvn_hm_put(&g_pred, &k, (void *)1); pthread_mutex_unlock(&g_pipe_mu); }
+                else if (miss) goto done;   // the queue is full
+            }
+        }
+        if (h.size < sizeof h) break;
+        p += h.size;
+    }
+done:
+    memcpy(&S, &save, sizeof S);
+    { static int n; static uint64_t tq; tq += queued; if (queued && (n++ < 8 || n % 64 == 0)) VKLOG("batch: %d pipelines of the rest of the submission queued ahead of their draws (%d draws read, %.2f ms; %llu queued, %llu taken so far)", queued, draws, (tick() - t0) / 1e6, (unsigned long long)tq, (unsigned long long)g_pred_hit); }
 }
 static void exec_ops(const uint8_t *p, const uint8_t *end) {
     for (;;) {

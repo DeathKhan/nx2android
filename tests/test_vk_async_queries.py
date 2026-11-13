@@ -27,7 +27,8 @@ class AsyncQueries(unittest.TestCase):
         source = (ROOT / 'nxnative/dm/android/gfx_vk_exec.c').read_text(encoding='utf-8')
         core = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
         worker = function(source, 'static void *async_pipe_thread(')
-        self.assertIn('async_pipe_complete(&k, p);', worker)
+        self.assertIn('apq_build(&k);', worker)   # (the build itself is shared with the prewarm threads, which take queued keys first)
+        self.assertIn('async_pipe_complete(&k, p);', function(source, 'static void apq_build(const pkey *kp) {'))
         code = r'''
 #include <assert.h>
 #include <stdint.h>
@@ -77,6 +78,10 @@ static uint64_t g_tex_frame,g_sync_pipes,g_sync_pipe_ns;
 static int occ_reset_next(void){return 0;} // no reset is proven ahead: a counted draw waits
 static int shader_wmem(vkshader_t *s){(void)s;return 0;}
 static void pipe_sibling(const pkey *k){(void)k;}
+static int pred_pending(const pkey *k){(void)k;return 0;}   // the batch prediction (predict_rest) is not exercised here
+static void pred_taken(const pkey *k,VkPipeline p){(void)k;(void)p;}
+static void predict_rest(const pkey *cur){(void)cur;}
+static int g_replay_waits;
 COMPLETE
 SHADER
 #define pthread_create fail_create
