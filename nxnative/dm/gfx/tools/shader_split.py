@@ -2984,48 +2984,6 @@ def separable_pairs(keys):
     return {(v, p) for v in single for p in cover}, cover
 
 SMASH_ARC = struct.pack('<Q', 0xABCDEF9876543210)   # smash_arc.MAGIC (scan_file reads only the first bytes, without importing the reader)
-BND2 = b'bnd2'
-
-def bnd2_resources(d, label):
-    """The resources of a Criterion Bundle 2 ('bnd2', Burnout Paradise's format; version 3 in Need for Speed: Hot Pursuit Remastered): → [(resource ID, type, block, data)].
-    Header: +0x04 version, +0x08 platform, +0x10 entry count, +0x14 entry table offset, +0x18 four block data offsets (u32), +0x28 flags (bit 0: resources zlib-compressed).
-    An entry is 0x50 bytes: +0x00 resource ID u64, +0x08 import hash u64, +0x10 four uncompressed sizes, +0x20 four sizes on disk (each with the alignment in the top
-    nibble), +0x30 four offsets (from that block's data offset), +0x40 import offset, +0x44 type ID, +0x48 import count u16, flags u8, stream index u8.
-    A resource has up to four blocks (0: main memory, 1: graphics memory). Hot Pursuit Remastered's SHADERS.BNDL keeps one whole GLSLC output in block 1 of each type 0x8 resource (2,112)"""
-    ver, _, _, cnt, eoff, *datoff, flags = field(d, '<10I', 4, f'{label}: bnd2 header')
-    table_end = eoff + cnt * 0x50
-    if ver not in (2, 3) or eoff < 0x30 or table_end > len(d): red(f'{label}: bnd2 version {ver} with {cnt} entries at {eoff:#x} is not a layout this reader knows')
-    out = []
-    for i in range(cnt):
-        e = eoff + i * 0x50
-        rid, = struct.unpack_from('<Q', d, e); typ, = struct.unpack_from('<I', d, e + 0x44)
-        unpacked = struct.unpack_from('<4I', d, e + 0x10)
-        sizes = struct.unpack_from('<4I', d, e + 0x20); offs = struct.unpack_from('<4I', d, e + 0x30)
-        for k in range(4):
-            n = sizes[k] & 0x0FFFFFFF; expected = unpacked[k] & 0x0FFFFFFF
-            where = f'{label}: bnd2 resource {rid:016x} block {k}'
-            if not n:
-                if expected: red(f'{where}: declares {expected} bytes and has none stored')
-                continue
-            start = datoff[k] + offs[k]
-            if start < table_end: red(f'{where}: its data at {start:#x} starts inside the resource table')
-            raw = span(d, start, n, where)
-            if flags & 1:
-                dec = zlib.decompressobj()
-                try: raw = dec.decompress(raw, expected + 1)
-                except zlib.error as e: red(f'{where}: damaged zlib stream ({e})')
-                if not dec.eof or len(raw) != expected: red(f'{where}: incomplete zlib stream or decompressed size differs from declared size {expected}')
-            elif len(raw) != expected: red(f'{where}: stored size differs from declared size {expected}')
-            out.append((rid, typ, k, raw))
-    return out
-
-def bnd2_shaders(d, label):
-    """GLSLC outputs in the resources of a Criterion Bundle 2 (bnd2_resources), each resource block scanned with glslc_shaders. Bundles without shaders (tracks, vehicles, UI) cost one
-    inflate of each resource; the outputs' magic decides, not the resource type, whose numbering is per game"""
-    found = []
-    for rid, typ, k, r in bnd2_resources(d, label):
-        if b'\x91\x68\x86\x19' in r: found += glslc_shaders(r, f'{label}/{rid:016x}.{typ:x}.{k}', need=False)
-    return found
 
 HEAPS_CACHE = 'shaders.cache.nx'
 
@@ -3103,6 +3061,96 @@ def var_pairs(found):
 def unreadable_why(e, name):
     why = str(e).removeprefix('[RED] ') if isinstance(e, SystemExit) else f'{type(e).__name__}: {e}'
     return why if why.lstrip('/').startswith(name.lstrip('/')) else f'{name}: {why}'   # most red lines name the file already
+
+BND2 = b'bnd2'
+
+def bnd2_v2_resources(d, label):
+    """Burnout Paradise's Bundle 2 (version 2): the resources bnd2_resources returns: → [(resource ID, type, block, data)].
+    Header: +0x04 version, +0x08 platform, +0x10 entry count, +0x14 entry table offset, +0x18/+0x1C/+0x20 the three blocks' data offsets (block 1: graphics memory).
+    An entry is 0x40 bytes: +0x00 resource ID u64, +0x10 three uncompressed sizes, +0x1C three sizes on disk (each with the alignment in the top nibble), +0x28 three
+    offsets from that block's data offset, +0x38 type ID (0x12 a shader, 0x32 its program, in the game's own numbering). A block is zlib or raw and nothing in the header
+    says which: the shader and AI bundles zlib their blocks (stored < expected; AI.DAT keeps its one resource in block 0, 0x367e60 bytes, 0x1b14a8 on disk; SHADERS.BNDL
+    keeps its 242 shaders' GLSLC outputs in block 1, its first, resource 00433b5e, 0x9f00 bytes at 0), the track bundles store every block uncompressed (stored ==
+    expected) — and a raw block's first two bytes can still look like a zlib header, so the inflate and its size decide"""
+    import zlib
+    cnt, eoff, *datoff = field(d, '<5I', 0x10, f'{label}: bnd2 header')
+    table_end = eoff + cnt * 0x40
+    if eoff < 0x30 or table_end > len(d) or any(x > len(d) for x in datoff):
+        red(f'{label}: bnd2 version 2 with {cnt} entries at {eoff:#x} and blocks at {", ".join(map(hex, datoff))} is not a layout this reader knows')
+    out = []
+    for i in range(cnt):
+        e = eoff + i * 0x40
+        rid, = struct.unpack_from('<Q', d, e); typ, = struct.unpack_from('<I', d, e + 0x38)
+        unpacked = struct.unpack_from('<3I', d, e + 0x10)
+        sizes = struct.unpack_from('<3I', d, e + 0x1C); offs = struct.unpack_from('<3I', d, e + 0x28)
+        for k in range(3):
+            n = sizes[k] & 0x0FFFFFFF; expected = unpacked[k] & 0x0FFFFFFF
+            where = f'{label}: bnd2 resource {rid:016x} block {k}'
+            if not n:
+                if expected: red(f'{where}: declares {expected} bytes and has none stored')
+                continue
+            start = datoff[k] + offs[k]
+            if start < table_end: red(f'{where}: its data at {start:#x} starts inside the resource table')
+            raw = span(d, start, n, where)
+            # the stream's own header says zlib: CMF 0x78 (deflate, 32 KB window) and a FLG that makes CMF * 256 + FLG a multiple of 31 (78 01, 78 5e, 78 9c, 78 da).
+            # That is no proof, though: a raw block can start with those two bytes by chance. Track bundles store every block uncompressed (stored == expected), the
+            # shader and AI bundles zlib theirs (stored < expected), so inflate when the header says zlib — and on a failed inflate or a wrong size, the stored bytes
+            # are the data when stored == expected
+            if len(raw) >= 2 and raw[0] == 0x78 and (raw[0] << 8 | raw[1]) % 31 == 0:
+                dec = zlib.decompressobj()
+                try:
+                    zraw = dec.decompress(raw, expected + 1)
+                    if dec.eof and len(zraw) == expected: raw = zraw
+                    elif n != expected: red(f'{where}: incomplete zlib stream or decompressed size differs from declared size {expected}')
+                except zlib.error as e:
+                    if n != expected: red(f'{where}: damaged zlib stream ({e})')
+            elif len(raw) != expected: red(f'{where}: stored size differs from declared size {expected}')
+            out.append((rid, typ, k, raw))
+    return out
+
+def bnd2_resources(d, label):
+    """The resources of a Criterion Bundle 2 ('bnd2', Burnout Paradise's format; version 3 in Need for Speed: Hot Pursuit Remastered): → [(resource ID, type, block, data)].
+    Version 2 (Burnout Paradise) has another layout: bnd2_v2_resources.
+    Header: +0x04 version, +0x08 platform, +0x10 entry count, +0x14 entry table offset, +0x18 four block data offsets (u32), +0x28 flags (bit 0: resources zlib-compressed).
+    An entry is 0x50 bytes: +0x00 resource ID u64, +0x08 import hash u64, +0x10 four uncompressed sizes, +0x20 four sizes on disk (each with the alignment in the top
+    nibble), +0x30 four offsets (from that block's data offset), +0x40 import offset, +0x44 type ID, +0x48 import count u16, flags u8, stream index u8.
+    A resource has up to four blocks (0: main memory, 1: graphics memory). Hot Pursuit Remastered's SHADERS.BNDL keeps one whole GLSLC output in block 1 of each type 0x8 resource (2,112)"""
+    import zlib
+    if field(d, '<I', 4, f'{label}: bnd2 version')[0] == 2: return bnd2_v2_resources(d, label)
+    ver, _, _, cnt, eoff, *datoff, flags = field(d, '<10I', 4, f'{label}: bnd2 header')
+    table_end = eoff + cnt * 0x50
+    if ver not in (2, 3) or eoff < 0x30 or table_end > len(d): red(f'{label}: bnd2 version {ver} with {cnt} entries at {eoff:#x} is not a layout this reader knows')
+    out = []
+    for i in range(cnt):
+        e = eoff + i * 0x50
+        rid, = struct.unpack_from('<Q', d, e); typ, = struct.unpack_from('<I', d, e + 0x44)
+        unpacked = struct.unpack_from('<4I', d, e + 0x10)
+        sizes = struct.unpack_from('<4I', d, e + 0x20); offs = struct.unpack_from('<4I', d, e + 0x30)
+        for k in range(4):
+            n = sizes[k] & 0x0FFFFFFF; expected = unpacked[k] & 0x0FFFFFFF
+            where = f'{label}: bnd2 resource {rid:016x} block {k}'
+            if not n:
+                if expected: red(f'{where}: declares {expected} bytes and has none stored')
+                continue
+            start = datoff[k] + offs[k]
+            if start < table_end: red(f'{where}: its data at {start:#x} starts inside the resource table')
+            raw = span(d, start, n, where)
+            if flags & 1:
+                dec = zlib.decompressobj()
+                try: raw = dec.decompress(raw, expected + 1)
+                except zlib.error as e: red(f'{where}: damaged zlib stream ({e})')
+                if not dec.eof or len(raw) != expected: red(f'{where}: incomplete zlib stream or decompressed size differs from declared size {expected}')
+            elif len(raw) != expected: red(f'{where}: stored size differs from declared size {expected}')
+            out.append((rid, typ, k, raw))
+    return out
+
+def bnd2_shaders(d, label):
+    """GLSLC outputs in the resources of a Criterion Bundle 2 (bnd2_resources), each resource block scanned with glslc_shaders. Bundles without shaders (tracks, vehicles, UI) cost one
+    inflate of each resource; the outputs' magic decides, not the resource type, whose numbering is per game"""
+    found = []
+    for rid, typ, k, r in bnd2_resources(d, label):
+        if b'\x91\x68\x86\x19' in r: found += glslc_shaders(r, f'{label}/{rid:016x}.{typ:x}.{k}', need=False)
+    return found
 
 def scan_file(args):
     """→ (relative path, {key: …}, pairs, extra); extra = this file's Unity type trees, 'defer' (no type tree, scanned again in the second pass), or ('unreadable', first reason, files left out).
