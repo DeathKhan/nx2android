@@ -46,6 +46,7 @@ float dm_overlay_scale(void) { return 1; }
 int dm_overlay_custom(int l, int c, float *x, float *y, float *s) {
     (void)l; (void)c; (void)x; (void)y; *s = 1; return 0;
 }
+int dm_overlay_off(int l, int c) { (void)l; (void)c; return 0; }   // no control hidden in the layout editor
 static void settings_save(void) { saves++; }
 static void dm_haptics_android_tap(void) {}
 // This tree's menu_do goes through menu_set and menu_step (every row's value in one place); the gamepad switch's part of them, as front_android.c has it
