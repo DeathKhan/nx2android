@@ -182,7 +182,32 @@ static void release_range(const void *addr, size_t len, _Atomic uint64_t *count)
         release_pages(r, (lo - r->base) >> g_shift, (hi - 1 - r->base) >> g_shift, count);
     }
 }
-static void prep_write(void *addr, size_t len) { frozen_wait((uintptr_t)addr); if (len > 1) frozen_wait((uintptr_t)addr + len - 1); release_range(addr, len, &g_preps); }   // (a frozen range: the host's write waits for its mapping)
+// The ranges covering the pages of a host write, remembered per thread for the next write to the same pages while no pool was registered or retired since (g_rgen): a scan of
+// every registered range for each write cost 14.8 us on a Galaxy Z Fold 8 in Ocarina of Time's Kokiri Forest, where the completion thread writes about 2,200 counter reports a frame,
+// 16 bytes each at the next address of one pool (about 30 ms a frame on that thread, which then retired chunks slower than the GPU finished them, and the GPU went idle between them).
+// A page's ranges change only at a registration or a retirement, and a range registered since has no protected page yet, so a set remembered before it is still right to release.
+// (A frozen range: the host's write waits for its mapping first)
+static _Atomic uint64_t g_rgen = 1;   // registrations and retirements so far, + 1 (nvn_dirty_add_range, nvn_dirty_remove_range)
+enum { PW_MAX = 4, PW_N = 32 };   // ranges a page can be in (adjacent pools share their rounded boundary pages; more are not remembered); page spans remembered, by their first page
+typedef struct { uint64_t gen; uintptr_t lo, hi; int n, idx[PW_MAX]; } pw_t;
+static __thread pw_t t_pw[PW_N];
+static void prep_write(void *addr, size_t len) {
+    uintptr_t a = (uintptr_t)addr, e = a + len;
+    frozen_wait(a); if (len > 1) frozen_wait(e - 1);
+    if (!len) return;
+    uintptr_t lo = a & ~(g_pg - 1), hi = (e + g_pg - 1) & ~(g_pg - 1); uint64_t gen = atomic_load_explicit(&g_rgen, memory_order_acquire);
+    pw_t *c = &t_pw[(lo >> g_shift) % PW_N];
+    int n = atomic_load(&g_nr), cached = c->gen == gen && lo >= c->lo && hi <= c->hi;
+    if (!cached) { c->gen = gen; c->lo = lo; c->hi = hi; c->n = 0; }
+    for (int k = 0; k < (cached ? c->n : n); k++) {
+        int i = cached ? c->idx[k] : k; range_t *r = rg(i);
+        if (!live_at(i) || hi <= r->base || lo >= r->end) continue;   // (base and end are page-aligned: the pages overlap when the bytes do)
+        if (!cached) { if (c->n < PW_MAX) c->idx[c->n++] = i; else c->gen = 0; }
+        uintptr_t l = a > r->base ? a : r->base, h = e < r->end ? e : r->end;
+        atomic_store(&r->prep, mach_absolute_time());
+        release_pages(r, (l - r->base) >> g_shift, (h - 1 - r->base) >> g_shift, &g_preps);
+    }
+}
 // A caller that no longer needs a span watched (a packaged texture not drawn for a while, gfx_vk_tex.c vk_tex_sweep) gives up its protection: the pages are stamped as written, so
 // the texture is uploaded and protected again when it is drawn. Textures stay protected until the game writes them, so the protected runs, each splitting its pool's mapping,
 // would grow with every place the player has seen
@@ -275,6 +300,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     r->born = atomic_fetch_add(&g_now, 1) + 1; atomic_fetch_add(&g_now, 1);   // published by the release store of live below; stamps taken from now on are past it
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_rgen, 1, memory_order_release);   // (prep_write's remembered ranges)
     pthread_mutex_unlock(&g_slot_mu);
 }
 // Pool destruction: first restore still-protected pages to writable (the pool memory may be reused for something else once returned to the game), then mark invalid
@@ -282,7 +308,7 @@ void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_lock(&g_slot_mu);
     range_t *r = NULL; int n = atomic_load(&g_nr);
     for (int i = 0; i < n && !r; i++) if (live_at(i) && rg(i)->mem == (uintptr_t)mem) r = rg(i);   // Match by the pool's exact start: an adjacent pool sharing a page may have the same rounded base
-    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); }
+    if (r) { prep_write((void *)r->base, r->end - r->base); atomic_store_explicit(&r->live, 0, memory_order_release); atomic_fetch_sub(&g_live, 1); atomic_fetch_add_explicit(&g_rgen, 1, memory_order_release); }
     pthread_mutex_unlock(&g_slot_mu);
 }
 // A zero-copy Metal buffer made while any of its pages is read-only drops every GPU write through it, with no error, even to pages never protected and even once its pages are writable again;
