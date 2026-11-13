@@ -514,7 +514,10 @@ static void rc_note(uint64_t a, int kind) {
     if (kind == 2) rc_occ_add(a);
     uint64_t f = mtl_last_fence() + 1;   // the submission being replayed (as OP_FENCE_SYNC)
     for (int i = 0; i < g_rc_npend; i++) if (g_rc_pend[i].addr == a) { g_rc_pend[i].kind = kind; g_rc_pend[i].fence = f; return; }
+    if (kind == 2) return;   // (g_rc_occ holds it. Appended here too, a frame's occlusion reports filled the table and a timestamp report after them was not noted: Ocarina of
+                             // Time clears its 768x432 refraction target under such a condition at each bind, reports once, and the later clears wiped the scene copy: opaque water)
     if (g_rc_npend < RC_PEND) { g_rc_pend[g_rc_npend].addr = a; g_rc_pend[g_rc_npend].fence = f; g_rc_pend[g_rc_npend++].kind = kind; }
+    else { static int said; if (!said) { said = 1; VKLOG("render conditions: more than %d timestamp reports pending, the rest are unknown until they land", RC_PEND); } }
 }
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at replay time
     uint64_t done = vk_reports_fence_done(), of = rc_occ_fence(a);
@@ -526,6 +529,9 @@ static void render_cond(const p_render_cond *rc) {
     if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; return; }
     uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
     g_rc_skip = known && (rc->mode ? x == y : x != y);
+    if (g_x_tracepass == -2) { int k0 = -1, k1 = -1; uint64_t f0 = 0, f1 = 0; for (int i = 0; i < g_rc_npend; i++) { if (g_rc_pend[i].addr == rc->addr) { k0 = g_rc_pend[i].kind; f0 = g_rc_pend[i].fence; } if (g_rc_pend[i].addr == rc->addr + 16) { k1 = g_rc_pend[i].kind; f1 = g_rc_pend[i].fence; } }
+        VKLOG("--- render condition mode %d at %#llx: %s (%s), memory %llu / %llu, reports done to %llu, occlusion fence %llu / %llu, pending kind %d fence %llu / kind %d fence %llu", rc->mode, (unsigned long long)rc->addr, g_rc_skip ? "skip" : "draw", known ? "known" : "unknown",
+            (unsigned long long)*(const volatile uint64_t *)(uintptr_t)rc->addr, (unsigned long long)*(const volatile uint64_t *)(uintptr_t)(rc->addr + 16), (unsigned long long)vk_reports_fence_done(), (unsigned long long)rc_occ_fence(rc->addr), (unsigned long long)rc_occ_fence(rc->addr + 16), k0, (unsigned long long)f0, k1, (unsigned long long)f1); }
 }
 
 void vk_exec_reset(void) {   // a new submission: NVN state does not carry over between command buffers, the replay starts from the defaults
@@ -1815,6 +1821,8 @@ static void clear_color(const p_clear_color *c) {
     // kept what earlier frames added, and the pass of fog boxes that reads them (vertex shader 1300ca45ddca3566) came out different every frame on its first road
     // (pass dumps over 4 frames, centre of the road: 29.6, 40.7, 31.7, 39.7; with every layer cleared 30.4 in each, the passes before it the same either way)
     VkClearRect r = {scissor_rect(), 0, P_ri.layerCount ? P_ri.layerCount : 1};
+    if (g_x_tracepass == -2) VKLOG("--- colour clear: slot %d mask %#x to %g %g %g %g, %ux%u at %d,%d, in pass %d%s", c->index, (unsigned)c->mask, c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3],
+        r.rect.extent.width, r.rect.extent.height, r.rect.offset.x, r.rect.offset.y, g_sub_pass - 1 + (S.pass_open == 2), S.pass_open == 2 ? " (before its first draw)" : "");
     if (S.pass_open == 2 && (c->mask & 0xf) == 0xf && pass_whole(r.rect)) {   // the whole attachment before any draw: its load op
         P_ca[c->index].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; P_ca[c->index].clearValue.color = a.clearValue.color; P_cleared = 1; g_vkst.folded++; return;
     }
@@ -5798,7 +5806,7 @@ static void exec_ops(const uint8_t *p, const uint8_t *end) {
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (g_la_depth < 16) g_la_ret[g_la_depth] = p + h.size; g_la_depth++; exec_ops((const uint8_t *)(uintptr_t)t, NULL); g_la_depth--; break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
-        case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); g_la_epoch++; mtl_sub_counter(ad, (uint32_t)t); break; }
+        case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); if (g_x_tracepass == -2) VKLOG("--- report counter type %#llx to %#llx", (unsigned long long)t, (unsigned long long)ad); g_la_epoch++; mtl_sub_counter(ad, (uint32_t)t); break; }
         case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); g_la_epoch++; if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) vk_occ_reset(); break; }
         case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8);
             if (!sync_replay_fence(s, mtl_last_fence() + 1)) { static int n; if (n++ < 4) VKLOG("fence on sync %p skipped: the game has finalized or freed it (nvn_obj.h sync_replay_fence)", (void *)s); }
