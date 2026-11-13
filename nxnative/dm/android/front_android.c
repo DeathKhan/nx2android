@@ -1214,7 +1214,7 @@ static int handle_event(AInputEvent *e) {
                 seen[k >> 3] |= (uint8_t)(1 << (k & 7)); LOG("[input] controller key %d (device %d): not mapped", k, AInputEvent_getDeviceId(e)); }
             return 0;
         }
-        pad_mark_used(AInputEvent_getDeviceId(e));
+        if (down) pad_mark_used(AInputEvent_getDeviceId(e));   // a release after a touch must not hide the controls again
         static uint64_t swallow;   // keys the menu took: the game does not get them until they are up again (+ or B closing the menu: its repeats, its release)
         if (atomic_load(&g_menu)) { if (down) swallow |= bit; if (down && AKeyEvent_getRepeatCount(e) == 0) menu_key(bit); return 1; }
         if (swallow & bit) { if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) swallow &= ~bit; return 1; }
