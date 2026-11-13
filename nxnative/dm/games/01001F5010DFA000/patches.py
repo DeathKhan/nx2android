@@ -1,5 +1,6 @@
 # Pokémon Legends: Arceus (01001F5010DFA000): the rewriter's patches of this game's own builds. dm/tools/patch_nso.py loads every profile's patches.py; MATCH_CUTS as described there
 # ("Registered patches"). Patches of Nintendo SDK module builds are in dm/tools/sdk_patches.py
+import struct
 from nso_asm import ADRP, B
 
 # 60 fps (30 on the Switch) on 1.1.1 (v262144) main, with game time at real time. Two things hold the game at 30, and the stubs move both to the host's frame step:
@@ -52,6 +53,27 @@ def frame_step(ctx):
         emit(w)
     emit(0xfd400400); emit(B(here(), 0x279a6f8))                     # orig: ldr d0,[x0,#8]; back
     fs_put(0x279a6f4, [B(0x279a6f4, start)], 'frame step: counts the vsyncs the scene update steps')
+    # Code that does not read the frame period: it builds 1/30 s in a register (mov wN,#0x8889; movk wN,#0x3d08,lsl #16) and steps by it once a frame. At 60 fps that code ran at
+    # double speed while the rest of the game ran at real time: the Poké Ball's throw and the capture sequence played too fast (Odin 3, 2026-11-13). Each site listed loads the host's
+    # step in seconds instead (state page +0x2c, hle.h), and the game's 1/30 while that is 0. The stub uses the site's own register only (no flags: main+0x2795230 sits between a cmp
+    # and its fcsel). Sites: timers that add 1/30 a frame; velocity × 1/30 and the step handed to update functions in the thrown-object code (main+0x198xxxx to main+0x1a1xxxx,
+    # main+0x1b4xxxx, main+0x257xxxx) and its helpers (main+0x17177b4, main+0x1728054); the function that returns 1/30 (main+0x1983760); the update that takes 1/30 unless its
+    # object's flag at +0x150 is set (main+0x2795230). Left alone: frames ↔ seconds conversions (main+0x8eedb4, main+0x191d2b8) and the defaults stored into objects
+    # (main+0x2f3e8c4, main+0x3002a04, main+0x301439c, main+0x3014d24), which are not known to be a frame's step. The 1/60 constants (4 sites) are not a frame's step on the Switch
+    for off in STEP_30:
+        d = 22 if off == 0x1a0f498 else 8; mov, movk = 0x52911120 | d, 0x72a7a100 | d   # mov wD,#0x8889; movk wD,#0x3d08,lsl #16
+        fs_site(off, struct.pack('<II', mov, movk).hex())
+        start = here(); emit(ADRP(d, here(), FS_STATE_OFF))
+        for w in (0xb9402c00 | d << 5 | d,   # ldr wD,[xD,#0x2c]    the host's step in seconds (float bits)
+                  0x35000060 | d,            # cbnz wD,back (+3)
+                  mov, movk):                # none: the game's 1/30
+            emit(w)
+        emit(B(here(), off + 8))
+        fs_put(off, [B(off, start)], 'frame step: a constant 1/30 s step is the host\'s step in seconds (state page +0x2c; 0 = the constant)')
+
+STEP_30 = (0x13b339c, 0x167ff0c, 0x16832c0, 0x16832e4, 0x16836d0, 0x17177b4, 0x1728054, 0x1982930, 0x1983760, 0x198e020, 0x198ec6c, 0x1a0baf0, 0x1a0bee4, 0x1a0da20, 0x1a0eea0,
+           0x1a0f304, 0x1a0f498, 0x1a0f55c, 0x1a17b10, 0x1a17f3c, 0x1a19104, 0x1a196c4, 0x1b48a48, 0x1b48a94, 0x1b49004, 0x1b493f4, 0x1d1b7cc, 0x1d5d684, 0x257ac30, 0x257c9f4,
+           0x257ce38, 0x2795230, 0x29faf8c, 0x2af25f4)
 
 FRAME_STEP = {'aee8f150dda1b5a838806e1a5ea6827a': frame_step}
 

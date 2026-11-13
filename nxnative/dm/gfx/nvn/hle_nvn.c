@@ -2852,6 +2852,8 @@ static void fstep_tick(const win_t *o, int c) {
     if (dm_fps_state) {   // the float first: a stub that reads it has seen the whole step set
         float sf = fixed ? (float)n : fstep_steady(shown, g_fs.k, n); uint32_t sb; memcpy(&sb, &sf, 4);
         __atomic_store_n((uint32_t *)(dm_fps_state + 0x28), sb, __ATOMIC_RELAXED);
+        float ss = sf / 60.0f; memcpy(&sb, &ss, 4);   // the same step in seconds, for code that adds a constant 1/30 s a frame (hle.h)
+        __atomic_store_n((uint32_t *)(dm_fps_state + 0x2c), sb, __ATOMIC_RELAXED);
         __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
     }
     atomic_store(&g_fs_k, g_fs.k);
@@ -2938,7 +2940,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         else if (strcmp(rs, last)) { snprintf(last, sizeof last, "%s", rs); char *e; float sc = *rs ? strtof(rs, &e) : 1.0f;
             if (*rs && (e == rs || *e || !(sc >= 0.5f && sc <= 1.0f))) LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to 1.0", rs);
             else { memcpy(dm_fps_state + 0x10, &sc, sizeof sc); LOG("[nvn] render scale %.2f from present %llu (DM_RENDER_SCALE)", sc, (unsigned long long)o->presents); } } }
-    if (c) fstep_tick(o, c);
+    if (c) fstep_tick(o, c); else if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 0x2c), 0, __ATOMIC_RELAXED);   // no step: the stubs run the game's own constant
     else g_fs_start = g_fs_wait = 0;   // the next acquire starts the next frame (dm_perf_frame_start: the CPU hint's and the adaptive frame rate's work time)
     dm_fps_lock_tick();   // after the frame step: at 120 fps the target follows the hold just decided
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
