@@ -737,7 +737,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     // The game's constant buffers and the driver segment are dynamic uniform buffers: their offset is given when the set is bound, so a set matches any draw's
     // with the same buffers (Unity updates a constant buffer before nearly every draw, and each update is a shadow at a new offset: NEO made a new set for
     // 94% of its draws, 5 ms a frame). Up to half the device's limit per stage, as the vertex and fragment sets share a pipeline layout. DM_VK_DYN_UBO=0: none.
-    static int dyn_on = -1; if (dyn_on < 0) { const char *e = getenv("DM_VK_DYN_UBO"); dyn_on = !(e && !atoi(e)); }
+    static int dyn_on = -1; if (dyn_on < 0) { int vk_gpl_on(void); const char *e = getenv("DM_VK_DYN_UBO"); dyn_on = !(e && !atoi(e)) && !vk_gpl_on(); }   // (not under pipeline libraries: with independent sets, the dynamic offsets of a part that names only its own set went to the wrong buffers on Turnip, Mario Odyssey's title screen 2026-11-14)
     uint32_t dynmax = dyn_on ? V.props.limits.maxDescriptorSetUniformBuffersDynamic / 2 : 0;
     uint32_t sdmax = storage_dynamic_limit(stage, V.dyn_ssbo, &V.props.limits), nubo = 0, nsbuf = 0;
     if (V.dyn_ssbo) { static int noted; if (!noted++) VKLOG("dynamic storage descriptors enabled (DM_VK_DYN_SSBO, startup): max %u per graphics stage, alignment %llu; buffers and ranges unchanged",
@@ -1330,6 +1330,17 @@ void vk_shader_c1(vkshader_t *s, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize 
     *buf = s->c1_buf; *off = 0; *len = (s->c1_len + 255) & ~255u;
 }
 // pipeline layouts by the set layouts of their stages (an empty layout fills the sets of absent stages)
+// A pipeline library part's layout: only its own stages' sets, the others absent (VK_NULL_HANDLE, allowed with independent sets), so one part serves every partner
+VkPipelineLayout vk_pipeline_layout_part(VkDescriptorSetLayout sets[VK_NSETS], int nsets) {
+    static nvn_hmap cache = {.klen = VK_NSETS * sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    VkDescriptorSetLayout k[VK_NSETS]; for (int i = 0; i < VK_NSETS; i++) k[i] = i < nsets ? sets[i] : VK_NULL_HANDLE;
+    pthread_mutex_lock(&mu);
+    VkPipelineLayout pl = nvn_hm_get(&cache, k);
+    if (!pl) { VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, (uint32_t)nsets, k};
+               VKCHK(vkCreatePipelineLayout(V.dev, &ci, NULL, &pl)); nvn_hm_put(&cache, k, pl); }
+    pthread_mutex_unlock(&mu);
+    return pl;
+}
 VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[VK_NSETS], int nsets) {
     static VkDescriptorSetLayout empty; static nvn_hmap cache = {.klen = VK_NSETS * sizeof(VkDescriptorSetLayout)}; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mu);
@@ -1337,7 +1348,8 @@ VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout sets[VK_NSETS], int ns
     VkDescriptorSetLayout k[VK_NSETS]; for (int i = 0; i < VK_NSETS; i++) { k[i] = i < nsets && sets[i] ? sets[i] : (i < nsets ? empty : VK_NULL_HANDLE); if (i < nsets) sets[i] = k[i]; }   // absent stages get the empty layout (the caller allocates their sets from it)
     VkPipelineLayout pl = nvn_hm_get(&cache, k);
     if (!pl) {
-        VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, (uint32_t)nsets, k};
+        int vk_gpl_on(void);   // (gfx_vk_exec.c: parts and the pipelines linked from them take layouts with independent sets)
+        VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, vk_gpl_on() ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0, (uint32_t)nsets, k};
         VKCHK(vkCreatePipelineLayout(V.dev, &ci, NULL, &pl)); nvn_hm_put(&cache, k, pl);
     }
     pthread_mutex_unlock(&mu);

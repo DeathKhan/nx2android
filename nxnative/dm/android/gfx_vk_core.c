@@ -691,6 +691,14 @@ void vk_init(void) {
     static VkPhysicalDeviceFaultFeaturesEXT dfault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     if (has_ext(ex, ne, "VK_EXT_device_fault")) { VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dfault}; vkGetPhysicalDeviceFeatures2(V.pd, &q); }
     if (dfault.deviceFault) { on[non++] = "VK_EXT_device_fault"; dfault.deviceFaultVendorBinary = VK_FALSE; dfault.pNext = dnext; dnext = &dfault; }
+    // VK_EXT_graphics_pipeline_library (Mesa's Turnip; Qualcomm's driver has none): a pipeline is linked from parts made once each (gfx_vk_exec.c gpl_build), so a
+    // new combination of shaders and state costs a link, not a compile. DM_VK_GPL=0 (start-up): one-piece pipelines as before
+    static VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+    { const char *e = getenv("DM_VK_GPL");
+      if (!(e && *e == '0') && has_ext(ex, ne, "VK_EXT_graphics_pipeline_library") && has_ext(ex, ne, "VK_KHR_pipeline_library") && non + 2 <= 64) {
+          VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fgpl}; vkGetPhysicalDeviceFeatures2(V.pd, &q);
+          if (fgpl.graphicsPipelineLibrary) { on[non++] = "VK_KHR_pipeline_library"; on[non++] = "VK_EXT_graphics_pipeline_library"; fgpl.pNext = dnext; dnext = &fgpl; V.has_gpl = 1; } }
+      VKLOG("graphics pipeline libraries: %s", V.has_gpl ? "on (pipelines linked from parts made once each)" : e && *e == '0' ? "off (DM_VK_GPL=0)" : "not offered by the driver"); }
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, dnext, 0, 1, &qci, 0, NULL, non, on, NULL};
     VKCHK(fp_create_device(V.pd, &dci, &V.dev));   // with FPCR 0 (fp_enter, above)
     vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)p_vkGetInstanceProcAddr(V.inst, "vkGetDeviceProcAddr");
