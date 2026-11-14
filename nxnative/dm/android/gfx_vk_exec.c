@@ -2407,7 +2407,7 @@ static VkPipeline gpl_build_ex(const pkey *k, VkPipelineLayout layout, vkshader_
     VkPipelineLayout vk_pipeline_layout_part(VkDescriptorSetLayout sets[VK_NSETS], int nsets);
     for (int i = 0; i < 3; i += 2) if (stg[i]) { pre_sets[stg[i]->set] = stg[i]->dsl; if (stg[i]->set + 1 > npre) npre = stg[i]->set + 1; }
     if (fs) { fs_sets[fs->set] = fs->dsl; if (fs->set + 1 > nfs) nfs = fs->set + 1; }
-    VkPipelineLayout pre_lay = vk_pipeline_layout_part(pre_sets, npre), fs_lay = fs ? vk_pipeline_layout_part(fs_sets, nfs) : VK_NULL_HANDLE;
+    VkPipelineLayout pre_lay = vk_pipeline_layout_part(pre_sets, npre), fs_lay = vk_pipeline_layout_part(fs_sets, nfs);
     VkFormat df = (VkFormat)k->dfmt; int has_stencil = df == VK_FORMAT_D24_UNORM_S8_UINT || df == VK_FORMAT_D32_SFLOAT_S8_UINT || df == VK_FORMAT_S8_UINT;
     VkFormat cf[8]; for (uint32_t i = 0; i < k->ncol; i++) cf[i] = (VkFormat)k->cfmt[i];
     VkPipelineRenderingCreateInfo rci0 = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 0, NULL, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
@@ -2456,7 +2456,7 @@ static VkPipeline gpl_build_ex(const pkey *k, VkPipelineLayout layout, vkshader_
     if (warm == 1) return lib[0];
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, (VkSampleCountFlagBits)k->samples, 0, 0, NULL, k->a2c, 0};
     if (V.has_gpl_dyn) { ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT; ms.alphaToCoverageEnable = 0; }
-    if (fs) {   // fragment shader
+    if (!k->raster_discard) {   // fragment shader (a pipeline that rasterizes needs this part and the output part even with no fragment shader: depth-only passes)
         gpl_fs_key key; memset(&key, 0, sizeof key); key.mfs = mod[1]; key.lay = fs_lay; key.atest = k->atest; key.aref = k->aref; key.dt = k->dt; key.dw = k->dw; key.df = k->df; key.st = k->st;
         memcpy(key.sf, k->sf, sizeof key.sf); memcpy(key.sfail, k->sfail, sizeof key.sfail); memcpy(key.szfail, k->szfail, sizeof key.szfail); memcpy(key.szpass, k->szpass, sizeof key.szpass);
         key.samples = k->samples; key.a2c = k->a2c; key.dfmt = k->dfmt;
@@ -2464,7 +2464,7 @@ static VkPipeline gpl_build_ex(const pkey *k, VkPipelineLayout layout, vkshader_
                              memset(key.szfail, 0, sizeof key.szfail); memset(key.szpass, 0, sizeof key.szpass); }   // (its shader, layout and alpha test only)
         static const VkSpecializationMapEntry at_me[2] = {{VK_ATEST_SPEC_FUNC, 0, 4}, {VK_ATEST_SPEC_REF, 4, 4}}; uint32_t at_v[2] = {k->atest, k->aref};
         VkSpecializationInfo at_si = {2, at_me, sizeof at_v, at_v};
-        VkPipelineShaderStageCreateInfo ss = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(VK_SHADER_STAGE_FRAGMENT_BIT, NULL), 0, VK_SHADER_STAGE_FRAGMENT_BIT, mod[1], "main", k->atest ? &at_si : NULL};
+        VkPipelineShaderStageCreateInfo ss = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(VK_SHADER_STAGE_FRAGMENT_BIT, NULL), 0, VK_SHADER_STAGE_FRAGMENT_BIT, mod[1], "main", k->atest ? &at_si : NULL}; uint32_t nss = fs ? 1 : 0;
         VkStencilOpState sf = {sop(k->sfail[0]), sop(k->szpass[0]), sop(k->szfail[0]), cmpop(k->sf[0]), 0xff, 0xff, 0}, sb = {sop(k->sfail[1]), sop(k->szpass[1]), sop(k->szfail[1]), cmpop(k->sf[1]), 0xff, 0xff, 0};
         VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0, k->dt, k->dt && k->dw, cmpop(k->df), 0, k->st, sf, sb, 0, 1};
         VkDynamicState dyn[12] = {VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE}; uint32_t nd = 3;
@@ -2472,7 +2472,7 @@ static VkPipeline gpl_build_ex(const pkey *k, VkPipelineLayout layout, vkshader_
                              dyn[nd++] = VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE; dyn[nd++] = VK_DYNAMIC_STATE_STENCIL_OP; dyn[nd++] = VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT;
                              dyn[nd++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT; ds.depthTestEnable = ds.depthWriteEnable = ds.stencilTestEnable = 0; }
         VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, nd, dyn};
-        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, V.has_gpl_dyn ? &rci0 : &rcid, 0, 1, &ss, NULL, NULL, NULL, NULL, NULL, &ms, &ds, NULL, &dy, fs_lay};
+        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, V.has_gpl_dyn ? &rci0 : &rcid, 0, nss, &ss, NULL, NULL, NULL, NULL, NULL, &ms, &ds, NULL, &dy, fs_lay};
         if (!(lib[nl++] = gpl_part(warm ? NULL : &g_gpl_fs, &key, 2, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &ci))) return VK_NULL_HANDLE;
         if (warm) return lib[nl - 1];
         // fragment output
