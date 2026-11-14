@@ -26,7 +26,7 @@ class PipelineCache(unittest.TestCase):
 #include <string.h>
 #include <unistd.h>
 #include <vulkan/vulkan_core.h>
-static struct { VkDevice dev; VkPhysicalDevice pd; VkPhysicalDeviceProperties props; VkPipelineCache pcache; } V;
+static struct { VkDevice dev; VkPhysicalDevice pd; VkPhysicalDeviceProperties props; VkPipelineCache pcache; int has_gpl; } V;
 static unsigned char payload[64];
 static size_t loaded;
 static int reject, creates, incomplete, fail_rename, fail_sync, reject_empty, reds, syncs, renames, queries;
@@ -49,6 +49,7 @@ static void properties(VkPhysicalDevice d, VkPhysicalDeviceProperties2 *p) {
 static int rename_test(const char *a,const char *b) { renames++; return fail_rename ? -1 : rename(a,b); }
 static int sync_test(int fd) { syncs++; return fail_sync ? -1 : fsync(fd); }
 #define vkCreatePipelineCache create
+#define vkDestroyPipelineCache(d, c, a) ((void)(d), (void)(c), (void)(a))   /* (the compaction retires old caches; off here: no pipeline libraries) */
 #define vkGetPipelineCacheData get
 #define vkGetPhysicalDeviceProperties2 properties
 #define rename rename_test
