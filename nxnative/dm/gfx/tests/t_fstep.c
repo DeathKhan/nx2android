@@ -18,7 +18,34 @@ static void run(sim *m, int n, double w, int kmin, int kmax, int fixed) {
     }
 }
 
+// frames whose cost depends on the hold they ran under: c1 at hold 1, c2 at a longer one (a game that does more with the longer frame)
+static void run2(sim *m, int n, double c1, double c2, int *at1, int *probes) {
+    for (int i = 0; i < n; i++) {
+        int k = m->s.k ? m->s.k : 1, step = m->next ? m->next : 1; double w = k == 1 ? c1 : c2, shown = w > k ? w : k; unsigned long long p = m->s.probes;
+        if (at1) *at1 += k == 1;
+        m->real += shown; m->game += step; m->s.gpu = w;
+        m->next = nvn_fstep_next(&m->s, shown, w, 1, 2, 0, 0);
+        if (probes) *probes += (int)(m->s.probes - p);
+    }
+}
+static void asis_cases(void) {
+    char b[200];
+    {   // Jubilife Village: a light scene holds hold 1 (0.6), a hitch steps to 2, and the village costs 0.91 at hold 2 (0.76 at hold 1): a probe brings hold 1 back within seconds
+        sim m = {0}; m.s.probe_near = 1; run2(&m, 900, 0.6, 0.6, 0, 0); run2(&m, 4, 1.6, 1.6, 0, 0);
+        check(m.s.k == 2, "as is: a hitch after a light scene steps to hold 2");
+        int at1 = 0, probes = 0; run2(&m, 600, 0.76, 0.91, &at1, &probes);
+        snprintf(b, sizeof b, "as is: a cost of 0.91 at hold 2 is probed and hold 1 holds (k %d, %d of 600 frames at hold 1, %d probes)", m.s.k, at1, probes);
+        check(m.s.k == 1 && at1 >= 450 && probes == 1, b);
+    }
+    {   // a scene that fits at hold 2 as it is but not at hold 1 (0.95 against 1.4): the probes fail and wait longer each time, 4 at most in two minutes
+        sim m = {0}; m.s.probe_near = 1; run2(&m, 900, 0.6, 0.6, 0, 0); run2(&m, 4, 1.6, 1.6, 0, 0);
+        int at1 = 0, probes = 0; run2(&m, 3600, 1.4, 0.95, &at1, &probes);
+        snprintf(b, sizeof b, "as is: 1.4 at hold 1 fails the probes, which back off (k %d, %d probes, %d of 3600 frames at hold 1)", m.s.k, probes, at1);
+        check(m.s.k == 2 && probes >= 2 && probes <= 4 && at1 <= 200, b);
+    }
+}
 int main(void) {
+    asis_cases();
     {   // 120 fps (hle_nvn.c fps_high): kmin 1, kmax 2, in ticks of 1/120 s. The target follows the hold, so a hold above what frames take is the game at the right speed
         sim m = {0}; m.s.per_vsync = 2;
         run(&m, 120, 0.7, 1, 2, 0); check(m.s.k == 1, "120 fps: frames of 5.8 ms hold 120");
@@ -277,7 +304,7 @@ int main(void) {
         for (int i = 0; i < 300; i++) run(&m, 1, i % 2 ? 0.92 : 0.80, 1, 3, 0);
         run(&m, 3, 1.6, 1, 3, 0);
         for (int i = 0; i < 2000; i++) run(&m, 1, i % 2 ? 0.92 : 0.80, 1, 3, 0);
-        check(m.s.k == 2 && m.s.probes == 0 && m.s.cref == 0, "hitch after 5 s at hold 1: no cost that held, no probe");
+        check(m.s.k == 1 && m.s.probes >= 1 && m.s.failed == 0 && m.s.cref == 0, "hitch after 5 s at hold 1: no cost that held, but the cost fits hold 1 as it is: one probe back");
     }
     {   // the cost at hold 2 is what held, but hold 1 no longer fits (1.3 there): each probe fails, the probes spread out 1 → 2 → 4 → 8 s, and the cost that held is kept
         sim m = {0}; double last = 0, gaps[5]; int ng = 0; uint64_t probes = 0;
@@ -300,9 +327,9 @@ int main(void) {
                         : "first movie after only 5 s at 60: no proven cost to save");
         run(&m, 60, 0.86, 1, 3, 0); uint64_t probes = m.s.probes; run(&m, 3, 1.6, 1, 3, 0);
         for (int i = 0; i < 1200; i++) run(&m, 1, m.s.k == 1 ? 0.86 : 0.9, 1, 3, 0);
-        check(sustained ? m.s.k == 1 && m.s.probes > probes : m.s.k == 2 && m.s.probes == probes,
+        check(m.s.k == 1 && m.s.probes > probes,
               sustained ? "  hitch 1 s after the first movie: the saved run brings 60 back"
-                        : "  hitch after a short unproven run: keep 30 without a same-cost probe");
+                        : "  hitch after a short unproven run: no same-cost probe, the cost fits hold 1 as it is and brings 60 back");
     }
     {   // Later movies keep the last proven cost through short runs, and replace it after another sustained run at a different cost.
         sim m = {0}; run(&m, 1200, 0.86, 1, 3, 0); run(&m, 120, 0.5, 2, 2, 0);
@@ -361,8 +388,8 @@ int main(void) {
                 nvn_fstep_next(&s, ms * 60 / 1000, 0.6, 1, 3, 0, 0);
             }
             snprintf(b, sizeof b, sl ? "165 Hz, cheap frames at hold 3, one refresh of slack: trials back to 2 and 1 (k %d, downs %llu)"
-                                     : "  without the slack the 54.5 ms frames count as late: hold 3 (20 fps) for good (k %d, downs %llu)", s.k, (unsigned long long)s.downs);
-            check(sl ? s.k == 1 && s.downs == 2 : s.k == 3 && s.downs == 0, b);
+                                     : "  without the slack the 54.5 ms frames count as late and no fit trial comes; the cost fits hold 1 as it is (k %d, downs %llu)", s.k, (unsigned long long)s.downs);
+            check(sl ? s.k == 1 && s.downs == 2 : s.k == 1 && s.downs == 1, b);
         }
         sim m = {0}; m.s.shown_slack = 60.0 / 165; run(&m, 60, 0.5, 1, 3, 0); run(&m, 300, 1.32, 1, 3, 0);
         check(m.s.k == 2, "  the slack does not hide work: 22 ms frames still step to hold 2");

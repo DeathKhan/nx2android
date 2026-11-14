@@ -2644,6 +2644,7 @@ static int fps_step_cap(void) {
     return dm_movie_playing() || t <= 30 || thermal || dm_frame_cap() == 30 ? 30 : 60;   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
+int dm_nvn_frame_step_on(void) { return fstep_on(); }   // Android's adaptive frame rate stays out of it then (perf_android.c)
 // Engine-native frame limiters have no frame-step state page. Their requested
 // cap still governs presentation, even when the profile uses display pacing.
 // Without a limiter the host writes (dm_fps_lock_engine) nothing makes the game
@@ -2865,7 +2866,8 @@ static void fstep_tick(const win_t *o, int c) {
         char why[160], held[48] = ""; int w = snprintf(why, sizeof why, "probe");
         if (cslow) w += snprintf(why + w, sizeof why - w, ", CPU %d%% on performance cores", g_fs_pshare);
         if (gslow) w += snprintf(why + w, sizeof why - w, ", GPU %.2f× its time at hold %d (%.2f)", g_fg.cur / g_fg.ref, kmin, g_fg.ref);
-        if (nvn_fstep_same(&g_fs)) snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
+        if (g_fs.atrial) snprintf(why + w, sizeof why - w, ", the cost fits hold %d as it is", kmin);
+        else if (nvn_fstep_same(&g_fs)) snprintf(why + w, sizeof why - w, ", cost %.2f× the cost that held hold %d", g_fs.ccur / g_fs.cref, kmin);
         if (g_fs.k > k0 && g_fs.cref > 0) snprintf(held, sizeof held, "; hold %d held at %.2f", kmin, g_fs.cref);   // what a probe compares the longer hold's cost with
         LOG("[nvn] frame step: hold %d → %d %s at present %llu (%s; cost %.2f, GPU %.2f%s)%s", k0, g_fs.k, fps_high() ? "ticks of 1/120 s" : "vsyncs", (unsigned long long)o->presents,
             fixed ? "the game's own step" : kmin0 > FSTEP_MAX ? "the game's own step ended" : kmin != kmin0 ? "the cap changed" : g_fs.k > k0 ? (g_fs.up_by == 2 ? "3 heavy late frames" : g_fs.up_by == 3 ? "late frames within 1 s" : "3 late frames") : g_fs.probes != probes0 ? why : "trial", cost, gpu, held, ++nlog == 40 ? "; further changes only counted below" : "");

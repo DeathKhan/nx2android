@@ -245,7 +245,13 @@ static int64_t work_pct(int q) {   // the q-th percentile of the last 64 frames'
     return v[(n * q) / 100];
 }
 static int64_t work_p95(void) { return work_pct(95); }
+// With the frame step (hle_nvn.c: the host hands the game its step in whole vsyncs and holds each frame that long) the hold is the frame step's to choose, and this
+// rate stays at the game's period. Its 40 fps showed the frame step's hold-1 frames for 1.5 vsyncs: every probe back to 60 failed as "late" at a cost that fitted
+// (Pokémon Legends: Arceus on the Odin 3, 0.80-0.91 vsyncs: six probes in a row, the hold-off doubled each time), the step no longer matched the time on screen (game
+// time 0.82 of real time), and a few late frames on the way into a scene took 60 fps away twice over
+__attribute__((weak)) int dm_nvn_frame_step_on(void) { return 0; }
 uint64_t dm_present_period_adapt(uint64_t period) {
+    if (dm_nvn_frame_step_on()) { g_step = 0; return period; }
     if (g_adapt < 0) { const char *e = getenv("DM_ADAPTIVE_FPS"); g_adapt = !(e && !atoi(e)); }
     if (!g_adapt || !period) return period;
     g_game_period = period;
@@ -380,7 +386,7 @@ static void adapt_frame(int64_t work, int64_t now) {
     // and each fight began at 40 until it climbed back 4 s later
     if (g_frame_cost > 0 && g_frame_cost < 1500000 && work > STEPS[g_step]) return;
     if (g_frame_cost > work) work = g_frame_cost;
-    if (!g_adapt) return;
+    if (!g_adapt || dm_nvn_frame_step_on()) return;
     g_work_hist[g_nwork++ % 64] = work;
     { static unsigned k; if (++k % 600 == 0) LOG("[perf] adaptive frame rate: %.0f fps, frame work p50 %.1f / p90 %.1f / p95 %.1f ms (last %.1f ms); late on screen %d of 64, step-downs held back %u", 1e9 / STEPS[g_step], work_pct(50) / 1e6, work_pct(90) / 1e6, work_p95() / 1e6, work / 1e6, shown_late(), g_held_back); }
     int pin = fps_pin(); if (pin >= 0) { if (g_step != pin) { g_step = pin; g_last_change = now; g_nshown = 0; } return; }
