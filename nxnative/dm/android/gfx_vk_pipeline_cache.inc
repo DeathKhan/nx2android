@@ -124,6 +124,25 @@ static size_t pcache_load(void) {
     free(data);return bytes;
 }
 void vk_pipeline_cache_changed(void) { pcache_burst(atomic_fetch_add_explicit(&g_pcache_generation,1,memory_order_relaxed)+1); }
+// Compaction (Turnip): a pipeline cache that pipelines were added to keeps each added shader as an allocation of its own, about 32 KB, each its own mapping; Mario
+// Odyssey's ~4,500 pipelines built again after a driver change reached vm.max_map_count (65,530) and allocations failed. A cache made from saved data holds them in
+// one block (the next start had ~6,600 mappings). So each save after PCACHE_COMPACT more pipelines also makes a new cache from the data just saved and takes it in
+// place of the old one, which goes PCACHE_RETIRE_S later (builds that began with it are done by then; what they add to it after the snapshot is made again later).
+// DM_VK_PCACHE_COMPACT=<pipelines> (start-up; 0 off): default 1000 with pipeline libraries (Turnip), else off
+enum { PCACHE_RETIRE_S=20 };
+static uint64_t g_pcache_compacted;
+static void *pcache_retire_main(void *c) { sleep(PCACHE_RETIRE_S); vkDestroyPipelineCache(V.dev,(VkPipelineCache)c,NULL); return NULL; }
+static void pcache_compact(const void *data,size_t bytes,uint64_t generation) {
+    static long every=-1; if (every<0) { const char *e=getenv("DM_VK_PCACHE_COMPACT"); every=e ? atol(e) : V.has_gpl ? 1000 : 0; }
+    if (every<=0 || generation<g_pcache_compacted+(uint64_t)every) return;
+    VkPipelineCacheCreateInfo info={VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,NULL,0,bytes,data};VkPipelineCache fresh;
+    if (vkCreatePipelineCache(V.dev,&info,NULL,&fresh)!=VK_SUCCESS) return;
+    VkPipelineCache old=V.pcache; __atomic_store_n(&V.pcache,fresh,__ATOMIC_RELEASE); g_pcache_compacted=generation;
+    pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th,&a,pcache_retire_main,(void *)old)) VKLOG("vk: pipeline cache compacted, the old one is kept (no thread)");
+    pthread_attr_destroy(&a);
+    VKLOG("vk: pipeline cache compacted after %llu pipelines (%zu KB from saved data; the old cache goes in %d s)",(unsigned long long)generation,bytes>>10,PCACHE_RETIRE_S);
+}
 void vk_pipeline_cache_save(void) {
     if (!V.pcache || !g_pcache_path[0]) return;
     pthread_mutex_lock(&g_pcache_io);
@@ -154,6 +173,7 @@ void vk_pipeline_cache_save(void) {
     if (ok && !rename(temporary,g_pcache_path)) {
         temporary[0]=0;g_pcache_saved=generation;g_pcache_bytes=bytes;
         memcpy(g_pcache_digest,header.digest,sizeof header.digest);g_pcache_digest_valid=1;g_pcache_migrate=0;
+        pcache_compact(data,bytes,generation);
     }
     else VKLOG("vk: pipeline-cache write was not published: %s",strerror(errno));
 done:
