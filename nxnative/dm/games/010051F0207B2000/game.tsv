@@ -41,6 +41,11 @@ shader_note	Tomodachi Life: Living the Dream shaders (14,388 in the RomFS's arch
 # colour pass tests depth EQUAL against its depth pre-pass. Run unconditionally, the clear wiped that depth and every head, face part and hair draw failed the test
 render_cond	on
 
+# ---- Threads ----
+# A LowPriorityJobExecuter thread (priority 50) builds a model's material blocks from a frame heap that is exactly full at that moment (main+0x328f5c takes the null
+# block: SIGSEGV at 0x10, 2 s after start, every start of 1.0.0 on the Odin 3). On the Switch the higher-priority threads of its core run first; with the check it boots
+core_preempt	on
+
 # ---- After the rewrite ----
 # the rewritten modules are larger than the default 64 MB of used memory (Age of Calamity: 66.6 MB → 72 MB)
 mem_used	0x6600000
