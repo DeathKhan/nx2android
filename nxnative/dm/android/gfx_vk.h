@@ -244,6 +244,7 @@ typedef struct {
     // a primitive's vertices, the most vertices and primitives a workgroup, and the words a vertex has in the emulation's vertex buffer (gfx_vk_exec.c mesh_draw)
     int mesh_kind; uint32_t mesh_threads, mesh_pay, mesh_task, mesh_verts, mesh_max_v, mesh_max_p, mesh_ncomp;
     int wmem;                           // gfx_vk_exec.c shader_wmem: 1 it writes memory (stores to storage buffers or images, atomics), 2 not, 0 not known yet
+    int used;                           // returned to the replay (not only to the warm pass, gfx_vk_exec.c gpl_warm): kept for good
     uint32_t mark_var;                  // DM_VK_POOL_MARK: the pool read marks' buffer variable (gfx_vk_shader.c spv_pool_mark), 0 none; its stores are not the game's memory writes (shader_wmem)
 } vkshader_t;
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader

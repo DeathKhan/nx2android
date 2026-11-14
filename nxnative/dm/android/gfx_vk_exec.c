@@ -2250,7 +2250,9 @@ static void *prewarm_thread(void *arg) {
     }
     return NULL;
 }
+static void gpl_warm_start(void);
 static void prewarm_start(void) {
+    gpl_warm_start();
     const char *root = getenv("DM_ROOT"); if (!root) return;
     char path[1024]; snprintf(path, sizeof path, "%s/vk_pipelines.bin", root);
     uint32_t hdr[2] = {PIPE_MAGIC, (uint32_t)sizeof(pkey)}, fh[2] = {0};
@@ -2331,7 +2333,12 @@ static nvn_hmap g_gpl_vi = {.klen = sizeof(gpl_vi_key)}, g_gpl_pre = {.klen = si
 static pthread_mutex_t g_gpl_mu = PTHREAD_MUTEX_INITIALIZER, g_gpl_link_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gpl_cv = PTHREAD_COND_INITIALIZER;
 #define GPL_MAKING ((VkPipeline)(uintptr_t)3)   // (a table entry while one thread makes that part)
 static uint64_t g_gpl_n[5], g_gpl_ns[5];   // parts made (vertex input, pre-rasterization, fragment shader, output) and pipelines linked, with their time
+void vk_pipeline_cache_changed(void);
 static VkPipeline gpl_part(nvn_hmap *m, const void *key, int kind, VkGraphicsPipelineLibraryFlagsEXT what, VkGraphicsPipelineCreateInfo *ci) {
+    if (!m) {   // (the warm pass: into the pipeline cache only)
+        VkGraphicsPipelineLibraryCreateInfoEXT li = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, ci->pNext, what}; ci->pNext = &li; ci->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+        VkPipeline p; pthread_mutex_lock(&g_gpl_link_mu); VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, ci, NULL, &p); pthread_mutex_unlock(&g_gpl_link_mu);   // (Turnip: one at a time, as the replay's)
+        if (r) return VK_NULL_HANDLE; vkDestroyPipeline(V.dev, p, NULL); vk_pipeline_cache_changed(); (void)key; (void)kind; return (VkPipeline)1; }
     pthread_mutex_lock(&g_gpl_mu); VkPipeline p;
     while ((p = nvn_hm_get(m, key)) == GPL_MAKING) pthread_cond_wait(&g_gpl_cv, &g_gpl_mu);   // another thread makes it: its result
     if (p) { pthread_mutex_unlock(&g_gpl_mu); return p; }
@@ -2386,8 +2393,9 @@ static void gpl_set_dynamic(VkCommandBuffer cb, const pkey *k) {
 #undef GD
     g_gd.k = *k; g_gd.valid = 1; g_gd.gen = g_cmd_gen;
 }
-static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]) {
-    if (!vk_gpl_on() || k->alt || k->flat || (stg[0] && stg[0]->xfb) || !stg[0]) return VK_NULL_HANDLE;
+// warm: 0 the pipeline, linked; 1 only the pre-rasterization part of stg[0], 2 only the fragment shader part of stg[1], into the pipeline cache (gpl_warm)
+static VkPipeline gpl_build_ex(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3], int warm) {
+    if (!vk_gpl_on() || k->alt || k->flat || (stg[0] && stg[0]->xfb) || (!stg[0] && warm != 2)) return VK_NULL_HANDLE;
     const vkshader_t *fs = stg[1] && !k->raster_discard ? stg[1] : NULL; uint32_t xo[3] = {0};
     if (stg[0]) xo[0] = (stg[2] ? stg[2]->in_locs : fs ? fs->in_locs : 0) & ~stg[0]->out_locs;
     if (stg[2]) xo[2] = (fs ? fs->in_locs : 0) & ~stg[2]->out_locs;
@@ -2406,7 +2414,7 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
     VkPipelineRenderingCreateInfo rcid = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 0, NULL, df == VK_FORMAT_S8_UINT ? VK_FORMAT_UNDEFINED : df, has_stencil ? df : VK_FORMAT_UNDEFINED};
     VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k->ncol, cf, rcid.depthAttachmentFormat, rcid.stencilAttachmentFormat};
     VkPipeline lib[4]; uint32_t nl = 0;
-    {   // vertex input
+    if (!warm) {   // vertex input
         gpl_vi_key key; memset(&key, 0, sizeof key);
         if (V.has_gpl_dyn) key.topo = 1000 + gpl_topo_class(k->topo);   // (one part per topology class: streams, topology and restart are set at each draw)
         else { key.nattr = k->nattr; memcpy(key.attr, k->attr, sizeof key.attr); key.nbind = k->nbind; memcpy(key.bind, k->bind, sizeof key.bind); key.topo = k->topo; key.restart = k->restart; }
@@ -2424,7 +2432,7 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 0, NULL, V.has_gpl_dyn ? NULL : &vi, &ia, NULL, NULL, NULL, NULL, NULL, NULL, V.has_gpl_dyn ? &dyv : NULL};
         if (!(lib[nl++] = gpl_part(&g_gpl_vi, &key, 0, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, &ci))) return VK_NULL_HANDLE;
     }
-    {   // pre-rasterization shaders
+    if (warm != 2) {   // pre-rasterization shaders
         gpl_pre_key key; memset(&key, 0, sizeof key); key.vs = stg[0]; key.gs = stg[2]; key.mvs = mod[0]; key.mgs = mod[2]; key.lay = pre_lay; key.raster_discard = k->raster_discard;
         if (!V.has_gpl_dyn) { key.topo = k->topo; key.clip_neg1 = k->clip_neg1; key.depth_clamp = k->depth_clamp; key.mode = k->mode; key.cull = k->cull; key.front = k->front; key.bias_en = k->bias_en; }
         else { key.topo = stg[2] ? k->topo : 1000 + gpl_topo_class(k->topo); if (!V.has_depth_clip_ctl) key.clip_neg1 = k->clip_neg1; }   // (a geometry shader's variant follows the topology)
@@ -2443,8 +2451,9 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
         VkPipelineInputAssemblyStateCreateInfo pia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, stg[2] ? (VkPrimitiveTopology)k->topo : rep[gpl_topo_class(k->topo)], 0};
         if (V.has_gpl_dyn) { if (V.has_depth_clip_ctl) vs.pNext = NULL; rs.cullMode = 0; rs.frontFace = VK_FRONT_FACE_CLOCKWISE; rs.depthBiasEnable = 0; rs.polygonMode = VK_POLYGON_MODE_FILL; rs.depthClampEnable = 0; }
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci0, 0, ns, ss, NULL, V.has_gpl_dyn ? &pia : NULL, NULL, &vs, &rs, NULL, NULL, NULL, &dy, pre_lay};
-        if (!(lib[nl++] = gpl_part(&g_gpl_pre, &key, 1, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, &ci))) return VK_NULL_HANDLE;
+        if (!(lib[nl++] = gpl_part(warm ? NULL : &g_gpl_pre, &key, 1, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, &ci))) return VK_NULL_HANDLE;
     }
+    if (warm == 1) return lib[0];
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, (VkSampleCountFlagBits)k->samples, 0, 0, NULL, k->a2c, 0};
     if (V.has_gpl_dyn) { ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT; ms.alphaToCoverageEnable = 0; }
     if (fs) {   // fragment shader
@@ -2464,7 +2473,8 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
                              dyn[nd++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT; ds.depthTestEnable = ds.depthWriteEnable = ds.stencilTestEnable = 0; }
         VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, nd, dyn};
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, V.has_gpl_dyn ? &rci0 : &rcid, 0, 1, &ss, NULL, NULL, NULL, NULL, NULL, &ms, &ds, NULL, &dy, fs_lay};
-        if (!(lib[nl++] = gpl_part(&g_gpl_fs, &key, 2, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &ci))) return VK_NULL_HANDLE;
+        if (!(lib[nl++] = gpl_part(warm ? NULL : &g_gpl_fs, &key, 2, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &ci))) return VK_NULL_HANDLE;
+        if (warm) return lib[nl - 1];
         // fragment output
         gpl_out_key ok; memset(&ok, 0, sizeof ok); ok.ncol = k->ncol; memcpy(ok.cfmt, k->cfmt, sizeof ok.cfmt); ok.dfmt = k->dfmt; ok.samples = k->samples; ok.a2c = k->a2c; ok.blend_en = k->blend_en;
         ok.logic_en = k->logic_en; ok.logic_op = k->logic_op; memcpy(ok.wmask, k->wmask, sizeof ok.wmask); memcpy(ok.bl, k->bl, sizeof ok.bl);
@@ -2482,7 +2492,7 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
     // the link (no link-time optimization: quick; the parts are compiled code already)
     VkPipelineLibraryCreateInfoKHR lci = {VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, NULL, nl, lib};
     // DM_VK_GPL_LTO=1 (start-up): the link optimizes across the parts (a full compile at the link; a check of the quick link)
-    static int lto = -1; if (lto < 0) { const char *e = getenv("DM_VK_GPL_LTO"); lto = e && *e == 1; if (lto) VKLOG("graphics pipeline library: links optimize across parts (DM_VK_GPL_LTO=1)"); }
+    static int lto = -1; if (lto < 0) { const char *e = getenv("DM_VK_GPL_LTO"); lto = e && *e == '1'; if (lto) VKLOG("graphics pipeline library: links optimize across parts (DM_VK_GPL_LTO=1)"); }
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lci, lto ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT : 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, layout};
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
     pthread_mutex_lock(&g_gpl_link_mu); VkPipeline p; VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p); pthread_mutex_unlock(&g_gpl_link_mu);
@@ -2494,6 +2504,48 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
         (unsigned long long)n[4], t[4] / 1e6 / (n[4] ? n[4] : 1), (unsigned long long)n[0], t[0] / 1e6 / (n[0] ? n[0] : 1), (unsigned long long)n[1], t[1] / 1e6 / (n[1] ? n[1] : 1),
         (unsigned long long)n[2], t[2] / 1e6 / (n[2] ? n[2] : 1), (unsigned long long)n[3], t[3] / 1e6 / (n[3] ? n[3] : 1));
     return p;
+}
+static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]) { return gpl_build_ex(k, layout, stg, 0); }
+// ---- every shader's part made ahead of time (V.has_gpl_dyn) ----
+// Per-shader parts depend on their shader alone, so each vertex shader's pre-rasterization part (with no outputs added) and each fragment shader's part (no alpha test, no
+// depth or dual-source variant) can be made before the shader is first drawn: once, into the pipeline cache, on a thread of its own at low priority that stands aside while
+// the replay builds or waits for a pipeline. A shader it loads only for this is unloaded again (vk_shader_warm_drop), so the pass costs no memory; the replay's later part
+// of the same shader is then a pipeline cache hit (about 0.05 ms) instead of a compile. Done once per bundle and driver (DM_ROOT/vk_gpl_warm.done), then not again.
+// The variants (outputs added for a fragment shader's inputs the vertex shader does not write, integer texel views, the alpha test, other topology classes) are still made
+// at first sight. DM_VK_GPL_WARM=0 (start-up): no warm pass; =2: again even if done
+static void *gpl_warm_thread(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "vk gpl warm"); setpriority(PRIO_PROCESS, 0, 15);
+    const char *root = getenv("DM_ROOT"), *e = getenv("DM_VK_GPL_WARM"); char path[1100], want[128], have[128] = "";
+    uint32_t vk_bundle_n(void); int vk_bundle_at(uint32_t i, uint64_t *key, int *stage);
+    vkshader_t *vk_shader_warm_get(uint64_t key, int stage, int *had); void vk_shader_warm_drop(vkshader_t *s);
+    uint32_t n = vk_bundle_n(); if (!n || !root) return NULL;
+    int o = snprintf(want, sizeof want, "v1 %u ", n); for (int i = 0; i < VK_UUID_SIZE; i++) o += snprintf(want + o, sizeof want - (size_t)o, "%02x", V.props.pipelineCacheUUID[i]);
+    snprintf(path, sizeof path, "%s/vk_gpl_warm.done", root);
+    { FILE *f = fopen(path, "r"); if (f) { if (!fgets(have, sizeof have, f)) have[0] = 0; fclose(f); } }
+    have[strcspn(have, "\n")] = 0;
+    if (!strcmp(have, want) && !(e && *e == '2')) { VKLOG("pipeline library warm pass: done before for this bundle and driver"); return NULL; }
+    sleep(10);   // (after the start's own pipelines: the prewarm takes the first seconds)
+    VKLOG("pipeline library warm pass: %u bundle entries, their vertex and fragment shaders' parts into the pipeline cache", n);
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a); uint32_t made = 0, failed = 0, seen = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t key; int st; if (!vk_bundle_at(i, &key, &st) || (st != 0 && st != 1)) continue;
+        for (int w = 0; w < 400 && __atomic_load_n(&g_replay_waits, __ATOMIC_RELAXED) > 0; w++) usleep(5000);   // (the replay builds or waits: it goes first)
+        int had = 0; vkshader_t *s = vk_shader_warm_get(key, st, &had); if (!s) continue;
+        pkey kw; memset(&kw, 0, sizeof kw); kw.topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; kw.samples = 1;
+        vkshader_t *stg[3] = {st == 0 ? s : NULL, st == 1 ? s : NULL, NULL};
+        if (gpl_build_ex(&kw, VK_NULL_HANDLE, stg, st == 0 ? 1 : 2)) made++; else failed++;
+        if (!had) vk_shader_warm_drop(s);
+        if (++seen % 2000 == 0) VKLOG("pipeline library warm pass: %u shaders (%u parts made, %u could not be)", seen, made, failed);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    void vk_pipeline_cache_save(void); vk_pipeline_cache_save();
+    if (made) { FILE *f = fopen(path, "w"); if (f) { fprintf(f, "%s\n", want); fclose(f); } }
+    VKLOG("pipeline library warm pass: done, %u shaders' parts made in %.0f s (%u could not be)", made, (double)(b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9, failed);
+    return NULL;
+}
+static void gpl_warm_start(void) {
+    const char *e = getenv("DM_VK_GPL_WARM"); if (!V.has_gpl_dyn || !vk_gpl_on() || (e && *e == '0')) return;
+    pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, gpl_warm_thread, NULL); pthread_attr_destroy(&a);
 }
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg_in[3]) {
     VkPipeline p; vkshader_t *stg[3] = {stg_in[0], stg_in[1], stg_in[2] ? vk_shader_gs_topo(stg_in[2], (VkPrimitiveTopology)k->topo) : NULL};

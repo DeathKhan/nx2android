@@ -524,7 +524,26 @@ static int storage_dynamic_binding(const dmsv_bind *b, uint32_t used, uint32_t l
     return used < limit && b->desc == RD_SSBO && b->count == 1 && (b->kind == RK_GS_CLAIM || (b->kind == RK_SBUF && b->reg >= 0 && b->reg < 16));
 }
 static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet);
+static __thread int t_warm;   // vk_shader_q for the warm pass (vk_shader_warm_get): the shader is not marked used
 vkshader_t *vk_shader(uint64_t key, int stage) { return vk_shader_q(key, stage, 0); }
+// The bundle's entries, for the warm pass (gfx_vk_exec.c gpl_warm): their keys and NVN stages
+uint32_t vk_bundle_n(void) { bundle_auto(); return g_bundle ? g_nent : 0; }
+int vk_bundle_at(uint32_t i, uint64_t *key, int *stage) { if (!g_bundle || i >= g_nent) return 0; memcpy(key, &g_ent[i].key, 8); *stage = (int)g_ent[i].stage; return 1; }
+// A shader for the warm pass: loaded as the replay loads it (the same SPIR-V, layout and module), without marking it used; *had: it was loaded before
+vkshader_t *vk_shader_warm_get(uint64_t key, int stage, int *had) {
+    bundle_auto(); struct { uint64_t key; uint64_t stage; } hk = {key, (uint64_t)stage};
+    pthread_mutex_lock(&g_sh_mu); vkshader_t *s = nvn_hm_get(&g_shaders, &hk); pthread_mutex_unlock(&g_sh_mu);
+    *had = s != NULL; t_warm = 1; s = vk_shader_q(key, stage, 1); t_warm = 0; return s;
+}
+// ... and gone again when nothing else took it meanwhile (its layout stays: layouts are shared by their bindings, shader_layout)
+void vk_shader_warm_drop(vkshader_t *s) {
+    struct { uint64_t key; uint64_t stage; } hk = {s->key, (uint64_t)s->stage};
+    pthread_mutex_lock(&g_sh_mu);
+    if (s->used || s->nvar || nvn_hm_get(&g_shaders, &hk) != s) { pthread_mutex_unlock(&g_sh_mu); return; }
+    nvn_hm_del(&g_shaders, &hk); pthread_mutex_unlock(&g_sh_mu);
+    if (s->mod) vkDestroyShaderModule(V.dev, s->mod, NULL);
+    free(s->spv); if (s->gs_claim_invocations) free((void *)s->b); free(s);
+}
 // A geometry shader's input primitive is fixed when it is translated, and Maxwell's shader header doesn't give it: shader_vk.py translates each geometry shader for
 // triangles under its own key and for the other four kinds under derived keys. Read as triangles, the points Xenoblade Chronicles 3's particle updates draw were taken
 // three at a time (Vulkan leaves a mismatch undefined), and the particles' records came out wrong: no husk particles, send-off particles or item orbs
@@ -566,7 +585,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     struct { uint64_t key; uint64_t stage; } hk = {key, (uint64_t)stage};
     pthread_mutex_lock(&g_sh_mu);
     vkshader_t *s = nvn_hm_get(&g_shaders, &hk);
-    if (s) { pthread_mutex_unlock(&g_sh_mu); return s == (void *)1 ? NULL : s; }
+    if (s) { if (s != (void *)1 && !t_warm) s->used = 1; pthread_mutex_unlock(&g_sh_mu); return s == (void *)1 ? NULL : s; }
     const bent *e = g_bundle ? find(key) : NULL;
     if (!e) { nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu);
               static int n; if (!quiet && n++ < 16) VKLOG("[RED] shader %016llx (stage %d) is not in the bundle", (unsigned long long)key, stage); return NULL; }
@@ -751,7 +770,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
         VkDescriptorType dt = ds ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : du ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : desc_type(b->desc);
         lb[nl++] = (VkDescriptorSetLayoutBinding){b->binding, dt, b->count ? b->count : 32, stage_flag(stage), NULL};
     }
-    s->dsl = shader_layout(lb, nl);
+    s->dsl = shader_layout(lb, nl); s->used = !t_warm;
     nvn_hm_put(&g_shaders, &hk, s);
     pthread_mutex_unlock(&g_sh_mu);
     return s;
