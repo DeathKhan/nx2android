@@ -918,6 +918,10 @@ class Port:
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         env = self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else []) + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else [])
         files = {**self.fps_files, **font_files}
+        # The starter pipeline list (gfx_vk_exec.c prewarm_start): a vk_pipelines.bin recorded in play, kept in the game's profile as vk_pipelines.seed.bin. On the
+        # device its entries the player's own list lacks are added to it, so a new install (or an emptied list) prewarms the effects earlier play met
+        seed = self.ap.path.parent / 'vk_pipelines.seed.bin'
+        if seed.is_file(): files['vk_pipelines.seed.bin'] = seed
         # Reuse: the pack is 186,000 hard links for a Switch 2 game (Ocarina of Time: 2:45 on an idle disk, 11 min beside another reader), made again on every run though an
         # app-only rebuild changes none of it. Its inputs are the stages' own keys (the rewrite's and the shader bundle's key files, the RomFS image's stamp), the profile, the
         # DLC / system data trees and the rows written into it; with the same key and the pack's manifest in place, the pack stands

@@ -176,6 +176,7 @@ struct vkimg {
     uint64_t vkbytes;                 // the image's device memory (vkGetImageMemoryRequirements size): what the texture budget counts (gfx_vk_budget.c)
     uint64_t zc_gen;                  // a texture over a movie picture slot (movie_zc_vk.c zc_tex_refresh): the slot's change count last converted into it
 };
+int vk_rt_predict(const tex_t *t, const view_t *vw, VkFormat *fmt, uint32_t *samples, VkImageAspectFlags *aspect, vkimg_t **img_out);   // a render target's attachment format, samples and aspect, its image if made (nothing made; gfx_vk_exec.c predict_rest)
 vkimg_t *vk_tex(const tex_t *t);                                 // the image of a texture object (created, uploaded or refreshed as needed)
 int vk_tex_storage_prepare(const tex_t *t, const view_t *view);                    // before descriptor collection/render pass: preserve contents when adding storage usage
 void vk_lrz_forget(vkimg_t *im);                                 // an image is being dropped: the pass code forgets it (gfx_vk_exec.c)

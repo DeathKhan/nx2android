@@ -524,6 +524,22 @@ void vk_tex_touch_ids(const int *ids, int n) {   // (each looked up as vk_tex_po
 }
 vkimg_t *vk_tex(const tex_t *t) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
     vkimg_t *im = vk_tex_(t); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[1] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return im; }
+// predict_rest (gfx_vk_exec.c): what begin_pass would take for a render target, without making its image or view: the image when it exists (pkey_fill reads
+// its fdz mark), the attachment view's format by vk_tex_view_as's rules for an attachment, the samples and the aspect. 0: not a drawable texture
+int vk_rt_predict(const tex_t *t, const view_t *vw, VkFormat *fmt, uint32_t *samples, VkImageAspectFlags *aspect, vkimg_t **img_out) {
+    *img_out = NULL;
+    if (!t || !t->serial || t->magic != MAGIC('T', 'E', 'X', 0)) return 0;
+    const vkfmt_t *tf = vk_fmt(t->d.format); if (!tf || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    akey k; tex_storage_key(&k, t, tf);
+    pthread_mutex_lock(&g_img_mu); vkimg_t *im = t->pool ? nvn_hm_get(&g_by_key, &k) : nvn_hm_get(&g_by_serial, &t->serial); pthread_mutex_unlock(&g_img_mu);
+    const vkfmt_t *f = vw && vw->set_format ? vk_fmt(vw->format) : tf; if (!f) f = tf;
+    VkFormat ifmt = im ? im->fmt : tf->vk; VkImageAspectFlags ia = im ? im->aspect : aspect_of(tf);
+    VkFormat v = im && im->promoted ? im->fmt : f->vk;
+    if ((ia & ~VK_IMAGE_ASPECT_COLOR_BIT) || (f->compressed || f->dec) != (tf->compressed || tf->dec) || (f->dec && f->dbpp != tf->dbpp)) v = ifmt;
+    if (im && im->fixed_fmt && v != im->fmt && v != srgb_twin(im->fmt) && v != im->fmt_cls[0] && v != im->fmt_cls[1]) v = im->fmt;
+    *fmt = v; *samples = t->d.samples > 1 ? t->d.samples : 1; *aspect = ia; *img_out = im;
+    return 1;
+}
 static vkimg_t *vk_tex_(const tex_t *t) {
     if (!t || !t->serial || t->magic != MAGIC('T', 'E', 'X', 0)) return NULL;
     const vkfmt_t *f = vk_fmt(t->d.format);
