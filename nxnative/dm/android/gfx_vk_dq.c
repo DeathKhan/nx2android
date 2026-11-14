@@ -33,7 +33,16 @@
     X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor) \
     X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) X(vkCmdSetLineWidth) X(vkCmdDraw) \
     X(vkCmdPushConstants) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) X(vkCmdDispatchIndirect) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) \
-    X(vkCmdWriteTimestamp) X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT) X(vkCmdDrawIndirectByteCountEXT) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount)
+    X(vkCmdWriteTimestamp) X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT) X(vkCmdDrawIndirectByteCountEXT) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) \
+    X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) \
+    X(vkCmdSetDepthCompareOp) X(vkCmdSetStencilTestEnable) X(vkCmdSetDepthBiasEnable) X(vkCmdSetPolygonModeEXT) X(vkCmdSetDepthClampEnableEXT) X(vkCmdSetRasterizationSamplesEXT) \
+    X(vkCmdSetAlphaToCoverageEnableEXT) X(vkCmdSetDepthClipNegativeOneToOneEXT) X(vkCmdSetStencilOp) X(vkCmdSetVertexInputEXT)
+// the per-draw state of pipelines linked from per-shader parts (gfx_vk_exec.c gpl_set_dynamic), one 32-bit argument each: queued like the rest, or the recorder's
+// draws ran with state set ahead of them out of order (Ocarina of Time's title under DM_VK_MT_REPLAY=2: the logo drawn with another draw's vertex input)
+#define DQ_U32(Y) Y(vkCmdSetCullMode, VkCullModeFlags) Y(vkCmdSetFrontFace, VkFrontFace) Y(vkCmdSetPrimitiveTopology, VkPrimitiveTopology) Y(vkCmdSetPrimitiveRestartEnable, VkBool32) \
+    Y(vkCmdSetDepthTestEnable, VkBool32) Y(vkCmdSetDepthWriteEnable, VkBool32) Y(vkCmdSetDepthCompareOp, VkCompareOp) Y(vkCmdSetStencilTestEnable, VkBool32) \
+    Y(vkCmdSetDepthBiasEnable, VkBool32) Y(vkCmdSetPolygonModeEXT, VkPolygonMode) Y(vkCmdSetDepthClampEnableEXT, VkBool32) Y(vkCmdSetRasterizationSamplesEXT, VkSampleCountFlagBits) \
+    Y(vkCmdSetAlphaToCoverageEnableEXT, VkBool32) Y(vkCmdSetDepthClipNegativeOneToOneEXT, VkBool32)
 #define DQ_SYNC(X) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkAllocateCommandBuffers) X(vkResetCommandPool) X(vkQueueSubmit) X(vkQueuePresentKHR) X(vkQueueWaitIdle) X(vkDeviceWaitIdle)
 #define DQ_MODE2(X) X(vkUpdateDescriptorSets)   // swapped with DM_VK_MT_REPLAY=2 only
 #define DQ_REAL(f) static PFN_##f r_##f;
@@ -213,6 +222,8 @@ typedef struct { uint32_t first, n; } a_range;
 typedef struct { VkBuffer b; VkDeviceSize off; VkIndexType t; } a_index;
 typedef struct { float c[4]; } a_blend;
 typedef struct { VkStencilFaceFlags f; uint32_t v; } a_stencil;
+typedef struct { VkStencilFaceFlags f; VkStencilOp fail, pass, dfail; VkCompareOp op; } a_sop;
+typedef struct { uint32_t nb, na; } a_vi;
 typedef struct { float c, clamp, slope; } a_bias;
 typedef struct { uint32_t a, b, c, d; int32_t e; uint32_t f; } a_draw;
 typedef struct { VkPipelineLayout l; VkShaderStageFlags st; uint32_t off, size; } a_push;
@@ -265,6 +276,11 @@ static void run(const rec_hdr *h) {
     case OP_vkCmdSetStencilWriteMask: { const a_stencil *a = (const void *)p; r_vkCmdSetStencilWriteMask(cb, a->f, a->v); break; }
     case OP_vkCmdSetDepthBias: { const a_bias *a = (const void *)p; r_vkCmdSetDepthBias(cb, a->c, a->clamp, a->slope); break; }
     case OP_vkCmdSetLineWidth: { float w; memcpy(&w, p, sizeof w); r_vkCmdSetLineWidth(cb, w); break; }
+#define DQ_RUN_U32(f, T) case OP_##f: { uint32_t v; memcpy(&v, p, 4); r_##f(cb, (T)v); break; }
+    DQ_U32(DQ_RUN_U32)
+    case OP_vkCmdSetStencilOp: { const a_sop *a = (const void *)p; r_vkCmdSetStencilOp(cb, a->f, a->fail, a->pass, a->dfail, a->op); break; }
+    case OP_vkCmdSetVertexInputEXT: { const a_vi *a = (const void *)p; const VkVertexInputBindingDescription2EXT *b = (const void *)(p + sizeof *a);
+        r_vkCmdSetVertexInputEXT(cb, a->nb, a->nb ? b : NULL, a->na, a->na ? (const VkVertexInputAttributeDescription2EXT *)(b + a->nb) : NULL); break; }
     case OP_vkCmdDraw: { const a_draw *a = (const void *)p; r_vkCmdDraw(cb, a->a, a->b, a->c, a->d); break; }
     case OP_vkCmdDrawIndexed: { const a_draw *a = (const void *)p; r_vkCmdDrawIndexed(cb, a->a, a->b, a->c, a->e, a->f); break; }
     case OP_vkCmdPushConstants: { const a_push *a = (const void *)p; r_vkCmdPushConstants(cb, a->l, a->st, a->off, a->size, p + sizeof *a); break; }
@@ -392,6 +408,18 @@ static VKAPI_ATTR void VKAPI_CALL w_vkCmdSetBlendConstants(VkCommandBuffer cb, c
 #define W_STENCIL(f) static VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb, VkStencilFaceFlags fl, uint32_t v) { \
     { BEGIN(OP_##f, a_stencil, 0); *a = (a_stencil){fl, v}; (void)at_; rec_end(base_); return; } direct: DIRECT(f, cb, fl, v); }
 W_STENCIL(vkCmdSetStencilReference) W_STENCIL(vkCmdSetStencilCompareMask) W_STENCIL(vkCmdSetStencilWriteMask)
+#define W_U32(f, T) static VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb, T v) { \
+    { BEGIN(OP_##f, uint32_t, 0); *a = (uint32_t)v; (void)at_; rec_end(base_); return; } direct: DIRECT(f, cb, v); }
+DQ_U32(W_U32)
+static VKAPI_ATTR void VKAPI_CALL w_vkCmdSetStencilOp(VkCommandBuffer cb, VkStencilFaceFlags f, VkStencilOp fail, VkStencilOp pass, VkStencilOp dfail, VkCompareOp op) {
+    { BEGIN(OP_vkCmdSetStencilOp, a_sop, 0); *a = (a_sop){f, fail, pass, dfail, op}; (void)at_; rec_end(base_); return; } direct: DIRECT(vkCmdSetStencilOp, cb, f, fail, pass, dfail, op); }
+static VKAPI_ATTR void VKAPI_CALL w_vkCmdSetVertexInputEXT(VkCommandBuffer cb, uint32_t nb, const VkVertexInputBindingDescription2EXT *b, uint32_t na, const VkVertexInputAttributeDescription2EXT *ad) {
+    for (uint32_t i = 0; i < nb; i++) if (b[i].pNext) goto direct;
+    for (uint32_t i = 0; i < na; i++) if (ad[i].pNext) goto direct;
+    { BEGIN(OP_vkCmdSetVertexInputEXT, a_vi, ARR(VkVertexInputBindingDescription2EXT, b, nb) + ARR(VkVertexInputAttributeDescription2EXT, ad, na)); *a = (a_vi){b ? nb : 0, ad ? na : 0};
+      put(&at_, b, ARR(VkVertexInputBindingDescription2EXT, b, nb)); put(&at_, ad, ARR(VkVertexInputAttributeDescription2EXT, ad, na)); rec_end(base_); return; }
+direct: DIRECT(vkCmdSetVertexInputEXT, cb, nb, b, na, ad);
+}
 static VKAPI_ATTR void VKAPI_CALL w_vkCmdSetDepthBias(VkCommandBuffer cb, float c, float clamp, float slope) {
     { BEGIN(OP_vkCmdSetDepthBias, a_bias, 0); *a = (a_bias){c, clamp, slope}; (void)at_; rec_end(base_); return; } direct: DIRECT(vkCmdSetDepthBias, cb, c, clamp, slope); }
 static VKAPI_ATTR void VKAPI_CALL w_vkCmdSetLineWidth(VkCommandBuffer cb, float w) {
