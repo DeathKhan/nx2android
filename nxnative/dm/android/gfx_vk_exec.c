@@ -2328,22 +2328,24 @@ typedef struct { const void *vs, *gs; VkShaderModule mvs, mgs; VkPipelineLayout 
 typedef struct { VkShaderModule mfs; VkPipelineLayout lay; uint32_t atest, aref, dt, dw, df, st, sf[2], sfail[2], szfail[2], szpass[2], samples, a2c, dfmt; } gpl_fs_key;
 typedef struct { uint32_t ncol, cfmt[8], dfmt, samples, a2c, blend_en, logic_en, logic_op, wmask[8]; struct { uint32_t src, dst, srca, dsta, eq, eqa; } bl[8]; } gpl_out_key;
 static nvn_hmap g_gpl_vi = {.klen = sizeof(gpl_vi_key)}, g_gpl_pre = {.klen = sizeof(gpl_pre_key)}, g_gpl_fs = {.klen = sizeof(gpl_fs_key)}, g_gpl_out = {.klen = sizeof(gpl_out_key)};
-static pthread_mutex_t g_gpl_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_gpl_mu = PTHREAD_MUTEX_INITIALIZER, g_gpl_link_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gpl_cv = PTHREAD_COND_INITIALIZER;
+#define GPL_MAKING ((VkPipeline)(uintptr_t)3)   // (a table entry while one thread makes that part)
 static uint64_t g_gpl_n[5], g_gpl_ns[5];   // parts made (vertex input, pre-rasterization, fragment shader, output) and pipelines linked, with their time
 static VkPipeline gpl_part(nvn_hmap *m, const void *key, int kind, VkGraphicsPipelineLibraryFlagsEXT what, VkGraphicsPipelineCreateInfo *ci) {
-    pthread_mutex_lock(&g_gpl_mu); VkPipeline p = nvn_hm_get(m, key); pthread_mutex_unlock(&g_gpl_mu);
-    if (p) return p;
+    pthread_mutex_lock(&g_gpl_mu); VkPipeline p;
+    while ((p = nvn_hm_get(m, key)) == GPL_MAKING) pthread_cond_wait(&g_gpl_cv, &g_gpl_mu);   // another thread makes it: its result
+    if (p) { pthread_mutex_unlock(&g_gpl_mu); return p; }
+    nvn_hm_put(m, key, GPL_MAKING); pthread_mutex_unlock(&g_gpl_mu);
     VkGraphicsPipelineLibraryCreateInfoEXT li = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, ci->pNext, what};
-    ci->pNext = &li; ci->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+    ci->pNext = &li; ci->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
-    VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, ci, NULL, &p);
+    pthread_mutex_lock(&g_gpl_link_mu); VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, ci, NULL, &p); pthread_mutex_unlock(&g_gpl_link_mu);   // (one at a time: Turnip)
     clock_gettime(CLOCK_MONOTONIC, &b);
     if (r) { static const char *nm[4] = {"vertex input", "pre-rasterization", "fragment shader", "fragment output"}; static int said[4];
-             if (!said[kind]++) VKLOG("[RED] graphics pipeline library: the %s part failed (%d): pipelines are made whole instead where it is needed", nm[kind], r); return VK_NULL_HANDLE; }
+             if (!said[kind]++) VKLOG("[RED] graphics pipeline library: the %s part failed (%d): pipelines are made whole instead where it is needed", nm[kind], r);
+             pthread_mutex_lock(&g_gpl_mu); nvn_hm_del(m, key); pthread_cond_broadcast(&g_gpl_cv); pthread_mutex_unlock(&g_gpl_mu); return VK_NULL_HANDLE; }
     pthread_mutex_lock(&g_gpl_mu);
-    VkPipeline had = nvn_hm_get(m, key);
-    if (had) { pthread_mutex_unlock(&g_gpl_mu); vkDestroyPipeline(V.dev, p, NULL); return had; }   // another thread made it meanwhile
-    nvn_hm_put(m, key, p); g_gpl_n[kind]++; g_gpl_ns[kind] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
+    nvn_hm_put(m, key, p); pthread_cond_broadcast(&g_gpl_cv); g_gpl_n[kind]++; g_gpl_ns[kind] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
     pthread_mutex_unlock(&g_gpl_mu);
     return p;
 }
@@ -2428,7 +2430,7 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
     static int lto = -1; if (lto < 0) { const char *e = getenv("DM_VK_GPL_LTO"); lto = e && *e == 1; if (lto) VKLOG("graphics pipeline library: links optimize across parts (DM_VK_GPL_LTO=1)"); }
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lci, lto ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT : 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, layout};
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
-    VkPipeline p; VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p);
+    pthread_mutex_lock(&g_gpl_link_mu); VkPipeline p; VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p); pthread_mutex_unlock(&g_gpl_link_mu);
     clock_gettime(CLOCK_MONOTONIC, &b);
     if (r) { static int said; if (!said++) VKLOG("[RED] graphics pipeline library: linking failed (%d): pipelines are made whole instead", r); return VK_NULL_HANDLE; }
     pthread_mutex_lock(&g_gpl_mu); g_gpl_n[4]++; g_gpl_ns[4] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
