@@ -698,6 +698,20 @@ void vk_init(void) {
       if (!(e && *e == '0') && has_ext(ex, ne, "VK_EXT_graphics_pipeline_library") && has_ext(ex, ne, "VK_KHR_pipeline_library") && non + 2 <= 64) {
           VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fgpl}; vkGetPhysicalDeviceFeatures2(V.pd, &q);
           if (fgpl.graphicsPipelineLibrary) { on[non++] = "VK_KHR_pipeline_library"; on[non++] = "VK_EXT_graphics_pipeline_library"; fgpl.pNext = dnext; dnext = &fgpl; V.has_gpl = 1; } }
+      static VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT fvi = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
+      static VkPhysicalDeviceExtendedDynamicState3FeaturesEXT fe3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+      const char *ed = getenv("DM_VK_GPL_DYN");
+      if (V.has_gpl && !(ed && *ed == '0') && v13 && has_ext(ex, ne, "VK_EXT_vertex_input_dynamic_state") && has_ext(ex, ne, "VK_EXT_extended_dynamic_state3") && non + 2 <= 64) {
+          fvi.pNext = &fe3; VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fvi}; vkGetPhysicalDeviceFeatures2(V.pd, &q);
+          if (fvi.vertexInputDynamicState && fe3.extendedDynamicState3PolygonMode && fe3.extendedDynamicState3DepthClampEnable && fe3.extendedDynamicState3RasterizationSamples &&
+              fe3.extendedDynamicState3AlphaToCoverageEnable && (!V.has_depth_clip_ctl || fe3.extendedDynamicState3DepthClipNegativeOneToOne)) {
+              VkPhysicalDeviceExtendedDynamicState3FeaturesEXT on3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+              on3.extendedDynamicState3PolygonMode = on3.extendedDynamicState3DepthClampEnable = on3.extendedDynamicState3RasterizationSamples = on3.extendedDynamicState3AlphaToCoverageEnable = VK_TRUE;
+              on3.extendedDynamicState3DepthClipNegativeOneToOne = V.has_depth_clip_ctl ? VK_TRUE : VK_FALSE; fe3 = on3;
+              VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT onv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT, NULL, VK_TRUE}; fvi = onv;
+              on[non++] = "VK_EXT_vertex_input_dynamic_state"; on[non++] = "VK_EXT_extended_dynamic_state3";
+              fe3.pNext = dnext; fvi.pNext = &fe3; dnext = &fvi; V.has_gpl_dyn = 1; } }
+      if (V.has_gpl) VKLOG("pipeline library parts: %s", V.has_gpl_dyn ? "per shader (vertex input, topology, rasterizer, depth / stencil, samples set at each draw)" : ed && *ed == '0' ? "with their state (DM_VK_GPL_DYN=0)" : "with their state (no vertex input / extended dynamic state 3)");
       VKLOG("graphics pipeline libraries: %s", V.has_gpl ? "on (pipelines linked from parts made once each)" : e && *e == '0' ? "off (DM_VK_GPL=0)" : "not offered by the driver"); }
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, dnext, 0, 1, &qci, 0, NULL, non, on, NULL};
     VKCHK(fp_create_device(V.pd, &dci, &V.dev));   // with FPCR 0 (fp_enter, above)

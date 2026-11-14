@@ -37,7 +37,7 @@ static struct {
     int64_t row_stride, image_stride;
     // the open render pass
     int pass_open; uint32_t pass_w, pass_h; VkFormat cfmt[8], dfmt; VkImageAspectFlags daspect; uint32_t samples; int ncol;
-    VkPipeline bound_pipe; int rp_pass;   // rp_pass: the open pass began with vkCmdBeginRenderPass
+    VkPipeline bound_pipe; int bound_dyn, rp_pass;   // rp_pass: the open pass began with vkCmdBeginRenderPass
 } S;
 static p_tf_bind g_tf[4]; static uint64_t g_tf_off[4]; static int g_tf_on, g_tf_in_pass; static uint32_t g_tf_verts;   // transform feedback: buffers, bytes written into each, capture on, a capture in the open pass (xfb_begin), vertices captured since Begin
 static int g_depth_zero = 1, g_lower_left;
@@ -2350,6 +2350,42 @@ static VkPipeline gpl_part(nvn_hmap *m, const void *key, int kind, VkGraphicsPip
     return p;
 }
 // The pipeline of key k linked from its parts; VK_NULL_HANDLE where pipeline libraries are off or a part could not be made (the caller makes it whole)
+static nvn_hmap g_gpl_dynp = {.klen = sizeof(VkPipeline)};   // the linked pipelines that take their state at each draw (gpl_set_dynamic); under g_gpl_mu
+static int gpl_is_dyn(VkPipeline p) { if (!V.has_gpl_dyn) return 0; pthread_mutex_lock(&g_gpl_mu); int r = nvn_hm_get(&g_gpl_dynp, &p) != NULL; pthread_mutex_unlock(&g_gpl_mu); return r; }
+static uint32_t gpl_topo_class(uint32_t t) { return t <= VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0 : t <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || t == VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY || t == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ? 1 : t == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST ? 3 : 2; }
+// The state a per-shader pipeline takes at each draw (the bind cache: set again when it changes, after a whole pipeline was bound, and in a new command buffer)
+static struct { uint64_t gen; int valid; pkey k; } g_gd;
+extern uint64_t g_cmd_gen;
+static void gpl_set_dynamic(VkCommandBuffer cb, const pkey *k) {
+    int all = !g_gd.valid || g_gd.gen != g_cmd_gen; const pkey *o = &g_gd.k;
+#define GD(f) (all || memcmp(&o->f, &k->f, sizeof k->f))
+    if (GD(cull)) vkCmdSetCullMode(cb, k->cull);
+    if (GD(front)) vkCmdSetFrontFace(cb, k->front ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
+    if (GD(topo)) vkCmdSetPrimitiveTopology(cb, (VkPrimitiveTopology)k->topo);
+    if (GD(restart)) vkCmdSetPrimitiveRestartEnable(cb, k->restart);
+    if (GD(dt)) vkCmdSetDepthTestEnable(cb, k->dt);
+    if (GD(dt) || GD(dw)) vkCmdSetDepthWriteEnable(cb, k->dt && k->dw);
+    if (GD(df)) vkCmdSetDepthCompareOp(cb, cmpop(k->df));
+    if (GD(st)) vkCmdSetStencilTestEnable(cb, k->st);
+    if (GD(sf) || GD(sfail) || GD(szfail) || GD(szpass)) {
+        vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, sop(k->sfail[0]), sop(k->szpass[0]), sop(k->szfail[0]), cmpop(k->sf[0]));
+        vkCmdSetStencilOp(cb, VK_STENCIL_FACE_BACK_BIT, sop(k->sfail[1]), sop(k->szpass[1]), sop(k->szfail[1]), cmpop(k->sf[1])); }
+    if (GD(bias_en)) vkCmdSetDepthBiasEnable(cb, k->bias_en);
+    if (GD(mode)) vkCmdSetPolygonModeEXT(cb, k->mode == 0 ? VK_POLYGON_MODE_POINT : k->mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL);
+    if (GD(depth_clamp)) vkCmdSetDepthClampEnableEXT(cb, k->depth_clamp);
+    if (GD(samples)) vkCmdSetRasterizationSamplesEXT(cb, (VkSampleCountFlagBits)k->samples);
+    if (GD(a2c)) vkCmdSetAlphaToCoverageEnableEXT(cb, k->a2c);
+    if (V.has_depth_clip_ctl && GD(clip_neg1)) vkCmdSetDepthClipNegativeOneToOneEXT(cb, k->clip_neg1);
+    if (GD(nattr) || GD(attr) || GD(nbind) || GD(bind)) {
+        VkVertexInputBindingDescription2EXT bd[17]; VkVertexInputAttributeDescription2EXT ad[16];
+        for (uint32_t i = 0; i < k->nbind; i++) bd[i] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL, k->bind[i].binding, k->bind[i].stride,
+            (VkVertexInputRate)k->bind[i].rate, k->bind[i].rate && V.has_divisor && k->bind[i].divisor > 1 ? k->bind[i].divisor : 1};
+        for (uint32_t i = 0; i < k->nattr; i++) ad[i] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, NULL, k->attr[i].loc, k->attr[i].binding,
+            (VkFormat)k->attr[i].fmt, k->attr[i].off};
+        vkCmdSetVertexInputEXT(cb, k->nbind, bd, k->nattr, ad); }
+#undef GD
+    g_gd.k = *k; g_gd.valid = 1; g_gd.gen = g_cmd_gen;
+}
 static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]) {
     if (!vk_gpl_on() || k->alt || k->flat || (stg[0] && stg[0]->xfb) || !stg[0]) return VK_NULL_HANDLE;
     const vkshader_t *fs = stg[1] && !k->raster_discard ? stg[1] : NULL; uint32_t xo[3] = {0};
@@ -2371,7 +2407,9 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
     VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k->ncol, cf, rcid.depthAttachmentFormat, rcid.stencilAttachmentFormat};
     VkPipeline lib[4]; uint32_t nl = 0;
     {   // vertex input
-        gpl_vi_key key; memset(&key, 0, sizeof key); key.nattr = k->nattr; memcpy(key.attr, k->attr, sizeof key.attr); key.nbind = k->nbind; memcpy(key.bind, k->bind, sizeof key.bind); key.topo = k->topo; key.restart = k->restart;
+        gpl_vi_key key; memset(&key, 0, sizeof key);
+        if (V.has_gpl_dyn) key.topo = 1000 + gpl_topo_class(k->topo);   // (one part per topology class: streams, topology and restart are set at each draw)
+        else { key.nattr = k->nattr; memcpy(key.attr, k->attr, sizeof key.attr); key.nbind = k->nbind; memcpy(key.bind, k->bind, sizeof key.bind); key.topo = k->topo; key.restart = k->restart; }
         VkVertexInputAttributeDescription ad[16]; VkVertexInputBindingDescription bd[17]; VkVertexInputBindingDivisorDescriptionEXT dd[17]; uint32_t ndd = 0;
         for (uint32_t i = 0; i < k->nattr; i++) ad[i] = (VkVertexInputAttributeDescription){k->attr[i].loc, k->attr[i].binding, (VkFormat)k->attr[i].fmt, k->attr[i].off};
         for (uint32_t i = 0; i < k->nbind; i++) { bd[i] = (VkVertexInputBindingDescription){k->bind[i].binding, k->bind[i].stride, (VkVertexInputRate)k->bind[i].rate};
@@ -2379,12 +2417,17 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
         VkPipelineVertexInputDivisorStateCreateInfoEXT dvs = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT, NULL, ndd, dd};
         VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, ndd ? &dvs : NULL, 0, k->nbind, bd, k->nattr, ad};
         VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, (VkPrimitiveTopology)k->topo, k->restart};
-        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 0, NULL, &vi, &ia};
+        VkDynamicState dvi[] = {VK_DYNAMIC_STATE_VERTEX_INPUT_EXT, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
+        VkPipelineDynamicStateCreateInfo dyv = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 3, dvi};
+        static const VkPrimitiveTopology rep[4] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_PATCH_LIST};
+        if (V.has_gpl_dyn) { ia.topology = rep[gpl_topo_class(k->topo)]; ia.primitiveRestartEnable = 0; }
+        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 0, NULL, V.has_gpl_dyn ? NULL : &vi, &ia, NULL, NULL, NULL, NULL, NULL, NULL, V.has_gpl_dyn ? &dyv : NULL};
         if (!(lib[nl++] = gpl_part(&g_gpl_vi, &key, 0, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, &ci))) return VK_NULL_HANDLE;
     }
     {   // pre-rasterization shaders
-        gpl_pre_key key; memset(&key, 0, sizeof key); key.vs = stg[0]; key.gs = stg[2]; key.mvs = mod[0]; key.mgs = mod[2]; key.lay = pre_lay; key.topo = k->topo; key.clip_neg1 = k->clip_neg1;
-        key.depth_clamp = k->depth_clamp; key.raster_discard = k->raster_discard; key.mode = k->mode; key.cull = k->cull; key.front = k->front; key.bias_en = k->bias_en;
+        gpl_pre_key key; memset(&key, 0, sizeof key); key.vs = stg[0]; key.gs = stg[2]; key.mvs = mod[0]; key.mgs = mod[2]; key.lay = pre_lay; key.raster_discard = k->raster_discard;
+        if (!V.has_gpl_dyn) { key.topo = k->topo; key.clip_neg1 = k->clip_neg1; key.depth_clamp = k->depth_clamp; key.mode = k->mode; key.cull = k->cull; key.front = k->front; key.bias_en = k->bias_en; }
+        else { key.topo = stg[2] ? k->topo : 1000 + gpl_topo_class(k->topo); if (!V.has_depth_clip_ctl) key.clip_neg1 = k->clip_neg1; }   // (a geometry shader's variant follows the topology)
         VkPipelineShaderStageCreateInfo ss[2]; uint32_t ns = 0;
         ss[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(VK_SHADER_STAGE_VERTEX_BIT, NULL), 0, VK_SHADER_STAGE_VERTEX_BIT, mod[0], "main", NULL};
         if (stg[2]) ss[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(VK_SHADER_STAGE_GEOMETRY_BIT, NULL), 0, VK_SHADER_STAGE_GEOMETRY_BIT, mod[2], "main", NULL};
@@ -2392,35 +2435,47 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
         VkPipelineViewportStateCreateInfo vs = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, k->clip_neg1 && V.has_depth_clip_ctl ? &dcc : NULL, 0, 1, NULL, 1, NULL};
         VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, k->depth_clamp, k->raster_discard,
             k->mode == 0 ? VK_POLYGON_MODE_POINT : k->mode == 1 ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL, k->cull, k->front ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE, k->bias_en, 0, 0, 0, 1.0f};
-        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH};
-        VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, sizeof dyn / sizeof *dyn, dyn};
-        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci0, 0, ns, ss, NULL, NULL, NULL, &vs, &rs, NULL, NULL, NULL, &dy, pre_lay};
+        VkDynamicState dyn[12] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH}; uint32_t nd = 4;
+        if (V.has_gpl_dyn) { dyn[nd++] = VK_DYNAMIC_STATE_CULL_MODE; dyn[nd++] = VK_DYNAMIC_STATE_FRONT_FACE; dyn[nd++] = VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE; dyn[nd++] = VK_DYNAMIC_STATE_POLYGON_MODE_EXT;
+                             dyn[nd++] = VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT; dyn[nd++] = VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY; if (V.has_depth_clip_ctl) dyn[nd++] = VK_DYNAMIC_STATE_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT; }
+        VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, nd, dyn};
+        static const VkPrimitiveTopology rep[4] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_PATCH_LIST};
+        VkPipelineInputAssemblyStateCreateInfo pia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, stg[2] ? (VkPrimitiveTopology)k->topo : rep[gpl_topo_class(k->topo)], 0};
+        if (V.has_gpl_dyn) { if (V.has_depth_clip_ctl) vs.pNext = NULL; rs.cullMode = 0; rs.frontFace = VK_FRONT_FACE_CLOCKWISE; rs.depthBiasEnable = 0; rs.polygonMode = VK_POLYGON_MODE_FILL; rs.depthClampEnable = 0; }
+        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci0, 0, ns, ss, NULL, V.has_gpl_dyn ? &pia : NULL, NULL, &vs, &rs, NULL, NULL, NULL, &dy, pre_lay};
         if (!(lib[nl++] = gpl_part(&g_gpl_pre, &key, 1, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, &ci))) return VK_NULL_HANDLE;
     }
     VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, (VkSampleCountFlagBits)k->samples, 0, 0, NULL, k->a2c, 0};
+    if (V.has_gpl_dyn) { ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT; ms.alphaToCoverageEnable = 0; }
     if (fs) {   // fragment shader
         gpl_fs_key key; memset(&key, 0, sizeof key); key.mfs = mod[1]; key.lay = fs_lay; key.atest = k->atest; key.aref = k->aref; key.dt = k->dt; key.dw = k->dw; key.df = k->df; key.st = k->st;
         memcpy(key.sf, k->sf, sizeof key.sf); memcpy(key.sfail, k->sfail, sizeof key.sfail); memcpy(key.szfail, k->szfail, sizeof key.szfail); memcpy(key.szpass, k->szpass, sizeof key.szpass);
         key.samples = k->samples; key.a2c = k->a2c; key.dfmt = k->dfmt;
+        if (V.has_gpl_dyn) { key.dt = key.dw = key.df = key.st = key.samples = key.a2c = key.dfmt = 0; memset(key.sf, 0, sizeof key.sf); memset(key.sfail, 0, sizeof key.sfail);
+                             memset(key.szfail, 0, sizeof key.szfail); memset(key.szpass, 0, sizeof key.szpass); }   // (its shader, layout and alpha test only)
         static const VkSpecializationMapEntry at_me[2] = {{VK_ATEST_SPEC_FUNC, 0, 4}, {VK_ATEST_SPEC_REF, 4, 4}}; uint32_t at_v[2] = {k->atest, k->aref};
         VkSpecializationInfo at_si = {2, at_me, sizeof at_v, at_v};
         VkPipelineShaderStageCreateInfo ss = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, vk_sg_pin(VK_SHADER_STAGE_FRAGMENT_BIT, NULL), 0, VK_SHADER_STAGE_FRAGMENT_BIT, mod[1], "main", k->atest ? &at_si : NULL};
         VkStencilOpState sf = {sop(k->sfail[0]), sop(k->szpass[0]), sop(k->szfail[0]), cmpop(k->sf[0]), 0xff, 0xff, 0}, sb = {sop(k->sfail[1]), sop(k->szpass[1]), sop(k->szfail[1]), cmpop(k->sf[1]), 0xff, 0xff, 0};
         VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0, k->dt, k->dt && k->dw, cmpop(k->df), 0, k->st, sf, sb, 0, 1};
-        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
-        VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, sizeof dyn / sizeof *dyn, dyn};
-        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rcid, 0, 1, &ss, NULL, NULL, NULL, NULL, NULL, &ms, &ds, NULL, &dy, fs_lay};
+        VkDynamicState dyn[12] = {VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE}; uint32_t nd = 3;
+        if (V.has_gpl_dyn) { dyn[nd++] = VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE; dyn[nd++] = VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE; dyn[nd++] = VK_DYNAMIC_STATE_DEPTH_COMPARE_OP;
+                             dyn[nd++] = VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE; dyn[nd++] = VK_DYNAMIC_STATE_STENCIL_OP; dyn[nd++] = VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT;
+                             dyn[nd++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT; ds.depthTestEnable = ds.depthWriteEnable = ds.stencilTestEnable = 0; }
+        VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, nd, dyn};
+        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, V.has_gpl_dyn ? &rci0 : &rcid, 0, 1, &ss, NULL, NULL, NULL, NULL, NULL, &ms, &ds, NULL, &dy, fs_lay};
         if (!(lib[nl++] = gpl_part(&g_gpl_fs, &key, 2, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &ci))) return VK_NULL_HANDLE;
         // fragment output
         gpl_out_key ok; memset(&ok, 0, sizeof ok); ok.ncol = k->ncol; memcpy(ok.cfmt, k->cfmt, sizeof ok.cfmt); ok.dfmt = k->dfmt; ok.samples = k->samples; ok.a2c = k->a2c; ok.blend_en = k->blend_en;
         ok.logic_en = k->logic_en; ok.logic_op = k->logic_op; memcpy(ok.wmask, k->wmask, sizeof ok.wmask); memcpy(ok.bl, k->bl, sizeof ok.bl);
         for (uint32_t i = k->ncol; i < 8; i++) { ok.cfmt[i] = 0; ok.wmask[i] = 0; memset(&ok.bl[i], 0, sizeof ok.bl[i]); }
+        if (V.has_gpl_dyn) ok.samples = ok.a2c = 0;
         VkPipelineColorBlendAttachmentState cba[8];
         for (uint32_t i = 0; i < k->ncol; i++) cba[i] = (VkPipelineColorBlendAttachmentState){(k->blend_en >> i) & 1, bfac(k->bl[i].src), bfac(k->bl[i].dst), bop(k->bl[i].eq),
             bfac(k->bl[i].srca), bfac(k->bl[i].dsta), bop(k->bl[i].eqa), k->wmask[i]};
         VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, k->logic_en, (VkLogicOp)k->logic_op, k->ncol, cba, {0, 0, 0, 0}};
-        VkDynamicState dyo[] = {VK_DYNAMIC_STATE_BLEND_CONSTANTS};
-        VkPipelineDynamicStateCreateInfo dyc = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 1, dyo};
+        VkDynamicState dyo[] = {VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT, VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT};
+        VkPipelineDynamicStateCreateInfo dyc = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, V.has_gpl_dyn ? 3 : 1, dyo};
         VkGraphicsPipelineCreateInfo co = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, &ms, NULL, &cb, &dyc, VK_NULL_HANDLE};
         if (!(lib[nl++] = gpl_part(&g_gpl_out, &ok, 3, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT, &co))) return VK_NULL_HANDLE;
     }
@@ -2433,7 +2488,7 @@ static VkPipeline gpl_build(const pkey *k, VkPipelineLayout layout, vkshader_t *
     pthread_mutex_lock(&g_gpl_link_mu); VkPipeline p; VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p); pthread_mutex_unlock(&g_gpl_link_mu);
     clock_gettime(CLOCK_MONOTONIC, &b);
     if (r) { static int said; if (!said++) VKLOG("[RED] graphics pipeline library: linking failed (%d): pipelines are made whole instead", r); return VK_NULL_HANDLE; }
-    pthread_mutex_lock(&g_gpl_mu); g_gpl_n[4]++; g_gpl_ns[4] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
+    pthread_mutex_lock(&g_gpl_mu); if (V.has_gpl_dyn) nvn_hm_put(&g_gpl_dynp, &p, (void *)1); g_gpl_n[4]++; g_gpl_ns[4] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec));
     uint64_t c = g_gpl_n[4], n[5], t[5]; memcpy(n, g_gpl_n, sizeof n); memcpy(t, g_gpl_ns, sizeof t); pthread_mutex_unlock(&g_gpl_mu);
     if (c == 1 || c % 500 == 0) VKLOG("graphics pipeline library: %llu pipelines linked (%.2f ms each); parts made: vertex input %llu (%.2f ms), pre-rasterization %llu (%.2f ms), fragment shader %llu (%.2f ms), output %llu (%.2f ms)",
         (unsigned long long)n[4], t[4] / 1e6 / (n[4] ? n[4] : 1), (unsigned long long)n[0], t[0] / 1e6 / (n[0] ? n[0] : 1), (unsigned long long)n[1], t[1] / 1e6 / (n[1] ? n[1] : 1),
@@ -4346,8 +4401,10 @@ static int prepare_draw(int prim, int indexed) {
         uint64_t kh = fnv(1469598103934665603ull, &k, sizeof k); VKLOG("ubo: present %llu pipeline %p key %016llx um %llx/%llx im %llx/%llx", (unsigned long long)g_tex_frame, (void *)p, (unsigned long long)kh,
               (unsigned long long)k.um[0], (unsigned long long)k.um[1], (unsigned long long)k.im[0], (unsigned long long)k.im[1]); }
     g_vkst.draws++; if (++g_pass_draws > g_vkst.max_pass_draws) g_vkst.max_pass_draws = g_pass_draws;
-    if (p != S.bound_pipe) { uint64_t tb = g_prof_on ? tick() : 0; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); S.bound_pipe = p; if (g_prof_on) g_prof_ns[4] += tick() - tb; }
+    if (p != S.bound_pipe && !S.bound_pipe) g_gd.valid = 0;   // (another pipeline was bound since: a clear's, a compute dispatch's; the dynamic state is set again)
+    if (p != S.bound_pipe) { uint64_t tb = g_prof_on ? tick() : 0; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); S.bound_pipe = p; S.bound_dyn = gpl_is_dyn(p); if (!S.bound_dyn) g_gd.valid = 0; if (g_prof_on) g_prof_ns[4] += tick() - tb; }
     set_dynamic(cb);
+    if (S.bound_dyn) gpl_set_dynamic(cb, &k);   // (a pipeline linked from per-shader parts: its vertex input, rasterizer and depth / stencil state, V.has_gpl_dyn)
     if (var == 1) { vkCmdSetDepthBias(cb, 0, 0, 0); memset(&g_bc.po, 0xff, sizeof g_bc.po); }
     if (pass_dump_draw_ready()) VKLOG("pd draw dynamic: prepared-draw=%d viewport=%a/%a/%a/%a/%a/%a scissor=%d/%d/%u/%u bias=%a/%a/%a stencil-mask=%#x/%#x stencil-write=%#x/%#x stencil-ref=%#x/%#x",
         g_draw_i, g_bc.vp.x, g_bc.vp.y, g_bc.vp.width, g_bc.vp.height, g_bc.vp.minDepth, g_bc.vp.maxDepth,
