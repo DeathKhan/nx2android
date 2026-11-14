@@ -182,7 +182,7 @@ int main(void){
 IMAGE_TYPE
 typedef struct { struct { int format,flags; } d; int set_swz; uint32_t swz; int stencil; } tex_t;
 typedef struct { int set_format,format,set_levels,base_level,nlevels,set_layers,min_layer,nlayers,set_target,target,set_dsmode,dsmode,set_swizzle,swz[4]; } view_t;
-typedef struct { VkFormat vk; VkComponentMapping swz; int depth,stencil,compressed,dec,dbpp; } vkfmt_t;
+typedef struct { VkFormat vk; VkComponentMapping swz; int depth,stencil,compressed,dec,dbpp,bpb; } vkfmt_t;
 VIEW_TYPE
 enum { NVN_TEXTURE_FLAGS_IMAGE=4 };
 static struct { VkPhysicalDevice pd; VkDevice dev; } V;
