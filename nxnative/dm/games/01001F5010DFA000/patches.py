@@ -70,10 +70,51 @@ def frame_step(ctx):
             emit(w)
         emit(B(here(), off + 8))
         fs_put(off, [B(off, start)], 'frame step: a constant 1/30 s step is the host\'s step in seconds (state page +0x2c; 0 = the constant)')
+    # The same step with a sign or a factor (found 2026-11-13 after the throw and the evolution still ran at double speed with the sites above): −1/30 (movk #0xbd08: gravity × −1/30
+    # added to a thrown object's vertical speed at main+0x1984a70, main+0x198da8c, main+0x1a158c8, main+0xafbbc4 and main+0x25ac3d8; count-down timers at the others), ±1/15
+    # (#0x3d88, #0xbd88: a value moved towards its goal by k/15 a frame, main+0x1e5c5xx) and 1/60 (#0x3c88: a timer that adds 1/60 a frame at main+0x1d49838). The host's step's
+    # float bits get the sign bit (eor) or one exponent step (add / sub 0x00800000: × 2, × 0.5); no flags
+    for off, d, hi in STEP_30K:
+        mov, movk = 0x52911120 | d, 0x72a00000 | hi << 5 | d
+        ops = ([0x11600000 | d << 5 | d] if hi & 0x7fff == 0x3d88 else [0x51600000 | d << 5 | d] if hi & 0x7fff == 0x3c88 else []) + ([0x52010000 | d << 5 | d] if hi & 0x8000 else [])
+        fs_site(off, struct.pack('<II', mov, movk).hex())
+        start = here(); emit(ADRP(d, here(), FS_STATE_OFF))
+        emit(0xb9402c00 | d << 5 | d)                # ldr wD,[xD,#0x2c]
+        emit(0x34000000 | (len(ops) + 2) << 5 | d)   # cbz wD,const
+        for w in ops: emit(w)                        # add / sub wD,wD,#0x800,lsl #12; eor wD,wD,#0x80000000
+        emit(B(here(), off + 8))
+        emit(mov); emit(movk); emit(B(here(), off + 8))   # const: the game's value
+        fs_put(off, [B(off, start)], 'frame step: a constant %s1/%d s step is the host\'s step in seconds with that sign and factor (state page +0x2c; 0 = the constant)'
+               % ('−' if hi & 0x8000 else '', {0x3d08: 30, 0x3d88: 15, 0x3c88: 60}[hi & 0x7fff]))
+    # Sequences that count frames. The game counts 30 fps frames in thousands of places (4,881 integer counters and 415 float ones in 1.1.1's main), and two players of authored
+    # sequences step one frame an update whatever the period: the battle effect sequence player (vtable main+0x40d3340; its advance at main+0x9dc3e0 adds the step at +0xf0, a
+    # constant 1.0, to the frame at +0xe8, and its commands compare whole frames) and the demo system (evolution, capture and event demos; its timeline is not found). Both ran at
+    # double speed at 60 fps. While one plays, its stub writes 1 to the state page +0x38 every update, and the host holds 30 fps while marks keep arriving (hle_nvn.c
+    # guest_hold30), the rate the sequences were authored for. The demo mark is in the demo manager's "finished?" poll (main+0x148ff9c, called every update by the five tasks
+    # that wait for a demo: main+0x115e138, 0x1290820, 0x13cf5c4, 0x13e0ec8, 0x148d854) while the manager's state at +0x6d8 is 5 or more (started).
+    # x8 at main+0x9dc3e0 is dead (the function returns without reading it); x9 at main+0x148ffb8 is set before its next read; the flags there are set again by the cmp at main+0x148ffc0
+    fs_site(0x9dc3e0, '62f240bd')
+    start = here(); emit(0xbd40f262)                                 # ldr s2,[x19,#0xf0]     (original)
+    emit(ADRP(16, here(), FS_STATE_OFF))
+    emit(0x52800028); emit(0xb9003a08)                               # mov w8,#1; str w8,[x16,#0x38]
+    emit(B(here(), 0x9dc3e4))
+    fs_put(0x9dc3e0, [B(0x9dc3e0, start)], 'frame step: a battle effect sequence asks the host for 30 fps while it plays (state page +0x38)')
+    fs_site(0x148ffb8, '08d846b9')
+    start = here(); emit(0xb946d808)                                 # ldr w8,[x0,#0x6d8]     (original)
+    emit(0x7100151f)                                                 # cmp w8,#5
+    emit(0x5400008b)                                                 # b.lt back (+4)
+    emit(ADRP(16, here(), FS_STATE_OFF))
+    emit(0x52800029); emit(0xb9003a09)                               # mov w9,#1; str w9,[x16,#0x38]
+    emit(B(here(), 0x148ffbc))
+    fs_put(0x148ffb8, [B(0x148ffb8, start)], 'frame step: a demo (evolution, capture, event) asks the host for 30 fps while it plays (state page +0x38)')
 
 STEP_30 = (0x13b339c, 0x167ff0c, 0x16832c0, 0x16832e4, 0x16836d0, 0x17177b4, 0x1728054, 0x1982930, 0x1983760, 0x198e020, 0x198ec6c, 0x1a0baf0, 0x1a0bee4, 0x1a0da20, 0x1a0eea0,
            0x1a0f304, 0x1a0f498, 0x1a0f55c, 0x1a17b10, 0x1a17f3c, 0x1a19104, 0x1a196c4, 0x1b48a48, 0x1b48a94, 0x1b49004, 0x1b493f4, 0x1d1b7cc, 0x1d5d684, 0x257ac30, 0x257c9f4,
            0x257ce38, 0x2795230, 0x29faf8c, 0x2af25f4)
+
+STEP_30K = ((0xafbbc4, 8, 0xbd08), (0x1984a70, 8, 0xbd08), (0x198da8c, 8, 0xbd08), (0x1a0b3ac, 8, 0xbd08), (0x1a158c8, 8, 0xbd08), (0x1aab5a4, 8, 0xbd08), (0x1aab5d4, 8, 0xbd08),
+            (0x1b47f5c, 8, 0xbd08), (0x1b47f94, 8, 0xbd08), (0x1b47fcc, 8, 0xbd08), (0x25ac3d8, 8, 0xbd08), (0x1e5c530, 9, 0xbd88), (0x1e5c588, 8, 0x3d88), (0x1e5c624, 9, 0x3d88),
+            (0x1d49838, 8, 0x3c88))
 
 FRAME_STEP = {'aee8f150dda1b5a838806e1a5ea6827a': frame_step}
 

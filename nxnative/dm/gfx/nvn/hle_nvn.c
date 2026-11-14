@@ -2634,6 +2634,16 @@ static void high_cap_tick(void) {
     if (!link_env) mtl_link_mode_set(ok ? 2 : 1);
 }
 __attribute__((weak)) int dm_frame_cap(void) { return 0; }   // the pause menu's frame cap (hle_framecap.c); graphics unit tests have none
+// A guest sequence that counts 30 fps frames and cannot take a step length (a profile's stub writes 1 at the state page +0x38 on every update while one plays; Arceus's battle
+// effect sequences and demos): 30 fps while the marks keep arriving, the rate it was authored for. 250 ms without a mark ends it (a hitch must not flip the rate mid-sequence)
+static int guest_hold30(void) {
+    static _Atomic uint64_t until; static _Atomic int was;
+    uint64_t now = now_ns();
+    if (__atomic_exchange_n((uint32_t *)(dm_fps_state + 0x38), 0, __ATOMIC_RELAXED)) atomic_store(&until, now + 250000000ull);
+    int on = now < atomic_load(&until);
+    if (atomic_exchange(&was, on) != on) LOG("[nvn] frame step: %s", on ? "a guest sequence that counts frames plays: 30 fps" : "the guest sequence ended: back to the target");
+    return on;
+}
 static int fps_step_cap(void) {
     if (!dm_fps_state) return fps_high() ? atomic_load(&g_high_cap) : 0;
     uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float t; memcpy(&t, &b, sizeof t);
@@ -2641,7 +2651,8 @@ static int fps_step_cap(void) {
     // Movies and a 30 fps target still need thermal samples: heat must reset the
     // calm interval, and cooling during those caps counts towards recovery.
     int thermal = thermal_capped();
-    return dm_movie_playing() || t <= 30 || thermal || dm_frame_cap() == 30 ? 30 : 60;   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
+    int seq = guest_hold30();
+    return dm_movie_playing() || t <= 30 || thermal || seq || dm_frame_cap() == 30 ? 30 : 60;   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
 int dm_nvn_frame_step_on(void) { return fstep_on(); }   // Android's adaptive frame rate stays out of it then (perf_android.c)
