@@ -251,6 +251,18 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         fputc('\n', stderr);
         crash_text(i, a);
     }
+    // DM_CRASH_WIDE=<register, 31 for sp>,<bytes before>,<words>: more of what one register points at (a heap behind a pointer into it), eight words a line, and the text each of those words points at (its name)
+    {   const char *e = getenv("DM_CRASH_WIDE"); int r = -1, back = 0, n = 0;
+        if (e && sscanf(e, "%d,%i,%i", &r, &back, &n) == 3 && r >= 0 && (r < 29 || r == 31) && n > 0 && n <= 512) {
+            uint64_t base = ((r == 31 ? DM_UC_SS(uc)->__sp : DM_UC_SS(uc)->__x[r]) & ~7ull) - (uint64_t)back, v;
+            for (int k = 0; k < n && crash_rd(base + 8ull * k, &v, sizeof v); k++) {
+                if (k % 8 == 0) fprintf(stderr, "%s[dm] x%d%+d:", k ? "\n" : "", r, 8 * k - back);
+                off("", v);
+            }
+            fputc('\n', stderr);
+            for (int k = 0; k < n && crash_rd(base + 8ull * k, &v, sizeof v); k++) if (v >= 0x100000000ull) crash_text(1000 + k, v);
+        }
+    }
     dm_backtrace(DM_UC_SS(uc)->__fp);
     // Stack words are read with vm_read_overwrite too: a host function the guest called runs on a stack of its own, and Super Mario Bros. Wonder's crash in
     // nvnBufferInitialize (issue #48) had sp 16 bytes below the top of it; the scan read past the top, faulted inside this handler, and its line came out empty
