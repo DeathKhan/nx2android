@@ -455,6 +455,16 @@ static void x_read(void) { light_diag_poll(); original_index_read(); set_profile
     { const char *e = getenv("DM_VK_ORDER_KEEP"); g_order_keep = e ? atoi(e) != 0 : DM_GAME_ORDER_KEEP; g_order_pending = g_order_check = 0; }
     { static uint64_t until; static int done; const char *la = getenv("DM_VK_LIST_AT");   // DM_VK_LIST_AT=<present>: the pass list of every submission over two presents from there
       if (la && !done && g_tex_frame >= (uint64_t)atoll(la)) { done = 1; until = g_tex_frame + 2; }
+      // DM_VK_LIST_FILE=<path>: the same list when that file appears (checked every 10 presents; removed when taken), for a screen reached by hand at an unknown present.
+      // Its lines: a number lists that many presents (at most 600); KEY=VALUE sets that environment variable from now on (the live switches: DM_VK_PASSDUMP and its
+      // companions, where Android has no DM_CTL); an empty file lists 2 presents
+      { static uint64_t polled; const char *lf = getenv("DM_VK_LIST_FILE");
+        if (lf && *lf && g_tex_frame >= polled + 10) { polled = g_tex_frame; FILE *f = fopen(lf, "r");
+          if (f) { char line[256]; int n = -1, envs = 0;
+            while (fgets(line, sizeof line, f)) { line[strcspn(line, "\r\n")] = 0; char *eq = strchr(line, '=');
+              if (eq && eq != line) { *eq = 0; setenv(line, eq + 1, 1); envs++; VKLOG("list file: %s=%s", line, eq + 1); } else if (*line) n = atoi(line); }
+            fclose(f); if (n < 0) n = envs ? 0 : 2; if (n > 600) n = 600;
+            if (!unlink(lf) && n > 0) until = g_tex_frame + (uint64_t)n; } } }
       if (until && g_tex_frame < until) { g_x_tracepass = -2; g_x_listpasses = 1; g_lst_nrd = 0; VKLOG("--- submission at present %llu", (unsigned long long)g_tex_frame); } }
     { const char *w = getenv("DM_VK_WATCH"); static char last[40]; if (!w || !*w || !strcmp(w, "0")) g_watch_off = -1;
       else if (strcmp(w, last)) { g_watch_off = strtoll(w, NULL, 16); const char *h = strchr(w, '#'); g_watch_n = h ? atoi(h + 1) : 20; }
