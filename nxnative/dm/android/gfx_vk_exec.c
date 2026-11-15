@@ -485,7 +485,7 @@ static void x_read(void) { light_diag_poll(); original_index_read(); set_profile
       if ((e = getenv("DM_VK_DEPTH_FUNC_FS")) && *e) { key = strtoull(e, &end, 16); if (*end == ':') { long f = strtol(end + 1, &end, 0); if (!*end && f >= 1 && f <= 8) func = (int)f; } if (!func) key = 0; }
       if (!key) func = 0;
       if (key != g_depth_func_fs || func != g_depth_func) { g_depth_func_fs = key; g_depth_func = func; VKLOG("depth function diagnostic: %016llx func %d (depth enable/write unchanged)", (unsigned long long)key, func); } }
-    g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : 1; if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
+    g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : !V.turnip; if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = (e = getenv("DM_VK_FDZ")) ? atoi(e) != 0 : !V.turnip; g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
     g_pace = !((e = getenv("DM_VK_PART_PACE")) && !atoi(e)); g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 0; g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e); g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) && atoi(e);
     g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_vbound = !((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_x_nflat = 0; if ((e = getenv("DM_VK_X_FLAT_VS"))) for (char *q = (char *)e; *q && g_x_nflat < 8; ) { char *nx; uint64_t v = strtoull(q, &nx, 16); if (nx == q) break; int m = 7; if (*nx == ':') m = (int)strtol(nx + 1, &nx, 10); g_x_flat_mode[g_x_nflat] = m; g_x_flat[g_x_nflat++] = v; q = *nx ? nx + 1 : nx; } g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = !((e = getenv("DM_VK_ASYNC_PIPE")) && !atoi(e)); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log; if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } } g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
     g_x_nskipvs = 0; for (const char *q = getenv("DM_VK_X_SKIPVS"); q && *q && g_x_nskipvs < 8;) { char *n; uint64_t v = strtoull(q, &n, 16); if (n == q) break; if (v) g_x_skipvs[g_x_nskipvs++] = v; q = *n ? n + 1 : n; } }
@@ -735,7 +735,8 @@ static int pass_commit(void) {
     S.pass_open = 1; g_vkst.passes++; g_sub_pass++; g_pass_wmem = 0;
     pass_journal_pass("begin");
     for (int i = 0; i < 9; i++) { vkimg_t *a = P_att[i].im; if (a && a->rt_last != g_tex_frame + 1) { a->rt_frames = a->rt_last == g_tex_frame ? a->rt_frames + 1 : 1; a->rt_last = g_tex_frame + 1; } }   // (async_pipe)
-    { extern uint64_t g_cmd_gen; g_cmd_gen++; }   // the bind cache starts empty in each pass: Adreno does not keep the state a pass's draws set for the next pass (XC3 drew its lighting black)
+    { static int reset = -1; if (reset < 0) { const char *e = getenv("DM_VK_PASS_BINDRESET"); reset = e && *e ? atoi(e) != 0 : !V.turnip; }
+      if (reset) { extern uint64_t g_cmd_gen; g_cmd_gen++; } }   // the bind cache starts empty in each pass: Qualcomm's driver does not keep the state a pass's draws set for the next pass (XC3 drew its lighting black); Turnip keeps it, as Vulkan says
     if (g_x_tracepass == -2) { g_x_listpasses = 1; list_reads("before it, dispatches");
         char t[512]; int n = 0; static const char LO[] = "LCD";   // load ops: Load, Clear, Don't care; each attachment's image by pool offset
         for (uint32_t i = 0; i < P_ri.colorAttachmentCount; i++) if (P_ca[i].imageView && P_att[i].im) n += snprintf(t + n, sizeof t - n, " c%u=%llx:%c(%ux%u)", i, (unsigned long long)P_att[i].im->off, LO[P_ca[i].loadOp < 3 ? P_ca[i].loadOp : 2], P_att[i].im->w, P_att[i].im->h);
@@ -1372,7 +1373,7 @@ fail:
 // pass draws into one scratch image per target instead (the level's contents copied in first: the pass loads), and its end copies each into its face of the level
 #define SM_N 32
 static struct { vkimg_t im[8]; VkImageView v[8]; } g_sm[SM_N]; static int g_sm_n, g_sm_failed;
-static int self_mrt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_SELF_MRT"); on = e && *e ? atoi(e) : 1; } return on; }
+static int self_mrt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_SELF_MRT"); on = e && *e ? atoi(e) : !V.turnip; } return on; }
 static int self_mrt_scratch(VkFormat fmt, uint32_t w, uint32_t h) {   // the scratch image's slot; -1: none could be made (the pass draws into the image itself)
     for (int i = 0; i < g_sm_n; i++) if (g_sm[i].im[0].fmt == fmt && g_sm[i].im[0].w == w && g_sm[i].im[0].h == h) return i;
     if (g_sm_failed || g_sm_n >= SM_N) return -1;
@@ -5101,6 +5102,7 @@ static VkPipeline compute_build(vkshader_t *cs, uint64_t um, uint64_t im) {   //
     if (bs >= 0) g_build[bs].phase = 2;
     VkResult r = vkCreateComputePipelines(V.dev, V.pcache, 1, &ci, NULL, &p); build_end(bs);
     vk_pipeline_cache_changed();
+    if (V.has_pstats && !r) VKLOG("pstats %p is compute shader %016llx, local %ux%ux%u", (void *)p, (unsigned long long)cs->key, cs->local[0], cs->local[1], cs->local[2]);
     if (r) { LOG("[RED] [vk] compute pipeline failed (%d): %016llx, local %ux%ux%u, %u bytes of SPIR-V", r, (unsigned long long)cs->key, cs->local[0], cs->local[1], cs->local[2], cs->nspv * 4); p = (VkPipeline)1; }
     return p;
 }
@@ -5659,12 +5661,24 @@ static int mesh_kernels(void) {   // meshlaunch.comp and meshprep.comp: three st
     }
     g_mesh_k.bad = 0; return 1;
 }
+// Between the mesh emulation's own dispatches: what one wrote (shader stores, the header's update) is what the next dispatch, its indirect arguments or the draw's
+// vertex fetch read; nothing else. DM_VK_MESH_BAR=1 (start-up; default on Turnip): that barrier alone, without the colour and depth caches' flush a full barrier costs (on Turnip a
+// CCU flush per kernel, three kernels per mesh draw); 0: the full barrier as before. The sequence's first barrier (after the pass ends) stays full
+static void mesh_bar(VkCommandBuffer cb) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_MESH_BAR"); on = e && *e ? atoi(e) : V.turnip; if (on) VKLOG("mesh emulation: narrow barriers between its dispatches (DM_VK_MESH_BAR=1)"); }
+    if (!on) { vk_img_barrier_all(cb); return; }
+    VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 1, &b, 0, NULL, 0, NULL);
+}
 static void mesh_helper(VkCommandBuffer cb, VkPipeline p, const mesh_buf b[3], const uint32_t pc[8]) {   // one dispatch of a helper kernel over three buffers
     VkDescriptorSet set = vk_alloc_set(g_mesh_k.dl); VkDescriptorBufferInfo bi[3]; VkWriteDescriptorSet w[3];
     for (int i = 0; i < 3; i++) { bi[i] = (VkDescriptorBufferInfo){b[i].b, b[i].off, b[i].len}; w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, (uint32_t)i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[i], NULL}; }
     vkUpdateDescriptorSets(V.dev, 3, w, 0, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p); vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_mesh_k.pl, 0, 1, &set, 0, NULL);
-    vkCmdPushConstants(cb, g_mesh_k.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 32, pc); vkCmdDispatch(cb, 1, 1, 1); vk_img_barrier_all(cb);
+    vkCmdPushConstants(cb, g_mesh_k.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 32, pc); vkCmdDispatch(cb, 1, 1, 1); mesh_bar(cb);
 }
 static VkPipeline mesh_cpipe(vkshader_t *k) {   // the kernel's compute pipeline, from the dispatch cache (compute_build; (VkPipeline)1 when it failed)
     uint64_t ck[3] = {k->key, g_num_um, g_num_im};
@@ -5678,8 +5692,10 @@ static int mesh_kernel(VkCommandBuffer cb, int st, vkshader_t *k, const mesh_buf
     VkPipeline p = mesh_cpipe(k); if (p == (VkPipeline)1) return 0;
     VkDescriptorSetLayout dsl[VK_NSETS] = {k->dsl}; VkPipelineLayout layout = vk_pipeline_layout(dsl, 1);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p); vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, (uint32_t)k->ndyn, dofs);
+    void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);   // DM_VK_PASS_TIMES: the kernel timed as a dispatch
     if (ind) vkCmdDispatchIndirect(cb, ind->b, ind->off + ind_at); else vkCmdDispatch(cb, groups, 1, 1);
-    vk_img_barrier_all(cb); return 1;
+    { extern uint64_t g_vk_pass_key; g_vk_pass_key = k->key; } vk_pass_ts(1, ind ? 0 : groups, (uint32_t)st, PT_DISPATCH, 1);
+    mesh_bar(cb); return 1;
 }
 // A task-less indirect mesh draw's count is written by the GPU and has no bound here: its workgroups were capped at DM_VK_MESH_MAX (2048) and the rest dropped
 // without a word. It is drawn as slices of up to DM_VK_MESH_MAX workgroups each, meshprep.comp giving each slice its part of the count. Every slice has buffers

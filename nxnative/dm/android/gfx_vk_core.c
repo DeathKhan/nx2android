@@ -253,8 +253,27 @@ static void pipe_note(const char *kind, uint32_t n, uint64_t before, const VkPip
 }
 static VKAPI_ATTR VkResult VKAPI_CALL acct_gpipe(VkDevice dev, VkPipelineCache pc, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *cb, VkPipeline *out) {
     uint64_t b = kgsl_mapped(); VkResult r = real_vkCreateGraphicsPipelines(dev, pc, n, ci, cb, out); pipe_note("graphics", n, b, ci->pStages, ci->stageCount); return r; }
+static void pstats_log(VkDevice dev, VkPipeline p) {   // DM_VK_PIPE_STATS: one line of the driver's statistics for a compute pipeline
+    static PFN_vkGetPipelineExecutableStatisticsKHR gs; if (!gs) gs = (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(dev, "vkGetPipelineExecutableStatisticsKHR");
+    if (!gs) return;
+    VkPipelineExecutableInfoKHR ei = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, NULL, p, 0}; VkPipelineExecutableStatisticKHR st[48]; uint32_t n = 48;
+    for (uint32_t i = 0; i < n; i++) st[i] = (VkPipelineExecutableStatisticKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
+    if (gs(dev, &ei, &n, st) < 0) return;
+    char b[1400]; int o = snprintf(b, sizeof b, "pstats %p:", (void *)p);
+    for (uint32_t i = 0; i < n && o < (int)sizeof b - 64; i++) {
+        o += snprintf(b + o, sizeof b - (size_t)o, " %s=", st[i].name);
+        switch (st[i].format) { case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: o += snprintf(b + o, sizeof b - (size_t)o, "%u", st[i].value.b32); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: o += snprintf(b + o, sizeof b - (size_t)o, "%lld", (long long)st[i].value.i64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: o += snprintf(b + o, sizeof b - (size_t)o, "%llu", (unsigned long long)st[i].value.u64); break;
+            default: o += snprintf(b + o, sizeof b - (size_t)o, "%.2f", st[i].value.f64); }
+    }
+    VKLOG("%s", b);
+}
 static VKAPI_ATTR VkResult VKAPI_CALL acct_cpipe(VkDevice dev, VkPipelineCache pc, uint32_t n, const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *cb, VkPipeline *out) {
-    uint64_t b = kgsl_mapped(); VkResult r = real_vkCreateComputePipelines(dev, pc, n, ci, cb, out); pipe_note("compute", n, b, &ci->stage, 1); return r; }
+    VkComputePipelineCreateInfo c1; if (V.has_pstats && n == 1) { c1 = ci[0]; c1.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR; ci = &c1; }
+    uint64_t b = kgsl_mapped(); VkResult r = real_vkCreateComputePipelines(dev, pc, n, ci, cb, out); pipe_note("compute", n, b, &ci->stage, 1);
+    if (V.has_pstats && n == 1 && r >= 0 && out[0]) pstats_log(dev, out[0]);
+    return r; }
 // ---------------- descriptor set layouts with large arrays: update-after-bind ----------------
 // Adreno's vkCmdBindDescriptorSets copies a bound set's descriptors into the command stream: Nintendo Switch 2 Welcome Tour binds its texture / sampler tables
 // (bindless arrays of tens of thousands of descriptors, RK_TEXD / RK_SAMPD) at most draws of its first scene, 12 MB of GPU memory a bind, 3.3 GB in one submission,
@@ -536,6 +555,9 @@ void vk_init(void) {
     VK_FNS(VK_LOADI)
     uint32_t n = 1; VKCHK(vkEnumeratePhysicalDevices(V.inst, &n, &V.pd)); if (!n) die("[vk] no GPU");
     vkGetPhysicalDeviceProperties(V.pd, &V.props); vkGetPhysicalDeviceMemoryProperties(V.pd, &V.mem);
+    { VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES}; VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
+      if (V.props.apiVersion >= VK_API_VERSION_1_2) { vkGetPhysicalDeviceProperties2(V.pd, &p2); V.turnip = dp.driverID == VK_DRIVER_ID_MESA_TURNIP; }
+      if (V.turnip) VKLOG("driver: Mesa Turnip (%s): the work-arounds for Qualcomm's driver are off (DM_VK_LRZ_TOUCH, DM_VK_FDZ, DM_VK_SELF_MRT, DM_VK_PASS_BINDRESET turn each back on)", dp.driverInfo); }
     // the device names itself before any check below can stop: a Moto g 5G 2024's log (Adreno 619) ended at the timeline check with no GPU or driver named.
     // driver: as Qualcomm encodes it (VK_MAKE_VERSION: 512.530.0), with the raw value for other vendors
     { uint32_t d = V.props.driverVersion;
@@ -691,6 +713,12 @@ void vk_init(void) {
     static VkPhysicalDeviceFaultFeaturesEXT dfault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     if (has_ext(ex, ne, "VK_EXT_device_fault")) { VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dfault}; vkGetPhysicalDeviceFeatures2(V.pd, &q); }
     if (dfault.deviceFault) { on[non++] = "VK_EXT_device_fault"; dfault.deviceFaultVendorBinary = VK_FALSE; dfault.pNext = dnext; dnext = &dfault; }
+    // DM_VK_PIPE_STATS=1 (start-up, diagnostic): the driver's statistics of each compute pipeline (registers, waves, instructions; acct_cpipe), where it offers them
+    static VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR fpe = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    { const char *e = getenv("DM_VK_PIPE_STATS");
+      if (e && *e == '1' && has_ext(ex, ne, "VK_KHR_pipeline_executable_properties") && non + 1 <= 64) {
+          VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fpe}; vkGetPhysicalDeviceFeatures2(V.pd, &q);
+          if (fpe.pipelineExecutableInfo) { on[non++] = "VK_KHR_pipeline_executable_properties"; fpe.pNext = dnext; dnext = &fpe; V.has_pstats = 1; } } }
     // VK_EXT_graphics_pipeline_library (Mesa's Turnip; Qualcomm's driver has none): a pipeline is linked from parts made once each (gfx_vk_exec.c gpl_build), so a
     // new combination of shaders and state costs a link, not a compile. DM_VK_GPL=0 (start-up): one-piece pipelines as before
     static VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
@@ -714,6 +742,7 @@ void vk_init(void) {
       if (V.has_gpl) VKLOG("pipeline library parts: %s", V.has_gpl_dyn ? "per shader (vertex input, topology, rasterizer, depth / stencil, samples set at each draw)" : ed && *ed == '0' ? "with their state (DM_VK_GPL_DYN=0)" : "with their state (no vertex input / extended dynamic state 3)");
       VKLOG("graphics pipeline libraries: %s", V.has_gpl ? "on (pipelines linked from parts made once each)" : e && *e == '0' ? "off (DM_VK_GPL=0)" : "not offered by the driver"); }
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, dnext, 0, 1, &qci, 0, NULL, non, on, NULL};
+    { void kgsl_capture_install(const char *root); kgsl_capture_install(getenv("DM_ROOT")); }   // DM_KGSL_CAPTURE (kgsl_capture.c): the driver's command streams, before it makes its first buffers
     VKCHK(fp_create_device(V.pd, &dci, &V.dev));   // with FPCR 0 (fp_enter, above)
     vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)p_vkGetInstanceProcAddr(V.inst, "vkGetDeviceProcAddr");
 #define VK_LOADD(f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f); if (!f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f "KHR"); if (!f) f = (PFN_##f)p_vkGetInstanceProcAddr(V.inst, #f);   // a promoted function by its extension's name (Vulkan 1.1 / 1.2 devices)
@@ -1514,6 +1543,16 @@ void vk_pass_report(void) {   // the most expensive passes since the last report
         else o += snprintf(b + o, sizeof b - (size_t)o, " #%d %.2f ms (%ux%u fmt %u, %u draws over %u px wide);", k, g_pacc[k] / g_pcnt[k], g_plast[k].w, g_plast[k].h, g_plast[k].fmt, g_plast[k].draws & 0xffff, g_plast[k].draws >> 16); }
     { extern uint64_t g_nvn_discards[2]; static uint64_t pd0, pd1; o += snprintf(b + o, sizeof b - (size_t)o, " discards since: colour %llu, depth %llu", (unsigned long long)(g_nvn_discards[0] - pd0), (unsigned long long)(g_nvn_discards[1] - pd1)); pd0 = g_nvn_discards[0]; pd1 = g_nvn_discards[1]; }
     VKLOG("%s", b);
+    {   // the frame's dispatches summed by their shader (a shader dispatched at several places of the frame counts once each)
+        enum { NK = 256 }; static uint64_t ks[NK]; static double kt[NK]; static uint32_t kn[NK]; int nk = 0; double dt = 0, pt = 0;
+        for (int i = 0; i < m; i++) { if (!g_pcnt[i]) continue; double a = g_pacc[i] / g_pcnt[i];
+            if (g_plast[i].fmt != PT_DISPATCH) { pt += a; continue; } dt += a;
+            int j = 0; while (j < nk && ks[j] != g_plast[i].key) j++; if (j == nk) { if (nk == NK) continue; ks[nk] = g_plast[i].key; kt[nk] = 0; kn[nk] = 0; nk++; } kt[j] += a; kn[j]++; }
+        for (int i = 0; i < nk; i++) for (int j = i + 1; j < nk; j++) if (kt[j] > kt[i]) { uint64_t a = ks[i]; ks[i] = ks[j]; ks[j] = a; double t = kt[i]; kt[i] = kt[j]; kt[j] = t; uint32_t c = kn[i]; kn[i] = kn[j]; kn[j] = c; }
+        char d[3000]; int q = snprintf(d, sizeof d, "dispatches by shader: %.2f ms a frame in %d shaders (passes %.2f ms):", dt, nk, pt);
+        for (int i = 0; i < nk && i < 30 && q < (int)sizeof d - 48; i++) q += snprintf(d + q, sizeof d - (size_t)q, " %016llx %.2f ms x%u;", (unsigned long long)ks[i], kt[i], kn[i]);
+        VKLOG("%s", d);
+    }
     memset(g_pacc, 0, sizeof g_pacc); memset(g_pcnt, 0, sizeof g_pcnt); g_pmax = 0;
 }
 // one submission at a time: the game's (hle_nvn.c holds its own lock around them) and the backend's own (texel readback, present)

@@ -55,6 +55,8 @@ typedef struct {
     VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qf;
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mem;
     VkPipelineCache pcache;
+    int turnip;   // the driver is Mesa's Turnip: the work-arounds for Qualcomm's driver are off by default (gfx_vk_exec.c: LRZ touches, fragment-depth variants, self-MRT scratch, the per-pass bind cache reset)
+    int has_pstats;   // DM_VK_PIPE_STATS=1: VK_KHR_pipeline_executable_properties on, compute pipelines' compiler statistics logged (gfx_vk_core.c acct_cpipe)
     int has_gpl, has_gpl_dyn, has_bc, has_astc, has_gs, has_depth_clip_ctl, has_custom_border, has_robust2, has_xfb, has_imageless, has_dtiming, has_dynrender, has_timeline, has_draw_count;   // has_draw_count: drawIndirectCount (multi-draws by the GPU's count)
     int has_filter_cubic; // EXT filter_cubic enabled; each blit still checks the source format capability
     int has_occ_precise;  // exact samples-passed query counts (used as a ratio by Bananza, not only a visibility Boolean)

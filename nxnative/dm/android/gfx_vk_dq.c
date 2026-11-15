@@ -515,6 +515,7 @@ void vk_dq_replay_thread(void) {   // gfx_vk_exec.c mtl_exec: the thread replayi
     atomic_store(&g_rep_clk_ok, 0); g_rep_thr = t; g_rep_clk = c; atomic_store_explicit(&g_rep_clk_ok, 1, memory_order_release);
 }
 void vk_dq_report(unsigned frames) {
+    { void kgsl_capture_report(void) __attribute__((weak)); if (kgsl_capture_report) kgsl_capture_report(); }   // DM_KGSL_CAPTURE: the driver's ioctls so far (kgsl_capture.c)
     static uint64_t prep, prec, precs, pdesc, pddir, psubs, pdrains, pwait, pdirect; static clockid_t pclk;
     if (!frames) return;
     double f = frames; int rok = atomic_load_explicit(&g_rep_clk_ok, memory_order_acquire); clockid_t rc = g_rep_clk;
