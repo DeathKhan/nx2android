@@ -5729,7 +5729,11 @@ static void mesh_draw_one(const p_draw *d, uint32_t batch) {
     uint32_t count = d->ind ? 0 : (uint32_t)d->count, first = d->ind ? 0 : (uint32_t)d->first, verts = ms->mesh_verts ? ms->mesh_verts : 3, ipw = ms->mesh_max_p * verts;
     uint32_t ntask = ts ? (d->ind ? cap_t : count) : 0, nmesh = ts ? cap_m : (d->ind ? cap_m : count), pay = ts ? ts->mesh_pay : ms->mesh_pay;
     if (!ntask && !nmesh) return;
-    vk_end_pass_land();   // the dispatches run outside the pass (prepare_draw begins it again for the draw)
+    // DM_VK_MESH_INPASS=1 (start-up; Turnip with nx2android's in-pass dispatches, buffer updates and copies): an open pass stays open, the deferred updates land in
+    // it and the kernels run in it (the driver renders that pass in sysmem and fences each dispatch); otherwise the pass ends before them and begins again after
+    static int inpass = -1; if (inpass < 0) { const char *e = getenv("DM_VK_MESH_INPASS"); inpass = V.turnip && e && atoi(e); if (inpass) VKLOG("mesh emulation: kernels inside the open pass (DM_VK_MESH_INPASS=1)"); }
+    if (inpass && S.pass_open == 1) { if (vk_sub_open()) { VkCommandBuffer vk_cmd_peek(void); void vk_ubd_land(VkCommandBuffer cb); vk_ubd_land(vk_cmd_peek()); } }
+    else vk_end_pass_land();   // the dispatches run outside the pass (prepare_draw begins it again for the draw)
     VkCommandBuffer cb = vk_cmd();
     // the buffers: control words (host-written; an indirect draw's record copied in by meshprep.comp), the task payloads, the launch list, the vertices and indices
     mesh_buf ctl; uint32_t *cw = vk_scratch(64, 256, &ctl.b, &ctl.off); ctl.len = 64; memset(cw, 0, 64); cw[0] = first; cw[1] = ts ? ntask : nmesh;
