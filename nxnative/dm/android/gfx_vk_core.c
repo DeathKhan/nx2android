@@ -251,15 +251,22 @@ static void pipe_note(const char *kind, uint32_t n, uint64_t before, const VkPip
         VKLOG("%s pipeline: %.1f MB of GPU memory mapped for it (stages %u: modules%s); pipelines %llu so far, %.0f MB in all, %llu of 16 MB or more", kind, d / 1048576.0, nst, mods, (unsigned long long)g_pipe_n, g_pipe_kgsl / 1048576.0, (unsigned long long)g_pipe_big); } }
     if (g_pipe_n && !(g_pipe_n & 63)) VKLOG("pipelines: %llu made, %.0f MB of GPU memory mapped around their creation (%llu of 16 MB or more)", (unsigned long long)g_pipe_n, g_pipe_kgsl / 1048576.0, (unsigned long long)g_pipe_big);
 }
+static void pstats_log_exec(VkDevice dev, VkPipeline p, uint32_t exe);
 static VKAPI_ATTR VkResult VKAPI_CALL acct_gpipe(VkDevice dev, VkPipelineCache pc, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *cb, VkPipeline *out) {
-    uint64_t b = kgsl_mapped(); VkResult r = real_vkCreateGraphicsPipelines(dev, pc, n, ci, cb, out); pipe_note("graphics", n, b, ci->pStages, ci->stageCount); return r; }
-static void pstats_log(VkDevice dev, VkPipeline p) {   // DM_VK_PIPE_STATS: one line of the driver's statistics for a compute pipeline
+    VkGraphicsPipelineCreateInfo g1; int st = V.has_pstats && n == 1 && !(ci->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) && ci->stageCount;
+    if (st) { g1 = ci[0]; g1.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR; ci = &g1; }
+    uint64_t b = kgsl_mapped(); VkResult r = real_vkCreateGraphicsPipelines(dev, pc, n, ci, cb, out); pipe_note("graphics", n, b, ci->pStages, ci->stageCount);
+    if (st && r >= 0 && out[0]) for (uint32_t e = 0; e < ci->stageCount && e < 3; e++) pstats_log_exec(dev, out[0], e);
+    return r; }
+static void pstats_log_exec(VkDevice dev, VkPipeline p, uint32_t exe);
+static void pstats_log(VkDevice dev, VkPipeline p) { pstats_log_exec(dev, p, 0); }
+static void pstats_log_exec(VkDevice dev, VkPipeline p, uint32_t exe) {   // DM_VK_PIPE_STATS: one line of the driver's statistics for one executable (stage) of a pipeline
     static PFN_vkGetPipelineExecutableStatisticsKHR gs; if (!gs) gs = (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(dev, "vkGetPipelineExecutableStatisticsKHR");
     if (!gs) return;
-    VkPipelineExecutableInfoKHR ei = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, NULL, p, 0}; VkPipelineExecutableStatisticKHR st[48]; uint32_t n = 48;
+    VkPipelineExecutableInfoKHR ei = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, NULL, p, exe}; VkPipelineExecutableStatisticKHR st[48]; uint32_t n = 48;
     for (uint32_t i = 0; i < n; i++) st[i] = (VkPipelineExecutableStatisticKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
     if (gs(dev, &ei, &n, st) < 0) return;
-    char b[1400]; int o = snprintf(b, sizeof b, "pstats %p:", (void *)p);
+    char b[1400]; int o = snprintf(b, sizeof b, "pstats %p/%u:", (void *)p, exe);
     for (uint32_t i = 0; i < n && o < (int)sizeof b - 64; i++) {
         o += snprintf(b + o, sizeof b - (size_t)o, " %s=", st[i].name);
         switch (st[i].format) { case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: o += snprintf(b + o, sizeof b - (size_t)o, "%u", st[i].value.b32); break;
@@ -696,7 +703,15 @@ void vk_init(void) {
     // are dropped, reads give values from the range or zeros). Off by default (it costs bounds checks on every access); for telling an out-of-range address from other
     // GPU faults (Welcome Tour's no-attachment draws, gfx_vk_exec.c noatt_on)
     { const char *e = getenv("DM_VK_ROBUST"); if (e && atoi(e)) { en.robustBufferAccess = ff.features.robustBufferAccess; VKLOG("%srobust buffer access %s (DM_VK_ROBUST)", en.robustBufferAccess ? "" : "[RED] ", en.robustBufferAccess ? "on" : "not offered by the device"); } }
-    f12.bufferDeviceAddressCaptureReplay = 0; f12.bufferDeviceAddressMultiDevice = 0;
+    // DM_VK_POOL_SVM=1 (start-up; nx2android's Turnip with TU_X_FIXED_REPLACE=1): each memory pool is device memory allocated at the pool's own address (capture/replay
+    // addresses: the GPU address is the CPU's on KGSL), mapped over the game's pages with their contents copied back, so a pointer the game's shaders read is a GPU address
+    { const char *e = getenv("DM_VK_POOL_SVM"); void svc_guest_range(uint8_t **base, size_t *size); uint8_t *gb; size_t gz; svc_guest_range(&gb, &gz);
+      int low = gb && (uint64_t)(uintptr_t)gb + gz <= 0x4000000000ull;   // KGSL mirrors CPU addresses on the GPU only below its own allocations (256 GB here)
+      int want = V.turnip && V.has_bda && f12.bufferDeviceAddressCaptureReplay && (e ? *e == '1' : low); V.has_svm = want;
+      if (want) setenv("TU_X_FIXED_REPLACE", "1", 0);   // (read by the driver at its first fixed-address mapping)
+      if (V.turnip) VKLOG("memory pools at the game's own GPU addresses: %s (game block %p +%#zx%s; DM_VK_POOL_SVM=0/1 overrides)", want ? "on" : "off", (void *)gb, gz, low ? "" : ", too high for the GPU to mirror");
+      if (!want) f12.bufferDeviceAddressCaptureReplay = 0; }
+    f12.bufferDeviceAddressMultiDevice = 0;
     featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)[1] = featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)[2] = 0;   // (its extension's: the same two)
     f13.robustImageAccess = 0;
     fbc.pNext = NULL; fcb.pNext = V.has_barycentric ? (void *)&fbc : NULL; fr2.pNext = V.has_custom_border ? (void *)&fcb : (V.has_barycentric ? (void *)&fbc : NULL); fdc.pNext = V.has_robust2 ? (void *)&fr2 : fr2.pNext;
@@ -713,6 +728,10 @@ void vk_init(void) {
     static VkPhysicalDeviceFaultFeaturesEXT dfault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     if (has_ext(ex, ne, "VK_EXT_device_fault")) { VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dfault}; vkGetPhysicalDeviceFeatures2(V.pd, &q); }
     if (dfault.deviceFault) { on[non++] = "VK_EXT_device_fault"; dfault.deviceFaultVendorBinary = VK_FALSE; dfault.pNext = dnext; dnext = &dfault; }
+    // DM_VK_POOL_HOSTPTR=1 (start-up; Turnip): memory pools are imported in place, the game's pages themselves (pool_hostptr). With nx2android's Turnip the GPU maps
+    // them at their CPU address, which is the game's: a pointer the game's shaders read from memory is then a GPU address as it is
+    { const char *e = getenv("DM_VK_POOL_HOSTPTR");
+      if (V.turnip && e && *e == '1' && has_ext(ex, ne, "VK_EXT_external_memory_host") && non + 1 <= 64) { on[non++] = "VK_EXT_external_memory_host"; V.has_hostptr = 1; } }
     // DM_VK_PIPE_STATS=1 (start-up, diagnostic): the driver's statistics of each compute pipeline (registers, waves, instructions; acct_cpipe), where it offers them
     static VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR fpe = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     { const char *e = getenv("DM_VK_PIPE_STATS");
@@ -981,7 +1000,54 @@ static void slab_give(slab_t *s, uint32_t i, uint64_t fence) {
     pthread_mutex_lock(&g_slab_mu); s->fence[i] = fence; s->bits[i >> 6] |= 1ull << (i & 63); s->nfree++; pthread_mutex_unlock(&g_slab_mu);
 }
 // Zero copy: the pages of [mem, mem+size) become an AHardwareBuffer's, imported as a VkBuffer (a slab's slot for a small pool, or a kept buffer of a freed pool of that size). 0 on success
+uint64_t g_svm_pools, g_svm_identity;
+static int pool_svm(vkpool_t *p, uint8_t *mem, uint64_t size) {   // memory at the pool's own address (V.has_svm); 0 done. Called with the pool frozen (pool_back_locked)
+    uint8_t *save = malloc(size); if (!save) return -1;
+    memcpy(save, mem, size);
+    VkBufferOpaqueCaptureAddressCreateInfo bc = {VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO, NULL, (uint64_t)(uintptr_t)mem};
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &bc, VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT, size, POOL_USAGE, VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer b; if (vkCreateBuffer(V.dev, &bi, NULL, &b)) { free(save); return -1; }
+    VkMemoryOpaqueCaptureAddressAllocateInfo ca = {VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO, NULL, (uint64_t)(uintptr_t)mem};
+    VkMemoryAllocateFlagsInfo fl = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &ca, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT | VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT, 0};
+    uint32_t ti = vk_mem_type(~0u, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl, size, ti}; VkDeviceMemory m;
+    VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &m);   // (the driver maps it at mem, over the game's pages)
+    if (r) { vkDestroyBuffer(V.dev, b, NULL); free(save); static int s; if (s++ < 4) VKLOG("[RED] pool at its own address refused (%d): %p +%#llx (the game's pages are untouched)", r, (void *)mem, (unsigned long long)size); return -1; }
+    void *map = NULL; vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &map);
+    if (map != mem) { static int s; if (!s++) VKLOG("[RED] pool at its own address: mapped at %p, not %p", map, (void *)mem); }
+    memcpy(mem, save, size); free(save);
+    if (vkBindBufferMemory(V.dev, b, m, 0)) { vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL); return -1; }
+    p->buf = b; p->mem = m; p->ahb = NULL; p->slab = NULL; p->boff = 0; p->zero_copy = 1; p->svm = 1; p->gpu = buf_gpu_addr(b);
+    g_svm_pools++; g_svm_identity += p->gpu == (uint64_t)(uintptr_t)mem;
+    static int n; if (n++ < 8 || !(g_svm_pools & 1023)) VKLOG("pool %p +%#llx at its own address: GPU address %#llx%s (%llu pools, %llu at the game's own address)", (void *)mem, (unsigned long long)size,
+        (unsigned long long)p->gpu, p->gpu == (uint64_t)(uintptr_t)mem ? ", the game's own" : "", (unsigned long long)g_svm_pools, (unsigned long long)g_svm_identity);
+    return 0;
+}
+uint64_t g_hostptr_pools, g_hostptr_identity;
+static int pool_hostptr(vkpool_t *p, uint8_t *mem, uint64_t size) {   // the pool's own pages as the buffer's memory (V.has_hostptr); 0 done
+    static PFN_vkGetMemoryHostPointerPropertiesEXT gp; if (!gp) gp = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(V.dev, "vkGetMemoryHostPointerPropertiesEXT");
+    if (!gp) return -1;
+    VkMemoryHostPointerPropertiesEXT hp = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (gp(V.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, mem, &hp) || !hp.memoryTypeBits) { static int s; if (!s++) VKLOG("[RED] pool import in place: no memory type for host pointer %p", (void *)mem); return -1; }
+    VkExternalMemoryBufferCreateInfo eb = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &eb, 0, size, POOL_USAGE, VK_SHARING_MODE_EXCLUSIVE};
+    VkBuffer b; if (vkCreateBuffer(V.dev, &bi, NULL, &b)) return -1;
+    VkImportMemoryHostPointerInfoEXT im = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, mem};
+    BDA_ALLOC_FLAGS(&im);
+    uint32_t ti = 0; while (ti < 32 && !(hp.memoryTypeBits >> ti & 1)) ti++;
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, bda_next, size, ti}; VkDeviceMemory m;
+    VkResult r = vkAllocateMemory(V.dev, &ai, NULL, &m);
+    if (r) { vkDestroyBuffer(V.dev, b, NULL); static int s; if (!s++) VKLOG("[RED] pool import in place refused (%d): %p +%#llx", r, (void *)mem, (unsigned long long)size); return -1; }
+    if (vkBindBufferMemory(V.dev, b, m, 0)) { vkDestroyBuffer(V.dev, b, NULL); vkFreeMemory(V.dev, m, NULL); return -1; }
+    p->buf = b; p->mem = m; p->ahb = NULL; p->slab = NULL; p->boff = 0; p->zero_copy = 1; p->gpu = buf_gpu_addr(b);
+    g_hostptr_pools++; g_hostptr_identity += p->gpu == (uint64_t)(uintptr_t)mem;
+    static int n; if (n++ < 8 || !(g_hostptr_pools & 1023)) VKLOG("pool %p +%#llx imported in place: GPU address %#llx%s (%llu pools, %llu at the game's own address)", (void *)mem, (unsigned long long)size,
+        (unsigned long long)p->gpu, p->gpu == (uint64_t)(uintptr_t)mem ? ", the game's own" : "", (unsigned long long)g_hostptr_pools, (unsigned long long)g_hostptr_identity);
+    return 0;
+}
 static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size) {
+    if (V.has_svm && !pool_svm(p, mem, size)) return 0;
+    if (V.has_hostptr && !pool_hostptr(p, mem, size)) return 0;
     slab_t *sl; uint32_t si;
     if (slab_take(size, &sl, &si)) {
         uint64_t off = (uint64_t)si * sl->slot_bytes;
@@ -1095,6 +1161,11 @@ int vk_pool_remap_ro(void *mem, size_t len) {
 // A pool that goes: its pages take the buffer's contents with them (the game may reuse the memory), as the pages of the pool they lie inside (see "Pools inside pools":
 // written into that pool's buffer first, then mapped from it, so the bytes are there at every moment) or else as anonymous memory. p has left the table
 static void pool_copy_back(vkpool_t *p) {
+    if (p->svm) {   // device memory at the pool's address (pool_svm): ordinary pages there again, with what it holds
+        uint64_t n = p->hi - p->lo; uint8_t *mem = (uint8_t *)(uintptr_t)p->lo, *save = malloc(n);
+        if (save) { memcpy(save, mem, n); if (mmap(mem, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == mem) memcpy(mem, save, n); free(save); }
+        return; }
+    if (p->zero_copy && !p->ahb && !p->slab) return;   // imported in place (pool_hostptr): the pages were the game's own all along
     for (uint64_t a = p->lo; a < p->hi; ) {
         uint8_t *mem = (uint8_t *)(uintptr_t)a; uint64_t e = p->hi, next = p->hi; int fd = -1, own = 0; off_t off = 0;
         pthread_rwlock_rdlock(&g_pool_mu);

@@ -27,7 +27,7 @@ static int spv_gmcache_wanted(const uint32_t *w, size_t n) {
     return 0;
 }
 
-typedef struct { size_t fn, end, ent[4], entac[4], del[2], delac[2], mul; uint32_t tab, tabc0, acty, wty, ity, found, pv[6]; int ne, nd; } spv_gmcache_fn;   // one helper's places
+typedef struct { size_t fn, end, ent[4], entac[4], del[2], delac[2], mul, sm, bc; uint32_t flag, nl, tab, tabc0, acty, wty, ity, found, pv[6]; int ne, nd; } spv_gmcache_fn;   // sm, bc: the hit test's selection merge and conditional branch (ident[2])   // one helper's places
 
 // An access chain's last index resolved as (base + c), c a small constant, through loads of locals stored once in the function, bitcasts and copies. def: each id's
 // defining instruction (word index); stv: each local's one store's value (0 none, ~0 stored more than once); fl bit 1 with cv: a constant's value. → c, or -1
@@ -44,10 +44,15 @@ static int spv_gmcache_c(const uint32_t *w, const uint32_t *def, const uint32_t 
 }
 
 // The module rewritten into o (cap words) → its length; 0 when nothing is done (*why says why; 0: no helper). sc: 4 * bound words of scratch
-static size_t spv_gmcache(const uint32_t *w, size_t n, uint32_t *sc, uint32_t *o, size_t cap, int *why) {
+// ident (nx2android's Turnip with memory pools at the game's own GPU addresses, gfx_vk_core.c pool_svm): {lo, hi} of the game's address block. Every helper's entry is
+// then that block with a delta of 0, as constants: an address in the block is used as it is (the compiler drops the table search behind the always-taken hit), one
+// outside it (a null or stale pointer) still misses into the search, which finds no pool and reads 0 as before. NULL: the private-word cache above
+static size_t spv_gmcache_x(const uint32_t *w, size_t n, uint32_t *sc, uint32_t *o, size_t cap, int *why, const uint64_t *ident);
+static size_t spv_gmcache(const uint32_t *w, size_t n, uint32_t *sc, uint32_t *o, size_t cap, int *why) { return spv_gmcache_x(w, n, sc, o, cap, why, 0); }
+static size_t spv_gmcache_x(const uint32_t *w, size_t n, uint32_t *sc, uint32_t *o, size_t cap, int *why, const uint64_t *ident) {
     *why = 0;
     if (n < 5 || w[0] != 0x07230203) { *why = SPV_GMCACHE_FORM; return 0; }
-    uint32_t bound = w[3], ver = w[1];
+    uint32_t bound = w[3], ver = w[1], g_boolty = 0, g_truec = 0;
     uint32_t *def = sc, *stv = sc + bound, *cv = sc + 2 * (size_t)bound; uint8_t *fl = (uint8_t *)(sc + 3 * (size_t)bound);   // fl: 1 a constant, 2 a Private variable with an initializer
     for (size_t i = 0; i < 3 * (size_t)bound; i++) sc[i] = 0;
     for (size_t i = 0; i < bound; i++) fl[i] = 0;
@@ -57,6 +62,8 @@ static size_t spv_gmcache(const uint32_t *w, size_t n, uint32_t *sc, uint32_t *o
         if (op >= 19 && op <= 39 && len >= 2 && x[1] < bound) def[x[1]] = (uint32_t)i;   // types
         else if ((op == 43 || op == 46 || op == 59 || op == 61 || op == 65 || op == 83 || op == 124 || op == 128 || op == 132) && len >= 3 && x[2] < bound) def[x[2]] = (uint32_t)i;
         if (op == 43 && len == 4 && x[2] < bound) { fl[x[2]] |= 1; cv[x[2]] = x[3]; }
+        if (op == 42 && len == 3 && x[2] < bound) { fl[x[2]] |= 4; if (!g_boolty) g_boolty = x[1]; }
+        if (op == 41 && len == 3 && !g_truec) g_truec = x[2];
         if (op == 59 && len == 5 && x[3] == 6 && x[2] < bound) fl[x[2]] |= 2;
         i += len; }
     if (!i_fn) return 0;
@@ -94,6 +101,9 @@ static size_t spv_gmcache(const uint32_t *w, size_t n, uint32_t *sc, uint32_t *o
             if (nb == 1 && c <= 3) { if (f->ent[c]) { *why = SPV_GMCACHE_FORM; return 0; } f->ent[c] = j; f->entac[c] = def[x[3]]; f->ne++; }
             else if (nb > 1 && (c == 4 || c == 5)) { if (f->del[c - 4]) { *why = SPV_GMCACHE_FORM; return 0; } f->del[c - 4] = j; f->delac[c - 4] = def[x[3]]; f->nd++; } }
         if (f->ne != 4 || f->nd != 2 || !fill || !f->mul) { *why = SPV_GMCACHE_FORM; return 0; }
+        for (size_t j = s; j < e && !f->flag; j += w[j] >> 16) if ((w[j] & 0xffff) == 62 && (w[j] >> 16) == 3 && w[j + 2] < bound && (fl[w[j + 2]] & 4)) f->flag = w[j + 1];
+        { size_t last = 0; for (int c = 0; c < 4; c++) if (f->ent[c] > last) last = f->ent[c];
+          for (size_t j = last; j < e; j += w[j] >> 16) { uint32_t op = w[j] & 0xffff; if (op == 247 && !f->sm) f->sm = j; if (op == 250 && f->sm) { f->bc = j; break; } if (op == 248) break; } }
         nf++;
     }
     if (!nf) return 0;
@@ -108,7 +118,10 @@ static size_t spv_gmcache(const uint32_t *w, size_t n, uint32_t *sc, uint32_t *o
     if (!pty) pty = nb_++;
     if (!nul) nul = nb_++;
     for (int c = 0; c < 6; c++) if (!cs[c]) cs[c] = nb_++;
-    for (int k = 0; k < nf; k++) for (int c = 0; c < 6; c++) F[k].pv[c] = nb_++;
+    uint32_t ic[6] = {0};   // ident: the six words as constants of the word type
+    uint32_t truec = g_truec; int newtrue = 0;
+    if (ident) { for (int c = 0; c < 6; c++) ic[c] = nb_++; if (ident[2]) { if (!truec && g_boolty) { truec = nb_++; newtrue = 1; } for (int q = 0; q < nf; q++) F[q].nl = nb_++; } }
+    else for (int k = 0; k < nf; k++) for (int c = 0; c < 6; c++) F[k].pv[c] = nb_++;
     if (cap < n + SPV_GMCACHE_EXTRA(nf)) { *why = SPV_GMCACHE_ROOM; return 0; }
     size_t k = 0;
     for (int q = 0; q < 5; q++) o[k++] = w[q];
@@ -118,8 +131,11 @@ static size_t spv_gmcache(const uint32_t *w, size_t n, uint32_t *sc, uint32_t *o
             if (pty >= bound) { o[k++] = 4u << 16 | 32; o[k++] = pty; o[k++] = 6; o[k++] = wty; }
             if (nul >= bound) { o[k++] = 3u << 16 | 46; o[k++] = wty; o[k++] = nul; }
             for (int c = 0; c < 6; c++) if (cs[c] >= bound) { o[k++] = 4u << 16 | 43; o[k++] = ity; o[k++] = cs[c]; o[k++] = (uint32_t)c; }
-            for (int f = 0; f < nf; f++) for (int c = 0; c < 6; c++) { o[k++] = 5u << 16 | 59; o[k++] = pty; o[k++] = F[f].pv[c]; o[k++] = 6; o[k++] = nul; } }
-        if (op == 15 && ver >= 0x10400) {   // SPIR-V 1.4: every global variable a function may use is in the interface
+            if (ident) { const uint32_t v[6] = {(uint32_t)ident[0], (uint32_t)(ident[0] >> 32), (uint32_t)ident[1], (uint32_t)(ident[1] >> 32), 0, 0};
+                for (int c = 0; c < 6; c++) { o[k++] = 4u << 16 | 43; o[k++] = wty; o[k++] = ic[c]; o[k++] = v[c]; }
+                if (newtrue) { o[k++] = 3u << 16 | 41; o[k++] = g_boolty; o[k++] = truec; } }
+            else for (int f = 0; f < nf; f++) for (int c = 0; c < 6; c++) { o[k++] = 5u << 16 | 59; o[k++] = pty; o[k++] = F[f].pv[c]; o[k++] = 6; o[k++] = nul; } }
+        if (op == 15 && ver >= 0x10400 && !ident) {   // SPIR-V 1.4: every global variable a function may use is in the interface
             o[k] = (len + 6u * (uint32_t)nf) << 16 | 15; for (uint32_t q = 1; q < len; q++) o[k + q] = x[q]; k += len;
             for (int f = 0; f < nf; f++) for (int c = 0; c < 6; c++) o[k++] = F[f].pv[c];
             i += len; continue; }
@@ -128,10 +144,17 @@ static size_t spv_gmcache(const uint32_t *w, size_t n, uint32_t *sc, uint32_t *o
         if (f) { for (int c = 0; c < 4; c++) { if (i == f->entac[c]) drop = 1; if (i == f->ent[c]) swap = c; }
                  for (int c = 0; c < 2; c++) { if (i == f->delac[c]) drop = 1; if (i == f->del[c]) swap = 4 + c; }
                  if (i == f->mul) fill = 1; }
+        if (ident && ident[2] && f && f->sm && f->bc && f->flag && truec && i == f->bc && len >= 4) {
+            o[k++] = 4u << 16 | 250; o[k++] = x[1]; o[k++] = f->nl; o[k++] = x[3];   // miss → the new block, hit → the access
+            o[k++] = 2u << 16 | 248; o[k++] = f->nl;
+            o[k++] = 3u << 16 | 62; o[k++] = f->flag; o[k++] = truec;   // not found: the access is skipped (reads 0)
+            o[k++] = 2u << 16 | 249; o[k++] = x[3];
+            i += len; continue; }
         if (drop) { i += len; continue; }
+        if (swap >= 0 && ident) { o[k++] = 4u << 16 | 83; o[k++] = x[1]; o[k++] = x[2]; o[k++] = ic[swap]; i += len; continue; }   // OpCopyObject of the constant
         if (swap >= 0) { o[k++] = 4u << 16 | 61; o[k++] = x[1]; o[k++] = x[2]; o[k++] = f->pv[swap]; i += len; continue; }
         for (uint32_t q = 0; q < len; q++) o[k + q] = x[q]; k += len; i += len;
-        if (fill) for (int c = 0; c < 6; c++) {   // the found entry's six words into the private ones
+        if (fill && !ident) for (int c = 0; c < 6; c++) {   // the found entry's six words into the private ones
             uint32_t a = nb_++, p = nb_++, v = nb_++;
             o[k++] = 5u << 16 | 128; o[k++] = f->ity; o[k++] = a; o[k++] = f->found; o[k++] = cs[c];
             o[k++] = 6u << 16 | 65; o[k++] = f->acty; o[k++] = p; o[k++] = f->tab; o[k++] = f->tabc0; o[k++] = a;

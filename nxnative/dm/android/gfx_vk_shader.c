@@ -571,7 +571,11 @@ static size_t spv_fit_gmcache(const uint32_t *code, size_t nw, uint64_t key, uin
     *out = NULL;
     if (!on || nw < 5 || !spv_gmcache_wanted(code, nw)) return 0;
     size_t cap = nw + SPV_GMCACHE_EXTRA(SPV_GMCACHE_MAX); uint32_t *s = malloc(4 * (size_t)code[3] * 4), *o = malloc(cap * 4); int why = 0;
-    size_t k = s && o ? spv_gmcache(code, nw, s, o, cap, &why) : 0; free(s);
+    uint64_t idr[3] = {0}; const uint64_t *ident = NULL;
+    if (V.has_svm) { void svc_guest_range(uint8_t **base, size_t *size); uint8_t *b; size_t z; svc_guest_range(&b, &z); idr[0] = (uint64_t)(uintptr_t)b; idr[1] = idr[0] + z; ident = idr;
+        { const char *e = getenv("DM_VK_GMIDENT_ALL"); idr[2] = !(e && *e == '0'); }   // no search compiled: an address outside the block reads 0 (the not-found path); 0: the search kept for misses
+        static int said; if (!said++) VKLOG("raw global memory: addresses in the game's block %#llx..%#llx are GPU addresses as they are (memory pools at their own addresses): no table lookups", (unsigned long long)idr[0], (unsigned long long)idr[1]); }
+    size_t k = s && o ? spv_gmcache_x(code, nw, s, o, cap, &why, ident) : 0; free(s);
     static _Atomic int told, logged, count;
     if (!k) { free(o);
         if (why && !atomic_exchange(&told, 1)) VKLOG("shader %016llx: raw global memory helpers not in the translator's form (%d), made as translated (said once)", (unsigned long long)key, why);

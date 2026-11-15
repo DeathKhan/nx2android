@@ -337,7 +337,13 @@ static void mem_init_once(void) {
     // they fit in the alias region depended on the address ASLR gave the block: NEO's nninitStartup aborted in StandardAllocator::Initialize on some runs and not on others.
     // 64-bit Android has the address space to over-reserve by 1 GB and trim (the alias region is the last part of the block, see the partition below)
     {   const size_t A = 1ull << 30, aoff = g_reserve - alias;   // the alias region's offset in the block
-        uint8_t *r = mmap(NULL, g_reserve + A, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        // DM_GUEST_AS_AT=<address> (start-up): the block asked for there (a hint, not fixed). nx2android's Turnip maps memory pools on the GPU at their CPU address (KGSL's
+        // shared virtual memory), which the kernel allows only in the lower part of the address space: there a pointer the game's shaders read is a GPU address as it is
+        // Default with the port's Turnip (DM_VK_DRIVER names libvulkan_freedreno): 64 GB, low enough for the GPU to mirror and below 2^39 as a Switch's addresses are. 0: anywhere
+        const char *at = getenv("DM_GUEST_AS_AT"), *drv = getenv("DM_VK_DRIVER");
+        uintptr_t want_at = at && *at ? (uintptr_t)strtoull(at, NULL, 0) : drv && strstr(drv, "freedreno") ? (uintptr_t)0x1000000000ull : 0;
+        void *hint = (void *)want_at;
+        uint8_t *r = mmap(hint, g_reserve + A, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
         if (r == MAP_FAILED) die("reserve guest AS");
         uint8_t *al = (uint8_t *)((((uintptr_t)r + aoff + A - 1) & ~(uintptr_t)(A - 1)) - aoff);
         if (al > r) munmap(r, (size_t)(al - r));
